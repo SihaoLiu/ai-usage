@@ -513,6 +513,10 @@ def main():
     def calculate_vendor_aggregate_time_series(interval_minutes=60):
         """Calculate total token usage per vendor over time.
 
+        This version distributes tokens evenly across the session time span to produce
+        smoother charts. Long-running sessions will have their token usage spread across
+        all intervals they span, rather than being concentrated at a single timestamp.
+
         Returns a time series where each time interval contains per-vendor totals:
         {
             interval_time: {
@@ -529,7 +533,40 @@ def main():
         # Get local timezone
         local_tz = datetime.now().astimezone().tzinfo
 
-        time_series = defaultdict(lambda: defaultdict(int))
+        time_series = defaultdict(lambda: defaultdict(float))
+
+        def to_interval(dt):
+            """Round datetime to the nearest interval boundary."""
+            total_minutes = dt.hour * 60 + dt.minute
+            interval_start_minutes = (total_minutes // interval_minutes) * interval_minutes
+            interval_hour = interval_start_minutes // 60
+            interval_minute = interval_start_minutes % 60
+            return dt.replace(hour=interval_hour, minute=interval_minute, second=0, microsecond=0)
+
+        def distribute_tokens(session_start_str, session_end_str, total_tokens):
+            """Distribute tokens evenly across intervals within session time span."""
+            try:
+                start = datetime.fromisoformat(session_start_str.replace('Z', '+00:00'))
+                end = datetime.fromisoformat(session_end_str.replace('Z', '+00:00'))
+                start_local = start.astimezone(local_tz)
+                end_local = end.astimezone(local_tz)
+            except Exception:
+                return []
+
+            start_interval = to_interval(start_local)
+            end_interval = to_interval(end_local)
+
+            intervals = []
+            current = start_interval
+            while current <= end_interval:
+                intervals.append(current)
+                current += timedelta(minutes=interval_minutes)
+
+            if not intervals:
+                return []
+
+            tokens_per_interval = total_tokens / len(intervals)
+            return [(interval_time, tokens_per_interval) for interval_time in intervals]
 
         # Helper to process usage data and add to time series
         def process_usage_data(usage_data, vendor_label):
@@ -537,30 +574,33 @@ def main():
                 timestamp_str = entry.get('timestamp')
                 if not timestamp_str:
                     continue
-                try:
-                    timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                    timestamp_local = timestamp.astimezone(local_tz)
 
-                    # Round down to the nearest interval
-                    total_minutes = timestamp_local.hour * 60 + timestamp_local.minute
-                    interval_start_minutes = (total_minutes // interval_minutes) * interval_minutes
-                    interval_hour = interval_start_minutes // 60
-                    interval_minute = interval_start_minutes % 60
+                usage = entry['message']['usage']
+                # Sum all token types
+                total = (usage.get('input_tokens', 0) +
+                         usage.get('output_tokens', 0) +
+                         usage.get('cache_read_input_tokens', 0) +
+                         usage.get('cache_creation_input_tokens', 0))
 
-                    interval_time = timestamp_local.replace(
-                        hour=interval_hour, minute=interval_minute, second=0, microsecond=0
-                    )
+                # Get session time span (if available)
+                session_start = entry.get('session_start_time', timestamp_str)
+                session_end = entry.get('session_end_time', timestamp_str)
 
-                    usage = entry['message']['usage']
-                    # Sum all token types
-                    total = (usage.get('input_tokens', 0) +
-                             usage.get('output_tokens', 0) +
-                             usage.get('cache_read_input_tokens', 0) +
-                             usage.get('cache_creation_input_tokens', 0))
+                # Distribute tokens across intervals
+                distributed = distribute_tokens(session_start, session_end, total)
 
-                    time_series[interval_time][vendor_label] += total
-                except Exception:
-                    continue
+                if distributed:
+                    for interval_time, tokens in distributed:
+                        time_series[interval_time][vendor_label] += tokens
+                else:
+                    # Fallback: use original timestamp-based bucketing
+                    try:
+                        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        timestamp_local = timestamp.astimezone(local_tz)
+                        interval_time = to_interval(timestamp_local)
+                        time_series[interval_time][vendor_label] += total
+                    except Exception:
+                        continue
 
         # Read and process Claude data
         claude_dir = get_claude_dir() / 'projects'

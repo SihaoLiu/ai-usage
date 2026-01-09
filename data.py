@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 
 def get_claude_dir():
@@ -13,7 +14,12 @@ def get_claude_dir():
 
 
 def read_jsonl_files(projects_dir):
-    """Read all JSONL files from projects directory."""
+    """Read all JSONL files from projects directory.
+
+    For Claude, each usage entry represents a single API call with its own timestamp.
+    We use each entry's own timestamp for time bucketing (no session-level spreading).
+    This ensures token consumption is attributed to the actual time of the API call.
+    """
     usage_data = []
 
     for jsonl_file in projects_dir.rglob('*.jsonl'):
@@ -27,6 +33,11 @@ def read_jsonl_files(projects_dir):
                         data = json.loads(line)
                         # Only include entries with usage data
                         if data.get('message') and data['message'].get('usage'):
+                            # Use entry's own timestamp (no session-level spreading)
+                            # This is correct because each Claude API call has its own timestamp
+                            timestamp = data.get('timestamp')
+                            data['session_start_time'] = timestamp
+                            data['session_end_time'] = timestamp
                             usage_data.append(data)
                     except json.JSONDecodeError:
                         continue

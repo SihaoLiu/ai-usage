@@ -27,10 +27,14 @@ def read_gemini_json_files(tmp_dir):
         "total": 8720       # total
     }
 
+    Session files also contain startTime and lastUpdated fields for time span tracking.
+
     Returns normalized data similar to Claude format for compatibility:
     [
         {
             'timestamp': '2025-12-11T23:18:08.351Z',
+            'session_start_time': '2025-12-11T23:18:08.351Z',  # Same as timestamp
+            'session_end_time': '2025-12-11T23:18:08.351Z',    # Same as timestamp
             'message': {
                 'model': 'gemini-3-pro-preview',
                 'usage': {
@@ -53,8 +57,20 @@ def read_gemini_json_files(tmp_dir):
             with open(session_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
+            # Extract session time span from file-level fields
+            session_start = data.get('startTime')
+            session_last_updated = data.get('lastUpdated')
+
             # Extract messages array
             messages = data.get('messages', [])
+
+            # Find the last message timestamp as fallback for session end
+            msg_timestamps = [m.get('timestamp') for m in messages if m.get('timestamp')]
+            last_msg_timestamp = max(msg_timestamps) if msg_timestamps else session_last_updated
+
+            # Determine session time span
+            # Use startTime as session start, and max of (lastUpdated, last message timestamp) as end
+            session_end = last_msg_timestamp if last_msg_timestamp else session_last_updated
 
             for msg in messages:
                 # Only process gemini type messages with tokens
@@ -80,9 +96,12 @@ def read_gemini_json_files(tmp_dir):
                 # Calculate non-cached input
                 non_cached_input = total_input - cached_input
 
-                # Normalize to Claude-like format
+                # Use entry's own timestamp (no session-level spreading)
+                # Each Gemini message represents a specific API call
                 normalized_entry = {
                     'timestamp': timestamp,
+                    'session_start_time': timestamp,
+                    'session_end_time': timestamp,
                     'message': {
                         'model': model,
                         'usage': {

@@ -14,6 +14,11 @@ from datetime import datetime
 from urllib.request import urlopen
 from urllib.error import URLError
 
+# Version cache: {vendor: {'version_str': str, 'timestamp': float}}
+# Cache duration: 5 minutes (300 seconds)
+_VERSION_CACHE = {}
+_VERSION_CACHE_TTL = 300
+
 # Claude imports
 from data import get_claude_dir, read_jsonl_files, filter_usage_data_by_days
 from stats import calculate_model_breakdown, calculate_model_token_breakdown_time_series
@@ -252,7 +257,18 @@ def main():
         return None
 
     def get_claude_version():
-        """Get the Claude Code version string with update status."""
+        """Get the Claude Code version string with update status.
+
+        Uses caching to avoid repeated network calls (5-minute TTL).
+        """
+        # Check cache first
+        cache_key = 'claude'
+        now = time.time()
+        if cache_key in _VERSION_CACHE:
+            cached = _VERSION_CACHE[cache_key]
+            if now - cached['timestamp'] < _VERSION_CACHE_TTL:
+                return cached['version_str']
+
         current_version = None
         try:
             result = subprocess.run(
@@ -268,21 +284,36 @@ def main():
             pass
 
         if not current_version:
-            return "Claude Code"
-
-        # Check for latest version
-        latest_version = get_latest_claude_version_from_npm()
-
-        if latest_version is None:
-            # Couldn't fetch latest version, just show current
-            return f"Claude Code ({current_version})"
-        elif current_version == latest_version:
-            return f"Claude Code ({current_version}, up-to-date)"
+            version_str = "Claude Code"
         else:
-            return f"Claude Code ({current_version}, a newer version {latest_version} available)"
+            # Check for latest version
+            latest_version = get_latest_claude_version_from_npm()
+
+            if latest_version is None:
+                # Couldn't fetch latest version, just show current
+                version_str = f"Claude Code ({current_version})"
+            elif current_version == latest_version:
+                version_str = f"Claude Code ({current_version}, up-to-date)"
+            else:
+                version_str = f"Claude Code ({current_version}, a newer version {latest_version} available)"
+
+        # Update cache
+        _VERSION_CACHE[cache_key] = {'version_str': version_str, 'timestamp': now}
+        return version_str
 
     def get_codex_version():
-        """Get the Codex version string with update status."""
+        """Get the Codex version string with update status.
+
+        Uses caching to avoid repeated network calls (5-minute TTL).
+        """
+        # Check cache first
+        cache_key = 'codex'
+        now = time.time()
+        if cache_key in _VERSION_CACHE:
+            cached = _VERSION_CACHE[cache_key]
+            if now - cached['timestamp'] < _VERSION_CACHE_TTL:
+                return cached['version_str']
+
         current_version = None
         try:
             result = subprocess.run(
@@ -302,18 +333,22 @@ def main():
             pass
 
         if not current_version:
-            return "Codex"
-
-        # Check for latest version
-        latest_version = get_latest_codex_version_from_npm()
-
-        if latest_version is None:
-            # Couldn't fetch latest version, just show current
-            return f"Codex ({current_version})"
-        elif current_version == latest_version:
-            return f"Codex ({current_version}, up-to-date)"
+            version_str = "Codex"
         else:
-            return f"Codex ({current_version}, a newer version {latest_version} available)"
+            # Check for latest version
+            latest_version = get_latest_codex_version_from_npm()
+
+            if latest_version is None:
+                # Couldn't fetch latest version, just show current
+                version_str = f"Codex ({current_version})"
+            elif current_version == latest_version:
+                version_str = f"Codex ({current_version}, up-to-date)"
+            else:
+                version_str = f"Codex ({current_version}, a newer version {latest_version} available)"
+
+        # Update cache
+        _VERSION_CACHE[cache_key] = {'version_str': version_str, 'timestamp': now}
+        return version_str
 
     def get_latest_gemini_version_from_npm():
         """Fetch the latest version from Gemini CLI's NPM registry."""
@@ -329,7 +364,18 @@ def main():
         return None
 
     def get_gemini_version():
-        """Get the Gemini CLI version string with update status."""
+        """Get the Gemini CLI version string with update status.
+
+        Uses caching to avoid repeated network calls (5-minute TTL).
+        """
+        # Check cache first
+        cache_key = 'gemini'
+        now = time.time()
+        if cache_key in _VERSION_CACHE:
+            cached = _VERSION_CACHE[cache_key]
+            if now - cached['timestamp'] < _VERSION_CACHE_TTL:
+                return cached['version_str']
+
         current_version = None
         try:
             result = subprocess.run(
@@ -348,18 +394,22 @@ def main():
             pass
 
         if not current_version:
-            return "Gemini CLI"
-
-        # Check for latest version
-        latest_version = get_latest_gemini_version_from_npm()
-
-        if latest_version is None:
-            # Couldn't fetch latest version, just show current
-            return f"Gemini CLI ({current_version})"
-        elif current_version == latest_version:
-            return f"Gemini CLI ({current_version}, up-to-date)"
+            version_str = "Gemini CLI"
         else:
-            return f"Gemini CLI ({current_version}, a newer version {latest_version} available)"
+            # Check for latest version
+            latest_version = get_latest_gemini_version_from_npm()
+
+            if latest_version is None:
+                # Couldn't fetch latest version, just show current
+                version_str = f"Gemini CLI ({current_version})"
+            elif current_version == latest_version:
+                version_str = f"Gemini CLI ({current_version}, up-to-date)"
+            else:
+                version_str = f"Gemini CLI ({current_version}, a newer version {latest_version} available)"
+
+        # Update cache
+        _VERSION_CACHE[cache_key] = {'version_str': version_str, 'timestamp': now}
+        return version_str
 
     def calculate_weighted_cost_per_mtok():
         """Calculate weighted average cost per MTok and total savings across all vendors.
@@ -577,10 +627,17 @@ def main():
 
                 usage = entry['message']['usage']
                 # Sum all token types
-                total = (usage.get('input_tokens', 0) +
-                         usage.get('output_tokens', 0) +
-                         usage.get('cache_read_input_tokens', 0) +
-                         usage.get('cache_creation_input_tokens', 0))
+                # Codex uses reasoning_output_tokens; Claude/Gemini use cache_creation_input_tokens
+                if vendor_label == 'Codex':
+                    total = (usage.get('input_tokens', 0) +
+                             usage.get('output_tokens', 0) +
+                             usage.get('cache_read_input_tokens', 0) +
+                             usage.get('reasoning_output_tokens', 0))
+                else:  # Claude and Gemini both use cache_creation_input_tokens
+                    total = (usage.get('input_tokens', 0) +
+                             usage.get('output_tokens', 0) +
+                             usage.get('cache_read_input_tokens', 0) +
+                             usage.get('cache_creation_input_tokens', 0))
 
                 # Get session time span (if available)
                 session_start = entry.get('session_start_time', timestamp_str)

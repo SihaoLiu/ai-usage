@@ -1,7 +1,8 @@
 """Statistics calculation functions for Codex (OpenAI) usage analysis."""
 
-from datetime import datetime, timedelta
 from collections import defaultdict
+
+from time_utils import parse_timestamp, distribute_tokens_to_intervals
 
 
 def calculate_codex_model_breakdown(usage_data):
@@ -19,8 +20,7 @@ def calculate_codex_model_breakdown(usage_data):
         'output': 0,
         'cache_read': 0,
         'reasoning': 0,
-        # For compatibility with Claude formatting
-        'cache_creation': 0,
+        'cache_creation': 0,  # For compatibility with Claude formatting
     })
 
     for entry in usage_data:
@@ -40,7 +40,6 @@ def calculate_codex_model_breakdown(usage_data):
     # Calculate totals and sort by total tokens
     result = []
 
-    # First pass: calculate total message count and populate result
     total_messages = sum(stats['count'] for stats in model_stats.values())
     threshold = total_messages * 0.01  # 1% threshold
 
@@ -49,65 +48,12 @@ def calculate_codex_model_breakdown(usage_data):
         if stats['count'] < threshold:
             continue
         stats['model'] = model
-        # Total IO (non-cached input + non-reasoning output)
         stats['total'] = stats['input'] + stats['output']
-        # Total with all tokens
         stats['total_with_cache'] = (stats['input'] + stats['output'] +
                                       stats['cache_read'] + stats['reasoning'])
         result.append(stats)
 
     result.sort(key=lambda x: x['total'], reverse=True)
-    return result
-
-
-def distribute_tokens_to_intervals(session_start_str, session_end_str, tokens, interval_minutes, local_tz):
-    """Distribute tokens evenly across time intervals within a session time span.
-
-    Args:
-        session_start_str: ISO timestamp string for session start
-        session_end_str: ISO timestamp string for session end
-        tokens: Dictionary with token counts
-        interval_minutes: Interval in minutes for bucketing
-        local_tz: Local timezone
-
-    Returns:
-        List of (interval_time, fraction_tokens) tuples
-    """
-    try:
-        start = datetime.fromisoformat(session_start_str.replace('Z', '+00:00'))
-        end = datetime.fromisoformat(session_end_str.replace('Z', '+00:00'))
-        start_local = start.astimezone(local_tz)
-        end_local = end.astimezone(local_tz)
-    except Exception:
-        return []
-
-    def to_interval(dt):
-        total_minutes = dt.hour * 60 + dt.minute
-        interval_start_minutes = (total_minutes // interval_minutes) * interval_minutes
-        interval_hour = interval_start_minutes // 60
-        interval_minute = interval_start_minutes % 60
-        return dt.replace(hour=interval_hour, minute=interval_minute, second=0, microsecond=0)
-
-    start_interval = to_interval(start_local)
-    end_interval = to_interval(end_local)
-
-    intervals = []
-    current = start_interval
-    while current <= end_interval:
-        intervals.append(current)
-        current += timedelta(minutes=interval_minutes)
-
-    if not intervals:
-        return []
-
-    num_intervals = len(intervals)
-    result = []
-    for interval_time in intervals:
-        fraction_tokens = {}
-        for key, value in tokens.items():
-            fraction_tokens[key] = value / num_intervals
-        result.append((interval_time, fraction_tokens))
-
     return result
 
 
@@ -126,10 +72,10 @@ def calculate_codex_model_token_breakdown_time_series(usage_data, interval_minut
     {
         interval_time: {
             'model_name (effort)': {
-                'input': 0,           # non-cached input
-                'output': 0,          # non-reasoning output
-                'cache_creation': 0,  # reasoning_output for Codex (replaces cache_creation)
-                'cache_read': 0,      # cached input
+                'input': 0,
+                'output': 0,
+                'cache_creation': 0,  # reasoning_output for Codex
+                'cache_read': 0,
             },
             ...
         },
@@ -139,10 +85,6 @@ def calculate_codex_model_token_breakdown_time_series(usage_data, interval_minut
     Note: For Codex, 'cache_creation' field stores reasoning_output tokens
     so Chart 1 shows (input + output) and Chart 2 shows (cache_read + reasoning)
     """
-    # Get local timezone automatically
-    local_tz = datetime.now().astimezone().tzinfo
-
-    # Group by time interval and model with breakdown
     time_series = defaultdict(lambda: defaultdict(lambda: {
         'input': 0,
         'output': 0,
@@ -164,7 +106,6 @@ def calculate_codex_model_token_breakdown_time_series(usage_data, interval_minut
         session_start = entry.get('session_start_time', timestamp_str)
         session_end = entry.get('session_end_time', timestamp_str)
 
-        # Prepare tokens dict
         tokens = {
             'input': usage.get('input_tokens', 0),
             'output': usage.get('output_tokens', 0),
@@ -174,7 +115,7 @@ def calculate_codex_model_token_breakdown_time_series(usage_data, interval_minut
 
         # Distribute tokens across intervals within session time span
         distributed = distribute_tokens_to_intervals(
-            session_start, session_end, tokens, interval_minutes, local_tz
+            session_start, session_end, tokens, interval_minutes
         )
 
         if distributed:
@@ -185,24 +126,22 @@ def calculate_codex_model_token_breakdown_time_series(usage_data, interval_minut
                 time_series[interval_time][model_key]['cache_creation'] += fraction_tokens['cache_creation']
         else:
             # Fallback: use original timestamp-based bucketing
-            try:
-                timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                timestamp_local = timestamp.astimezone(local_tz)
-
-                total_minutes = timestamp_local.hour * 60 + timestamp_local.minute
-                interval_start_minutes = (total_minutes // interval_minutes) * interval_minutes
-                interval_hour = interval_start_minutes // 60
-                interval_minute = interval_start_minutes % 60
-
-                interval_time = timestamp_local.replace(
-                    hour=interval_hour, minute=interval_minute, second=0, microsecond=0
-                )
-
-                time_series[interval_time][model_key]['input'] += tokens['input']
-                time_series[interval_time][model_key]['output'] += tokens['output']
-                time_series[interval_time][model_key]['cache_read'] += tokens['cache_read']
-                time_series[interval_time][model_key]['cache_creation'] += tokens['cache_creation']
-            except Exception:
+            timestamp_local = parse_timestamp(timestamp_str)
+            if timestamp_local is None:
                 continue
+
+            total_minutes = timestamp_local.hour * 60 + timestamp_local.minute
+            interval_start_minutes = (total_minutes // interval_minutes) * interval_minutes
+            interval_hour = interval_start_minutes // 60
+            interval_minute = interval_start_minutes % 60
+
+            interval_time = timestamp_local.replace(
+                hour=interval_hour, minute=interval_minute, second=0, microsecond=0
+            )
+
+            time_series[interval_time][model_key]['input'] += tokens['input']
+            time_series[interval_time][model_key]['output'] += tokens['output']
+            time_series[interval_time][model_key]['cache_read'] += tokens['cache_read']
+            time_series[interval_time][model_key]['cache_creation'] += tokens['cache_creation']
 
     return time_series

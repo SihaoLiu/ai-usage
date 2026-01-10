@@ -1,7 +1,8 @@
 """Statistics calculation functions for Claude Code usage analysis."""
 
-from datetime import datetime, timedelta
 from collections import defaultdict
+
+from time_utils import parse_timestamp, distribute_tokens_to_intervals
 
 
 def calculate_overall_stats(usage_data):
@@ -68,22 +69,20 @@ def calculate_model_breakdown(usage_data):
 
 def calculate_time_series(usage_data, interval_hours=1):
     """Calculate token usage over time in specified hour intervals (local timezone)."""
-    # Get local timezone automatically
-    local_tz = datetime.now().astimezone().tzinfo
-
-    # Group by time interval and model
     time_series = defaultdict(lambda: defaultdict(int))
 
     for entry in usage_data:
-        timestamp_str = entry.get('timestamp')
-        if not timestamp_str:
+        # Use pre-parsed timestamp if available (from caching layer)
+        timestamp_local = entry.get('_parsed_timestamp')
+        if timestamp_local is None:
+            timestamp_str = entry.get('timestamp')
+            if timestamp_str:
+                timestamp_local = parse_timestamp(timestamp_str)
+
+        if timestamp_local is None:
             continue
 
         try:
-            # Parse ISO timestamp and convert to local timezone
-            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-            timestamp_local = timestamp.astimezone(local_tz)
-
             # Round down to the nearest interval
             hour = timestamp_local.hour
             interval_hour = (hour // interval_hours) * interval_hours
@@ -92,7 +91,6 @@ def calculate_time_series(usage_data, interval_hours=1):
             model = entry['message'].get('model', 'unknown')
             usage = entry['message']['usage']
 
-            # Total tokens (input + output, in kilo tokens)
             total_tokens = usage.get('input_tokens', 0) + usage.get('output_tokens', 0)
 
             time_series[interval_time][model] += total_tokens
@@ -104,22 +102,20 @@ def calculate_time_series(usage_data, interval_hours=1):
 
 def calculate_all_tokens_time_series(usage_data, interval_hours=1):
     """Calculate ALL token usage (input + output + cache) over time in specified hour intervals (local timezone)."""
-    # Get local timezone automatically
-    local_tz = datetime.now().astimezone().tzinfo
-
-    # Group by time interval (all models combined)
     time_series = defaultdict(lambda: defaultdict(int))
 
     for entry in usage_data:
-        timestamp_str = entry.get('timestamp')
-        if not timestamp_str:
+        # Use pre-parsed timestamp if available (from caching layer)
+        timestamp_local = entry.get('_parsed_timestamp')
+        if timestamp_local is None:
+            timestamp_str = entry.get('timestamp')
+            if timestamp_str:
+                timestamp_local = parse_timestamp(timestamp_str)
+
+        if timestamp_local is None:
             continue
 
         try:
-            # Parse ISO timestamp and convert to local timezone
-            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-            timestamp_local = timestamp.astimezone(local_tz)
-
             # Round down to the nearest interval
             hour = timestamp_local.hour
             interval_hour = (hour // interval_hours) * interval_hours
@@ -127,13 +123,11 @@ def calculate_all_tokens_time_series(usage_data, interval_hours=1):
 
             usage = entry['message']['usage']
 
-            # ALL tokens: input + output + cache_creation + cache_read
             total_tokens = (usage.get('input_tokens', 0) +
                           usage.get('output_tokens', 0) +
                           usage.get('cache_creation_input_tokens', 0) +
                           usage.get('cache_read_input_tokens', 0))
 
-            # Use 'all' as a single model key to combine all models
             time_series[interval_time]['all'] += total_tokens
         except Exception:
             continue
@@ -143,10 +137,6 @@ def calculate_all_tokens_time_series(usage_data, interval_hours=1):
 
 def calculate_token_breakdown_time_series(usage_data, interval_hours=1):
     """Calculate token usage breakdown (input/output/cache_creation/cache_read) over time in specified hour intervals (local timezone)."""
-    # Get local timezone automatically
-    local_tz = datetime.now().astimezone().tzinfo
-
-    # Group by time interval with breakdown
     time_series = defaultdict(lambda: {
         'input': 0,
         'output': 0,
@@ -155,15 +145,17 @@ def calculate_token_breakdown_time_series(usage_data, interval_hours=1):
     })
 
     for entry in usage_data:
-        timestamp_str = entry.get('timestamp')
-        if not timestamp_str:
+        # Use pre-parsed timestamp if available (from caching layer)
+        timestamp_local = entry.get('_parsed_timestamp')
+        if timestamp_local is None:
+            timestamp_str = entry.get('timestamp')
+            if timestamp_str:
+                timestamp_local = parse_timestamp(timestamp_str)
+
+        if timestamp_local is None:
             continue
 
         try:
-            # Parse ISO timestamp and convert to local timezone
-            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-            timestamp_local = timestamp.astimezone(local_tz)
-
             # Round down to the nearest interval
             hour = timestamp_local.hour
             interval_hour = (hour // interval_hours) * interval_hours
@@ -171,7 +163,6 @@ def calculate_token_breakdown_time_series(usage_data, interval_hours=1):
 
             usage = entry['message']['usage']
 
-            # Accumulate each token type separately
             time_series[interval_time]['input'] += usage.get('input_tokens', 0)
             time_series[interval_time]['output'] += usage.get('output_tokens', 0)
             time_series[interval_time]['cache_creation'] += usage.get('cache_creation_input_tokens', 0)
@@ -180,61 +171,6 @@ def calculate_token_breakdown_time_series(usage_data, interval_hours=1):
             continue
 
     return time_series
-
-
-def distribute_tokens_to_intervals(session_start_str, session_end_str, tokens, interval_minutes, local_tz):
-    """Distribute tokens evenly across time intervals within a session time span.
-
-    Args:
-        session_start_str: ISO timestamp string for session start
-        session_end_str: ISO timestamp string for session end
-        tokens: Dictionary with token counts (input, output, cache_creation, cache_read)
-        interval_minutes: Interval in minutes for bucketing
-        local_tz: Local timezone
-
-    Returns:
-        List of (interval_time, fraction_tokens) tuples where fraction_tokens has the
-        same keys as input tokens dict but with proportionally distributed values.
-    """
-    try:
-        start = datetime.fromisoformat(session_start_str.replace('Z', '+00:00'))
-        end = datetime.fromisoformat(session_end_str.replace('Z', '+00:00'))
-        start_local = start.astimezone(local_tz)
-        end_local = end.astimezone(local_tz)
-    except Exception:
-        return []
-
-    # Calculate start and end intervals
-    def to_interval(dt):
-        total_minutes = dt.hour * 60 + dt.minute
-        interval_start_minutes = (total_minutes // interval_minutes) * interval_minutes
-        interval_hour = interval_start_minutes // 60
-        interval_minute = interval_start_minutes % 60
-        return dt.replace(hour=interval_hour, minute=interval_minute, second=0, microsecond=0)
-
-    start_interval = to_interval(start_local)
-    end_interval = to_interval(end_local)
-
-    # Generate all intervals between start and end (inclusive)
-    intervals = []
-    current = start_interval
-    while current <= end_interval:
-        intervals.append(current)
-        current += timedelta(minutes=interval_minutes)
-
-    if not intervals:
-        return []
-
-    # Distribute tokens evenly across intervals
-    num_intervals = len(intervals)
-    result = []
-    for interval_time in intervals:
-        fraction_tokens = {}
-        for key, value in tokens.items():
-            fraction_tokens[key] = value / num_intervals
-        result.append((interval_time, fraction_tokens))
-
-    return result
 
 
 def calculate_model_token_breakdown_time_series(usage_data, interval_minutes=60):
@@ -262,10 +198,6 @@ def calculate_model_token_breakdown_time_series(usage_data, interval_minutes=60)
         ...
     }
     """
-    # Get local timezone automatically
-    local_tz = datetime.now().astimezone().tzinfo
-
-    # Group by time interval and model with breakdown
     time_series = defaultdict(lambda: defaultdict(lambda: {
         'input': 0,
         'output': 0,
@@ -285,7 +217,6 @@ def calculate_model_token_breakdown_time_series(usage_data, interval_minutes=60)
         session_start = entry.get('session_start_time', timestamp_str)
         session_end = entry.get('session_end_time', timestamp_str)
 
-        # Prepare tokens dict
         tokens = {
             'input': usage.get('input_tokens', 0),
             'output': usage.get('output_tokens', 0),
@@ -295,11 +226,10 @@ def calculate_model_token_breakdown_time_series(usage_data, interval_minutes=60)
 
         # Distribute tokens across intervals within session time span
         distributed = distribute_tokens_to_intervals(
-            session_start, session_end, tokens, interval_minutes, local_tz
+            session_start, session_end, tokens, interval_minutes
         )
 
         if distributed:
-            # Add distributed tokens to each interval
             for interval_time, fraction_tokens in distributed:
                 time_series[interval_time][model]['input'] += fraction_tokens['input']
                 time_series[interval_time][model]['output'] += fraction_tokens['output']
@@ -307,24 +237,22 @@ def calculate_model_token_breakdown_time_series(usage_data, interval_minutes=60)
                 time_series[interval_time][model]['cache_read'] += fraction_tokens['cache_read']
         else:
             # Fallback: use original timestamp-based bucketing
-            try:
-                timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                timestamp_local = timestamp.astimezone(local_tz)
-
-                total_minutes = timestamp_local.hour * 60 + timestamp_local.minute
-                interval_start_minutes = (total_minutes // interval_minutes) * interval_minutes
-                interval_hour = interval_start_minutes // 60
-                interval_minute = interval_start_minutes % 60
-
-                interval_time = timestamp_local.replace(
-                    hour=interval_hour, minute=interval_minute, second=0, microsecond=0
-                )
-
-                time_series[interval_time][model]['input'] += tokens['input']
-                time_series[interval_time][model]['output'] += tokens['output']
-                time_series[interval_time][model]['cache_creation'] += tokens['cache_creation']
-                time_series[interval_time][model]['cache_read'] += tokens['cache_read']
-            except Exception:
+            timestamp_local = parse_timestamp(timestamp_str)
+            if timestamp_local is None:
                 continue
+
+            total_minutes = timestamp_local.hour * 60 + timestamp_local.minute
+            interval_start_minutes = (total_minutes // interval_minutes) * interval_minutes
+            interval_hour = interval_start_minutes // 60
+            interval_minute = interval_start_minutes % 60
+
+            interval_time = timestamp_local.replace(
+                hour=interval_hour, minute=interval_minute, second=0, microsecond=0
+            )
+
+            time_series[interval_time][model]['input'] += tokens['input']
+            time_series[interval_time][model]['output'] += tokens['output']
+            time_series[interval_time][model]['cache_creation'] += tokens['cache_creation']
+            time_series[interval_time][model]['cache_read'] += tokens['cache_read']
 
     return time_series

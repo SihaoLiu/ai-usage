@@ -4,35 +4,58 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository contains a single Python utility (`claude-usage.py`) that analyzes Claude Code usage statistics by parsing JSONL files from the `~/.claude/projects` directory. It generates comprehensive reports including token usage statistics, model breakdowns, and time-series visualizations.
+A Python utility for monitoring token usage and costs across multiple AI coding assistants: **Claude Code**, **OpenAI Codex**, and **Google Gemini CLI**. Uses only Python standard library (zero dependencies).
 
 ## Running the Script
 
 ```bash
-# No additional dependencies required - uses only Python standard library
-python3 claude-usage.py
-# or
-./claude-usage.py
+# All vendors, last 7 days
+python3 vibe-usage.py
+
+# Last 30 days
+python3 vibe-usage.py --days 30
+
+# Specific vendor only
+python3 vibe-usage.py --vendor claude
+python3 vibe-usage.py --vendor codex
+python3 vibe-usage.py --vendor gemini
+
+# Monitor mode (auto-refresh every hour)
+python3 vibe-usage.py --monitor
 ```
 
-The script reads from `~/.claude/projects` by default, or from the path specified in the `CLAUDE_CONFIG_DIR` environment variable.
+## Data Sources
+
+| Vendor | Directory | File Pattern |
+|--------|-----------|--------------|
+| Claude | `~/.claude/projects/` | `**/*.jsonl` |
+| Codex | `~/.codex/sessions/` | `YYYY/MM/DD/*.jsonl` |
+| Gemini | `~/.gemini/tmp/` | `<hash>/chats/session-*.json` |
+
+Environment variables can override default paths:
+- `CLAUDE_CONFIG_DIR` (default: `~/.claude`)
+- `CODEX_CONFIG_DIR` (default: `~/.codex`)
+- `GEMINI_CONFIG_DIR` (default: `~/.gemini`)
 
 ## Architecture
 
-**Single-file utility structure:**
-- Data parsing functions (`read_jsonl_files`, `get_claude_dir`) - Read JSONL logs from Claude projects
-- Statistics calculation (`calculate_overall_stats`, `calculate_model_breakdown`, `calculate_time_series`) - Aggregate token usage data
-- Visualization functions (`print_line_chart`, `print_model_chart`) - ASCII-based charts for 8-hour interval analysis
-- All times are displayed in the system's local timezone
-
-**Data flow:**
-1. Scans `~/.claude/projects/**/*.jsonl` for usage data
-2. Filters entries containing message.usage fields
-3. Aggregates by model and time (8-hour intervals)
-4. Outputs formatted tables and ASCII charts
+```
+vibe-usage.py          # Main entry point with CLI argument parsing
+├── data.py            # Claude data reader
+├── data_codex.py      # Codex data reader
+├── data_gemini.py     # Gemini data reader
+├── stats.py           # Claude statistics calculation
+├── stats_codex.py     # Codex statistics calculation
+├── stats_gemini.py    # Gemini statistics calculation
+├── formatting.py      # Output formatting and responsive tables
+├── charts.py          # ASCII chart visualization
+├── constants.py       # Pricing configuration loader
+└── pricing.json       # API pricing data for all vendors
+```
 
 **Key implementation notes:**
 - Token values are displayed in thousands (KTok) in charts
 - Cache tokens (creation and read) are tracked separately
 - Time series data is bucketed into 8-hour intervals for trend analysis
-- Model-specific symbols used in charts: █ (Sonnet 4.5), ▓ (Haiku 4.5), ▒ (Opus 4.1)
+- All times are displayed in the system's local timezone
+- Display adapts to terminal width (Full/Medium/Compact/Minimal modes)

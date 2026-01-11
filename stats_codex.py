@@ -1,7 +1,8 @@
 """Statistics calculation functions for Codex (OpenAI) usage analysis."""
 
-from datetime import datetime, timedelta
 from collections import defaultdict
+
+from time_utils import parse_timestamp, distribute_tokens_to_intervals
 
 
 def calculate_codex_model_breakdown(usage_data):
@@ -19,8 +20,7 @@ def calculate_codex_model_breakdown(usage_data):
         'output': 0,
         'cache_read': 0,
         'reasoning': 0,
-        # For compatibility with Claude formatting
-        'cache_creation': 0,
+        'cache_creation': 0,  # For compatibility with Claude formatting
     })
 
     for entry in usage_data:
@@ -40,7 +40,6 @@ def calculate_codex_model_breakdown(usage_data):
     # Calculate totals and sort by total tokens
     result = []
 
-    # First pass: calculate total message count and populate result
     total_messages = sum(stats['count'] for stats in model_stats.values())
     threshold = total_messages * 0.01  # 1% threshold
 
@@ -49,9 +48,7 @@ def calculate_codex_model_breakdown(usage_data):
         if stats['count'] < threshold:
             continue
         stats['model'] = model
-        # Total IO (non-cached input + non-reasoning output)
         stats['total'] = stats['input'] + stats['output']
-        # Total with all tokens
         stats['total_with_cache'] = (stats['input'] + stats['output'] +
                                       stats['cache_read'] + stats['reasoning'])
         result.append(stats)
@@ -63,6 +60,10 @@ def calculate_codex_model_breakdown(usage_data):
 def calculate_codex_model_token_breakdown_time_series(usage_data, interval_minutes=60):
     """Calculate token usage breakdown by model over time for Codex.
 
+    This version distributes tokens evenly across the session time span to produce
+    smoother charts. Long-running sessions will have their token usage spread across
+    all intervals they span, rather than being concentrated at a single timestamp.
+
     Args:
         usage_data: List of usage data entries
         interval_minutes: Interval in minutes for bucketing (default: 60 = 1 hour)
@@ -71,10 +72,10 @@ def calculate_codex_model_token_breakdown_time_series(usage_data, interval_minut
     {
         interval_time: {
             'model_name (effort)': {
-                'input': 0,           # non-cached input
-                'output': 0,          # non-reasoning output
-                'cache_creation': 0,  # reasoning_output for Codex (replaces cache_creation)
-                'cache_read': 0,      # cached input
+                'input': 0,
+                'output': 0,
+                'cache_creation': 0,  # reasoning_output for Codex
+                'cache_read': 0,
             },
             ...
         },
@@ -84,10 +85,6 @@ def calculate_codex_model_token_breakdown_time_series(usage_data, interval_minut
     Note: For Codex, 'cache_creation' field stores reasoning_output tokens
     so Chart 1 shows (input + output) and Chart 2 shows (cache_read + reasoning)
     """
-    # Get local timezone automatically
-    local_tz = datetime.now().astimezone().tzinfo
-
-    # Group by time interval and model with breakdown
     time_series = defaultdict(lambda: defaultdict(lambda: {
         'input': 0,
         'output': 0,
@@ -100,16 +97,41 @@ def calculate_codex_model_token_breakdown_time_series(usage_data, interval_minut
         if not timestamp_str:
             continue
 
-        try:
-            # Parse ISO timestamp and convert to local timezone
-            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-            timestamp_local = timestamp.astimezone(local_tz)
+        model = entry['message'].get('model', 'unknown')
+        effort = entry['message'].get('effort', 'unknown')
+        model_key = f"{model} ({effort})"
+        usage = entry['message']['usage']
 
-            # Round down to the nearest interval
+        # Get session time span (if available)
+        session_start = entry.get('session_start_time', timestamp_str)
+        session_end = entry.get('session_end_time', timestamp_str)
+
+        tokens = {
+            'input': usage.get('input_tokens', 0),
+            'output': usage.get('output_tokens', 0),
+            'cache_read': usage.get('cache_read_input_tokens', 0),
+            'cache_creation': usage.get('reasoning_output_tokens', 0),  # reasoning for Codex
+        }
+
+        # Distribute tokens across intervals within session time span
+        distributed = distribute_tokens_to_intervals(
+            session_start, session_end, tokens, interval_minutes
+        )
+
+        if distributed:
+            for interval_time, fraction_tokens in distributed:
+                time_series[interval_time][model_key]['input'] += fraction_tokens['input']
+                time_series[interval_time][model_key]['output'] += fraction_tokens['output']
+                time_series[interval_time][model_key]['cache_read'] += fraction_tokens['cache_read']
+                time_series[interval_time][model_key]['cache_creation'] += fraction_tokens['cache_creation']
+        else:
+            # Fallback: use original timestamp-based bucketing
+            timestamp_local = parse_timestamp(timestamp_str)
+            if timestamp_local is None:
+                continue
+
             total_minutes = timestamp_local.hour * 60 + timestamp_local.minute
             interval_start_minutes = (total_minutes // interval_minutes) * interval_minutes
-
-            # Convert back to hour and minute
             interval_hour = interval_start_minutes // 60
             interval_minute = interval_start_minutes % 60
 
@@ -117,19 +139,9 @@ def calculate_codex_model_token_breakdown_time_series(usage_data, interval_minut
                 hour=interval_hour, minute=interval_minute, second=0, microsecond=0
             )
 
-            model = entry['message'].get('model', 'unknown')
-            effort = entry['message'].get('effort', 'unknown')
-            model_key = f"{model} ({effort})"
-            usage = entry['message']['usage']
-
-            # Accumulate each token type
-            time_series[interval_time][model_key]['input'] += usage.get('input_tokens', 0)
-            time_series[interval_time][model_key]['output'] += usage.get('output_tokens', 0)
-            time_series[interval_time][model_key]['cache_read'] += usage.get('cache_read_input_tokens', 0)
-            # For Codex: use cache_creation field to store reasoning_output
-            time_series[interval_time][model_key]['cache_creation'] += usage.get('reasoning_output_tokens', 0)
-
-        except Exception:
-            continue
+            time_series[interval_time][model_key]['input'] += tokens['input']
+            time_series[interval_time][model_key]['output'] += tokens['output']
+            time_series[interval_time][model_key]['cache_read'] += tokens['cache_read']
+            time_series[interval_time][model_key]['cache_creation'] += tokens['cache_creation']
 
     return time_series

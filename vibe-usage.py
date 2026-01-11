@@ -20,7 +20,7 @@ _VERSION_CACHE = {}
 _VERSION_CACHE_TTL = 300
 
 # Claude imports
-from data import get_claude_dir, read_jsonl_files, filter_usage_data_by_days
+from data import get_claude_dir, read_jsonl_files, read_all_jsonl_files, filter_usage_data_by_days
 from stats import calculate_model_breakdown, calculate_model_token_breakdown_time_series
 # Codex imports
 from data_codex import get_codex_dir, read_codex_jsonl_files, filter_codex_usage_data_by_days
@@ -460,10 +460,9 @@ def main():
                     total_cost += stats['cache_creation'] * pricing['cache_output'] / 1_000_000
             return total_cost
 
-        # Get Claude data
-        claude_dir = get_claude_dir() / 'projects'
-        if claude_dir.exists():
-            claude_data = read_jsonl_files(claude_dir)
+        # Get Claude data (reads from both ~/.config/claude and ~/.claude)
+        claude_data = read_all_jsonl_files()
+        if claude_data:
             claude_filtered = filter_usage_data_by_days(claude_data, days_state['days'])
             total = 0
             for entry in claude_filtered:
@@ -659,10 +658,9 @@ def main():
                     except Exception:
                         continue
 
-        # Read and process Claude data
-        claude_dir = get_claude_dir() / 'projects'
-        if claude_dir.exists():
-            claude_data = read_jsonl_files(claude_dir)
+        # Read and process Claude data (reads from both ~/.config/claude and ~/.claude)
+        claude_data = read_all_jsonl_files()
+        if claude_data:
             claude_filtered = filter_usage_data_by_days(claude_data, days_state['days'])
             process_usage_data(claude_filtered, 'Claude')
 
@@ -813,7 +811,8 @@ def main():
         elif current_vendor == 'gemini':
             usage_data = read_gemini_json_files(current_data_dir)
         else:
-            usage_data = read_jsonl_files(current_data_dir)
+            # Claude: read from both ~/.config/claude and ~/.claude with deduplication
+            usage_data = read_all_jsonl_files()
 
         if not usage_data:
             print("No usage data found.")

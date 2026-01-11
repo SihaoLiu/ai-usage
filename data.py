@@ -6,10 +6,34 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 
+def get_claude_dirs():
+    """Get Claude configuration directories.
+
+    Returns a list of paths to check:
+    - If CLAUDE_CONFIG_DIR is set, uses those paths (comma-separated)
+    - Otherwise, returns both XDG path (~/.config/claude) and legacy path (~/.claude)
+    """
+    claude_dir_env = os.environ.get('CLAUDE_CONFIG_DIR')
+    if claude_dir_env:
+        # Support comma-separated paths like ccusage does
+        return [Path(p.strip()) for p in claude_dir_env.split(',') if p.strip()]
+
+    # Return both XDG-compliant path (new default) and legacy path (old default)
+    return [
+        Path(os.path.expanduser('~/.config/claude')),  # New XDG-compliant path
+        Path(os.path.expanduser('~/.claude')),          # Legacy path
+    ]
+
+
 def get_claude_dir():
-    """Get Claude configuration directory."""
-    claude_dir = os.environ.get('CLAUDE_CONFIG_DIR', os.path.expanduser('~/.claude'))
-    return Path(claude_dir)
+    """Get Claude configuration directory (legacy function for compatibility)."""
+    dirs = get_claude_dirs()
+    # Return first directory that has a projects subdirectory
+    for d in dirs:
+        if (d / 'projects').exists():
+            return d
+    # Fallback to first directory
+    return dirs[0] if dirs else Path(os.path.expanduser('~/.claude'))
 
 
 def read_jsonl_files(projects_dir):
@@ -32,6 +56,51 @@ def read_jsonl_files(projects_dir):
                         continue
         except Exception:
             continue
+
+    return usage_data
+
+
+def read_all_jsonl_files():
+    """Read all JSONL files from all Claude configuration directories.
+
+    Combines data from both XDG path (~/.config/claude/projects) and
+    legacy path (~/.claude/projects), deduplicating entries by message ID + request ID.
+    """
+    usage_data = []
+    seen_hashes = set()
+
+    for claude_dir in get_claude_dirs():
+        projects_dir = claude_dir / 'projects'
+        if not projects_dir.exists():
+            continue
+
+        for jsonl_file in projects_dir.rglob('*.jsonl'):
+            try:
+                with open(jsonl_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            # Only include entries with usage data
+                            if not (data.get('message') and data['message'].get('usage')):
+                                continue
+
+                            # Deduplicate by message ID + request ID (like ccusage does)
+                            message_id = data.get('message', {}).get('id')
+                            request_id = data.get('requestId')
+                            if message_id and request_id:
+                                hash_key = f"{message_id}:{request_id}"
+                                if hash_key in seen_hashes:
+                                    continue
+                                seen_hashes.add(hash_key)
+
+                            usage_data.append(data)
+                        except json.JSONDecodeError:
+                            continue
+            except Exception:
+                continue
 
     return usage_data
 

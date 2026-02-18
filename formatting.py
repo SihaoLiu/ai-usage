@@ -73,6 +73,16 @@ def get_short_model_name(model, vendor='claude'):
         return SHORT_MODEL_NAMES.get(model, model[:12] if len(model) > 12 else model)
 
 
+def _format_model_name_with_vendor_prefix(model, vendor='claude', show_vendor_prefix=False, use_short_name=True, prefix_width=6):
+    """Format model name for table output, optionally with explicit vendor prefix."""
+    name = get_short_model_name(model, vendor) if use_short_name else model
+    if not show_vendor_prefix:
+        return name
+    # Keep vendor prefixes aligned across rows by normalizing width.
+    aligned_vendor = f"{vendor}".ljust(prefix_width)
+    return f"{aligned_vendor}: {name}"
+
+
 def format_number(num):
     """Format number with thousand separators."""
     return f"{num:,}"
@@ -263,6 +273,40 @@ def get_table_display_mode(terminal_width, terminal_height, num_models):
         return 'hidden'
 
 
+def _get_strategy_totals(stats, vendor='claude'):
+    """Return vendor-specific token buckets for the final summary table."""
+    resolved_vendor = stats.get('vendor', vendor)
+    cache_hit = stats['cache_read']
+
+    if resolved_vendor == 'claude':
+        prefill = stats['input'] + stats['cache_creation']
+        decoding = stats['output']
+    elif resolved_vendor == 'codex':
+        prefill = stats['input']
+        decoding = stats['output'] + stats.get('reasoning', 0)
+    elif resolved_vendor == 'gemini':
+        prefill = stats['input']
+        decoding = stats['output'] + stats.get('thinking', 0)
+    else:
+        # Fallback to Claude-style decomposition
+        prefill = stats['input']
+        decoding = stats['output']
+
+    return cache_hit, prefill, decoding
+
+
+def _get_strategy_costs(input_cost, output_cost, cache_output_cost, cache_input_cost, vendor='claude'):
+    """Return cost totals grouped by strategy buckets for display only."""
+    cache_hit_cost = cache_input_cost
+    if vendor == 'claude':
+        prefill_cost = input_cost + cache_output_cost
+        decoding_cost = output_cost
+    else:
+        prefill_cost = input_cost
+        decoding_cost = output_cost + cache_output_cost
+    return cache_hit_cost, prefill_cost, decoding_cost
+
+
 def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, terminal_height=None, vendor='claude'):
     """Print model breakdown table with responsive formatting.
 
@@ -281,8 +325,9 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
     sum_input = 0
     sum_output = 0
     sum_total = 0
-    sum_cache_creation = 0  # For Codex: reasoning; for Gemini: thinking
-    sum_cache_read = 0
+    sum_cache_hit = 0
+    sum_prefill = 0
+    sum_decoding = 0
     sum_total_with_cache = 0
 
     for stats in model_stats:
@@ -290,15 +335,11 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
         sum_input += stats['input']
         sum_output += stats['output']
         sum_total += stats['total']
-        # For Codex, sum 'reasoning' field; for Gemini, sum 'thinking'; for Claude, sum 'cache_creation'
-        if vendor == 'codex':
-            sum_cache_creation += stats.get('reasoning', 0)
-        elif vendor == 'gemini':
-            sum_cache_creation += stats.get('thinking', 0)
-        else:
-            sum_cache_creation += stats['cache_creation']
-        sum_cache_read += stats['cache_read']
-        sum_total_with_cache += stats['total_with_cache']
+        cache_hit, prefill, decoding = _get_strategy_totals(stats, vendor=vendor)
+        sum_cache_hit += cache_hit
+        sum_prefill += prefill
+        sum_decoding += decoding
+        sum_total_with_cache += cache_hit + prefill + decoding
 
     # Determine display mode
     if terminal_width is None or terminal_height is None:
@@ -310,46 +351,70 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
         return False
 
     # Calculate costs (needed for all modes)
-    # Select pricing tables based on vendor
-    if vendor == 'codex':
-        pricing_table = CODEX_MODEL_PRICING
-        default_pricing = CODEX_DEFAULT_PRICING
-        subscription_price = CODEX_SUBSCRIPTION_PRICE
-    elif vendor == 'gemini':
-        pricing_table = GEMINI_MODEL_PRICING
-        default_pricing = GEMINI_DEFAULT_PRICING
-        subscription_price = GEMINI_SUBSCRIPTION_PRICE
-    else:
-        pricing_table = MODEL_PRICING
-        default_pricing = DEFAULT_PRICING
-        subscription_price = SUBSCRIPTION_PRICE
-
     input_cost = 0
     output_cost = 0
     cache_output_cost = 0  # For Codex: reasoning; for Gemini: thinking
     cache_input_cost = 0
+    cache_hit_cost = 0
+    prefill_cost = 0
+    decoding_cost = 0
+    if vendor == 'codex':
+        subscription_price = CODEX_SUBSCRIPTION_PRICE
+    elif vendor == 'gemini':
+        subscription_price = GEMINI_SUBSCRIPTION_PRICE
+    else:
+        subscription_price = SUBSCRIPTION_PRICE
 
     for stats in model_stats:
+        resolved_vendor = stats.get('vendor', vendor)
+
+        # Select pricing tables based on row vendor
+        if resolved_vendor == 'codex':
+            pricing_table = CODEX_MODEL_PRICING
+            default_pricing = CODEX_DEFAULT_PRICING
+        elif resolved_vendor == 'gemini':
+            pricing_table = GEMINI_MODEL_PRICING
+            default_pricing = GEMINI_DEFAULT_PRICING
+        else:
+            pricing_table = MODEL_PRICING
+            default_pricing = DEFAULT_PRICING
+
         model = stats['model']
         # For Codex, extract base model name (without effort level) for pricing lookup
-        if vendor == 'codex' and ' (' in model and model.endswith(')'):
+        if resolved_vendor == 'codex' and ' (' in model and model.endswith(')'):
             base_model = model.rsplit(' (', 1)[0]
         else:
             base_model = model
         pricing = pricing_table.get(base_model, default_pricing)
-        input_cost += stats['input'] * pricing['input'] / 1_000_000
-        output_cost += stats['output'] * pricing['output'] / 1_000_000
-        cache_input_cost += stats['cache_read'] * pricing['cache_input'] / 1_000_000
+        row_input_cost = stats['input'] * pricing['input'] / 1_000_000
+        row_output_cost = stats['output'] * pricing['output'] / 1_000_000
+        row_cache_input_cost = stats['cache_read'] * pricing['cache_input'] / 1_000_000
         # For Codex, reasoning tokens are billed at output rate
         # For Gemini, thinking tokens are billed at output rate
         # For Claude, cache_creation has its own pricing
-        if vendor == 'codex':
-            cache_output_cost += stats.get('reasoning', 0) * pricing['output'] / 1_000_000
-        elif vendor == 'gemini':
+        if resolved_vendor == 'codex':
+            row_cache_output_cost = stats.get('reasoning', 0) * pricing['output'] / 1_000_000
+        elif resolved_vendor == 'gemini':
             # Thinking tokens are billed at output rate for Gemini
-            cache_output_cost += stats.get('thinking', 0) * pricing['output'] / 1_000_000
+            row_cache_output_cost = stats.get('thinking', 0) * pricing['output'] / 1_000_000
         else:
-            cache_output_cost += stats['cache_creation'] * pricing['cache_output'] / 1_000_000
+            row_cache_output_cost = stats['cache_creation'] * pricing['cache_output'] / 1_000_000
+
+        row_prefill_cost, row_decoding_cost = _get_strategy_costs(
+            row_input_cost,
+            row_output_cost,
+            row_cache_output_cost,
+            row_cache_input_cost,
+            vendor=resolved_vendor
+        )[1:]
+
+        input_cost += row_input_cost
+        output_cost += row_output_cost
+        cache_output_cost += row_cache_output_cost
+        cache_input_cost += row_cache_input_cost
+        cache_hit_cost += row_cache_input_cost
+        prefill_cost += row_prefill_cost
+        decoding_cost += row_decoding_cost
 
     io_total_cost = input_cost + output_cost
     cache_total_cost = cache_output_cost + cache_input_cost
@@ -357,22 +422,28 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
 
     # Print table based on mode
     if mode == 'full':
-        _print_table_full(model_stats, sum_messages, sum_input, sum_output, sum_total,
-                          sum_cache_creation, sum_cache_read, sum_total_with_cache,
+        _print_table_full(model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding, sum_total_with_cache,
                           input_cost, output_cost, io_total_cost,
-                          cache_output_cost, cache_input_cost, total_cost, vendor)
+                          cache_output_cost, cache_input_cost, total_cost, vendor,
+                          cache_hit_cost, prefill_cost, decoding_cost,
+                          show_vendor_prefix=(vendor == 'all'))
     elif mode == 'medium':
-        _print_table_medium(model_stats, sum_messages, sum_input, sum_output, sum_total,
-                            sum_cache_creation, sum_cache_read, sum_total_with_cache,
+        _print_table_medium(model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding, sum_total_with_cache,
                             input_cost, output_cost, io_total_cost,
-                            cache_output_cost, cache_input_cost, total_cost, vendor)
+                            cache_output_cost, cache_input_cost, total_cost, vendor,
+                            cache_hit_cost, prefill_cost, decoding_cost,
+                            show_vendor_prefix=(vendor == 'all'))
     elif mode == 'compact':
-        _print_table_compact(model_stats, sum_messages, sum_input, sum_output, sum_total,
-                             sum_cache_creation, sum_cache_read, sum_total_with_cache,
+        _print_table_compact(model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding, sum_total_with_cache,
                              input_cost, output_cost, io_total_cost,
-                             cache_output_cost, cache_input_cost, total_cost, vendor)
+                             cache_output_cost, cache_input_cost, total_cost, vendor,
+                             cache_hit_cost, prefill_cost, decoding_cost,
+                             show_vendor_prefix=(vendor == 'all'))
     elif mode == 'minimal':
-        _print_table_minimal(model_stats, sum_messages, sum_total, sum_total_with_cache, total_cost, vendor)
+        _print_table_minimal(model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding, sum_total_with_cache,
+                             total_cost, vendor,
+                             cache_hit_cost, prefill_cost, decoding_cost,
+                             show_vendor_prefix=(vendor == 'all'))
 
     # Print cost summary (all modes)
     daily_cost = total_cost / days_in_data if days_in_data > 0 else 0
@@ -391,277 +462,232 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
     return True
 
 
-def _print_table_full(model_stats, sum_messages, sum_input, sum_output, sum_total,
-                      sum_cache_creation, sum_cache_read, sum_total_with_cache,
+def _print_table_full(model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding, sum_total_with_cache,
                       input_cost, output_cost, io_total_cost,
-                      cache_output_cost, cache_input_cost, total_cost, vendor='claude'):
+                      cache_output_cost, cache_input_cost, total_cost, vendor='claude',
+                      cache_hit_cost=None, prefill_cost=None, decoding_cost=None, show_vendor_prefix=False):
     """Print full-width table (width ~204)."""
+    table_width = 152
+
     print("Usage / Cost by Model")
-    print("=" * 204)
+    print("=" * table_width)
 
-    # Column headers based on vendor
-    if vendor == 'codex':
-        col2_name1 = 'Cache Read Input'
-        col2_name2 = 'Reasoning Output'
-    elif vendor == 'gemini':
-        col2_name1 = 'Cache Read Input'
-        col2_name2 = 'Thinking Output'
-    else:
-        col2_name1 = 'Cache Read Input'
-        col2_name2 = 'Cache Creation Input'
-
-    header = f"| {'Model':<35} {'Messages':>18} | {'Input':>22} {'Output':>22} {'Total':>22} | {col2_name1:>22} {col2_name2:>22} {'Total':>26} |"
+    header = (f"| {'Model':<35} {'Messages':>18} | "
+              f"{'Cache Hit':>22} {'Prefill':>22} {'Decoding':>22} {'Total':>22} |")
     print(header)
-    print("|" + "-" * 202 + "|")
+    print("|" + "-" * (table_width - 2) + "|")
 
     for stats in model_stats:
         msg_str = format_with_pct(stats['count'], sum_messages, 18)
-        input_str = format_with_pct(stats['input'], sum_input, 22)
-        output_str = format_with_pct(stats['output'], sum_output, 22)
-        total_str = format_with_pct(stats['total'], sum_total, 22)
-        cache_read_str = format_with_pct(stats['cache_read'], sum_cache_read, 22)
-        # For Codex, use 'reasoning'; for Gemini, use 'thinking'; for Claude, use 'cache_creation'
-        if vendor == 'codex':
-            col2_val2 = stats.get('reasoning', 0)
-        elif vendor == 'gemini':
-            col2_val2 = stats.get('thinking', 0)
-        else:
-            col2_val2 = stats['cache_creation']
-        col2_str2 = format_with_pct(col2_val2, sum_cache_creation, 22)
-        total_with_cache_str = format_with_pct(stats['total_with_cache'], sum_total_with_cache, 26)
+        effective_vendor = stats.get('vendor', vendor)
+        cache_hit, prefill, decoding = _get_strategy_totals(stats, vendor=effective_vendor)
+        model_name = _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix, use_short_name=False)
+        cache_hit_str = format_with_pct(cache_hit, sum_cache_hit, 22)
+        prefill_str = format_with_pct(prefill, sum_prefill, 22)
+        decoding_str = format_with_pct(decoding, sum_decoding, 22)
+        total_with_cache_str = format_with_pct(cache_hit + prefill + decoding, sum_total_with_cache, 22)
 
-        row = (f"| {stats['model']:<35} "
+        row = (f"| {model_name:<35} "
                f"{msg_str} | "
-               f"{input_str} "
-               f"{output_str} "
-               f"{total_str} | "
-               f"{cache_read_str} "
-               f"{col2_str2} "
+               f"{cache_hit_str} "
+               f"{prefill_str} "
+               f"{decoding_str} "
                f"{total_with_cache_str} |")
         print(row)
 
-    print("|" + "-" * 202 + "|")
+    print("|" + "-" * (table_width - 2) + "|")
     sum_row = (f"| {'TOTAL':<35} "
                f"{format_with_100pct_up(sum_messages, 18)} | "
-               f"{format_with_100pct_up(sum_input, 22)} "
-               f"{format_with_100pct_up(sum_output, 22)} "
-               f"{format_with_100pct_up(sum_total, 22)} | "
-               f"{format_with_100pct_up(sum_cache_read, 22)} "
-               f"{format_with_100pct_up(sum_cache_creation, 22)} "
-               f"{format_with_100pct_up(sum_total_with_cache, 26)} |")
+               f"{format_with_100pct_up(sum_cache_hit, 22)} "
+               f"{format_with_100pct_up(sum_prefill, 22)} "
+               f"{format_with_100pct_up(sum_decoding, 22)} "
+               f"{format_with_100pct_up(sum_total_with_cache, 22)} |")
     print(sum_row)
 
     def format_cost_with_pct(cost, total, width):
         pct = (cost / total * 100) if total > 0 else 0
         return f"${cost:.2f}({pct:4.1f}%)".rjust(width)
 
+    if cache_hit_cost is None or prefill_cost is None or decoding_cost is None:
+        cache_hit_cost, prefill_cost, decoding_cost = _get_strategy_costs(
+            input_cost, output_cost, cache_output_cost, cache_input_cost, vendor=vendor
+        )
+
     cost_row = (f"| {'Cost(API)':<35} "
                 f"{'':>18} | "
-                f"{format_cost_with_pct(input_cost, total_cost, 22)} "
-                f"{format_cost_with_pct(output_cost, total_cost, 22)} "
-                f"{format_cost_with_pct(io_total_cost, total_cost, 22)} | "
-                f"{format_cost_with_pct(cache_input_cost, total_cost, 22)} "
-                f"{format_cost_with_pct(cache_output_cost, total_cost, 22)} "
-                f"{format_with_100pct_left(total_cost, 26)} |")
+                f"{format_cost_with_pct(cache_hit_cost, total_cost, 22)} "
+                f"{format_cost_with_pct(prefill_cost, total_cost, 22)} "
+                f"{format_cost_with_pct(decoding_cost, total_cost, 22)} "
+                f"{format_with_100pct_left(total_cost, 22)} |")
     print(cost_row)
-    print("=" * 204)
+    print("=" * table_width)
 
 
-def _print_table_medium(model_stats, sum_messages, sum_input, sum_output, sum_total,
-                        sum_cache_creation, sum_cache_read, sum_total_with_cache,
+def _print_table_medium(model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding, sum_total_with_cache,
                         input_cost, output_cost, io_total_cost,
-                        cache_output_cost, cache_input_cost, total_cost, vendor='claude'):
+                        cache_output_cost, cache_input_cost, total_cost, vendor='claude',
+                        cache_hit_cost=None, prefill_cost=None, decoding_cost=None, show_vendor_prefix=False):
     """Print medium-width table with short names (width ~135)."""
     # Column widths sized for typical data with percentages
     w_model = 12
     w_msgs = 15
-    w_io = 18      # Input/Output/Total columns
     w_cache = 20   # Cache columns (larger numbers)
 
-    table_width = 135
+    table_width = 118
 
     print("Usage / Cost by Model")
     print("=" * table_width)
 
-    # Column headers based on vendor (shorter names for medium width)
-    if vendor == 'codex':
-        col2_name1 = 'CacheReadIn'
-        col2_name2 = 'ReasonOut'
-    elif vendor == 'gemini':
-        col2_name1 = 'CacheReadIn'
-        col2_name2 = 'ThinkingOut'
-    else:
-        col2_name1 = 'CacheReadIn'
-        col2_name2 = 'CacheCreateIn'
-
     header = (f"| {'Model':<{w_model}} {'Msgs':>{w_msgs}} "
-              f"| {'Input':>{w_io}} {'Output':>{w_io}} {'Total':>{w_io}} "
-              f"| {col2_name1:>{w_cache}} {col2_name2:>{w_cache}} |")
+              f"| {'CacheHit':>{w_cache}} {'Prefill':>{w_cache}} {'Decode':>{w_cache}} {'Total':>{w_cache}} |")
     print(header)
     print("|" + "-" * (table_width - 2) + "|")
 
     for stats in model_stats:
-        model_name = get_short_model_name(stats['model'], vendor)
-        cache_read_str = format_with_pct(stats['cache_read'], sum_cache_read, w_cache)
-        # For Codex, use 'reasoning'; for Gemini, use 'thinking'; for Claude, use 'cache_creation'
-        if vendor == 'codex':
-            col2_val2 = stats.get('reasoning', 0)
-        elif vendor == 'gemini':
-            col2_val2 = stats.get('thinking', 0)
-        else:
-            col2_val2 = stats['cache_creation']
-        col2_str2 = format_with_pct(col2_val2, sum_cache_creation, w_cache)
+        effective_vendor = stats.get('vendor', vendor)
+        model_name = _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix)
+        cache_hit, prefill, decoding = _get_strategy_totals(stats, vendor=effective_vendor)
+        cache_hit_str = format_with_pct(cache_hit, sum_cache_hit, w_cache)
+        prefill_str = format_with_pct(prefill, sum_prefill, w_cache)
+        decoding_str = format_with_pct(decoding, sum_decoding, w_cache)
+        total_str = format_with_pct(cache_hit + prefill + decoding, sum_total_with_cache, w_cache)
         row = (f"| {model_name:<{w_model}} "
                f"{format_with_pct(stats['count'], sum_messages, w_msgs)} "
-               f"| {format_with_pct(stats['input'], sum_input, w_io)} "
-               f"{format_with_pct(stats['output'], sum_output, w_io)} "
-               f"{format_with_pct(stats['total'], sum_total, w_io)} "
-               f"| {cache_read_str} "
-               f"{col2_str2} |")
+               f"| {cache_hit_str} "
+               f"{prefill_str} "
+               f"{decoding_str} "
+               f"{total_str} |")
         print(row)
 
     print("|" + "-" * (table_width - 2) + "|")
     sum_row = (f"| {'TOTAL':<{w_model}} "
                f"{format_with_100pct_up(sum_messages, w_msgs)} "
-               f"| {format_with_100pct_up(sum_input, w_io)} "
-               f"{format_with_100pct_up(sum_output, w_io)} "
-               f"{format_with_100pct_up(sum_total, w_io)} "
-               f"| {format_with_100pct_up(sum_cache_read, w_cache)} "
-               f"{format_with_100pct_up(sum_cache_creation, w_cache)} |")
+               f"| {format_with_100pct_up(sum_cache_hit, w_cache)} "
+               f"{format_with_100pct_up(sum_prefill, w_cache)} "
+               f"{format_with_100pct_up(sum_decoding, w_cache)} "
+               f"{format_with_100pct_up(sum_total_with_cache, w_cache)} |")
     print(sum_row)
 
     def format_cost_with_pct(cost, total, width):
         pct = (cost / total * 100) if total > 0 else 0
         return f"${cost:.2f}({pct:4.1f}%)".rjust(width)
 
-    # Medium mode has no total cost column with breakdown, so use simple format
+    if cache_hit_cost is None or prefill_cost is None or decoding_cost is None:
+        cache_hit_cost, prefill_cost, decoding_cost = _get_strategy_costs(
+            input_cost, output_cost, cache_output_cost, cache_input_cost, vendor=vendor
+        )
+
     cost_row = (f"| {'Cost(API)':<{w_model}} "
                 f"{'':>{w_msgs}} "
-                f"| {format_cost_with_pct(input_cost, total_cost, w_io)} "
-                f"{format_cost_with_pct(output_cost, total_cost, w_io)} "
-                f"{format_cost_with_pct(io_total_cost, total_cost, w_io)} "
-                f"| {format_cost_with_pct(cache_input_cost, total_cost, w_cache)} "
-                f"{format_cost_with_pct(cache_output_cost, total_cost, w_cache)} |")
+                f"{format_cost_with_pct(cache_hit_cost, total_cost, w_cache)} "
+                f"{format_cost_with_pct(prefill_cost, total_cost, w_cache)} "
+                f"{format_cost_with_pct(decoding_cost, total_cost, w_cache)} "
+                f"{format_with_100pct_left(total_cost, w_cache)} |")
     print(cost_row)
     print("=" * table_width)
 
 
-def _print_table_compact(model_stats, sum_messages, sum_input, sum_output, sum_total,
-                         sum_cache_creation, sum_cache_read, sum_total_with_cache,
+def _print_table_compact(model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding, sum_total_with_cache,
                          input_cost, output_cost, io_total_cost,
-                         cache_output_cost, cache_input_cost, total_cost, vendor='claude'):
+                         cache_output_cost, cache_input_cost, total_cost, vendor='claude',
+                         cache_hit_cost=None, prefill_cost=None, decoding_cost=None, show_vendor_prefix=False):
     """Print compact table with short names, no percentages (width ~82)."""
     # Column widths for compact numbers (K/M/B format)
     w_model = 12
     w_msgs = 7
     w_val = 8   # For compact numbers and costs
 
-    table_width = 82
+    table_width = 62
 
     print("Usage / Cost by Model")
     print("=" * table_width)
 
-    # Column headers based on vendor (compact names)
-    if vendor == 'codex':
-        col2_name1 = 'CacheRIn'
-        col2_name2 = 'ReasnOut'
-    elif vendor == 'gemini':
-        col2_name1 = 'CacheRIn'
-        col2_name2 = 'ThinkOut'
-    else:
-        col2_name1 = 'CacheRIn'
-        col2_name2 = 'CacheCIn'
-
     header = (f"| {'Model':<{w_model}} {'Msgs':>{w_msgs}} "
-              f"| {'Input':>{w_val}} {'Output':>{w_val}} {'Total':>{w_val}} "
-              f"| {col2_name1:>{w_val}} {col2_name2:>{w_val}} {'Total':>{w_val}} |")
+              f"| {'CacheHit':>{w_val}} {'Prefill':>{w_val}} {'Decode':>{w_val}} {'Total':>{w_val}} |")
     print(header)
     print("|" + "-" * (table_width - 2) + "|")
 
     for stats in model_stats:
-        model_name = get_short_model_name(stats['model'], vendor)
-        # For Codex, use 'reasoning'; for Gemini, use 'thinking'; for Claude, use 'cache_creation'
-        if vendor == 'codex':
-            col2_val2 = stats.get('reasoning', 0)
-        elif vendor == 'gemini':
-            col2_val2 = stats.get('thinking', 0)
-        else:
-            col2_val2 = stats['cache_creation']
+        effective_vendor = stats.get('vendor', vendor)
+        model_name = _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix)
+        cache_hit, prefill, decoding = _get_strategy_totals(stats, vendor=effective_vendor)
         row = (f"| {model_name:<{w_model}} "
                f"{format_number_compact(stats['count']):>{w_msgs}} "
-               f"| {format_number_compact(stats['input']):>{w_val}} "
-               f"{format_number_compact(stats['output']):>{w_val}} "
-               f"{format_number_compact(stats['total']):>{w_val}} "
-               f"| {format_number_compact(stats['cache_read']):>{w_val}} "
-               f"{format_number_compact(col2_val2):>{w_val}} "
-               f"{format_number_compact(stats['total_with_cache']):>{w_val}} |")
+               f"| {format_number_compact(cache_hit):>{w_val}} "
+               f"{format_number_compact(prefill):>{w_val}} "
+               f"{format_number_compact(decoding):>{w_val}} "
+               f"{format_number_compact(cache_hit + prefill + decoding):>{w_val}} |")
         print(row)
 
     print("|" + "-" * (table_width - 2) + "|")
     sum_row = (f"| {'TOTAL':<{w_model}} "
                f"{format_number_compact(sum_messages):>{w_msgs}} "
-               f"| {format_number_compact(sum_input):>{w_val}} "
-               f"{format_number_compact(sum_output):>{w_val}} "
-               f"{format_number_compact(sum_total):>{w_val}} "
-               f"| {format_number_compact(sum_cache_read):>{w_val}} "
-               f"{format_number_compact(sum_cache_creation):>{w_val}} "
+               f"| {format_number_compact(sum_cache_hit):>{w_val}} "
+               f"{format_number_compact(sum_prefill):>{w_val}} "
+               f"{format_number_compact(sum_decoding):>{w_val}} "
                f"{format_number_compact(sum_total_with_cache):>{w_val}} |")
     print(sum_row)
 
+    if cache_hit_cost is None or prefill_cost is None or decoding_cost is None:
+        cache_hit_cost, prefill_cost, decoding_cost = _get_strategy_costs(
+            input_cost, output_cost, cache_output_cost, cache_input_cost, vendor=vendor
+        )
+
     cost_row = (f"| {'Cost':<{w_model}} "
                 f"{'':>{w_msgs}} "
-                f"| ${input_cost:>{w_val - 1}.2f} "
-                f"${output_cost:>{w_val - 1}.2f} "
-                f"${io_total_cost:>{w_val - 1}.2f} "
-                f"| ${cache_input_cost:>{w_val - 1}.2f} "
-                f"${cache_output_cost:>{w_val - 1}.2f} "
+                f"| ${cache_hit_cost:>{w_val - 1}.2f} "
+                f"${prefill_cost:>{w_val - 1}.2f} "
+                f"${decoding_cost:>{w_val - 1}.2f} "
                 f"${total_cost:>{w_val - 1}.2f} |")
     print(cost_row)
     print("=" * table_width)
 
 
-def _print_table_minimal(model_stats, sum_messages, sum_total, sum_total_with_cache, total_cost, vendor='claude'):
-    """Print minimal table - just model, messages, totals."""
+def _print_table_minimal(model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding, sum_total_with_cache, total_cost, vendor='claude',
+                        cache_hit_cost=None, prefill_cost=None, decoding_cost=None, show_vendor_prefix=False):
+    """Print minimal table - just model, messages, and strategy totals."""
     # Column widths
     w_model = 12
     w_msgs = 7
-    w_io = 10
-    w_cache = 12
-    w_all = 12
+    w_strategy = 10
 
-    # Calculate actual width: | Model<12> Msgs<7> | I/O<10> Cache<12> All<12> |
-    # = 2 + 12 + 1 + 7 + 1 + 2 + 10 + 1 + 12 + 1 + 12 + 2 = 63
-    table_width = 2 + w_model + 1 + w_msgs + 1 + 2 + w_io + 1 + w_cache + 1 + w_all + 2
+    # Calculate actual width: | Model<12> Msgs<7> | Cache Hit/Prefill/Decode/Total |
+    table_width = 2 + w_model + 1 + w_msgs + 1 + 2 + w_strategy * 4 + 3 + 2
 
     print("Usage Summary")
     print("=" * table_width)
 
     header = (f"| {'Model':<{w_model}} {'Msgs':>{w_msgs}} "
-              f"| {'I/O Total':>{w_io}} {'Cache Total':>{w_cache}} {'All Total':>{w_all}} |")
+              f"| {'Cache Hit':>{w_strategy}} {'Prefill':>{w_strategy}} {'Decode':>{w_strategy}} {'All':>{w_strategy}} |")
     print(header)
     print("|" + "-" * (table_width - 2) + "|")
 
     for stats in model_stats:
-        model_name = get_short_model_name(stats['model'], vendor)
+        effective_vendor = stats.get('vendor', vendor)
+        model_name = _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix)
+        cache_hit, prefill, decoding = _get_strategy_totals(stats, vendor=effective_vendor)
         row = (f"| {model_name:<{w_model}} "
                f"{format_number_compact(stats['count']):>{w_msgs}} "
-               f"| {format_number_compact(stats['total']):>{w_io}} "
-               f"{format_number_compact(stats['cache_creation'] + stats['cache_read']):>{w_cache}} "
-               f"{format_number_compact(stats['total_with_cache']):>{w_all}} |")
+               f"| {format_number_compact(cache_hit):>{w_strategy}} "
+               f"{format_number_compact(prefill):>{w_strategy}} "
+               f"{format_number_compact(decoding):>{w_strategy}} "
+               f"{format_number_compact(cache_hit + prefill + decoding):>{w_strategy}} |")
         print(row)
 
     print("|" + "-" * (table_width - 2) + "|")
     sum_row = (f"| {'TOTAL':<{w_model}} "
                f"{format_number_compact(sum_messages):>{w_msgs}} "
-               f"| {format_number_compact(sum_total):>{w_io}} "
-               f"{format_number_compact(sum_total_with_cache - sum_total):>{w_cache}} "
-               f"{format_number_compact(sum_total_with_cache):>{w_all}} |")
+               f"| {format_number_compact(sum_cache_hit):>{w_strategy}} "
+               f"{format_number_compact(sum_prefill):>{w_strategy}} "
+               f"{format_number_compact(sum_decoding):>{w_strategy}} "
+               f"{format_number_compact(sum_total_with_cache):>{w_strategy}} |")
     print(sum_row)
 
     cost_row = (f"| {'Cost':<{w_model}} "
                 f"{'':>{w_msgs}} "
-                f"| {'':>{w_io}} "
-                f"{'':>{w_cache}} "
-                f"${total_cost:>{w_all - 1}.2f} |")
+                f"| {'':>{w_strategy}} "
+                f"{'':>{w_strategy}} "
+                f"{'':>{w_strategy}} "
+                f"${total_cost:>{w_strategy - 1}.2f} |")
     print(cost_row)
     print("=" * table_width)

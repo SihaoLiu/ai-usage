@@ -83,6 +83,17 @@ def _format_model_name_with_vendor_prefix(model, vendor='claude', show_vendor_pr
     return f"{aligned_vendor}: {name}"
 
 
+def _fit_text_to_width(text, width):
+    """Fit text into fixed width, truncating with ellipsis when needed."""
+    if text is None:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return f"{text[: width - 3]}..."
+
+
 def format_number(num):
     """Format number with thousand separators."""
     return f"{num:,}"
@@ -481,7 +492,15 @@ def _print_table_full(model_stats, sum_messages, sum_cache_hit, sum_prefill, sum
         msg_str = format_with_pct(stats['count'], sum_messages, 18)
         effective_vendor = stats.get('vendor', vendor)
         cache_hit, prefill, decoding = _get_strategy_totals(stats, vendor=effective_vendor)
-        model_name = _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix, use_short_name=False)
+        model_name = _fit_text_to_width(
+            _format_model_name_with_vendor_prefix(
+                stats['model'],
+                effective_vendor,
+                show_vendor_prefix=show_vendor_prefix,
+                use_short_name=False
+            ),
+            35
+        )
         cache_hit_str = format_with_pct(cache_hit, sum_cache_hit, 22)
         prefill_str = format_with_pct(prefill, sum_prefill, 22)
         decoding_str = format_with_pct(decoding, sum_decoding, 22)
@@ -529,11 +548,11 @@ def _print_table_medium(model_stats, sum_messages, sum_cache_hit, sum_prefill, s
                         cache_hit_cost=None, prefill_cost=None, decoding_cost=None, show_vendor_prefix=False):
     """Print medium-width table with short names (width ~135)."""
     # Column widths sized for typical data with percentages
-    w_model = 12
+    w_model = 22
     w_msgs = 15
     w_cache = 20   # Cache columns (larger numbers)
 
-    table_width = 118
+    table_width = 128
 
     print("Usage / Cost by Model")
     print("=" * table_width)
@@ -545,7 +564,10 @@ def _print_table_medium(model_stats, sum_messages, sum_cache_hit, sum_prefill, s
 
     for stats in model_stats:
         effective_vendor = stats.get('vendor', vendor)
-        model_name = _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix)
+        model_name = _fit_text_to_width(
+            _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix),
+            w_model
+        )
         cache_hit, prefill, decoding = _get_strategy_totals(stats, vendor=effective_vendor)
         cache_hit_str = format_with_pct(cache_hit, sum_cache_hit, w_cache)
         prefill_str = format_with_pct(prefill, sum_prefill, w_cache)
@@ -609,7 +631,10 @@ def _print_table_compact(model_stats, sum_messages, sum_cache_hit, sum_prefill, 
 
     for stats in model_stats:
         effective_vendor = stats.get('vendor', vendor)
-        model_name = _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix)
+        model_name = _fit_text_to_width(
+            _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix),
+            w_model
+        )
         cache_hit, prefill, decoding = _get_strategy_totals(stats, vendor=effective_vendor)
         row = (f"| {model_name:<{w_model}} "
                f"{format_number_compact(stats['count']):>{w_msgs}} "
@@ -664,7 +689,10 @@ def _print_table_minimal(model_stats, sum_messages, sum_cache_hit, sum_prefill, 
 
     for stats in model_stats:
         effective_vendor = stats.get('vendor', vendor)
-        model_name = _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix)
+        model_name = _fit_text_to_width(
+            _format_model_name_with_vendor_prefix(stats['model'], effective_vendor, show_vendor_prefix=show_vendor_prefix),
+            w_model
+        )
         cache_hit, prefill, decoding = _get_strategy_totals(stats, vendor=effective_vendor)
         row = (f"| {model_name:<{w_model}} "
                f"{format_number_compact(stats['count']):>{w_msgs}} "

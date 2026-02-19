@@ -680,6 +680,64 @@ def main():
 
         return dict(time_series)
 
+    def calculate_all_model_breakdown():
+        """Calculate model breakdown for all vendors (used for --vendor all mode).
+
+        Returns:
+            list: Combined model stats list with vendor tags for mixed-vendor pricing/counting.
+        """
+        all_model_stats = []
+
+        def _tag_vendor_stats(stats_list, vendor):
+            tagged = []
+            for item in stats_list:
+                row = dict(item)
+                row['vendor'] = vendor
+                # Keep all optional fields explicit for mixed-vendor formatting.
+                row.setdefault('cache_creation', 0)
+                row.setdefault('reasoning', 0)
+                row.setdefault('thinking', 0)
+                tagged.append(row)
+            return tagged
+
+        # Claude (uses cache_creation for cache write input)
+        claude_data = read_all_jsonl_files()
+        if claude_data:
+            claude_filtered = filter_usage_data_by_days(claude_data, days_state['days'])
+            all_model_stats.extend(_tag_vendor_stats(
+                calculate_model_breakdown(claude_filtered),
+                'claude'
+            ))
+
+        # Codex (uses reasoning for decoding + cache_read input)
+        codex_dir = get_codex_dir() / 'sessions'
+        if codex_dir.exists():
+            codex_data = read_codex_jsonl_files(codex_dir)
+            if codex_data:
+                codex_filtered = filter_codex_usage_data_by_days(codex_data, days_state['days'])
+                all_model_stats.extend(_tag_vendor_stats(
+                    calculate_codex_model_breakdown(codex_filtered),
+                    'codex'
+                ))
+
+        # Gemini (uses thinking for decoding + cache_read input)
+        gemini_dir = get_gemini_dir() / 'tmp'
+        if gemini_dir.exists():
+            gemini_data = read_gemini_json_files(gemini_dir)
+            if gemini_data:
+                gemini_filtered = filter_gemini_usage_data_by_days(gemini_data, days_state['days'])
+                all_model_stats.extend(_tag_vendor_stats(
+                    calculate_gemini_model_breakdown(gemini_filtered),
+                    'gemini'
+                ))
+
+        # Sort by total tokens including cache terms
+        all_model_stats.sort(
+            key=lambda item: item.get('total_with_cache', item.get('total', 0)),
+            reverse=True
+        )
+        return all_model_stats
+
     def print_stats_all():
         """Print vendor comparison statistics (for --vendor all mode)."""
         # Clear screen in monitor mode
@@ -693,10 +751,8 @@ def main():
 
         # Get terminal dimensions
         target_width = get_chart_target_width()
-        chart_height = calculate_chart_height(
-            is_monitor_mode=not args.once,
-            table_printed=False  # No table in 'all' mode
-        )
+        terminal_width = get_terminal_width()
+        terminal_height = get_terminal_height()
 
         # Calculate optimal interval
         optimal_interval = calculate_optimal_interval_minutes(days_state['days'], target_width)
@@ -713,9 +769,28 @@ def main():
         # Calculate vendor aggregate time series
         vendor_time_series = calculate_vendor_aggregate_time_series(interval_minutes=interval_minutes)
 
+        # Build combined model breakdown table data
+        all_model_stats = calculate_all_model_breakdown()
+
+        table_printed = False
+        if all_model_stats:
+            table_printed = print_model_breakdown(
+                all_model_stats,
+                days_in_data=days_state['days'],
+                terminal_width=terminal_width,
+                terminal_height=terminal_height,
+                vendor='all'
+            )
+            print()
+
         if not vendor_time_series:
             print("No usage data found from any vendor.")
             return False
+
+        chart_height = calculate_chart_height(
+            is_monitor_mode=not args.once,
+            table_printed=table_printed
+        ) * 2
 
         # Calculate time span info for display
         from datetime import timedelta
@@ -746,7 +821,6 @@ def main():
             interval_str = f"{interval_minutes}m"
 
         # Print time span info
-        terminal_width = get_terminal_width()
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         start_str_full = now.strftime('%Y-%m-%d %H:%M')
         end_str_full = start_time_rounded.strftime('%Y-%m-%d %H:%M')
@@ -766,7 +840,7 @@ def main():
         # Print vendor comparison chart
         print_vendor_comparison_chart(
             vendor_time_series,
-            height=chart_height * 2,  # Use more height since no table
+            height=chart_height,
             days_back=days_state['days'],
             target_width=target_width,
             interval_minutes=interval_minutes,

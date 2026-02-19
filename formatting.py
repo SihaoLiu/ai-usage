@@ -374,7 +374,7 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
     elif vendor == 'gemini':
         subscription_price = GEMINI_SUBSCRIPTION_PRICE
     elif vendor == 'all':
-        subscription_price = 400
+        subscription_price = SUBSCRIPTION_PRICE + CODEX_SUBSCRIPTION_PRICE + GEMINI_SUBSCRIPTION_PRICE
     else:
         subscription_price = SUBSCRIPTION_PRICE
 
@@ -413,19 +413,19 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
         else:
             row_cache_output_cost = stats['cache_creation'] * pricing['cache_output'] / 1_000_000
 
-        row_prefill_cost, row_decoding_cost = _get_strategy_costs(
+        row_cache_hit_cost, row_prefill_cost, row_decoding_cost = _get_strategy_costs(
             row_input_cost,
             row_output_cost,
             row_cache_output_cost,
             row_cache_input_cost,
             vendor=resolved_vendor
-        )[1:]
+        )
 
         input_cost += row_input_cost
         output_cost += row_output_cost
         cache_output_cost += row_cache_output_cost
         cache_input_cost += row_cache_input_cost
-        cache_hit_cost += row_cache_input_cost
+        cache_hit_cost += row_cache_hit_cost
         prefill_cost += row_prefill_cost
         decoding_cost += row_decoding_cost
 

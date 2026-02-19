@@ -326,7 +326,7 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
         days_in_data: Number of days the data covers (for cost projections)
         terminal_width: Terminal width (None for default full mode)
         terminal_height: Terminal height (None for default full mode)
-        vendor: 'claude', 'codex', or 'gemini' (affects pricing and display)
+        vendor: 'claude', 'codex', 'gemini', or 'all' (affects pricing and display)
 
     Returns:
         bool: True if table was printed, False if hidden due to space constraints
@@ -373,6 +373,8 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
         subscription_price = CODEX_SUBSCRIPTION_PRICE
     elif vendor == 'gemini':
         subscription_price = GEMINI_SUBSCRIPTION_PRICE
+    elif vendor == 'all':
+        subscription_price = 400
     else:
         subscription_price = SUBSCRIPTION_PRICE
 

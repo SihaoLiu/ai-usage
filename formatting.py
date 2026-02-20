@@ -3,15 +3,17 @@
 import math
 
 from constants import (
-    MODEL_PRICING, DEFAULT_PRICING, SUBSCRIPTION_PRICE,
-    CODEX_MODEL_PRICING, CODEX_DEFAULT_PRICING, CODEX_SUBSCRIPTION_PRICE,
-    GEMINI_MODEL_PRICING, GEMINI_DEFAULT_PRICING, GEMINI_SUBSCRIPTION_PRICE
+    MODEL_PRICING, DEFAULT_PRICING,
+    CODEX_MODEL_PRICING, CODEX_DEFAULT_PRICING,
+    GEMINI_MODEL_PRICING, GEMINI_DEFAULT_PRICING,
 )
 
 # Short model name mapping for Claude
 SHORT_MODEL_NAMES = {
+    'claude-opus-4-6': 'Opus 4.6',
     'claude-opus-4-5-20251101': 'Opus 4.5',
     'claude-opus-4-1-20250805': 'Opus 4.1',
+    'claude-sonnet-4-6': 'Sonnet 4.6',
     'claude-sonnet-4-5-20250929': 'Sonnet 4.5',
     'claude-sonnet-4-20250514': 'Sonnet 4',
     'claude-haiku-4-5-20251001': 'Haiku 4.5',
@@ -21,11 +23,18 @@ SHORT_MODEL_NAMES = {
 # Short model name mapping for Codex (OpenAI)
 # Note: Codex model names include effort level like "gpt-5-codex (high)"
 CODEX_SHORT_MODEL_NAMES = {
-    'gpt-5-codex': 'GPT-5 Codex',
-    'gpt-5.1-codex': 'GPT-5.1 Codex',
+    'gpt-5.3-codex': 'GPT-5.3 Cdx',
+    'gpt-5.2-codex': 'GPT-5.2 Cdx',
+    'gpt-5.1-codex': 'GPT-5.1 Cdx',
     'gpt-5.1-codex-max': 'GPT-5.1 Max',
     'gpt-5.1-codex-mini': 'GPT-5.1 Mini',
+    'gpt-5-codex': 'GPT-5 Codex',
     'codex-mini-latest': 'Codex Mini',
+    'gpt-5.2': 'GPT-5.2',
+    'gpt-5.1': 'GPT-5.1',
+    'gpt-5': 'GPT-5',
+    'gpt-5-mini': 'GPT-5 Mini',
+    'gpt-5-nano': 'GPT-5 Nano',
     'gpt-4.1': 'GPT-4.1',
     'gpt-4.1-mini': 'GPT-4.1 Mini',
     'gpt-4.1-nano': 'GPT-4.1 Nano',
@@ -37,8 +46,10 @@ CODEX_SHORT_MODEL_NAMES = {
 
 # Short model name mapping for Gemini (Google)
 GEMINI_SHORT_MODEL_NAMES = {
+    'gemini-3.1-pro-preview': 'Gem 3.1 Pro',
     'gemini-3-pro-preview': 'Gem 3 Pro',
     'gemini-3-pro-image-preview': 'Gem 3 Img',
+    'gemini-3-flash-preview': 'Gem 3 Fl',
     'gemini-2.5-pro': 'Gem 2.5 Pro',
     'gemini-2.5-flash': 'Gem 2.5 Fl',
     'gemini-2.5-flash-preview-09-2025': 'Gem 2.5 Fl',
@@ -318,7 +329,8 @@ def _get_strategy_costs(input_cost, output_cost, cache_output_cost, cache_input_
     return cache_hit_cost, prefill_cost, decoding_cost
 
 
-def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, terminal_height=None, vendor='claude'):
+def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, terminal_height=None, vendor='claude',
+                          subscription_fees=None):
     """Print model breakdown table with responsive formatting.
 
     Args:
@@ -327,6 +339,7 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
         terminal_width: Terminal width (None for default full mode)
         terminal_height: Terminal height (None for default full mode)
         vendor: 'claude', 'codex', 'gemini', or 'all' (affects pricing and display)
+        subscription_fees: dict with keys 'claude', 'codex', 'gemini' mapping to monthly fees
 
     Returns:
         bool: True if table was printed, False if hidden due to space constraints
@@ -369,14 +382,16 @@ def print_model_breakdown(model_stats, days_in_data=7, terminal_width=None, term
     cache_hit_cost = 0
     prefill_cost = 0
     decoding_cost = 0
+    if subscription_fees is None:
+        subscription_fees = {'claude': 0, 'codex': 0, 'gemini': 0}
     if vendor == 'codex':
-        subscription_price = CODEX_SUBSCRIPTION_PRICE
+        subscription_price = subscription_fees['codex']
     elif vendor == 'gemini':
-        subscription_price = GEMINI_SUBSCRIPTION_PRICE
+        subscription_price = subscription_fees['gemini']
     elif vendor == 'all':
-        subscription_price = SUBSCRIPTION_PRICE + CODEX_SUBSCRIPTION_PRICE + GEMINI_SUBSCRIPTION_PRICE
+        subscription_price = subscription_fees['claude'] + subscription_fees['codex'] + subscription_fees['gemini']
     else:
-        subscription_price = SUBSCRIPTION_PRICE
+        subscription_price = subscription_fees['claude']
 
     for stats in model_stats:
         resolved_vendor = stats.get('vendor', vendor)

@@ -32,7 +32,7 @@ from stats_gemini import calculate_gemini_model_breakdown, calculate_gemini_mode
 from formatting import print_model_breakdown, format_cost_per_mtok
 from charts import print_multi_line_chart, print_vendor_comparison_chart
 from constants import (
-    SUBSCRIPTION_PRICE, CODEX_SUBSCRIPTION_PRICE, GEMINI_SUBSCRIPTION_PRICE,
+    load_subscription_fees, prompt_subscription_fees,
     MODEL_PRICING, DEFAULT_PRICING,
     CODEX_MODEL_PRICING, CODEX_DEFAULT_PRICING,
     GEMINI_MODEL_PRICING, GEMINI_DEFAULT_PRICING,
@@ -224,6 +224,11 @@ def main():
 
     # Initialize vendor state
     update_vendor_state(args.vendor)
+
+    # Load subscription fees from .fee.env (prompt interactively if missing)
+    subscription_fees = load_subscription_fees()
+    if subscription_fees is None:
+        subscription_fees = prompt_subscription_fees()
 
     # For 'all' vendor, we don't check data_dir (handled separately)
     if args.vendor != 'all' and not vendor_state['data_dir'].exists():
@@ -511,11 +516,11 @@ def main():
         if grand_total == 0:
             return 0, 0, {}
 
-        # Subscription prices per vendor
+        # Subscription prices per vendor (from .fee.env)
         subscription_prices = {
-            'Claude': SUBSCRIPTION_PRICE,
-            'Codex': CODEX_SUBSCRIPTION_PRICE,
-            'Gemini': GEMINI_SUBSCRIPTION_PRICE,
+            'Claude': subscription_fees['claude'],
+            'Codex': subscription_fees['codex'],
+            'Gemini': subscription_fees['gemini'],
         }
 
         # Calculate cost per MTok and savings for each vendor
@@ -779,7 +784,8 @@ def main():
                 days_in_data=days_state['days'],
                 terminal_width=terminal_width,
                 terminal_height=terminal_height,
-                vendor='all'
+                vendor='all',
+                subscription_fees=subscription_fees
             )
             print()
 
@@ -921,7 +927,8 @@ def main():
             days_in_data=days_state['days'],
             terminal_width=terminal_width,
             terminal_height=terminal_height,
-            vendor=current_vendor
+            vendor=current_vendor,
+            subscription_fees=subscription_fees
         )
 
         # Get target width and height for charts

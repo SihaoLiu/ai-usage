@@ -1,47 +1,63 @@
 {
   "_meta": {
     "description": "API pricing and subscription costs for AI services",
-    "last_updated": "2026-01-07",
-    "notes": "All prices are per million tokens (MTok). Update this file when pricing changes."
+    "last_updated": "2026-02-19",
+    "notes": "All prices are per million tokens (MTok) at standard API rates. Update this file when pricing changes."
   },
   "claude": {
-    "subscription_price": 200,
     "models": {
-      "claude-sonnet-4-5-20250929": {
-        "input": 1.50,
-        "output": 7.50,
-        "cache_input": 0.15,
-        "cache_output": 1.875,
-        "_comment": "Tiered pricing: ≤200K tokens tier"
-      },
-      "claude-haiku-4-5-20251001": {
-        "input": 0.50,
-        "output": 2.50,
-        "cache_input": 0.05,
-        "cache_output": 0.625
+      "claude-opus-4-6": {
+        "input": 5.00,
+        "output": 25.00,
+        "cache_input": 0.50,
+        "cache_output": 6.25
       },
       "claude-opus-4-5-20251101": {
-        "input": 2.50,
-        "output": 12.50,
-        "cache_input": 0.25,
-        "cache_output": 3.125
+        "input": 5.00,
+        "output": 25.00,
+        "cache_input": 0.50,
+        "cache_output": 6.25
+      },
+      "claude-sonnet-4-6": {
+        "input": 3.00,
+        "output": 15.00,
+        "cache_input": 0.30,
+        "cache_output": 3.75
+      },
+      "claude-sonnet-4-5-20250929": {
+        "input": 3.00,
+        "output": 15.00,
+        "cache_input": 0.30,
+        "cache_output": 3.75
+      },
+      "claude-haiku-4-5-20251001": {
+        "input": 1.00,
+        "output": 5.00,
+        "cache_input": 0.10,
+        "cache_output": 1.25
       }
     },
     "default": {
-      "input": 1.50,
-      "output": 7.50,
-      "cache_input": 0.15,
-      "cache_output": 1.875,
-      "_comment": "Fallback for unknown models, using Sonnet ≤200K tier"
+      "input": 3.00,
+      "output": 15.00,
+      "cache_input": 0.30,
+      "cache_output": 3.75,
+      "_comment": "Fallback for unknown models, using Sonnet standard pricing"
     }
   },
   "codex": {
-    "subscription_price": 200,
     "models": {
-      "gpt-5-codex": {
-        "input": 1.25,
-        "output": 10.00,
-        "cache_input": 0.125,
+      "gpt-5.3-codex": {
+        "input": 1.75,
+        "output": 14.00,
+        "cache_input": 0.175,
+        "cache_output": 0.0,
+        "_comment": "Estimated based on gpt-5.2 pricing, official API pricing pending"
+      },
+      "gpt-5.2-codex": {
+        "input": 1.75,
+        "output": 14.00,
+        "cache_input": 0.175,
         "cache_output": 0.0
       },
       "gpt-5.1-codex": {
@@ -62,10 +78,46 @@
         "cache_input": 0.025,
         "cache_output": 0.0
       },
+      "gpt-5-codex": {
+        "input": 1.25,
+        "output": 10.00,
+        "cache_input": 0.125,
+        "cache_output": 0.0
+      },
       "codex-mini-latest": {
         "input": 1.50,
         "output": 6.00,
         "cache_input": 0.375,
+        "cache_output": 0.0
+      },
+      "gpt-5.2": {
+        "input": 1.75,
+        "output": 14.00,
+        "cache_input": 0.175,
+        "cache_output": 0.0
+      },
+      "gpt-5.1": {
+        "input": 1.25,
+        "output": 10.00,
+        "cache_input": 0.125,
+        "cache_output": 0.0
+      },
+      "gpt-5": {
+        "input": 1.25,
+        "output": 10.00,
+        "cache_input": 0.125,
+        "cache_output": 0.0
+      },
+      "gpt-5-mini": {
+        "input": 0.25,
+        "output": 2.00,
+        "cache_input": 0.025,
+        "cache_output": 0.0
+      },
+      "gpt-5-nano": {
+        "input": 0.05,
+        "output": 0.40,
+        "cache_input": 0.005,
         "cache_output": 0.0
       },
       "gpt-4.1": {
@@ -112,22 +164,33 @@
       }
     },
     "default": {
-      "input": 1.25,
-      "output": 10.00,
-      "cache_input": 0.125,
+      "input": 1.75,
+      "output": 14.00,
+      "cache_input": 0.175,
       "cache_output": 0.0,
-      "_comment": "Fallback, using gpt-5-codex Standard tier"
+      "_comment": "Fallback, using gpt-5.2 pricing"
     }
   },
   "gemini": {
-    "subscription_price": 19.99,
     "models": {
-      "gemini-3-pro-preview": {
+      "gemini-3.1-pro-preview": {
         "input": 2.00,
         "output": 12.00,
         "cache_input": 0.20,
         "cache_output": 0.0,
-        "_comment": "Most powerful agentic model, ≤200K tokens tier"
+        "_comment": "Same pricing as Gemini 3 Pro, ≤200K tokens tier"
+      },
+      "gemini-3-pro-preview": {
+        "input": 2.00,
+        "output": 12.00,
+        "cache_input": 0.20,
+        "cache_output": 0.0
+      },
+      "gemini-3-flash-preview": {
+        "input": 0.50,
+        "output": 3.00,
+        "cache_input": 0.05,
+        "cache_output": 0.0
       },
       "gemini-2.5-pro": {
         "input": 1.25,
@@ -162,23 +225,22 @@
       "gemini-2.0-flash": {
         "input": 0.10,
         "output": 0.40,
-        "cache_input": 0.025,
+        "cache_input": 0.01,
         "cache_output": 0.0
       },
       "gemini-2.0-flash-lite": {
         "input": 0.075,
         "output": 0.30,
-        "cache_input": 0.0,
-        "cache_output": 0.0,
-        "_comment": "Cache not available"
+        "cache_input": 0.008,
+        "cache_output": 0.0
       }
     },
     "default": {
-      "input": 0.30,
-      "output": 2.50,
-      "cache_input": 0.03,
+      "input": 0.50,
+      "output": 3.00,
+      "cache_input": 0.05,
       "cache_output": 0.0,
-      "_comment": "Fallback, using 2.5 Flash tier"
+      "_comment": "Fallback, using Gemini 3 Flash pricing"
     }
   }
 }

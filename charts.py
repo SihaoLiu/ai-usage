@@ -5,11 +5,13 @@ from formatting import format_y_axis_value, format_total_value
 
 # Model display configuration for Claude
 MODEL_CONFIG = {
-    'claude-opus-4-5-20251101': {'short': 'Opus 4.5', 'order': 0},
-    'claude-opus-4-1-20250805': {'short': 'Opus 4.1', 'order': 1},
-    'claude-sonnet-4-5-20250929': {'short': 'Sonnet 4.5', 'order': 2},
-    'claude-sonnet-4-20250514': {'short': 'Sonnet 4', 'order': 3},
-    'claude-haiku-4-5-20251001': {'short': 'Haiku 4.5', 'order': 4},
+    'claude-opus-4-6': {'short': 'Opus 4.6', 'order': 0},
+    'claude-opus-4-5-20251101': {'short': 'Opus 4.5', 'order': 1},
+    'claude-opus-4-1-20250805': {'short': 'Opus 4.1', 'order': 2},
+    'claude-sonnet-4-6': {'short': 'Sonnet 4.6', 'order': 3},
+    'claude-sonnet-4-5-20250929': {'short': 'Sonnet 4.5', 'order': 4},
+    'claude-sonnet-4-20250514': {'short': 'Sonnet 4', 'order': 5},
+    'claude-haiku-4-5-20251001': {'short': 'Haiku 4.5', 'order': 6},
 }
 
 # Color configuration for lines (ANSI 256-color codes)

@@ -24,6 +24,7 @@ SHORT_MODEL_NAMES = {
 # Note: Codex model names include effort level like "gpt-5-codex (high)"
 CODEX_SHORT_MODEL_NAMES = {
     'gpt-5.3-codex': 'GPT-5.3 Cdx',
+    'gpt-5.3-codex-spark': 'GPT-5.3 Sprk',
     'gpt-5.2-codex': 'GPT-5.2 Cdx',
     'gpt-5.1-codex': 'GPT-5.1 Cdx',
     'gpt-5.1-codex-max': 'GPT-5.1 Max',

@@ -4,24 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A Python utility for monitoring token usage and costs across multiple AI coding assistants: **Claude Code**, **OpenAI Codex**, and **Google Gemini CLI**. Uses only Python standard library (zero dependencies).
+A Rust utility for monitoring token usage and costs across multiple AI coding assistants: **Claude Code**, **OpenAI Codex**, and **Google Gemini CLI**.
 
-## Running the Script
+## Building and Running
 
 ```bash
-# All vendors, last 7 days
-python3 vibe-usage.py
+# Build
+cargo build --release
+
+# All vendors, last 7 days (monitor mode)
+./target/release/vibe-usage
+
+# Single snapshot
+./target/release/vibe-usage --once
 
 # Last 30 days
-python3 vibe-usage.py --days 30
+./target/release/vibe-usage --days 30
 
 # Specific vendor only
-python3 vibe-usage.py --vendor claude
-python3 vibe-usage.py --vendor codex
-python3 vibe-usage.py --vendor gemini
-
-# Monitor mode (auto-refresh every hour)
-python3 vibe-usage.py --monitor
+./target/release/vibe-usage --vendor claude
+./target/release/vibe-usage --vendor codex
+./target/release/vibe-usage --vendor gemini
 ```
 
 ## Data Sources
@@ -40,17 +43,23 @@ Environment variables can override default paths:
 ## Architecture
 
 ```
-vibe-usage.py          # Main entry point with CLI argument parsing
-├── data.py            # Claude data reader
-├── data_codex.py      # Codex data reader
-├── data_gemini.py     # Gemini data reader
-├── stats.py           # Claude statistics calculation
-├── stats_codex.py     # Codex statistics calculation
-├── stats_gemini.py    # Gemini statistics calculation
-├── formatting.py      # Output formatting and responsive tables
-├── charts.py          # ASCII chart visualization
-├── constants.py       # Pricing configuration loader
-└── pricing.json       # API pricing data for all vendors
+src/
+  main.rs            # Entry point, CLI args, monitor loop, vendor aggregation
+  constants.rs       # Pricing loader (pricing.json + .fee.env)
+  formatting.rs      # Output formatting and responsive tables
+  charts.rs          # ASCII chart visualization
+  time_utils.rs      # Timezone and time formatting utilities
+  data/
+    mod.rs           # Common types (UsageEntry, TokenUsage)
+    claude.rs        # Claude data reader (dedup by message ID)
+    codex.rs         # Codex data reader (session_meta + token_count)
+    gemini.rs        # Gemini data reader (JSON sessions)
+  stats/
+    mod.rs           # Generic model breakdown and time series calculation
+    claude.rs        # Claude statistics wrappers
+    codex.rs         # Codex statistics wrappers
+    gemini.rs        # Gemini statistics wrappers
+pricing.json         # API pricing data for all vendors
 ```
 
 **Key implementation notes:**
@@ -59,3 +68,16 @@ vibe-usage.py          # Main entry point with CLI argument parsing
 - Time series data is bucketed into 8-hour intervals for trend analysis
 - All times are displayed in the system's local timezone
 - Display adapts to terminal width (Full/Medium/Compact/Minimal modes)
+- Monitor mode uses crossterm raw mode; disable before printing, re-enable after
+
+## Testing
+
+```bash
+cargo build --release && cargo test
+```
+
+Snapshot tests compare Rust output against Python reference snapshots using fixture data in `tests/fixtures/`.
+
+## Legacy Python
+
+The original Python implementation (`vibe-usage.py` and modules) is preserved for reference and snapshot comparison.

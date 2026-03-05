@@ -38,6 +38,7 @@ struct AppState {
     pricing: AllPricing,
     subscription_fees: SubscriptionFees,
     version_cache: HashMap<String, VersionCacheEntry>,
+    all_vendor_prompt: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -133,6 +134,22 @@ fn round_to_nice_interval(optimal: f64) -> i64 {
         }
     }
     *nice.last().unwrap()
+}
+
+/// Get the data directory for a vendor, or None for "all".
+fn get_vendor_data_dir(vendor: &str) -> Option<PathBuf> {
+    match vendor {
+        "codex" => Some(get_codex_dir().join("sessions")),
+        "gemini" => Some(get_gemini_dir().join("tmp")),
+        "claude" => {
+            let dirs = data::claude::get_claude_dirs();
+            Some(dirs.into_iter()
+                .map(|d| d.join("projects"))
+                .find(|p| p.exists())
+                .unwrap_or_else(|| PathBuf::from("~/.claude/projects")))
+        }
+        _ => None, // "all" has no single directory
+    }
 }
 
 fn read_vendor_data(vendor: &str, days: i64) -> Vec<UsageEntry> {
@@ -245,6 +262,7 @@ fn calculate_all_model_breakdown(all_data: &AllVendorData) -> Vec<ModelBreakdown
         all_stats.extend(stats::calculate_gemini_model_breakdown(&all_data.gemini));
     }
 
+    all_stats.sort_by(|a, b| b.total.cmp(&a.total));
     all_stats
 }
 
@@ -257,10 +275,17 @@ fn calculate_weighted_cost_per_mtok(
     subscription_fees: &SubscriptionFees,
 ) -> (f64, f64) {
     // Per-vendor: (total_tokens, api_cost)
+    // Match Python: Gemini weighted cost uses sessions dir (not tmp)
+    let gemini_sessions_exist = get_gemini_dir().join("sessions").exists();
+    let gemini_entries: &[UsageEntry] = if gemini_sessions_exist {
+        &all_data.gemini
+    } else {
+        &[]
+    };
     let vendor_configs: &[(&str, &[UsageEntry], f64)] = &[
         ("claude", &all_data.claude, subscription_fees.claude),
         ("codex", &all_data.codex, subscription_fees.codex),
-        ("gemini", &all_data.gemini, subscription_fees.gemini),
+        ("gemini", gemini_entries, subscription_fees.gemini),
     ];
 
     let mut vendor_data: Vec<(i64, f64, f64)> = Vec::new(); // (tokens, api_cost, sub_price)
@@ -489,7 +514,7 @@ fn print_time_span_info(days: i64, interval_minutes: i64, terminal_width: u16) {
     println!();
 }
 
-fn print_stats_single(state: &AppState, once: bool) -> Option<bool> {
+fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let (size_ok, width, height) = check_terminal_size();
     if !size_ok {
         print_terminal_too_small(width, height);
@@ -571,7 +596,7 @@ fn print_stats_single(state: &AppState, once: bool) -> Option<bool> {
     Some(true)
 }
 
-fn print_stats_all(state: &AppState, once: bool) -> Option<bool> {
+fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     let (size_ok, width, height) = check_terminal_size();
     if !size_ok {
         print_terminal_too_small(width, height);
@@ -593,6 +618,21 @@ fn print_stats_all(state: &AppState, once: bool) -> Option<bool> {
     let interval_minutes = round_to_nice_interval(optimal);
 
     let all_data = load_all_vendor_data(state);
+
+    // Compute and cache the weighted cost prompt for show_prompt reuse
+    let (weighted_cost, total_savings) = calculate_weighted_cost_per_mtok(
+        &all_data, state.days, &state.pricing, &state.subscription_fees,
+    );
+    state.all_vendor_prompt = if weighted_cost > 0.0 {
+        Some(format!(
+            "All Vendors Comparison, {} / MTok, Monthly Saving ${:.2}",
+            formatting::format_cost_per_mtok(weighted_cost),
+            total_savings,
+        ))
+    } else {
+        None
+    };
+
     let vendor_time_series = calculate_vendor_aggregate_time_series(&all_data, interval_minutes);
     let all_model_stats = calculate_all_model_breakdown(&all_data);
 
@@ -631,7 +671,7 @@ fn print_stats_all(state: &AppState, once: bool) -> Option<bool> {
     Some(true)
 }
 
-fn print_stats(state: &AppState, once: bool) -> Option<bool> {
+fn print_stats(state: &mut AppState, once: bool) -> Option<bool> {
     if state.vendor == "all" {
         print_stats_all(state, once)
     } else {
@@ -647,18 +687,7 @@ fn main() {
         .unwrap_or_else(|| prompt_subscription_fees());
 
     // Validate vendor data directory on startup (matches Python behavior)
-    if args.vendor != "all" {
-        let data_dir = match args.vendor.as_str() {
-            "codex" => get_codex_dir().join("sessions"),
-            "gemini" => get_gemini_dir().join("tmp"),
-            _ => {
-                let dirs = data::claude::get_claude_dirs();
-                dirs.into_iter()
-                    .map(|d| d.join("projects"))
-                    .find(|p| p.exists())
-                    .unwrap_or_else(|| PathBuf::from("~/.claude/projects"))
-            }
-        };
+    if let Some(data_dir) = get_vendor_data_dir(&args.vendor) {
         if !data_dir.exists() {
             eprintln!("Error: Data directory not found at {}", data_dir.display());
             std::process::exit(1);
@@ -672,10 +701,11 @@ fn main() {
         pricing,
         subscription_fees,
         version_cache: HashMap::new(),
+        all_vendor_prompt: None,
     };
 
     if args.once {
-        let result = print_stats(&state, true);
+        let result = print_stats(&mut state, true);
         match result {
             None => std::process::exit(1),
             Some(false) => std::process::exit(0),
@@ -691,10 +721,19 @@ fn main() {
                  state.monitor_interval, state.vendor, state.days);
         println!("{}\n", "=".repeat(width as usize));
 
+        // Helper: disable raw mode, run print_stats, re-enable raw mode.
+        // This ensures println! in formatting/charts code outputs \r\n properly.
+        let refresh_display = |state: &mut AppState| -> Option<bool> {
+            crossterm::terminal::disable_raw_mode().ok();
+            let result = print_stats(state, false);
+            crossterm::terminal::enable_raw_mode().ok();
+            result
+        };
+
         // Enable raw mode for non-blocking input
         crossterm::terminal::enable_raw_mode().ok();
 
-        let result = print_stats(&state, false);
+        let result = refresh_display(&mut state);
         let mut terminal_too_small = result.is_none();
         let mut last_size = get_terminal_size();
 
@@ -704,25 +743,14 @@ fn main() {
             }
             let (width, _) = get_terminal_size();
             let version = if state.vendor == "all" {
-                let all_data = load_all_vendor_data(state);
-                let (weighted_cost, total_savings) = calculate_weighted_cost_per_mtok(
-                    &all_data, state.days, &state.pricing, &state.subscription_fees,
-                );
-                if weighted_cost > 0.0 {
-                    format!(
-                        "All Vendors Comparison, {} / MTok, Monthly Saving ${:.2}",
-                        formatting::format_cost_per_mtok(weighted_cost),
-                        total_savings,
-                    )
-                } else {
-                    "All Vendors Comparison".to_string()
-                }
+                state.all_vendor_prompt.clone()
+                    .unwrap_or_else(|| "All Vendors Comparison".to_string())
             } else {
                 get_version(state, &state.vendor.clone())
             };
-            println!("\n\r{}", version);
-            println!("{}\r", "-".repeat(width as usize));
-            print!("> ");
+            println!("\n\r{}\r", version);
+            println!("\r{}\r", "-".repeat(width as usize));
+            print!("\r> ");
             io::stdout().flush().unwrap();
         };
 
@@ -752,7 +780,7 @@ fn main() {
                     println!("TERMINAL RESIZED (width: {}, height: {})\r", current_size.0, current_size.1);
                     println!("{}\n\r", "=".repeat(width as usize));
                 }
-                let result = print_stats(&state, false);
+                let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
                 next_refresh = std::time::Instant::now()
                     + std::time::Duration::from_secs(state.monitor_interval);
@@ -769,7 +797,7 @@ fn main() {
                     println!("AUTO-REFRESH\r");
                     println!("{}\n\r", "=".repeat(width as usize));
                 }
-                let result = print_stats(&state, false);
+                let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
                 next_refresh = std::time::Instant::now()
                     + std::time::Duration::from_secs(state.monitor_interval);
@@ -808,19 +836,32 @@ fn main() {
                                     println!("\n\r{}\r", "=".repeat(width as usize));
                                     println!("MANUAL REFRESH\r");
                                     println!("{}\n\r", "=".repeat(width as usize));
-                                    let result = print_stats(&state, false);
+                                    let result = refresh_display(&mut state);
                                     terminal_too_small = result.is_none();
                                     did_refresh = true;
                                 }
                                 "n" => {
                                     let rotation = ["all", "claude", "codex", "gemini"];
                                     let idx = rotation.iter().position(|&v| v == state.vendor).unwrap_or(0);
-                                    state.vendor = rotation[(idx + 1) % rotation.len()].to_string();
+                                    let mut new_vendor = rotation[(idx + 1) % rotation.len()];
+                                    // Validate directory; skip missing vendors
+                                    for _ in 0..rotation.len() {
+                                        if let Some(dir) = get_vendor_data_dir(new_vendor) {
+                                            if !dir.exists() {
+                                                println!("Skipping {} (no data dir)...\r", new_vendor);
+                                                let skip_idx = rotation.iter().position(|&v| v == new_vendor).unwrap_or(0);
+                                                new_vendor = rotation[(skip_idx + 1) % rotation.len()];
+                                                continue;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    state.vendor = new_vendor.to_string();
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!("\n\r{}\r", "=".repeat(width as usize));
                                     println!("SWITCHED TO {}\r", state.vendor.to_uppercase());
                                     println!("{}\n\r", "=".repeat(width as usize));
-                                    let result = print_stats(&state, false);
+                                    let result = refresh_display(&mut state);
                                     terminal_too_small = result.is_none();
                                     did_refresh = true;
                                 }
@@ -831,7 +872,7 @@ fn main() {
                                         println!("\n\r{}\r", "=".repeat(width as usize));
                                         println!("SWITCHED TO ALL VENDORS\r");
                                         println!("{}\n\r", "=".repeat(width as usize));
-                                        let result = print_stats(&state, false);
+                                        let result = refresh_display(&mut state);
                                         terminal_too_small = result.is_none();
                                         did_refresh = true;
                                     } else {
@@ -845,7 +886,7 @@ fn main() {
                                         println!("\n\r{}\r", "=".repeat(width as usize));
                                         println!("CHANGED TO 1 DAY\r");
                                         println!("{}\n\r", "=".repeat(width as usize));
-                                        let result = print_stats(&state, false);
+                                        let result = refresh_display(&mut state);
                                         terminal_too_small = result.is_none();
                                         did_refresh = true;
                                     } else {
@@ -859,7 +900,7 @@ fn main() {
                                         println!("\n\r{}\r", "=".repeat(width as usize));
                                         println!("CHANGED TO 7 DAYS (WEEK MODE)\r");
                                         println!("{}\n\r", "=".repeat(width as usize));
-                                        let result = print_stats(&state, false);
+                                        let result = refresh_display(&mut state);
                                         terminal_too_small = result.is_none();
                                         did_refresh = true;
                                     } else {
@@ -873,7 +914,7 @@ fn main() {
                                         println!("\n\r{}\r", "=".repeat(width as usize));
                                         println!("CHANGED TO 30 DAYS (MONTH MODE)\r");
                                         println!("{}\n\r", "=".repeat(width as usize));
-                                        let result = print_stats(&state, false);
+                                        let result = refresh_display(&mut state);
                                         terminal_too_small = result.is_none();
                                         did_refresh = true;
                                     } else {
@@ -909,12 +950,20 @@ fn main() {
                                         "v" | "vendor" if parts.len() == 2 => {
                                             let nv = parts[1];
                                             if ["claude", "codex", "gemini", "all"].contains(&nv) {
+                                                // Validate directory before switching
+                                                if let Some(dir) = get_vendor_data_dir(nv) {
+                                                    if !dir.exists() {
+                                                        println!("Error: Data directory not found at {}\r", dir.display());
+                                                        show_prompt(&mut state, terminal_too_small);
+                                                        continue 'monitor;
+                                                    }
+                                                }
                                                 state.vendor = nv.to_string();
                                                 println!("{}\r", "-".repeat(width as usize));
                                                 println!("\n\r{}\r", "=".repeat(width as usize));
                                                 println!("SWITCHED TO {}\r", nv.to_uppercase());
                                                 println!("{}\n\r", "=".repeat(width as usize));
-                                                let result = print_stats(&state, false);
+                                                let result = refresh_display(&mut state);
                                                 terminal_too_small = result.is_none();
                                                 did_refresh = true;
                                             } else {
@@ -929,7 +978,7 @@ fn main() {
                                                     println!("\n\r{}\r", "=".repeat(width as usize));
                                                     println!("CHANGED TO {} DAYS\r", n);
                                                     println!("{}\n\r", "=".repeat(width as usize));
-                                                    let result = print_stats(&state, false);
+                                                    let result = refresh_display(&mut state);
                                                     terminal_too_small = result.is_none();
                                                     did_refresh = true;
                                                 } else {
@@ -996,7 +1045,7 @@ fn main() {
                                 println!("TERMINAL RESIZED (width: {}, height: {})\r", w, h);
                                 println!("{}\n\r", "=".repeat(w as usize));
                             }
-                            let result = print_stats(&state, false);
+                            let result = refresh_display(&mut state);
                             terminal_too_small = result.is_none();
                             next_refresh = std::time::Instant::now()
                                 + std::time::Duration::from_secs(state.monitor_interval);

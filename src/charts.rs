@@ -212,13 +212,15 @@ fn print_daily_header(
         }
     }
 
-    let daily_totals: Vec<(usize, f64, DateTime<Local>)> = daily_data.values()
+    let mut daily_totals: Vec<(usize, f64, DateTime<Local>)> = daily_data.values()
         .filter(|(_, cols, _)| !cols.is_empty())
         .map(|(total, cols, time)| {
             let mid = (cols.iter().min().unwrap() + cols.iter().max().unwrap()) / 2;
             (mid, *total, *time)
         })
         .collect();
+    // Sort by column position (left to right) to match rendering order
+    daily_totals.sort_by_key(|(mid_col, _, _)| *mid_col);
 
     let weekday_abbr = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 

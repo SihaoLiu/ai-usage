@@ -26,9 +26,7 @@ fn read_single_codex_file(path: &Path) -> Vec<UsageEntry> {
         Err(_) => return Vec::new(),
     };
 
-    // First pass: collect all entries and find session start time
-    let mut session_start_time: Option<String> = None;
-    let mut all_timestamps: Vec<String> = Vec::new();
+    // First pass: collect all entries
     let mut file_entries: Vec<serde_json::Value> = Vec::new();
 
     for line in content.lines() {
@@ -42,34 +40,7 @@ fn read_single_codex_file(path: &Path) -> Vec<UsageEntry> {
             Err(_) => continue,
         };
 
-        let entry_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp = data
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        if let Some(ref ts) = timestamp {
-            all_timestamps.push(ts.clone());
-        }
-
-        if entry_type == "session_meta" {
-            let payload = data.get("payload");
-            if let Some(payload_ts) = payload
-                .and_then(|p| p.get("timestamp"))
-                .and_then(|v| v.as_str())
-            {
-                session_start_time = Some(payload_ts.to_string());
-            } else if let Some(ref ts) = timestamp {
-                session_start_time = Some(ts.clone());
-            }
-        }
-
         file_entries.push(data);
-    }
-
-    // Fallback: use first timestamp
-    if session_start_time.is_none() && !all_timestamps.is_empty() {
-        session_start_time = all_timestamps.into_iter().min();
     }
 
     // Second pass: process entries

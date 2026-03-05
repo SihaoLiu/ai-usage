@@ -6,7 +6,8 @@ mod stats;
 mod time_utils;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
@@ -150,8 +151,38 @@ fn read_vendor_data(vendor: &str, days: i64) -> Vec<UsageEntry> {
     }
 }
 
+/// Loaded and filtered data for all vendors.
+struct AllVendorData {
+    claude: Vec<UsageEntry>,
+    codex: Vec<UsageEntry>,
+    gemini: Vec<UsageEntry>,
+}
+
+fn load_all_vendor_data(state: &AppState) -> AllVendorData {
+    let claude_raw = read_all_jsonl_files_dedup(Some(state.days));
+    let claude = data::filter_usage_data_by_days(&claude_raw, state.days);
+
+    let codex_dir = get_codex_dir().join("sessions");
+    let codex = if codex_dir.exists() {
+        let raw = data::codex::read_codex_jsonl_files(&codex_dir, Some(state.days));
+        data::filter_usage_data_by_days(&raw, state.days)
+    } else {
+        Vec::new()
+    };
+
+    let gemini_dir = get_gemini_dir().join("tmp");
+    let gemini = if gemini_dir.exists() {
+        let raw = data::gemini::read_gemini_json_files(&gemini_dir, Some(state.days));
+        data::filter_usage_data_by_days(&raw, state.days)
+    } else {
+        Vec::new()
+    };
+
+    AllVendorData { claude, codex, gemini }
+}
+
 fn calculate_vendor_aggregate_time_series(
-    state: &AppState,
+    all_data: &AllVendorData,
     interval_minutes: i64,
 ) -> VendorTimeSeries {
     let mut time_series: VendorTimeSeries = HashMap::new();
@@ -188,64 +219,136 @@ fn calculate_vendor_aggregate_time_series(
         }
     };
 
-    // Claude
-    let claude_data = read_all_jsonl_files_dedup(Some(state.days));
-    if !claude_data.is_empty() {
-        let filtered = data::filter_usage_data_by_days(&claude_data, state.days);
-        process_data(&filtered, "Claude", &mut time_series);
+    if !all_data.claude.is_empty() {
+        process_data(&all_data.claude, "Claude", &mut time_series);
     }
-
-    // Codex
-    let codex_dir = get_codex_dir().join("sessions");
-    if codex_dir.exists() {
-        let codex_data = data::codex::read_codex_jsonl_files(&codex_dir, Some(state.days));
-        let filtered = data::filter_usage_data_by_days(&codex_data, state.days);
-        process_data(&filtered, "Codex", &mut time_series);
+    if !all_data.codex.is_empty() {
+        process_data(&all_data.codex, "Codex", &mut time_series);
     }
-
-    // Gemini
-    let gemini_dir = get_gemini_dir().join("tmp");
-    if gemini_dir.exists() {
-        let gemini_data = data::gemini::read_gemini_json_files(&gemini_dir, Some(state.days));
-        let filtered = data::filter_usage_data_by_days(&gemini_data, state.days);
-        process_data(&filtered, "Gemini", &mut time_series);
+    if !all_data.gemini.is_empty() {
+        process_data(&all_data.gemini, "Gemini", &mut time_series);
     }
 
     time_series
 }
 
-fn calculate_all_model_breakdown(state: &AppState) -> Vec<ModelBreakdownRow> {
+fn calculate_all_model_breakdown(all_data: &AllVendorData) -> Vec<ModelBreakdownRow> {
     let mut all_stats: Vec<ModelBreakdownRow> = Vec::new();
 
-    // Claude
-    let claude_data = read_all_jsonl_files_dedup(Some(state.days));
-    if !claude_data.is_empty() {
-        let filtered = data::filter_usage_data_by_days(&claude_data, state.days);
-        all_stats.extend(stats::calculate_claude_model_breakdown(&filtered));
+    if !all_data.claude.is_empty() {
+        all_stats.extend(stats::calculate_claude_model_breakdown(&all_data.claude));
+    }
+    if !all_data.codex.is_empty() {
+        all_stats.extend(stats::calculate_codex_model_breakdown(&all_data.codex));
+    }
+    if !all_data.gemini.is_empty() {
+        all_stats.extend(stats::calculate_gemini_model_breakdown(&all_data.gemini));
     }
 
-    // Codex
-    let codex_dir = get_codex_dir().join("sessions");
-    if codex_dir.exists() {
-        let codex_data = data::codex::read_codex_jsonl_files(&codex_dir, Some(state.days));
-        if !codex_data.is_empty() {
-            let filtered = data::filter_usage_data_by_days(&codex_data, state.days);
-            all_stats.extend(stats::calculate_codex_model_breakdown(&filtered));
-        }
-    }
-
-    // Gemini
-    let gemini_dir = get_gemini_dir().join("tmp");
-    if gemini_dir.exists() {
-        let gemini_data = data::gemini::read_gemini_json_files(&gemini_dir, Some(state.days));
-        if !gemini_data.is_empty() {
-            let filtered = data::filter_usage_data_by_days(&gemini_data, state.days);
-            all_stats.extend(stats::calculate_gemini_model_breakdown(&filtered));
-        }
-    }
-
-    all_stats.sort_by(|a, b| b.total_with_cache.cmp(&a.total_with_cache));
     all_stats
+}
+
+/// Calculate weighted average cost per MTok and total monthly savings across all vendors.
+/// Returns (weighted_cost_per_mtok, total_monthly_savings).
+fn calculate_weighted_cost_per_mtok(
+    all_data: &AllVendorData,
+    days: i64,
+    pricing: &AllPricing,
+    subscription_fees: &SubscriptionFees,
+) -> (f64, f64) {
+    // Per-vendor: (total_tokens, api_cost)
+    let vendor_configs: &[(&str, &[UsageEntry], f64)] = &[
+        ("claude", &all_data.claude, subscription_fees.claude),
+        ("codex", &all_data.codex, subscription_fees.codex),
+        ("gemini", &all_data.gemini, subscription_fees.gemini),
+    ];
+
+    let mut vendor_data: Vec<(i64, f64, f64)> = Vec::new(); // (tokens, api_cost, sub_price)
+
+    for &(vendor, entries, sub_price) in vendor_configs {
+        if entries.is_empty() {
+            continue;
+        }
+
+        // Accumulate per-model stats
+        let mut model_stats: HashMap<String, (i64, i64, i64, i64)> = HashMap::new();
+        let mut total_tokens: i64 = 0;
+
+        for entry in entries {
+            let model = &entry.model;
+            let e = model_stats.entry(model.clone()).or_insert((0, 0, 0, 0));
+            e.0 += entry.usage.input_tokens;
+            e.1 += entry.usage.output_tokens;
+            e.2 += entry.usage.cache_read_input_tokens;
+            match vendor {
+                "codex" => {
+                    e.3 += entry.usage.reasoning_output_tokens;
+                    total_tokens += entry.usage.input_tokens + entry.usage.output_tokens
+                        + entry.usage.cache_read_input_tokens + entry.usage.reasoning_output_tokens;
+                }
+                "gemini" => {
+                    e.3 += entry.usage.cache_creation_input_tokens; // thinking stored here
+                    total_tokens += entry.usage.input_tokens + entry.usage.output_tokens
+                        + entry.usage.cache_read_input_tokens + entry.usage.cache_creation_input_tokens;
+                }
+                _ => {
+                    e.3 += entry.usage.cache_creation_input_tokens;
+                    total_tokens += entry.usage.input_tokens + entry.usage.output_tokens
+                        + entry.usage.cache_read_input_tokens + entry.usage.cache_creation_input_tokens;
+                }
+            }
+        }
+
+        if total_tokens == 0 {
+            continue;
+        }
+
+        // Calculate API cost
+        let mut api_cost = 0.0;
+        for (model, (input, output, cache_read, extra)) in &model_stats {
+            let base_model = if vendor == "codex" && model.contains(" (") && model.ends_with(')') {
+                model.rsplit_once(" (").map(|(base, _)| base).unwrap_or(model)
+            } else {
+                model.as_str()
+            };
+            let p = pricing.get_pricing(vendor, base_model);
+            api_cost += *input as f64 * p.input / 1_000_000.0;
+            api_cost += *output as f64 * p.output / 1_000_000.0;
+            api_cost += *cache_read as f64 * p.cache_input / 1_000_000.0;
+            api_cost += match vendor {
+                "codex" | "gemini" => *extra as f64 * p.output / 1_000_000.0,
+                _ => *extra as f64 * p.cache_output / 1_000_000.0,
+            };
+        }
+
+        vendor_data.push((total_tokens, api_cost, sub_price));
+    }
+
+    let grand_total: i64 = vendor_data.iter().map(|(t, _, _)| t).sum();
+    if grand_total == 0 || days <= 0 {
+        return (0.0, 0.0);
+    }
+
+    let mut weighted_cost = 0.0;
+    let mut total_savings = 0.0;
+
+    for (tokens, api_cost, sub_price) in &vendor_data {
+        let percentage = *tokens as f64 / grand_total as f64;
+        let monthly_tokens = (*tokens as f64 / days as f64) * 30.0;
+        let cost_per_mtok = if monthly_tokens > 0.0 {
+            sub_price / (monthly_tokens / 1_000_000.0)
+        } else {
+            0.0
+        };
+        let daily_api_cost = api_cost / days as f64;
+        let monthly_api_cost = daily_api_cost * 30.0;
+        let savings = monthly_api_cost - sub_price;
+
+        weighted_cost += percentage * cost_per_mtok;
+        total_savings += savings;
+    }
+
+    (weighted_cost, total_savings)
 }
 
 fn get_version(state: &mut AppState, vendor: &str) -> String {
@@ -317,20 +420,16 @@ fn get_version(state: &mut AppState, vendor: &str) -> String {
 
 fn fetch_npm_version(package: &str) -> Option<String> {
     let url = format!("https://registry.npmjs.org/{}/latest", package);
-    Command::new("curl")
-        .args(["-sf", "--max-time", "10", &url])
-        .output()
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .new_agent();
+    let body: String = agent.get(&url)
+        .call().ok()?
+        .body_mut().read_to_string().ok()?;
+    serde_json::from_str::<serde_json::Value>(&body)
         .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                let body = String::from_utf8_lossy(&output.stdout);
-                serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("version").and_then(|v| v.as_str()).map(String::from))
-            } else {
-                None
-            }
-        })
+        .and_then(|v| v.get("version").and_then(|v| v.as_str()).map(String::from))
 }
 
 fn get_chart_target_width() -> usize {
@@ -493,8 +592,9 @@ fn print_stats_all(state: &AppState, once: bool) -> Option<bool> {
     let optimal = calculate_optimal_interval_minutes(state.days, target_width);
     let interval_minutes = round_to_nice_interval(optimal);
 
-    let vendor_time_series = calculate_vendor_aggregate_time_series(state, interval_minutes);
-    let all_model_stats = calculate_all_model_breakdown(state);
+    let all_data = load_all_vendor_data(state);
+    let vendor_time_series = calculate_vendor_aggregate_time_series(&all_data, interval_minutes);
+    let all_model_stats = calculate_all_model_breakdown(&all_data);
 
     let mut table_printed = false;
     if !all_model_stats.is_empty() {
@@ -546,6 +646,25 @@ fn main() {
     let subscription_fees = load_subscription_fees()
         .unwrap_or_else(|| prompt_subscription_fees());
 
+    // Validate vendor data directory on startup (matches Python behavior)
+    if args.vendor != "all" {
+        let data_dir = match args.vendor.as_str() {
+            "codex" => get_codex_dir().join("sessions"),
+            "gemini" => get_gemini_dir().join("tmp"),
+            _ => {
+                let dirs = data::claude::get_claude_dirs();
+                dirs.into_iter()
+                    .map(|d| d.join("projects"))
+                    .find(|p| p.exists())
+                    .unwrap_or_else(|| PathBuf::from("~/.claude/projects"))
+            }
+        };
+        if !data_dir.exists() {
+            eprintln!("Error: Data directory not found at {}", data_dir.display());
+            std::process::exit(1);
+        }
+    }
+
     let mut state = AppState {
         vendor: args.vendor.clone(),
         days: args.days,
@@ -572,8 +691,12 @@ fn main() {
                  state.monitor_interval, state.vendor, state.days);
         println!("{}\n", "=".repeat(width as usize));
 
+        // Enable raw mode for non-blocking input
+        crossterm::terminal::enable_raw_mode().ok();
+
         let result = print_stats(&state, false);
         let mut terminal_too_small = result.is_none();
+        let mut last_size = get_terminal_size();
 
         let show_prompt = |state: &mut AppState, too_small: bool| {
             if too_small {
@@ -581,192 +704,309 @@ fn main() {
             }
             let (width, _) = get_terminal_size();
             let version = if state.vendor == "all" {
-                "All Vendors Comparison".to_string()
+                let all_data = load_all_vendor_data(state);
+                let (weighted_cost, total_savings) = calculate_weighted_cost_per_mtok(
+                    &all_data, state.days, &state.pricing, &state.subscription_fees,
+                );
+                if weighted_cost > 0.0 {
+                    format!(
+                        "All Vendors Comparison, {} / MTok, Monthly Saving ${:.2}",
+                        formatting::format_cost_per_mtok(weighted_cost),
+                        total_savings,
+                    )
+                } else {
+                    "All Vendors Comparison".to_string()
+                }
             } else {
                 get_version(state, &state.vendor.clone())
             };
-            println!("\n{}", version);
-            println!("{}", "-".repeat(width as usize));
+            println!("\n\r{}", version);
+            println!("{}\r", "-".repeat(width as usize));
             print!("> ");
             io::stdout().flush().unwrap();
         };
 
         show_prompt(&mut state, terminal_too_small);
 
-        let stdin = io::stdin();
-        loop {
-            let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) => {
-                    let (width, _) = get_terminal_size();
-                    println!("\n{}", "-".repeat(width as usize));
-                    println!("\nExiting monitor mode...");
-                    break;
-                }
-                Ok(_) => {
-                    let command = line.trim();
-                    let (width, _) = get_terminal_size();
+        let mut next_refresh = std::time::Instant::now()
+            + std::time::Duration::from_secs(state.monitor_interval);
+        let mut input_buf = String::new();
 
-                    match command {
-                        "r" | "refresh" => {
-                            println!("{}", "-".repeat(width as usize));
-                            println!("\n{}", "=".repeat(width as usize));
-                            println!("MANUAL REFRESH");
-                            println!("{}\n", "=".repeat(width as usize));
-                            let result = print_stats(&state, false);
-                            terminal_too_small = result.is_none();
+        let cleanup_and_break = |msg: &str| {
+            crossterm::terminal::disable_raw_mode().ok();
+            let (width, _) = get_terminal_size();
+            println!("\n\r{}\r", "-".repeat(width as usize));
+            println!("\r{}", msg);
+        };
+
+        'monitor: loop {
+            // Check terminal resize
+            let current_size = get_terminal_size();
+            if current_size != last_size {
+                last_size = current_size;
+                if !terminal_too_small {
+                    let (width, _) = current_size;
+                    println!("\r{}\r", " ".repeat(width as usize + 2));
+                    println!("{}\r", "-".repeat(width as usize));
+                    println!("\n\r{}\r", "=".repeat(width as usize));
+                    println!("TERMINAL RESIZED (width: {}, height: {})\r", current_size.0, current_size.1);
+                    println!("{}\n\r", "=".repeat(width as usize));
+                }
+                let result = print_stats(&state, false);
+                terminal_too_small = result.is_none();
+                next_refresh = std::time::Instant::now()
+                    + std::time::Duration::from_secs(state.monitor_interval);
+                show_prompt(&mut state, terminal_too_small);
+            }
+
+            // Check auto-refresh
+            if std::time::Instant::now() >= next_refresh {
+                if !terminal_too_small {
+                    let (width, _) = get_terminal_size();
+                    println!("\r{}\r", " ".repeat(width as usize + 2));
+                    println!("{}\r", "-".repeat(width as usize));
+                    println!("\n\r{}\r", "=".repeat(width as usize));
+                    println!("AUTO-REFRESH\r");
+                    println!("{}\n\r", "=".repeat(width as usize));
+                }
+                let result = print_stats(&state, false);
+                terminal_too_small = result.is_none();
+                next_refresh = std::time::Instant::now()
+                    + std::time::Duration::from_secs(state.monitor_interval);
+                show_prompt(&mut state, terminal_too_small);
+            }
+
+            // Poll for input with 1s timeout
+            let timeout = std::time::Duration::from_secs(1)
+                .min(next_refresh.saturating_duration_since(std::time::Instant::now()));
+            if crossterm::event::poll(timeout).unwrap_or(false) {
+                use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+                if let Ok(event) = crossterm::event::read() {
+                    match event {
+                        Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. })
+                            if modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            cleanup_and_break("Monitoring stopped.");
+                            break 'monitor;
                         }
-                        "n" => {
-                            let rotation = ["all", "claude", "codex", "gemini"];
-                            let idx = rotation.iter().position(|&v| v == state.vendor).unwrap_or(0);
-                            state.vendor = rotation[(idx + 1) % rotation.len()].to_string();
-                            println!("{}", "-".repeat(width as usize));
-                            println!("\n{}", "=".repeat(width as usize));
-                            println!("SWITCHED TO {}", state.vendor.to_uppercase());
-                            println!("{}\n", "=".repeat(width as usize));
-                            let result = print_stats(&state, false);
-                            terminal_too_small = result.is_none();
+                        Event::Key(KeyEvent { code: KeyCode::Char('d'), modifiers, .. })
+                            if modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            cleanup_and_break("Exiting monitor mode...");
+                            break 'monitor;
                         }
-                        "a" => {
-                            if state.vendor != "all" {
-                                state.vendor = "all".to_string();
-                                println!("{}", "-".repeat(width as usize));
-                                println!("\n{}", "=".repeat(width as usize));
-                                println!("SWITCHED TO ALL VENDORS");
-                                println!("{}\n", "=".repeat(width as usize));
-                                let result = print_stats(&state, false);
-                                terminal_too_small = result.is_none();
-                            } else {
-                                println!("Already monitoring all vendors.");
-                            }
-                        }
-                        "d" | "day" | "days" => {
-                            if state.days != 1 {
-                                state.days = 1;
-                                println!("{}", "-".repeat(width as usize));
-                                println!("\n{}", "=".repeat(width as usize));
-                                println!("CHANGED TO 1 DAY");
-                                println!("{}\n", "=".repeat(width as usize));
-                                let result = print_stats(&state, false);
-                                terminal_too_small = result.is_none();
-                            } else {
-                                println!("Already showing 1 day.");
-                            }
-                        }
-                        "w" | "week" => {
-                            if state.days != 7 {
-                                state.days = 7;
-                                println!("{}", "-".repeat(width as usize));
-                                println!("\n{}", "=".repeat(width as usize));
-                                println!("CHANGED TO 7 DAYS (WEEK MODE)");
-                                println!("{}\n", "=".repeat(width as usize));
-                                let result = print_stats(&state, false);
-                                terminal_too_small = result.is_none();
-                            } else {
-                                println!("Already showing 7 days (week mode).");
-                            }
-                        }
-                        "m" | "month" => {
-                            if state.days != 30 {
-                                state.days = 30;
-                                println!("{}", "-".repeat(width as usize));
-                                println!("\n{}", "=".repeat(width as usize));
-                                println!("CHANGED TO 30 DAYS (MONTH MODE)");
-                                println!("{}\n", "=".repeat(width as usize));
-                                let result = print_stats(&state, false);
-                                terminal_too_small = result.is_none();
-                            } else {
-                                println!("Already showing 30 days (month mode).");
-                            }
-                        }
-                        "h" | "help" => {
-                            println!("{}", "-".repeat(width as usize));
-                            println!("Available Commands:");
-                            println!("  r, refresh       - Refresh statistics immediately");
-                            println!("  v, vendor [X]    - Switch vendor (claude|codex|gemini|all)");
-                            println!("  n                - Rotate to next vendor");
-                            println!("  a                - Jump to vendor=all");
-                            println!("  d, day, days [N] - Change days (default: 1 if no N)");
-                            println!("  w, week          - Week mode (7 days)");
-                            println!("  m, month         - Month mode (30 days)");
-                            println!("  i, interval <N>  - Change refresh interval (seconds)");
-                            println!("  h, help          - Show this help");
-                            println!("  e, exit          - Exit monitor mode");
-                            println!("  Ctrl+C, Ctrl+D   - Exit monitor mode");
-                            println!("{}", "-".repeat(width as usize));
-                            println!("Current: vendor={}, days={}, interval={}s",
-                                     state.vendor, state.days, state.monitor_interval);
-                        }
-                        "e" | "exit" => {
-                            println!("{}", "-".repeat(width as usize));
-                            println!("\nExiting monitor mode...");
-                            break;
-                        }
-                        "" => {}
-                        _ => {
-                            let parts: Vec<&str> = command.splitn(2, ' ').collect();
-                            match parts[0] {
-                                "v" | "vendor" if parts.len() == 2 => {
-                                    let nv = parts[1];
-                                    if ["claude", "codex", "gemini", "all"].contains(&nv) {
-                                        state.vendor = nv.to_string();
-                                        println!("{}", "-".repeat(width as usize));
-                                        println!("\n{}", "=".repeat(width as usize));
-                                        println!("SWITCHED TO {}", nv.to_uppercase());
-                                        println!("{}\n", "=".repeat(width as usize));
+                        Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                            println!("\r");
+                            let command = input_buf.trim().to_string();
+                            input_buf.clear();
+                            let (width, _) = get_terminal_size();
+
+                            let mut did_refresh = false;
+                            match command.as_str() {
+                                "r" | "refresh" => {
+                                    println!("{}\r", "-".repeat(width as usize));
+                                    println!("\n\r{}\r", "=".repeat(width as usize));
+                                    println!("MANUAL REFRESH\r");
+                                    println!("{}\n\r", "=".repeat(width as usize));
+                                    let result = print_stats(&state, false);
+                                    terminal_too_small = result.is_none();
+                                    did_refresh = true;
+                                }
+                                "n" => {
+                                    let rotation = ["all", "claude", "codex", "gemini"];
+                                    let idx = rotation.iter().position(|&v| v == state.vendor).unwrap_or(0);
+                                    state.vendor = rotation[(idx + 1) % rotation.len()].to_string();
+                                    println!("{}\r", "-".repeat(width as usize));
+                                    println!("\n\r{}\r", "=".repeat(width as usize));
+                                    println!("SWITCHED TO {}\r", state.vendor.to_uppercase());
+                                    println!("{}\n\r", "=".repeat(width as usize));
+                                    let result = print_stats(&state, false);
+                                    terminal_too_small = result.is_none();
+                                    did_refresh = true;
+                                }
+                                "a" => {
+                                    if state.vendor != "all" {
+                                        state.vendor = "all".to_string();
+                                        println!("{}\r", "-".repeat(width as usize));
+                                        println!("\n\r{}\r", "=".repeat(width as usize));
+                                        println!("SWITCHED TO ALL VENDORS\r");
+                                        println!("{}\n\r", "=".repeat(width as usize));
                                         let result = print_stats(&state, false);
                                         terminal_too_small = result.is_none();
+                                        did_refresh = true;
                                     } else {
-                                        println!("Usage: v, vendor [claude|codex|gemini|all]");
+                                        println!("Already monitoring all vendors.\r");
                                     }
                                 }
-                                "d" | "day" | "days" if parts.len() == 2 => {
-                                    if let Ok(n) = parts[1].parse::<i64>() {
-                                        if n >= 1 {
-                                            state.days = n;
-                                            println!("{}", "-".repeat(width as usize));
-                                            println!("\n{}", "=".repeat(width as usize));
-                                            println!("CHANGED TO {} DAYS", n);
-                                            println!("{}\n", "=".repeat(width as usize));
-                                            let result = print_stats(&state, false);
-                                            terminal_too_small = result.is_none();
-                                        } else {
-                                            println!("Days must be at least 1.");
-                                        }
+                                "d" | "day" | "days" => {
+                                    if state.days != 1 {
+                                        state.days = 1;
+                                        println!("{}\r", "-".repeat(width as usize));
+                                        println!("\n\r{}\r", "=".repeat(width as usize));
+                                        println!("CHANGED TO 1 DAY\r");
+                                        println!("{}\n\r", "=".repeat(width as usize));
+                                        let result = print_stats(&state, false);
+                                        terminal_too_small = result.is_none();
+                                        did_refresh = true;
                                     } else {
-                                        println!("Invalid days value.");
+                                        println!("Already showing 1 day.\r");
                                     }
                                 }
-                                "i" | "interval" if parts.len() == 2 => {
-                                    if let Ok(n) = parts[1].parse::<u64>() {
-                                        if n >= 1 {
-                                            state.monitor_interval = n;
-                                            println!("Refresh interval changed to {} seconds.", n);
-                                        } else {
-                                            println!("Interval must be at least 1 second.");
-                                        }
+                                "w" | "week" => {
+                                    if state.days != 7 {
+                                        state.days = 7;
+                                        println!("{}\r", "-".repeat(width as usize));
+                                        println!("\n\r{}\r", "=".repeat(width as usize));
+                                        println!("CHANGED TO 7 DAYS (WEEK MODE)\r");
+                                        println!("{}\n\r", "=".repeat(width as usize));
+                                        let result = print_stats(&state, false);
+                                        terminal_too_small = result.is_none();
+                                        did_refresh = true;
                                     } else {
-                                        println!("Invalid interval value.");
+                                        println!("Already showing 7 days (week mode).\r");
                                     }
                                 }
-                                "v" | "vendor" => {
-                                    println!("Current vendor: {}", state.vendor);
-                                    println!("Usage: v, vendor [claude|codex|gemini|all]");
+                                "m" | "month" => {
+                                    if state.days != 30 {
+                                        state.days = 30;
+                                        println!("{}\r", "-".repeat(width as usize));
+                                        println!("\n\r{}\r", "=".repeat(width as usize));
+                                        println!("CHANGED TO 30 DAYS (MONTH MODE)\r");
+                                        println!("{}\n\r", "=".repeat(width as usize));
+                                        let result = print_stats(&state, false);
+                                        terminal_too_small = result.is_none();
+                                        did_refresh = true;
+                                    } else {
+                                        println!("Already showing 30 days (month mode).\r");
+                                    }
                                 }
-                                "i" | "interval" => {
-                                    println!("Current interval: {} seconds", state.monitor_interval);
-                                    println!("Usage: i <N> or interval <N>");
+                                "h" | "help" => {
+                                    println!("{}\r", "-".repeat(width as usize));
+                                    println!("Available Commands:\r");
+                                    println!("  r, refresh       - Refresh statistics immediately\r");
+                                    println!("  v, vendor [X]    - Switch vendor (claude|codex|gemini|all)\r");
+                                    println!("  n                - Rotate to next vendor\r");
+                                    println!("  a                - Jump to vendor=all\r");
+                                    println!("  d, day, days [N] - Change days (default: 1 if no N)\r");
+                                    println!("  w, week          - Week mode (7 days)\r");
+                                    println!("  m, month         - Month mode (30 days)\r");
+                                    println!("  i, interval <N>  - Change refresh interval (seconds)\r");
+                                    println!("  h, help          - Show this help\r");
+                                    println!("  e, exit          - Exit monitor mode\r");
+                                    println!("  Ctrl+C, Ctrl+D   - Exit monitor mode\r");
+                                    println!("{}\r", "-".repeat(width as usize));
+                                    println!("Current: vendor={}, days={}, interval={}s\r",
+                                             state.vendor, state.days, state.monitor_interval);
                                 }
+                                "e" | "exit" => {
+                                    cleanup_and_break("Exiting monitor mode...");
+                                    break 'monitor;
+                                }
+                                "" => {}
                                 _ => {
-                                    println!("Unknown command: '{}'. Type h for help.", command);
+                                    let parts: Vec<&str> = command.splitn(2, ' ').collect();
+                                    match parts[0] {
+                                        "v" | "vendor" if parts.len() == 2 => {
+                                            let nv = parts[1];
+                                            if ["claude", "codex", "gemini", "all"].contains(&nv) {
+                                                state.vendor = nv.to_string();
+                                                println!("{}\r", "-".repeat(width as usize));
+                                                println!("\n\r{}\r", "=".repeat(width as usize));
+                                                println!("SWITCHED TO {}\r", nv.to_uppercase());
+                                                println!("{}\n\r", "=".repeat(width as usize));
+                                                let result = print_stats(&state, false);
+                                                terminal_too_small = result.is_none();
+                                                did_refresh = true;
+                                            } else {
+                                                println!("Usage: v, vendor [claude|codex|gemini|all]\r");
+                                            }
+                                        }
+                                        "d" | "day" | "days" if parts.len() == 2 => {
+                                            if let Ok(n) = parts[1].parse::<i64>() {
+                                                if n >= 1 {
+                                                    state.days = n;
+                                                    println!("{}\r", "-".repeat(width as usize));
+                                                    println!("\n\r{}\r", "=".repeat(width as usize));
+                                                    println!("CHANGED TO {} DAYS\r", n);
+                                                    println!("{}\n\r", "=".repeat(width as usize));
+                                                    let result = print_stats(&state, false);
+                                                    terminal_too_small = result.is_none();
+                                                    did_refresh = true;
+                                                } else {
+                                                    println!("Days must be at least 1.\r");
+                                                }
+                                            } else {
+                                                println!("Invalid days value.\r");
+                                            }
+                                        }
+                                        "i" | "interval" if parts.len() == 2 => {
+                                            if let Ok(n) = parts[1].parse::<u64>() {
+                                                if n >= 1 {
+                                                    state.monitor_interval = n;
+                                                    next_refresh = std::time::Instant::now()
+                                                        + std::time::Duration::from_secs(n);
+                                                    println!("Refresh interval changed to {} seconds.\r", n);
+                                                } else {
+                                                    println!("Interval must be at least 1 second.\r");
+                                                }
+                                            } else {
+                                                println!("Invalid interval value.\r");
+                                            }
+                                        }
+                                        "v" | "vendor" => {
+                                            println!("Current vendor: {}\r", state.vendor);
+                                            println!("Usage: v, vendor [claude|codex|gemini|all]\r");
+                                        }
+                                        "i" | "interval" => {
+                                            println!("Current interval: {} seconds\r", state.monitor_interval);
+                                            println!("Usage: i <N> or interval <N>\r");
+                                        }
+                                        _ => {
+                                            println!("Unknown command: '{}'. Type h for help.\r", command);
+                                        }
+                                    }
                                 }
                             }
+                            if did_refresh {
+                                next_refresh = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval);
+                            }
+                            show_prompt(&mut state, terminal_too_small);
                         }
+                        Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+                            if !input_buf.is_empty() {
+                                input_buf.pop();
+                                print!("\x08 \x08");
+                                io::stdout().flush().unwrap();
+                            }
+                        }
+                        Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers, .. })
+                            if !modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            input_buf.push(c);
+                            print!("{}", c);
+                            io::stdout().flush().unwrap();
+                        }
+                        Event::Resize(w, h) => {
+                            last_size = (w, h);
+                            if !terminal_too_small {
+                                println!("\r{}\r", " ".repeat(w as usize + 2));
+                                println!("{}\r", "-".repeat(w as usize));
+                                println!("\n\r{}\r", "=".repeat(w as usize));
+                                println!("TERMINAL RESIZED (width: {}, height: {})\r", w, h);
+                                println!("{}\n\r", "=".repeat(w as usize));
+                            }
+                            let result = print_stats(&state, false);
+                            terminal_too_small = result.is_none();
+                            next_refresh = std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval);
+                            show_prompt(&mut state, terminal_too_small);
+                        }
+                        _ => {}
                     }
-                    show_prompt(&mut state, terminal_too_small);
                 }
-                Err(_) => break,
             }
         }
+        crossterm::terminal::disable_raw_mode().ok();
     }
 }

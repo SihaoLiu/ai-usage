@@ -108,7 +108,7 @@ fn round_to_nice(value: f64, round_up: bool) -> i64 {
 #[derive(Clone)]
 enum ChartColumn {
     Separator,
-    Data { data_idx: usize, sub_col: usize, total_cols: usize },
+    Data { data_idx: usize, sub_col: usize },
 }
 
 struct ChartLayout {
@@ -183,7 +183,7 @@ fn build_chart_layout(
         data_to_col.insert(i, col_idx);
 
         for sub_col in 0..cols {
-            columns.push(ChartColumn::Data { data_idx: i, sub_col, total_cols: cols });
+            columns.push(ChartColumn::Data { data_idx: i, sub_col });
             col_idx += 1;
         }
     }

@@ -15,6 +15,7 @@ pub struct UsageEntry {
     pub session_end_time: String,
     pub model: String,
     pub effort: Option<String>,
+    #[allow(dead_code)]
     pub vendor: &'static str,
     pub usage: TokenUsage,
 }
@@ -29,12 +30,6 @@ pub struct TokenUsage {
     pub reasoning_output_tokens: i64,
 }
 
-impl TokenUsage {
-    /// Total I/O tokens (input + output, no cache).
-    pub fn io_total(&self) -> i64 {
-        self.input_tokens + self.output_tokens
-    }
-}
 
 /// Filter usage data to only include entries from the last N days.
 /// Uses the latest timestamp in the data as the reference point.

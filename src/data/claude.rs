@@ -28,99 +28,10 @@ pub fn get_claude_dirs() -> Vec<PathBuf> {
     ]
 }
 
-/// Get the primary Claude directory (first one with a projects subdirectory).
-pub fn get_claude_dir() -> PathBuf {
-    let dirs = get_claude_dirs();
-    for d in &dirs {
-        if d.join("projects").exists() {
-            return d.clone();
-        }
-    }
-    dirs.into_iter()
-        .next()
-        .unwrap_or_else(|| dirs_home().join(".claude"))
-}
-
 fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("~"))
-}
-
-/// Read a single Claude JSONL file and return usage entries.
-fn read_single_jsonl_file(path: &Path) -> Vec<UsageEntry> {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut entries = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let data: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Only include entries with usage data
-        let message = match data.get("message") {
-            Some(m) => m,
-            None => continue,
-        };
-        let usage = match message.get("usage") {
-            Some(u) => u,
-            None => continue,
-        };
-
-        let timestamp = data
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let model = message
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let parsed_ts = parse_timestamp(&timestamp);
-
-        entries.push(UsageEntry {
-            timestamp: timestamp.clone(),
-            parsed_timestamp: parsed_ts,
-            session_start_time: timestamp.clone(),
-            session_end_time: timestamp,
-            model,
-            effort: None,
-            vendor: "claude",
-            usage: TokenUsage {
-                input_tokens: usage
-                    .get("input_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0),
-                output_tokens: usage
-                    .get("output_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0),
-                cache_read_input_tokens: usage
-                    .get("cache_read_input_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0),
-                cache_creation_input_tokens: usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0),
-                reasoning_output_tokens: 0,
-            },
-        });
-    }
-
-    entries
 }
 
 /// Collect all JSONL file paths under the given directory,
@@ -151,40 +62,6 @@ fn collect_jsonl_files(dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
         })
         .map(|e| e.path().to_path_buf())
         .collect()
-}
-
-/// Read all Claude JSONL files from all config directories with deduplication.
-pub fn read_all_jsonl_files() -> Vec<UsageEntry> {
-    let dirs = get_claude_dirs();
-    let mut all_files: Vec<PathBuf> = Vec::new();
-
-    for dir in &dirs {
-        let projects_dir = dir.join("projects");
-        if projects_dir.exists() {
-            all_files.extend(collect_jsonl_files(&projects_dir, None));
-        }
-    }
-
-    // Sort for deterministic output
-    all_files.sort();
-
-    // Parse files in parallel
-    let all_entries: Vec<Vec<UsageEntry>> = all_files
-        .par_iter()
-        .map(|path| read_single_jsonl_file(path))
-        .collect();
-
-    // Flatten and deduplicate by message_id:request_id
-    let mut result = Vec::new();
-    for file_entries in all_entries {
-        for entry in file_entries {
-            result.push(entry);
-        }
-    }
-
-    // Deduplicate using a more robust approach: re-read for dedup keys
-    // For efficiency, we do deduplication at read time with raw JSON
-    result
 }
 
 /// Read all Claude JSONL files with full deduplication by message_id:request_id.

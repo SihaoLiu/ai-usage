@@ -1,7 +1,7 @@
 {
   "_meta": {
     "description": "API pricing and subscription costs for AI services",
-    "last_updated": "2026-03-03",
+    "last_updated": "2026-03-05",
     "notes": "All prices are per million tokens (MTok) at standard API rates. Update this file when pricing changes."
   },
   "claude": {
@@ -47,6 +47,19 @@
   },
   "codex": {
     "models": {
+      "gpt-5.4": {
+        "input": 2.50,
+        "output": 15.00,
+        "cache_input": 0.25,
+        "cache_output": 0.0
+      },
+      "gpt-5.4-codex": {
+        "input": 2.50,
+        "output": 15.00,
+        "cache_input": 0.25,
+        "cache_output": 0.0,
+        "_comment": "No official API pricing yet, estimated same as gpt-5.4"
+      },
       "gpt-5.3-codex": {
         "input": 1.75,
         "output": 14.00,
@@ -170,11 +183,11 @@
       }
     },
     "default": {
-      "input": 1.75,
-      "output": 14.00,
-      "cache_input": 0.175,
+      "input": 2.50,
+      "output": 15.00,
+      "cache_input": 0.25,
       "cache_output": 0.0,
-      "_comment": "Fallback, using gpt-5.2 pricing"
+      "_comment": "Fallback, using gpt-5.4 pricing"
     }
   },
   "gemini": {

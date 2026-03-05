@@ -20,6 +20,8 @@ fn claude_short_model_names() -> HashMap<&'static str, &'static str> {
 // Short model name mappings for Codex
 fn codex_short_model_names() -> HashMap<&'static str, &'static str> {
     HashMap::from([
+        ("gpt-5.4", "GPT-5.4"),
+        ("gpt-5.4-codex", "GPT-5.4 Cdx"),
         ("gpt-5.3-codex", "GPT-5.3 Cdx"),
         ("gpt-5.3-codex-spark", "GPT-5.3 Sprk"),
         ("gpt-5.2-codex", "GPT-5.2 Cdx"),

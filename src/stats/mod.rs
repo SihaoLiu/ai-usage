@@ -112,7 +112,7 @@ pub(crate) fn calculate_model_breakdown_generic(
         })
         .collect();
 
-    result.sort_by(|a, b| b.total.cmp(&a.total));
+    result.sort_by(|a, b| b.count.cmp(&a.count));
     result
 }
 

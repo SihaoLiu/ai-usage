@@ -1,3 +1,0 @@
-{"type":"session_meta","payload":{"model":"gpt-5.3-codex","effort":"high","timestamp":"2026-03-04T09:00:00.000Z"},"timestamp":"2026-03-04T09:00:00.000Z"}
-{"type":"token_count","payload":{"input_tokens":3000,"output_tokens":1500,"cached_tokens":1000,"reasoning_tokens":200},"timestamp":"2026-03-04T09:30:00.000Z"}
-{"type":"token_count","payload":{"input_tokens":5000,"output_tokens":2500,"cached_tokens":2000,"reasoning_tokens":400},"timestamp":"2026-03-04T10:30:00.000Z"}

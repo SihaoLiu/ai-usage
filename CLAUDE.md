@@ -77,7 +77,3 @@ cargo build --release && cargo test
 ```
 
 Snapshot tests compare Rust output against Python reference snapshots using fixture data in `tests/fixtures/`.
-
-## Legacy Python
-
-The original Python implementation is preserved in the `legacy/` directory for reference and snapshot comparison.

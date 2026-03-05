@@ -1,3 +1,0 @@
-Calculating Codex usage...
-Showing data from last 3 days
-No usage data found.

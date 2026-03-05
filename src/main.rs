@@ -262,7 +262,7 @@ fn calculate_all_model_breakdown(all_data: &AllVendorData) -> Vec<ModelBreakdown
         all_stats.extend(stats::calculate_gemini_model_breakdown(&all_data.gemini));
     }
 
-    all_stats.sort_by(|a, b| b.total.cmp(&a.total));
+    all_stats.sort_by(|a, b| b.count.cmp(&a.count));
     all_stats
 }
 
@@ -647,7 +647,6 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
             &state.subscription_fees,
             &state.pricing,
         );
-        println!();
     }
 
     if vendor_time_series.is_empty() {

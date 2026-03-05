@@ -26,7 +26,7 @@ capture() {
     echo "Capturing: $name (${cols}x${lines})"
     COLUMNS="$cols" LINES="$lines" "$RUST_BIN" --once "${args[@]}" \
         > "$SNAPSHOTS/rust/${name}.txt" 2>&1 || true
-    COLUMNS="$cols" LINES="$lines" python3 "$ROOT_DIR/vibe-usage.py" --once "${args[@]}" \
+    COLUMNS="$cols" LINES="$lines" python3 "$ROOT_DIR/legacy/vibe-usage.py" --once "${args[@]}" \
         > "$SNAPSHOTS/python/${name}.txt" 2>&1 || true
 }
 

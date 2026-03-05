@@ -125,7 +125,7 @@ cargo test --test snapshot_test
 
 ## Legacy Python
 
-The original Python implementation is preserved in the project root (`vibe-usage.py` and supporting modules). The Rust version produces equivalent output and is used as the primary tool.
+The original Python implementation is preserved in the `legacy/` directory. The Rust version produces equivalent output and is used as the primary tool.
 
 ## License
 

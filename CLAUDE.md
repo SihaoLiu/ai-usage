@@ -80,4 +80,4 @@ Snapshot tests compare Rust output against Python reference snapshots using fixt
 
 ## Legacy Python
 
-The original Python implementation (`vibe-usage.py` and modules) is preserved for reference and snapshot comparison.
+The original Python implementation is preserved in the `legacy/` directory for reference and snapshot comparison.

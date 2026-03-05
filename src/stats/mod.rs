@@ -100,7 +100,7 @@ pub(crate) fn calculate_model_breakdown_generic(
 
     let mut result: Vec<ModelBreakdownRow> = model_stats
         .into_values()
-        .filter(|r| r.count >= threshold)
+        .filter(|r| r.count >= threshold && !r.model.contains("<synthetic>"))
         .map(|mut r| {
             r.total = r.input + r.output;
             r.total_with_cache = match vendor {

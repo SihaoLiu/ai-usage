@@ -1,3 +1,5 @@
 __pycache__
 .fee.env
 /target
+tests/snapshots/python/
+tests/snapshots/rust/

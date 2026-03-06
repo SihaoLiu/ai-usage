@@ -830,7 +830,7 @@ fn main() {
 
                             let mut did_refresh = false;
                             match command.as_str() {
-                                "r" | "refresh" => {
+                                "" | "r" | "refresh" => {
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!("\n\r{}\r", "=".repeat(width as usize));
                                     println!("MANUAL REFRESH\r");
@@ -942,7 +942,6 @@ fn main() {
                                     cleanup_and_break("Exiting monitor mode...");
                                     break 'monitor;
                                 }
-                                "" => {}
                                 _ => {
                                     let parts: Vec<&str> = command.splitn(2, ' ').collect();
                                     match parts[0] {

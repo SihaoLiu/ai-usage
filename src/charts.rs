@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 
@@ -195,32 +195,63 @@ fn print_daily_header(
     layout: &ChartLayout,
     line_values_fn: &dyn Fn(usize) -> f64,
 ) {
-    // Group by calendar date
-    let mut daily_data: BTreeMap<chrono::NaiveDate, (f64, Vec<usize>, DateTime<Local>)> = BTreeMap::new();
+    // Build visual segments between day-boundary separators
+    let total_cols = layout.columns.len();
+    let sep_positions: Vec<usize> = layout.columns.iter().enumerate()
+        .filter(|(_, col)| matches!(col, ChartColumn::Separator))
+        .map(|(i, _)| i)
+        .collect();
 
-    for (col_idx, col) in layout.columns.iter().enumerate() {
-        if let ChartColumn::Data { data_idx, sub_col, .. } = col {
-            let time = layout.sorted_times[*data_idx];
-            let date_key = time.date_naive();
-
-            let entry = daily_data.entry(date_key).or_insert((0.0, Vec::new(), time));
-            entry.1.push(col_idx);
-
-            if *sub_col == 0 {
-                entry.0 += line_values_fn(*data_idx);
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    if sep_positions.is_empty() {
+        if total_cols > 0 {
+            segments.push((0, total_cols - 1));
+        }
+    } else {
+        if sep_positions[0] > 0 {
+            segments.push((0, sep_positions[0] - 1));
+        }
+        for i in 0..sep_positions.len() - 1 {
+            let start = sep_positions[i] + 1;
+            let end = sep_positions[i + 1] - 1;
+            if start <= end {
+                segments.push((start, end));
             }
+        }
+        let start = sep_positions.last().unwrap() + 1;
+        if start < total_cols {
+            segments.push((start, total_cols - 1));
         }
     }
 
-    let mut daily_totals: Vec<(usize, f64, DateTime<Local>)> = daily_data.values()
-        .filter(|(_, cols, _)| !cols.is_empty())
-        .map(|(total, cols, time)| {
-            let mid = (cols.iter().min().unwrap() + cols.iter().max().unwrap()) / 2;
-            (mid, *total, *time)
-        })
-        .collect();
-    // Sort by column position (left to right) to match rendering order
-    daily_totals.sort_by_key(|(mid_col, _, _)| *mid_col);
+    // For each visual segment, compute midpoint, sum tokens, and pick a representative date
+    let mut daily_totals: Vec<(usize, f64, DateTime<Local>)> = Vec::new();
+    for &(seg_start, seg_end) in &segments {
+        let mid = (seg_start + seg_end) / 2;
+        let mut total = 0.0;
+        let mut repr_time: Option<DateTime<Local>> = None;
+
+        for col_idx in seg_start..=seg_end {
+            if let ChartColumn::Data { data_idx, sub_col } = &layout.columns[col_idx] {
+                let time = layout.sorted_times[*data_idx];
+                // Prefer non-midnight time as representative date
+                let dominated = repr_time.map_or(true, |r| {
+                    r.hour() == 0 && r.minute() == 0
+                        && (time.hour() != 0 || time.minute() != 0)
+                });
+                if dominated {
+                    repr_time = Some(time);
+                }
+                if *sub_col == 0 {
+                    total += line_values_fn(*data_idx);
+                }
+            }
+        }
+
+        if let Some(time) = repr_time {
+            daily_totals.push((mid, total, time));
+        }
+    }
 
     let weekday_abbr = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 

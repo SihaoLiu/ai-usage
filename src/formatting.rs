@@ -132,7 +132,13 @@ fn format_model_name_with_vendor_prefix(
     if !show_vendor_prefix {
         return name;
     }
-    format!("{:<width$}: {}", vendor, name, width = prefix_width)
+    let display_vendor = match vendor {
+        "claude" => "Claude",
+        "codex" => "OpenAI",
+        "gemini" => "Google",
+        _ => vendor,
+    };
+    format!("{:<width$}: {}", display_vendor, name, width = prefix_width)
 }
 
 fn fit_text_to_width(text: &str, width: usize) -> String {
@@ -489,7 +495,8 @@ fn print_table_full(
     show_vendor_prefix: bool,
 ) {
     let table_width = 152;
-    println!("Usage / Cost by Model");
+    println!();
+    println!("{:^width$}", "Usage / Cost by Model", width = table_width);
     println!("{}", "=".repeat(table_width));
 
     println!(
@@ -564,7 +571,8 @@ fn print_table_medium(
     let w_cache = 20;
     let table_width = 128;
 
-    println!("Usage / Cost by Model");
+    println!();
+    println!("{:^width$}", "Usage / Cost by Model", width = table_width);
     println!("{}", "=".repeat(table_width));
 
     println!(
@@ -612,7 +620,7 @@ fn print_table_medium(
     );
 
     println!(
-        "| {:<w_model$} {:>w_msgs$} {} {} {} {} |",
+        "| {:<w_model$} {:>w_msgs$} | {} {} {} {} |",
         "Cost(API)",
         "",
         format_cost_with_pct(cache_hit_cost, total_cost, w_cache),
@@ -643,7 +651,8 @@ fn print_table_compact(
     let w_val = 8;
     let table_width = 62;
 
-    println!("Usage / Cost by Model");
+    println!();
+    println!("{:^width$}", "Usage / Cost by Model", width = table_width);
     println!("{}", "=".repeat(table_width));
 
     println!(
@@ -722,7 +731,8 @@ fn print_table_minimal(
     let w_strategy = 10;
     let table_width = 2 + w_model + 1 + w_msgs + 1 + 2 + w_strategy * 4 + 3 + 2;
 
-    println!("Usage Summary");
+    println!();
+    println!("{:^width$}", "Usage Summary", width = table_width);
     println!("{}", "=".repeat(table_width));
 
     println!(

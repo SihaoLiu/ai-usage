@@ -105,6 +105,23 @@ fn round_to_nice(value: f64, round_up: bool) -> i64 {
     }
 }
 
+fn format_total_compact(value: f64) -> String {
+    let (scaled, unit) = if value >= 999_500_000.0 {
+        (value / 1_000_000_000.0, "G")
+    } else if value >= 999_500.0 {
+        (value / 1_000_000.0, "M")
+    } else if value >= 999.5 {
+        (value / 1_000.0, "K")
+    } else {
+        return format!("{}", value.round() as i64);
+    };
+    if scaled < 9.95 {
+        format!("{:.1}{}", scaled, unit)
+    } else {
+        format!("{}{}", scaled.round() as i64, unit)
+    }
+}
+
 #[derive(Clone)]
 enum ChartColumn {
     Separator,
@@ -253,17 +270,37 @@ fn print_daily_header(
         }
     }
 
-    let weekday_abbr = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    // Determine display mode based on minimum inner segment width
+    let inner_min = if segments.len() > 2 {
+        segments[1..segments.len() - 1].iter().map(|(s, e)| e - s + 1).min().unwrap_or(0)
+    } else {
+        segments.iter().map(|(s, e)| e - s + 1).min().unwrap_or(0)
+    };
+    let compact = inner_min < 13;
+    if compact && inner_min < 7 {
+        return;
+    }
+
+    let weekday_normal = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let weekday_compact = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 
     let mut weekday_line = " ".repeat(7);
     let mut date_line = " ".repeat(7);
     let mut prev_end = 0usize;
 
     for (mid_col, total, day_start) in &daily_totals {
-        let total_str = format_total_value(*total);
-        let weekday = weekday_abbr[day_start.weekday().num_days_from_monday() as usize];
-        let mut weekday_total = format!("{} : {}", weekday, total_str);
-        let mut date_str = day_start.format(" %m / %d").to_string();
+        let wd_idx = day_start.weekday().num_days_from_monday() as usize;
+        let (mut weekday_total, mut date_str) = if compact {
+            (
+                format!("{}:{}", weekday_compact[wd_idx], format_total_compact(*total)),
+                day_start.format("%m/%d").to_string(),
+            )
+        } else {
+            (
+                format!("{} : {}", weekday_normal[wd_idx], format_total_value(*total)),
+                day_start.format(" %m / %d").to_string(),
+            )
+        };
 
         let colon_idx = weekday_total.find(':').unwrap_or(0);
         let slash_idx = date_str.find('/').unwrap_or(0);

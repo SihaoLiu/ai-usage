@@ -99,22 +99,60 @@ fn print_terminal_too_small(width: u16, height: u16) {
     }
 }
 
-fn calculate_chart_height(is_monitor_mode: bool, table_printed: bool) -> usize {
+/// Calculate chart height(s) that fit within the terminal.
+/// For single vendor: returns per-chart height (2 charts displayed).
+/// For all vendor: returns the single chart height.
+/// Also returns whether the layout fits (true) or overflows (false).
+fn calculate_chart_height(
+    is_monitor_mode: bool,
+    table_printed: bool,
+    num_models: usize,
+    is_all_vendor: bool,
+) -> (usize, bool) {
     let (_, height) = get_terminal_size();
-    let header_lines = 5usize;
-    let breakdown_table_lines = if table_printed { 15 } else { 0 };
-    let chart1_overhead = 6;
-    let chart2_overhead = 13;
-    let final_lines = 1;
-    let monitor_prompt_lines = if is_monitor_mode { 4 } else { 0 };
+    let th = height as usize;
 
-    let fixed_overhead = header_lines + breakdown_table_lines + chart1_overhead + chart2_overhead
-        + final_lines + monitor_prompt_lines;
+    // Header: "Calculating...", "Showing data...", "Monitor mode..." (or 2 if --once)
+    let header_lines = if is_monitor_mode { 3 } else { 2 };
 
-    let available_height = (height as usize).saturating_sub(fixed_overhead);
-    let chart_height = available_height / 2;
+    // Table: 1 blank + 1 title + 1 =border + 1 header + 1 -border
+    //        + num_models rows + 1 -border + 1 TOTAL + 1 Cost + 1 =border
+    //        + 1 cost summary = 10 + num_models
+    let table_lines = if table_printed { 10 + num_models } else { 0 };
 
-    chart_height.max(10).min(60)
+    // Time span info: 1 line + 1 blank
+    let time_span_lines = 2;
+
+    // Per-chart overhead: 1 blank + 1 title + 1 =border + 2 daily_header
+    //                     + 1 x-axis bottom line + 1 legend = 7
+    // X-axis labels: typically 2 lines (blank + label chars), up to 5
+    let chart_overhead = 7;
+    let x_axis_label_lines = 3; // blank + typically 2 label rows
+
+    // Monitor prompt: 1 blank + 1 version + 1 separator + 1 "> " = 4
+    let prompt_lines = if is_monitor_mode { 4 } else { 0 };
+
+    let min_chart = 5usize;
+
+    if is_all_vendor {
+        // Single chart
+        let fixed = header_lines + table_lines + time_span_lines
+            + chart_overhead + x_axis_label_lines + prompt_lines;
+        let available = th.saturating_sub(fixed);
+        let chart_height = available.max(min_chart).min(60);
+        let fits = th >= fixed + min_chart;
+        (chart_height, fits)
+    } else {
+        // Two charts: chart1 (io, no x-axis labels) + chart2 (cache, with x-axis labels)
+        let chart1_fixed = chart_overhead;
+        let chart2_fixed = chart_overhead + x_axis_label_lines;
+        let fixed = header_lines + table_lines + time_span_lines
+            + chart1_fixed + chart2_fixed + prompt_lines;
+        let available = th.saturating_sub(fixed);
+        let per_chart = (available / 2).max(min_chart).min(60);
+        let fits = th >= fixed + min_chart * 2;
+        (per_chart, fits)
+    }
 }
 
 fn calculate_optimal_interval_minutes(days_back: i64, target_width: usize) -> f64 {
@@ -462,7 +500,7 @@ fn get_chart_target_width() -> usize {
     (width as f64 * 0.99) as usize
 }
 
-fn print_time_span_info(days: i64, interval_minutes: i64, terminal_width: u16) {
+fn print_time_span_info(days: i64, interval_minutes: i64, terminal_width: u16, left_pad: &str) {
     let now = Local::now();
     let start_time = now - Duration::days(days);
     let total_minutes = start_time.hour() as i64 * 60 + start_time.minute() as i64;
@@ -506,10 +544,10 @@ fn print_time_span_info(days: i64, interval_minutes: i64, terminal_width: u16) {
         now_short, start_short, end_short, interval_str, data_points
     );
 
-    if terminal_width as usize >= full_line.len() {
-        println!("{}", full_line);
+    if terminal_width as usize >= full_line.len() + left_pad.len() {
+        println!("{}{}", left_pad, full_line);
     } else {
-        println!("{}", short_line);
+        println!("{}{}", left_pad, short_line);
     }
     println!();
 }
@@ -521,11 +559,51 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         return None;
     }
 
+    let vendor = &state.vendor;
+
+    // Pre-load data to determine model count for height check
+    let usage_data = read_vendor_data(vendor, state.days);
+    if usage_data.is_empty() {
+        if !once { print!("\x1b[2J\x1b[H"); }
+        println!("No usage data found.");
+        return Some(false);
+    }
+    let filtered = data::filter_usage_data_by_days(&usage_data, state.days);
+    if filtered.is_empty() {
+        if !once { print!("\x1b[2J\x1b[H"); }
+        println!("No usage data found in the last {} days.", state.days);
+        return Some(false);
+    }
+    let model_stats = match vendor.as_str() {
+        "codex" => stats::calculate_codex_model_breakdown(&filtered),
+        "gemini" => stats::calculate_gemini_model_breakdown(&filtered),
+        _ => stats::calculate_claude_model_breakdown(&filtered),
+    };
+
+    // Pre-check whether table will be displayed and total height fits
+    let table_mode = formatting::get_table_display_mode(width, height, model_stats.len());
+    let mut will_print_table = table_mode != "hidden";
+
+    let target_width = get_chart_target_width();
+    let (mut chart_height, mut fits) = calculate_chart_height(
+        !once, will_print_table, model_stats.len(), false,
+    );
+    // If it doesn't fit with table, try without
+    if !fits && will_print_table {
+        will_print_table = false;
+        let result = calculate_chart_height(!once, false, model_stats.len(), false);
+        chart_height = result.0;
+        fits = result.1;
+    }
+    if !fits {
+        print_terminal_too_small(width, height);
+        return None;
+    }
+
     if !once {
         print!("\x1b[2J\x1b[H");
     }
 
-    let vendor = &state.vendor;
     let vendor_name = match vendor.as_str() {
         "codex" => "Codex",
         "gemini" => "Gemini CLI",
@@ -538,36 +616,17 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         println!("Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)", state.monitor_interval);
     }
 
-    let usage_data = read_vendor_data(vendor, state.days);
-    if usage_data.is_empty() {
-        println!("No usage data found.");
-        return Some(false);
-    }
-
-    let filtered = data::filter_usage_data_by_days(&usage_data, state.days);
-    if filtered.is_empty() {
-        println!("No usage data found in the last {} days.", state.days);
-        return Some(false);
-    }
-
-    let model_stats = match vendor.as_str() {
-        "codex" => stats::calculate_codex_model_breakdown(&filtered),
-        "gemini" => stats::calculate_gemini_model_breakdown(&filtered),
-        _ => stats::calculate_claude_model_breakdown(&filtered),
-    };
-
-    let table_printed = print_model_breakdown(
+    // Only print table if height allows it
+    let effective_height = if will_print_table { height } else { 0 };
+    print_model_breakdown(
         &model_stats,
         state.days,
         Some(width),
-        Some(height),
+        Some(effective_height),
         vendor,
         &state.subscription_fees,
         &state.pricing,
     );
-
-    let target_width = get_chart_target_width();
-    let chart_height = calculate_chart_height(!once, table_printed);
 
     let optimal = calculate_optimal_interval_minutes(state.days, target_width);
     let interval_minutes = round_to_nice_interval(optimal);
@@ -580,17 +639,24 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
 
     let included_models: HashSet<String> = model_stats.iter().map(|s| s.model.clone()).collect();
 
+    let table_w = if will_print_table {
+        formatting::get_table_width(&formatting::get_table_display_mode(width, height, model_stats.len()))
+    } else { 0 };
+    let table_pad = formatting::center_pad(width as usize, table_w);
+
     if !model_ts.is_empty() {
-        print_time_span_info(state.days, interval_minutes, width);
+        print_time_span_info(state.days, interval_minutes, width, &table_pad);
     }
 
     charts::print_multi_line_chart(
         &model_ts, chart_height, state.days, "io", false,
         Some(target_width), interval_minutes, vendor, Some(&included_models), true,
+        Some(width as usize),
     );
     charts::print_multi_line_chart(
         &model_ts, chart_height, state.days, "cache", true,
         Some(target_width), interval_minutes, vendor, Some(&included_models), true,
+        Some(width as usize),
     );
 
     Some(true)
@@ -601,16 +667,6 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     if !size_ok {
         print_terminal_too_small(width, height);
         return None;
-    }
-
-    if !once {
-        print!("\x1b[2J\x1b[H");
-    }
-
-    println!("Calculating usage across all vendors...");
-    println!("Showing data from last {} days", state.days);
-    if !once {
-        println!("Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)", state.monitor_interval);
     }
 
     let target_width = get_chart_target_width();
@@ -636,13 +692,43 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     let vendor_time_series = calculate_vendor_aggregate_time_series(&all_data, interval_minutes);
     let all_model_stats = calculate_all_model_breakdown(&all_data);
 
-    let mut table_printed = false;
+    // Pre-check whether table will be displayed
+    let table_mode = formatting::get_table_display_mode(width, height, all_model_stats.len());
+    let mut will_print_table = table_mode != "hidden" && !all_model_stats.is_empty();
+
+    // Check total height fits before printing anything
+    let (mut chart_height, mut fits) = calculate_chart_height(
+        !once, will_print_table, all_model_stats.len(), true,
+    );
+    // If it doesn't fit with table, try without
+    if !fits && will_print_table {
+        will_print_table = false;
+        let result = calculate_chart_height(!once, false, all_model_stats.len(), true);
+        chart_height = result.0;
+        fits = result.1;
+    }
+    if !fits {
+        print_terminal_too_small(width, height);
+        return None;
+    }
+
+    if !once {
+        print!("\x1b[2J\x1b[H");
+    }
+
+    println!("Calculating usage across all vendors...");
+    println!("Showing data from last {} days", state.days);
+    if !once {
+        println!("Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)", state.monitor_interval);
+    }
+
     if !all_model_stats.is_empty() {
-        table_printed = print_model_breakdown(
+        let effective_height = if will_print_table { height } else { 0 };
+        print_model_breakdown(
             &all_model_stats,
             state.days,
             Some(width),
-            Some(height),
+            Some(effective_height),
             "all",
             &state.subscription_fees,
             &state.pricing,
@@ -654,9 +740,12 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         return Some(false);
     }
 
-    let chart_height = calculate_chart_height(!once, table_printed) * 2;
+    let table_w = if will_print_table {
+        formatting::get_table_width(&formatting::get_table_display_mode(width, height, all_model_stats.len()))
+    } else { 0 };
+    let table_pad = formatting::center_pad(width as usize, table_w);
 
-    print_time_span_info(state.days, interval_minutes, width);
+    print_time_span_info(state.days, interval_minutes, width, &table_pad);
 
     charts::print_vendor_comparison_chart(
         &vendor_time_series,
@@ -665,6 +754,7 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         Some(target_width),
         interval_minutes,
         true,
+        Some(width as usize),
     );
 
     Some(true)

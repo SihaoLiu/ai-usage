@@ -296,6 +296,17 @@ pub fn get_table_display_mode(
     }
 }
 
+/// Get the table width for a given display mode.
+pub fn get_table_width(mode: &str) -> usize {
+    match mode {
+        "full" => 152,
+        "medium" => 128,
+        "compact" => 62,
+        "minimal" => 53,
+        _ => 0,
+    }
+}
+
 /// Get strategy totals for a model breakdown row.
 fn get_strategy_totals(stats: &ModelBreakdownRow) -> (i64, i64, i64) {
     let cache_hit = stats.cache_read;
@@ -419,27 +430,29 @@ pub fn print_model_breakdown(
 
     let show_vendor_prefix = vendor == "all";
 
+    let tw = terminal_width.unwrap_or(200) as usize;
+
     // Print table based on mode
     match mode {
         "full" => print_table_full(
             model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
             sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
-            decoding_cost, vendor, show_vendor_prefix,
+            decoding_cost, vendor, show_vendor_prefix, tw,
         ),
         "medium" => print_table_medium(
             model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
             sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
-            decoding_cost, vendor, show_vendor_prefix,
+            decoding_cost, vendor, show_vendor_prefix, tw,
         ),
         "compact" => print_table_compact(
             model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
             sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
-            decoding_cost, vendor, show_vendor_prefix,
+            decoding_cost, vendor, show_vendor_prefix, tw,
         ),
         "minimal" => print_table_minimal(
             model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
             sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
-            decoding_cost, vendor, show_vendor_prefix,
+            decoding_cost, vendor, show_vendor_prefix, tw,
         ),
         _ => {}
     }
@@ -464,20 +477,39 @@ pub fn print_model_breakdown(
         0.0
     };
 
+    let table_width = match mode {
+        "full" => 152,
+        "medium" => 128,
+        "compact" => 62,
+        _ => 53, // minimal
+    };
+    let cost_pad = center_pad(tw, table_width);
+
     if mode == "full" || mode == "medium" {
-        println!(
+        let line = format!(
             "Daily: ${:.2}, Weekly: ${:.2}, Monthly(30d): ${:.2}, Monthly Saving ${:.2}, {} / MTok",
             daily_cost, weekly_cost, monthly_cost, savings,
             format_cost_per_mtok(cost_per_mtok)
         );
+        println!("{}{}", cost_pad, line);
     } else {
-        println!(
+        let line = format!(
             "Daily: ${:.2}, Monthly: ${:.2}, Saving: ${:.2}",
             daily_cost, monthly_cost, savings
         );
+        println!("{}{}", cost_pad, line);
     }
 
     true
+}
+
+/// Center a line of given content_width within terminal_width using left padding.
+pub fn center_pad(terminal_width: usize, content_width: usize) -> String {
+    if terminal_width > content_width {
+        " ".repeat((terminal_width - content_width) / 2)
+    } else {
+        String::new()
+    }
 }
 
 fn print_table_full(
@@ -493,17 +525,19 @@ fn print_table_full(
     decoding_cost: f64,
     _vendor: &str,
     show_vendor_prefix: bool,
+    terminal_width: usize,
 ) {
     let table_width = 152;
+    let p = center_pad(terminal_width, table_width);
     println!();
-    println!("{:^width$}", "Usage / Cost by Model", width = table_width);
-    println!("{}", "=".repeat(table_width));
+    println!("{}{:^width$}", p, "Usage / Cost by Model", width = table_width);
+    println!("{}{}", p, "=".repeat(table_width));
 
     println!(
-        "| {:<35} {:>18} | {:>22} {:>22} {:>22} {:>22} |",
-        "Model", "Messages", "Cache Hit", "Prefill", "Decoding", "Total"
+        "{}| {:<35} {:>18} | {:>22} {:>22} {:>22} {:>22} |",
+        p, "Model", "Messages", "Cache Hit", "Prefill", "Decoding", "Total"
     );
-    println!("|{}|", "-".repeat(table_width - 2));
+    println!("{}|{}|", p, "-".repeat(table_width - 2));
 
     for stats in model_stats {
         let effective_vendor = &stats.vendor;
@@ -519,7 +553,8 @@ fn print_table_full(
         );
         let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
         println!(
-            "| {:<35} {} | {} {} {} {} |",
+            "{}| {:<35} {} | {} {} {} {} |",
+            p,
             model_name,
             format_with_pct(stats.count, sum_messages, 18),
             format_with_pct(cache_hit, sum_cache_hit, 22),
@@ -529,9 +564,10 @@ fn print_table_full(
         );
     }
 
-    println!("|{}|", "-".repeat(table_width - 2));
+    println!("{}|{}|", p, "-".repeat(table_width - 2));
     println!(
-        "| {:<35} {} | {} {} {} {} |",
+        "{}| {:<35} {} | {} {} {} {} |",
+        p,
         "TOTAL",
         format_with_100pct_up(sum_messages, 18),
         format_with_100pct_up(sum_cache_hit, 22),
@@ -541,7 +577,8 @@ fn print_table_full(
     );
 
     println!(
-        "| {:<35} {:>18} | {} {} {} {} |",
+        "{}| {:<35} {:>18} | {} {} {} {} |",
+        p,
         "Cost(API)",
         "",
         format_cost_with_pct(cache_hit_cost, total_cost, 22),
@@ -549,7 +586,7 @@ fn print_table_full(
         format_cost_with_pct(decoding_cost, total_cost, 22),
         format_with_100pct_left(total_cost, 22),
     );
-    println!("{}", "=".repeat(table_width));
+    println!("{}{}", p, "=".repeat(table_width));
 }
 
 fn print_table_medium(
@@ -565,22 +602,24 @@ fn print_table_medium(
     decoding_cost: f64,
     _vendor: &str,
     show_vendor_prefix: bool,
+    terminal_width: usize,
 ) {
     let w_model = 22;
     let w_msgs = 15;
     let w_cache = 20;
     let table_width = 128;
+    let p = center_pad(terminal_width, table_width);
 
     println!();
-    println!("{:^width$}", "Usage / Cost by Model", width = table_width);
-    println!("{}", "=".repeat(table_width));
+    println!("{}{:^width$}", p, "Usage / Cost by Model", width = table_width);
+    println!("{}{}", p, "=".repeat(table_width));
 
     println!(
-        "| {:<w_model$} {:>w_msgs$} | {:>w_cache$} {:>w_cache$} {:>w_cache$} {:>w_cache$} |",
-        "Model", "Msgs", "CacheHit", "Prefill", "Decode", "Total",
+        "{}| {:<w_model$} {:>w_msgs$} | {:>w_cache$} {:>w_cache$} {:>w_cache$} {:>w_cache$} |",
+        p, "Model", "Msgs", "CacheHit", "Prefill", "Decode", "Total",
         w_model = w_model, w_msgs = w_msgs, w_cache = w_cache,
     );
-    println!("|{}|", "-".repeat(table_width - 2));
+    println!("{}|{}|", p, "-".repeat(table_width - 2));
 
     for stats in model_stats {
         let effective_vendor = &stats.vendor;
@@ -596,7 +635,8 @@ fn print_table_medium(
         );
         let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
         println!(
-            "| {:<w_model$} {} | {} {} {} {} |",
+            "{}| {:<w_model$} {} | {} {} {} {} |",
+            p,
             model_name,
             format_with_pct(stats.count, sum_messages, w_msgs),
             format_with_pct(cache_hit, sum_cache_hit, w_cache),
@@ -607,9 +647,10 @@ fn print_table_medium(
         );
     }
 
-    println!("|{}|", "-".repeat(table_width - 2));
+    println!("{}|{}|", p, "-".repeat(table_width - 2));
     println!(
-        "| {:<w_model$} {} | {} {} {} {} |",
+        "{}| {:<w_model$} {} | {} {} {} {} |",
+        p,
         "TOTAL",
         format_with_100pct_up(sum_messages, w_msgs),
         format_with_100pct_up(sum_cache_hit, w_cache),
@@ -620,7 +661,8 @@ fn print_table_medium(
     );
 
     println!(
-        "| {:<w_model$} {:>w_msgs$} | {} {} {} {} |",
+        "{}| {:<w_model$} {:>w_msgs$} | {} {} {} {} |",
+        p,
         "Cost(API)",
         "",
         format_cost_with_pct(cache_hit_cost, total_cost, w_cache),
@@ -629,7 +671,7 @@ fn print_table_medium(
         format_with_100pct_left(total_cost, w_cache),
         w_model = w_model, w_msgs = w_msgs,
     );
-    println!("{}", "=".repeat(table_width));
+    println!("{}{}", p, "=".repeat(table_width));
 }
 
 fn print_table_compact(
@@ -645,22 +687,24 @@ fn print_table_compact(
     decoding_cost: f64,
     _vendor: &str,
     show_vendor_prefix: bool,
+    terminal_width: usize,
 ) {
     let w_model = 12;
     let w_msgs = 7;
     let w_val = 8;
     let table_width = 62;
+    let p = center_pad(terminal_width, table_width);
 
     println!();
-    println!("{:^width$}", "Usage / Cost by Model", width = table_width);
-    println!("{}", "=".repeat(table_width));
+    println!("{}{:^width$}", p, "Usage / Cost by Model", width = table_width);
+    println!("{}{}", p, "=".repeat(table_width));
 
     println!(
-        "| {:<w_model$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} |",
-        "Model", "Msgs", "CacheHit", "Prefill", "Decode", "Total",
+        "{}| {:<w_model$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} |",
+        p, "Model", "Msgs", "CacheHit", "Prefill", "Decode", "Total",
         w_model = w_model, w_msgs = w_msgs, w_val = w_val,
     );
-    println!("|{}|", "-".repeat(table_width - 2));
+    println!("{}|{}|", p, "-".repeat(table_width - 2));
 
     for stats in model_stats {
         let effective_vendor = &stats.vendor;
@@ -676,7 +720,8 @@ fn print_table_compact(
         );
         let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
         println!(
-            "| {:<w_model$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} |",
+            "{}| {:<w_model$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} |",
+            p,
             model_name,
             format_number_compact(stats.count),
             format_number_compact(cache_hit),
@@ -687,9 +732,10 @@ fn print_table_compact(
         );
     }
 
-    println!("|{}|", "-".repeat(table_width - 2));
+    println!("{}|{}|", p, "-".repeat(table_width - 2));
     println!(
-        "| {:<w_model$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} |",
+        "{}| {:<w_model$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} |",
+        p,
         "TOTAL",
         format_number_compact(sum_messages),
         format_number_compact(sum_cache_hit),
@@ -700,7 +746,8 @@ fn print_table_compact(
     );
 
     println!(
-        "| {:<w_model$} {:>w_msgs$} | ${:>w_cost$.2} ${:>w_cost$.2} ${:>w_cost$.2} ${:>w_cost$.2} |",
+        "{}| {:<w_model$} {:>w_msgs$} | ${:>w_cost$.2} ${:>w_cost$.2} ${:>w_cost$.2} ${:>w_cost$.2} |",
+        p,
         "Cost",
         "",
         cache_hit_cost,
@@ -709,7 +756,7 @@ fn print_table_compact(
         total_cost,
         w_model = w_model, w_msgs = w_msgs, w_cost = w_val - 1,
     );
-    println!("{}", "=".repeat(table_width));
+    println!("{}{}", p, "=".repeat(table_width));
 }
 
 fn print_table_minimal(
@@ -725,22 +772,24 @@ fn print_table_minimal(
     _decoding_cost: f64,
     _vendor: &str,
     show_vendor_prefix: bool,
+    terminal_width: usize,
 ) {
     let w_model = 12;
     let w_msgs = 7;
     let w_strategy = 10;
     let table_width = 2 + w_model + 1 + w_msgs + 1 + 2 + w_strategy * 4 + 3 + 2;
+    let p = center_pad(terminal_width, table_width);
 
     println!();
-    println!("{:^width$}", "Usage Summary", width = table_width);
-    println!("{}", "=".repeat(table_width));
+    println!("{}{:^width$}", p, "Usage Summary", width = table_width);
+    println!("{}{}", p, "=".repeat(table_width));
 
     println!(
-        "| {:<w_model$} {:>w_msgs$} | {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} |",
-        "Model", "Msgs", "Cache Hit", "Prefill", "Decode", "All",
+        "{}| {:<w_model$} {:>w_msgs$} | {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} |",
+        p, "Model", "Msgs", "Cache Hit", "Prefill", "Decode", "All",
         w_model = w_model, w_msgs = w_msgs, w_strategy = w_strategy,
     );
-    println!("|{}|", "-".repeat(table_width - 2));
+    println!("{}|{}|", p, "-".repeat(table_width - 2));
 
     for stats in model_stats {
         let effective_vendor = &stats.vendor;
@@ -756,7 +805,8 @@ fn print_table_minimal(
         );
         let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
         println!(
-            "| {:<w_model$} {:>w_msgs$} | {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} |",
+            "{}| {:<w_model$} {:>w_msgs$} | {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} |",
+            p,
             model_name,
             format_number_compact(stats.count),
             format_number_compact(cache_hit),
@@ -767,9 +817,10 @@ fn print_table_minimal(
         );
     }
 
-    println!("|{}|", "-".repeat(table_width - 2));
+    println!("{}|{}|", p, "-".repeat(table_width - 2));
     println!(
-        "| {:<w_model$} {:>w_msgs$} | {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} |",
+        "{}| {:<w_model$} {:>w_msgs$} | {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} |",
+        p,
         "TOTAL",
         format_number_compact(sum_messages),
         format_number_compact(sum_cache_hit),
@@ -780,10 +831,10 @@ fn print_table_minimal(
     );
 
     println!(
-        "| {:<w_model$} {:>w_msgs$} | {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} ${:>w_cost$.2} |",
-        "Cost", "", "", "", "",
+        "{}| {:<w_model$} {:>w_msgs$} | {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} ${:>w_cost$.2} |",
+        p, "Cost", "", "", "", "",
         total_cost,
         w_model = w_model, w_msgs = w_msgs, w_strategy = w_strategy, w_cost = w_strategy - 1,
     );
-    println!("{}", "=".repeat(table_width));
+    println!("{}{}", p, "=".repeat(table_width));
 }

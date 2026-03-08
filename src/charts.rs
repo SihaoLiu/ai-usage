@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 
-use crate::formatting::{format_y_axis_value, format_total_value};
+use crate::formatting::{format_y_axis_value, format_total_value, center_pad};
 use crate::stats::{ModelTimeSeries, VendorTimeSeries};
 
 const RESET_COLOR: &str = "\x1b[0m";
@@ -211,6 +211,7 @@ fn build_chart_layout(
 fn print_daily_header(
     layout: &ChartLayout,
     line_values_fn: &dyn Fn(usize) -> f64,
+    pad: &str,
 ) {
     // Build visual segments between day-boundary separators
     let total_cols = layout.columns.len();
@@ -334,11 +335,11 @@ fn print_daily_header(
         prev_end = start_pos + max_len;
     }
 
-    println!("{}", weekday_line);
-    println!("{}", date_line);
+    println!("{}{}", pad, weekday_line);
+    println!("{}{}", pad, date_line);
 }
 
-fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64) {
+fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) {
     println!();
 
     let first_time = layout.sorted_times.last().unwrap(); // oldest (reversed)
@@ -414,7 +415,7 @@ fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64) {
                 }
             }
         }
-        println!("{}", line);
+        println!("{}{}", pad, line);
     }
 }
 
@@ -426,6 +427,7 @@ fn render_grid(
     lines: &[LineConfig],
     line_values: &HashMap<usize, Vec<f64>>,
     use_bold_for_last: bool,
+    pad: &str,
 ) {
     let value_to_row = |value: f64| -> usize {
         if max_value == min_value {
@@ -524,7 +526,7 @@ fn render_grid(
                 }
             }
         }
-        println!("{}{}", y_label, line_str);
+        println!("{}{}{}", pad, y_label, line_str);
     }
 
     // X-axis
@@ -535,7 +537,7 @@ fn render_grid(
             ChartColumn::Data { .. } => x_axis.push('\u{2500}'), // ─
         }
     }
-    println!("      \u{2514}{}", x_axis); // └
+    println!("{}      \u{2514}{}", pad, x_axis); // └
 }
 
 struct LineConfig {
@@ -557,6 +559,7 @@ pub fn print_multi_line_chart(
     vendor: &str,
     included_models: Option<&HashSet<String>>,
     show_legend: bool,
+    terminal_width: Option<usize>,
 ) {
     if time_series.is_empty() {
         println!("No time series data available.");
@@ -689,29 +692,31 @@ pub fn print_multi_line_chart(
     let max_value = if max_value == min_value { min_value + 5000 } else { max_value };
 
     // Print title
-    let total_width = layout.columns.len() + 7;
+    let chart_width = layout.columns.len() + 7;
+    let tw = terminal_width.unwrap_or(chart_width);
+    let pad = center_pad(tw, chart_width);
     if !show_x_axis {
         println!();
     }
-    println!("{:^width$}", chart_title, width = total_width);
-    println!("{}", "=".repeat(total_width));
+    println!("{}{:^width$}", pad, chart_title, width = chart_width);
+    println!("{}{}", pad, "=".repeat(chart_width));
 
     // Daily header - sum all lines for daily totals
     print_daily_header(&layout, &|data_idx| {
         lines.iter().enumerate().map(|(i, _)| line_values[&i][data_idx]).sum::<f64>()
-    });
+    }, &pad);
 
-    render_grid(&layout, height, max_value, min_value, &lines, &line_values, false);
+    render_grid(&layout, height, max_value, min_value, &lines, &line_values, false, &pad);
 
     if show_x_axis {
-        print_x_axis_labels(&layout, interval_minutes);
+        print_x_axis_labels(&layout, interval_minutes, &pad);
     }
 
     if show_legend {
         let legend_parts: Vec<String> = lines.iter()
             .map(|l| format!("{}\u{2500}{} {}", l.color, RESET_COLOR, l.label))
             .collect();
-        println!("Legend: {}", legend_parts.join("  "));
+        println!("{}Legend: {}", pad, legend_parts.join("  "));
     }
 }
 
@@ -723,6 +728,7 @@ pub fn print_vendor_comparison_chart(
     target_width: Option<usize>,
     interval_minutes: i64,
     show_legend: bool,
+    terminal_width: Option<usize>,
 ) {
     if time_series.is_empty() {
         println!("No time series data available.");
@@ -814,19 +820,21 @@ pub fn print_vendor_comparison_chart(
     }).collect();
 
     let chart_title = "Total Token Consumption by Vendor";
-    let total_width = layout.columns.len() + 7;
+    let chart_width = layout.columns.len() + 7;
+    let tw = terminal_width.unwrap_or(chart_width);
+    let pad = center_pad(tw, chart_width);
     println!();
-    println!("{:^width$}", chart_title, width = total_width);
-    println!("{}", "=".repeat(total_width));
+    println!("{}{:^width$}", pad, chart_title, width = chart_width);
+    println!("{}{}", pad, "=".repeat(chart_width));
 
     // Daily header using "All" totals
     print_daily_header(&layout, &|data_idx| {
         vendor_data["All"][data_idx]
-    });
+    }, &pad);
 
-    render_grid(&layout, height, max_value, min_value, &lines, &line_values, true);
+    render_grid(&layout, height, max_value, min_value, &lines, &line_values, true, &pad);
 
-    print_x_axis_labels(&layout, interval_minutes);
+    print_x_axis_labels(&layout, interval_minutes, &pad);
 
     if show_legend {
         // Calculate vendor totals and percentages
@@ -848,6 +856,6 @@ pub fn print_vendor_comparison_chart(
         }
         let all_color = vendor_color("All");
         legend_items.push(format!("{}\u{2501}{} All(100%)", all_color, RESET_COLOR));
-        println!("Legend: {}", legend_items.join("  "));
+        println!("{}Legend: {}", pad, legend_items.join("  "));
     }
 }

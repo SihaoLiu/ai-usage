@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
 
 /// Parse an ISO timestamp string to a local DateTime.
 /// Handles formats like "2025-12-11T23:18:08.351Z" and "2025-12-11T23:18:08+00:00".
@@ -28,19 +28,75 @@ pub fn parse_timestamp(timestamp_str: &str) -> Option<DateTime<Local>> {
 }
 
 /// Round a DateTime down to the nearest interval boundary.
+/// DST-safe: uses `from_local_datetime` to handle spring-forward gaps.
 pub fn to_interval(dt: &DateTime<Local>, interval_minutes: i64) -> DateTime<Local> {
     let total_minutes = (dt.hour() as i64) * 60 + (dt.minute() as i64);
     let interval_start = (total_minutes / interval_minutes) * interval_minutes;
     let hour = (interval_start / 60) as u32;
     let minute = (interval_start % 60) as u32;
-    dt.with_hour(hour)
-        .unwrap()
-        .with_minute(minute)
-        .unwrap()
-        .with_second(0)
-        .unwrap()
-        .with_nanosecond(0)
-        .unwrap()
+
+    let target_naive = dt.date_naive().and_hms_opt(hour, minute, 0).unwrap();
+    match Local.from_local_datetime(&target_naive) {
+        chrono::LocalResult::Single(d) => d,
+        chrono::LocalResult::Ambiguous(d, _) => d,
+        chrono::LocalResult::None => {
+            // DST gap: the target wall-clock time doesn't exist.
+            // Advance to the next interval boundary that does exist.
+            let next_start = interval_start + interval_minutes;
+            if next_start < 1440 {
+                let nh = (next_start / 60) as u32;
+                let nm = (next_start % 60) as u32;
+                let next_naive = dt.date_naive().and_hms_opt(nh, nm, 0).unwrap();
+                match Local.from_local_datetime(&next_naive) {
+                    chrono::LocalResult::Single(d) | chrono::LocalResult::Ambiguous(d, _) => d,
+                    _ => dt.with_second(0).unwrap().with_nanosecond(0).unwrap(),
+                }
+            } else {
+                dt.with_second(0).unwrap().with_nanosecond(0).unwrap()
+            }
+        }
+    }
+}
+
+/// Round a start_time down to its interval boundary, handling DST gaps.
+pub fn round_to_interval_start(dt: &DateTime<Local>, interval_minutes: i64) -> DateTime<Local> {
+    to_interval(dt, interval_minutes)
+}
+
+/// Generate all wall-clock-aligned interval times between `start` (inclusive) and
+/// `end` (inclusive). Skips times that fall in DST gaps.
+pub fn generate_interval_times(
+    start: &DateTime<Local>,
+    end: &DateTime<Local>,
+    interval_minutes: i64,
+) -> Vec<DateTime<Local>> {
+    let start_date = start.date_naive();
+    let end_date = end.date_naive();
+    let intervals_per_day = 1440 / interval_minutes;
+
+    let mut times = Vec::new();
+    let mut d = start_date;
+    while d <= end_date {
+        for i in 0..intervals_per_day {
+            let minutes = i * interval_minutes;
+            let hour = (minutes / 60) as u32;
+            let minute = (minutes % 60) as u32;
+            let naive = d.and_hms_opt(hour, minute, 0).unwrap();
+            match Local.from_local_datetime(&naive) {
+                chrono::LocalResult::Single(local_dt)
+                | chrono::LocalResult::Ambiguous(local_dt, _) => {
+                    if local_dt >= *start && local_dt <= *end {
+                        times.push(local_dt);
+                    }
+                }
+                chrono::LocalResult::None => {
+                    // DST gap: skip
+                }
+            }
+        }
+        d = d.succ_opt().unwrap_or(d);
+    }
+    times
 }
 
 /// Token breakdown for distribution across intervals.
@@ -71,12 +127,7 @@ pub fn distribute_tokens_to_intervals(
     let start_interval = to_interval(&start_local, interval_minutes);
     let end_interval = to_interval(&end_local, interval_minutes);
 
-    let mut intervals = Vec::new();
-    let mut current = start_interval;
-    while current <= end_interval {
-        intervals.push(current);
-        current = current + Duration::minutes(interval_minutes);
-    }
+    let intervals = generate_interval_times(&start_interval, &end_interval, interval_minutes);
 
     if intervals.is_empty() {
         return Vec::new();

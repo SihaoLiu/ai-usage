@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
-use chrono::{Duration, Local, Timelike};
+use chrono::{Duration, Local};
 use clap::Parser;
 use crossterm::terminal;
 
@@ -503,20 +503,11 @@ fn get_chart_target_width() -> usize {
 fn print_time_span_info(days: i64, interval_minutes: i64, terminal_width: u16, left_pad: &str) {
     let now = Local::now();
     let start_time = now - Duration::days(days);
-    let total_minutes = start_time.hour() as i64 * 60 + start_time.minute() as i64;
-    let interval_start = (total_minutes / interval_minutes) * interval_minutes;
-    let start_rounded = start_time
-        .with_hour((interval_start / 60) as u32).unwrap()
-        .with_minute((interval_start % 60) as u32).unwrap()
-        .with_second(0).unwrap()
-        .with_nanosecond(0).unwrap();
+    let start_rounded = time_utils::round_to_interval_start(&start_time, interval_minutes);
 
-    let mut data_points = 0;
-    let mut current = start_rounded;
-    while current <= now {
-        data_points += 1;
-        current = current + Duration::minutes(interval_minutes);
-    }
+    let data_points = time_utils::generate_interval_times(
+        &start_rounded, &now, interval_minutes,
+    ).len();
 
     let interval_str = if interval_minutes >= 60 {
         if interval_minutes % 60 == 0 {

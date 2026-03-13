@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
+use crate::time_utils::{round_to_interval_start, generate_interval_times};
 
 use crate::formatting::{format_y_axis_value, format_total_value, center_pad};
 use crate::stats::{ModelTimeSeries, VendorTimeSeries};
@@ -141,21 +142,9 @@ fn build_chart_layout(
 ) -> ChartLayout {
     let now = Local::now();
     let start_time = now - Duration::days(days_back);
+    let start_rounded = round_to_interval_start(&start_time, interval_minutes);
 
-    let total_minutes = start_time.hour() as i64 * 60 + start_time.minute() as i64;
-    let interval_start = (total_minutes / interval_minutes) * interval_minutes;
-    let start_rounded = start_time
-        .with_hour((interval_start / 60) as u32).unwrap()
-        .with_minute((interval_start % 60) as u32).unwrap()
-        .with_second(0).unwrap()
-        .with_nanosecond(0).unwrap();
-
-    let mut sorted_times = Vec::new();
-    let mut current = start_rounded;
-    while current <= now {
-        sorted_times.push(current);
-        current = current + Duration::minutes(interval_minutes);
-    }
+    let mut sorted_times = generate_interval_times(&start_rounded, &now, interval_minutes);
 
     if sorted_times.len() > 500 {
         let step = sorted_times.len() / 500;

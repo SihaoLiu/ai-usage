@@ -1,7 +1,7 @@
 {
   "_meta": {
     "description": "API pricing and subscription costs for AI services",
-    "last_updated": "2026-03-05",
+    "last_updated": "2026-03-22",
     "notes": "All prices are per million tokens (MTok) at standard API rates. Update this file when pricing changes."
   },
   "claude": {
@@ -59,6 +59,18 @@
         "cache_input": 0.25,
         "cache_output": 0.0,
         "_comment": "No official API pricing yet, estimated same as gpt-5.4"
+      },
+      "gpt-5.4-mini": {
+        "input": 0.75,
+        "output": 4.50,
+        "cache_input": 0.075,
+        "cache_output": 0.0
+      },
+      "gpt-5.4-nano": {
+        "input": 0.20,
+        "output": 1.25,
+        "cache_input": 0.02,
+        "cache_output": 0.0
       },
       "gpt-5.3-codex": {
         "input": 1.75,
@@ -198,6 +210,12 @@
         "cache_input": 0.20,
         "cache_output": 0.0,
         "_comment": "Same pricing as Gemini 3 Pro, ≤200K tokens tier"
+      },
+      "gemini-3.1-flash-lite-preview": {
+        "input": 0.25,
+        "output": 1.50,
+        "cache_input": 0.025,
+        "cache_output": 0.0
       },
       "gemini-3-pro-preview": {
         "input": 2.00,

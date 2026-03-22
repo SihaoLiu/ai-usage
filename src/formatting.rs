@@ -22,6 +22,8 @@ fn codex_short_model_names() -> HashMap<&'static str, &'static str> {
     HashMap::from([
         ("gpt-5.4", "GPT-5.4"),
         ("gpt-5.4-codex", "GPT-5.4 Cdx"),
+        ("gpt-5.4-mini", "GPT-5.4 Mini"),
+        ("gpt-5.4-nano", "GPT-5.4 Nano"),
         ("gpt-5.3-codex", "GPT-5.3 Cdx"),
         ("gpt-5.3-codex-spark", "GPT-5.3 Sprk"),
         ("gpt-5.2-codex", "GPT-5.2 Cdx"),
@@ -49,6 +51,7 @@ fn codex_short_model_names() -> HashMap<&'static str, &'static str> {
 fn gemini_short_model_names() -> HashMap<&'static str, &'static str> {
     HashMap::from([
         ("gemini-3.1-pro-preview", "Gem 3.1 Pro"),
+        ("gemini-3.1-flash-lite-preview", "Gem 3.1 Lt"),
         ("gemini-3-pro-preview", "Gem 3 Pro"),
         ("gemini-3-pro-image-preview", "Gem 3 Img"),
         ("gemini-3-flash-preview", "Gem 3 Fl"),

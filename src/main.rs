@@ -312,18 +312,10 @@ fn calculate_weighted_cost_per_mtok(
     pricing: &AllPricing,
     subscription_fees: &SubscriptionFees,
 ) -> (f64, f64) {
-    // Per-vendor: (total_tokens, api_cost)
-    // Match Python: Gemini weighted cost uses sessions dir (not tmp)
-    let gemini_sessions_exist = get_gemini_dir().join("sessions").exists();
-    let gemini_entries: &[UsageEntry] = if gemini_sessions_exist {
-        &all_data.gemini
-    } else {
-        &[]
-    };
     let vendor_configs: &[(&str, &[UsageEntry], f64)] = &[
         ("claude", &all_data.claude, subscription_fees.claude),
         ("codex", &all_data.codex, subscription_fees.codex),
-        ("gemini", gemini_entries, subscription_fees.gemini),
+        ("gemini", &all_data.gemini, subscription_fees.gemini),
     ];
 
     let mut vendor_data: Vec<(i64, f64, f64)> = Vec::new(); // (tokens, api_cost, sub_price)
@@ -338,6 +330,9 @@ fn calculate_weighted_cost_per_mtok(
         let mut total_tokens: i64 = 0;
 
         for entry in entries {
+            if entry.model.contains("<synthetic>") {
+                continue;
+            }
             let model = &entry.model;
             let e = model_stats.entry(model.clone()).or_insert((0, 0, 0, 0));
             e.0 += entry.usage.input_tokens;

@@ -234,14 +234,16 @@ pub fn format_total_value(value: f64) -> String {
     format_number_compact(value as i64)
 }
 
-/// Format cost per MTok with appropriate precision.
+/// Format cost per MTok with appropriate precision (at least 2 significant figures).
 pub fn format_cost_per_mtok(value: f64) -> String {
-    if value >= 0.01 {
-        format!("${:.2}", value)
-    } else if value <= 0.0 {
+    if value <= 0.0 {
         "$0.00".to_string()
+    } else if value >= 0.1 {
+        format!("${:.2}", value)
     } else {
-        let decimal_places = (-value.log10()).ceil() as usize;
+        // For small values, ensure at least 2 significant digits
+        let leading_zeros = (-value.log10()).ceil() as usize;
+        let decimal_places = leading_zeros + 1;
         format!("${:.prec$}", value, prec = decimal_places)
     }
 }
@@ -383,9 +385,16 @@ pub fn print_model_breakdown(
         sum_total_with_cache += cache_hit + prefill + decoding;
     }
 
+    // Filter rows for display (1% message threshold), but keep all data for sums
+    let threshold = (sum_messages as f64 * 0.01) as i64;
+    let display_stats: Vec<&ModelBreakdownRow> = model_stats
+        .iter()
+        .filter(|r| r.count >= threshold)
+        .collect();
+
     // Determine display mode
     let mode = match (terminal_width, terminal_height) {
-        (Some(w), Some(h)) => get_table_display_mode(w, h, model_stats.len()),
+        (Some(w), Some(h)) => get_table_display_mode(w, h, display_stats.len()),
         _ => "full",
     };
 
@@ -393,7 +402,7 @@ pub fn print_model_breakdown(
         return false;
     }
 
-    // Calculate costs per-row, applying vendor-specific cost strategy per model
+    // Calculate costs from ALL rows (not just displayed ones)
     let mut cache_hit_cost: f64 = 0.0;
     let mut prefill_cost: f64 = 0.0;
     let mut decoding_cost: f64 = 0.0;
@@ -435,25 +444,25 @@ pub fn print_model_breakdown(
 
     let tw = terminal_width.unwrap_or(200) as usize;
 
-    // Print table based on mode
+    // Print table based on mode (display rows only, sums include all data)
     match mode {
         "full" => print_table_full(
-            model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
+            &display_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
             sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
             decoding_cost, vendor, show_vendor_prefix, tw,
         ),
         "medium" => print_table_medium(
-            model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
+            &display_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
             sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
             decoding_cost, vendor, show_vendor_prefix, tw,
         ),
         "compact" => print_table_compact(
-            model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
+            &display_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
             sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
             decoding_cost, vendor, show_vendor_prefix, tw,
         ),
         "minimal" => print_table_minimal(
-            model_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
+            &display_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
             sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
             decoding_cost, vendor, show_vendor_prefix, tw,
         ),
@@ -516,7 +525,7 @@ pub fn center_pad(terminal_width: usize, content_width: usize) -> String {
 }
 
 fn print_table_full(
-    model_stats: &[ModelBreakdownRow],
+    model_stats: &[&ModelBreakdownRow],
     sum_messages: i64,
     sum_cache_hit: i64,
     sum_prefill: i64,
@@ -593,7 +602,7 @@ fn print_table_full(
 }
 
 fn print_table_medium(
-    model_stats: &[ModelBreakdownRow],
+    model_stats: &[&ModelBreakdownRow],
     sum_messages: i64,
     sum_cache_hit: i64,
     sum_prefill: i64,
@@ -678,7 +687,7 @@ fn print_table_medium(
 }
 
 fn print_table_compact(
-    model_stats: &[ModelBreakdownRow],
+    model_stats: &[&ModelBreakdownRow],
     sum_messages: i64,
     sum_cache_hit: i64,
     sum_prefill: i64,
@@ -763,7 +772,7 @@ fn print_table_compact(
 }
 
 fn print_table_minimal(
-    model_stats: &[ModelBreakdownRow],
+    model_stats: &[&ModelBreakdownRow],
     sum_messages: i64,
     sum_cache_hit: i64,
     sum_prefill: i64,

@@ -6,6 +6,7 @@ use crate::stats::ModelBreakdownRow;
 // Short model name mappings for Claude
 fn claude_short_model_names() -> HashMap<&'static str, &'static str> {
     HashMap::from([
+        ("claude-opus-4-7", "Opus 4.7"),
         ("claude-opus-4-6", "Opus 4.6"),
         ("claude-opus-4-5-20251101", "Opus 4.5"),
         ("claude-opus-4-1-20250805", "Opus 4.1"),

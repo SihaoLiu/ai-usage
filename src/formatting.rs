@@ -206,7 +206,16 @@ pub fn format_number_compact(value: i64) -> String {
 
 /// Format Y-axis value to always be 5 characters with K/M units.
 pub fn format_y_axis_value(value: f64) -> String {
-    if value >= 1_000_000.0 {
+    if value >= 1_000_000_000.0 {
+        let val_b = value / 1_000_000_000.0;
+        if val_b >= 100.0 {
+            format!("{:3} B", val_b as i64)
+        } else if val_b >= 10.0 {
+            format!(" {:2} B", val_b as i64)
+        } else {
+            format!("{:3.1} B", val_b)
+        }
+    } else if value >= 1_000_000.0 {
         let val_m = value / 1_000_000.0;
         if val_m >= 100.0 {
             format!("{:3} M", val_m as i64)

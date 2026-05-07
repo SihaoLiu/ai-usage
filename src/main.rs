@@ -826,6 +826,14 @@ fn main() {
             println!("\n\r{}\r", version);
             println!("\r{}\r", "-".repeat(width as usize));
             print!("\r> ");
+            // Render dimmed watermark as placeholder, then move cursor back so the
+            // first keystroke lands right after "> ". The watermark is wiped via
+            // \x1b[K when the user starts typing (see Char handler below). Skip the
+            // watermark if it would not fit on the prompt line and wrap awkwardly.
+            let (mark, mark_visible) = formatting::prompt_watermark();
+            if (width as usize) >= 2 + mark_visible {
+                print!("{}\x1b[{}D", mark, mark_visible);
+            }
             io::stdout().flush().unwrap();
         };
 
@@ -1100,12 +1108,25 @@ fn main() {
                             if !input_buf.is_empty() {
                                 input_buf.pop();
                                 print!("\x08 \x08");
+                                if input_buf.is_empty() {
+                                    // Restore the placeholder watermark, unless the
+                                    // terminal is too narrow to fit it after "> ".
+                                    let (mark, mark_visible) = formatting::prompt_watermark();
+                                    let (w, _) = get_terminal_size();
+                                    if (w as usize) >= 2 + mark_visible {
+                                        print!("{}\x1b[{}D", mark, mark_visible);
+                                    }
+                                }
                                 io::stdout().flush().unwrap();
                             }
                         }
                         Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers, .. })
                             if !modifiers.contains(KeyModifiers::CONTROL) =>
                         {
+                            if input_buf.is_empty() {
+                                // First keystroke: wipe the watermark from cursor to EOL.
+                                print!("\x1b[K");
+                            }
                             input_buf.push(c);
                             print!("{}", c);
                             io::stdout().flush().unwrap();

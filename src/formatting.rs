@@ -263,7 +263,18 @@ pub fn format_cost_per_mtok(value: f64) -> String {
 // ROW_PCT_COLOR: token type's share within a single model/row (row direction, marked with ←).
 const COL_PCT_COLOR: &str = "\x1b[36m"; // cyan
 const ROW_PCT_COLOR: &str = "\x1b[33m"; // yellow
+const WATERMARK_COLOR: &str = "\x1b[38;5;240m"; // muted gray for background watermark
 const COLOR_RESET: &str = "\x1b[0m";
+
+/// Watermark text shown as a dimmed placeholder in the monitor-mode prompt.
+/// Returns `(colored_string, visible_width)`. The visible width is needed by
+/// callers so they can move the cursor back over the watermark after rendering it.
+pub fn prompt_watermark() -> (String, usize) {
+    let text = format!("ai-usage by SihaoLiu, v{}", env!("CARGO_PKG_VERSION"));
+    let visible = text.chars().count();
+    let colored = format!("{}{}{}", WATERMARK_COLOR, text, COLOR_RESET);
+    (colored, visible)
+}
 
 fn pad_left(visible_len: usize, width: usize) -> String {
     if visible_len < width {

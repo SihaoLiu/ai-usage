@@ -258,34 +258,124 @@ pub fn format_cost_per_mtok(value: f64) -> String {
     }
 }
 
-fn format_with_pct(value: i64, total: i64, width: usize) -> String {
+// ANSI color codes for percentage breakdown.
+// COL_PCT_COLOR: model's share among models for one token type (column direction, marked with ↑).
+// ROW_PCT_COLOR: token type's share within a single model/row (row direction, marked with ←).
+const COL_PCT_COLOR: &str = "\x1b[36m"; // cyan
+const ROW_PCT_COLOR: &str = "\x1b[33m"; // yellow
+const COLOR_RESET: &str = "\x1b[0m";
+
+fn pad_left(visible_len: usize, width: usize) -> String {
+    if visible_len < width {
+        " ".repeat(width - visible_len)
+    } else {
+        String::new()
+    }
+}
+
+/// Single column-percentage cell with cyan ↑ arrow (used for Messages column).
+fn format_with_col_pct(value: i64, total: i64, width: usize) -> String {
     let pct = if total > 0 {
         value as f64 / total as f64 * 100.0
     } else {
         0.0
     };
-    let s = format!("{}({:4.1}%)", format_number(value), pct);
-    format!("{:>width$}", s, width = width)
+    let value_str = format_number(value);
+    let pct_str = format!("{:.0}%", pct);
+    // Visible: value + "(" + "↑" + pct + ")"
+    let visible = value_str.chars().count() + pct_str.chars().count() + 3;
+    let pad = pad_left(visible, width);
+    format!(
+        "{pad}{val}(\u{2191}{cc}{pct}{rst})",
+        pad = pad,
+        val = value_str,
+        cc = COL_PCT_COLOR,
+        pct = pct_str,
+        rst = COLOR_RESET,
+    )
 }
 
-fn format_with_100pct_up(value: i64, width: usize) -> String {
-    let s = format!("{}(\u{2191}100%)", format_number(value));
-    format!("{:>width$}", s, width = width)
-}
-
-fn format_with_100pct_left(value: f64, width: usize) -> String {
-    let s = format!("${:.2}(\u{2190}100%)", value);
-    format!("{:>width$}", s, width = width)
-}
-
-fn format_cost_with_pct(cost: f64, total: f64, width: usize) -> String {
-    let pct = if total > 0.0 {
-        cost / total * 100.0
+/// Token cell with both column-% (↑ cyan, model share among models) and row-% (← yellow,
+/// token type share within this row). When `compact` is true, the value is shown in
+/// K/M/B form so dual-percent cells fit in tighter terminal widths without misaligning.
+fn format_with_dual_pct(
+    value: i64,
+    col_total: i64,
+    row_total: i64,
+    width: usize,
+    compact: bool,
+) -> String {
+    let col_pct = if col_total > 0 {
+        value as f64 / col_total as f64 * 100.0
     } else {
         0.0
     };
-    let s = format!("${:.2}({:4.1}%)", cost, pct);
-    format!("{:>width$}", s, width = width)
+    let row_pct = if row_total > 0 {
+        value as f64 / row_total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let value_str = if compact {
+        format_number_compact(value)
+    } else {
+        format_number(value)
+    };
+    let col_str = format!("{:.0}%", col_pct);
+    let row_str = format!("{:.0}%", row_pct);
+    // Visible: value + "(" + "↑" + col + "·" + "←" + row + ")" -> 5 fixed chars
+    let visible =
+        value_str.chars().count() + col_str.chars().count() + row_str.chars().count() + 5;
+    let pad = pad_left(visible, width);
+    format!(
+        "{pad}{val}(\u{2191}{cc}{col}{rst}\u{00B7}\u{2190}{rc}{row}{rst})",
+        pad = pad,
+        val = value_str,
+        cc = COL_PCT_COLOR,
+        col = col_str,
+        rst = COLOR_RESET,
+        rc = ROW_PCT_COLOR,
+        row = row_str,
+    )
+}
+
+/// Cost cell with row-percentage (← yellow). Cost row has only one row, so column-%
+/// would always be 100% and is omitted.
+fn format_cost_with_row_pct(cost: f64, row_total: f64, width: usize) -> String {
+    let row_pct = if row_total > 0.0 {
+        cost / row_total * 100.0
+    } else {
+        0.0
+    };
+    let cost_str = format!("${:.2}", cost);
+    let row_str = format!("{:.0}%", row_pct);
+    // Visible: cost + "(" + "←" + row + ")" -> 3 fixed chars
+    let visible = cost_str.chars().count() + row_str.chars().count() + 3;
+    let pad = pad_left(visible, width);
+    format!(
+        "{pad}{cost}(\u{2190}{rc}{row}{rst})",
+        pad = pad,
+        cost = cost_str,
+        rc = ROW_PCT_COLOR,
+        row = row_str,
+        rst = COLOR_RESET,
+    )
+}
+
+/// Centered legend line explaining the dual-percentage color coding.
+fn dual_pct_legend(table_width: usize) -> String {
+    let visible = "Legend:  \u{2191} % across models   \u{00B7}   \u{2190} % within model".chars().count();
+    let lpad = if visible < table_width {
+        " ".repeat((table_width - visible) / 2)
+    } else {
+        String::new()
+    };
+    format!(
+        "{lpad}Legend:  {cc}\u{2191} % across models{rst}   \u{00B7}   {rc}\u{2190} % within model{rst}",
+        lpad = lpad,
+        cc = COL_PCT_COLOR,
+        rst = COLOR_RESET,
+        rc = ROW_PCT_COLOR,
+    )
 }
 
 /// Determine table display mode based on terminal dimensions.
@@ -314,7 +404,7 @@ pub fn get_table_display_mode(
 /// Get the table width for a given display mode.
 pub fn get_table_width(mode: &str) -> usize {
     match mode {
-        "full" => 152,
+        "full" => 168,
         "medium" => 128,
         "compact" => 62,
         "minimal" => 53,
@@ -500,7 +590,7 @@ pub fn print_model_breakdown(
     };
 
     let table_width = match mode {
-        "full" => 152,
+        "full" => 168,
         "medium" => 128,
         "compact" => 62,
         _ => 53, // minimal
@@ -549,15 +639,21 @@ fn print_table_full(
     show_vendor_prefix: bool,
     terminal_width: usize,
 ) {
-    let table_width = 152;
+    let w_model = 35;
+    let w_msgs = 18;
+    let w_cache = 26;
+    // 2 ('| ') + w_model + 1 (' ') + w_msgs + 3 (' | ') + 4 * w_cache + 3 (3 spaces) + 2 (' |')
+    let table_width = 2 + w_model + 1 + w_msgs + 3 + 4 * w_cache + 3 + 2;
     let p = center_pad(terminal_width, table_width);
     println!();
     println!("{}{:^width$}", p, "Usage / Cost by Model", width = table_width);
     println!("{}{}", p, "=".repeat(table_width));
+    println!("{}{}", p, dual_pct_legend(table_width));
 
     println!(
-        "{}| {:<35} {:>18} | {:>22} {:>22} {:>22} {:>22} |",
-        p, "Model", "Messages", "Cache Hit", "Prefill", "Decoding", "Total"
+        "{}| {:<wm$} {:>wn$} | {:>wc$} {:>wc$} {:>wc$} {:>wc$} |",
+        p, "Model", "Messages", "Cache Hit", "Prefill", "Decoding", "Total",
+        wm = w_model, wn = w_msgs, wc = w_cache,
     );
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
@@ -571,42 +667,46 @@ fn print_table_full(
                 false,
                 6,
             ),
-            35,
+            w_model,
         );
         let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
+        let row_total = cache_hit + prefill + decoding;
         println!(
-            "{}| {:<35} {} | {} {} {} {} |",
+            "{}| {:<wm$} {} | {} {} {} {} |",
             p,
             model_name,
-            format_with_pct(stats.count, sum_messages, 18),
-            format_with_pct(cache_hit, sum_cache_hit, 22),
-            format_with_pct(prefill, sum_prefill, 22),
-            format_with_pct(decoding, sum_decoding, 22),
-            format_with_pct(cache_hit + prefill + decoding, sum_total_with_cache, 22),
+            format_with_col_pct(stats.count, sum_messages, w_msgs),
+            format_with_dual_pct(cache_hit, sum_cache_hit, row_total, w_cache, false),
+            format_with_dual_pct(prefill, sum_prefill, row_total, w_cache, false),
+            format_with_dual_pct(decoding, sum_decoding, row_total, w_cache, false),
+            format_with_dual_pct(row_total, sum_total_with_cache, row_total, w_cache, false),
+            wm = w_model,
         );
     }
 
     println!("{}|{}|", p, "-".repeat(table_width - 2));
     println!(
-        "{}| {:<35} {} | {} {} {} {} |",
+        "{}| {:<wm$} {} | {} {} {} {} |",
         p,
         "TOTAL",
-        format_with_100pct_up(sum_messages, 18),
-        format_with_100pct_up(sum_cache_hit, 22),
-        format_with_100pct_up(sum_prefill, 22),
-        format_with_100pct_up(sum_decoding, 22),
-        format_with_100pct_up(sum_total_with_cache, 22),
+        format_with_col_pct(sum_messages, sum_messages, w_msgs),
+        format_with_dual_pct(sum_cache_hit, sum_cache_hit, sum_total_with_cache, w_cache, false),
+        format_with_dual_pct(sum_prefill, sum_prefill, sum_total_with_cache, w_cache, false),
+        format_with_dual_pct(sum_decoding, sum_decoding, sum_total_with_cache, w_cache, false),
+        format_with_dual_pct(sum_total_with_cache, sum_total_with_cache, sum_total_with_cache, w_cache, false),
+        wm = w_model,
     );
 
     println!(
-        "{}| {:<35} {:>18} | {} {} {} {} |",
+        "{}| {:<wm$} {:>wn$} | {} {} {} {} |",
         p,
         "Cost(API)",
         "",
-        format_cost_with_pct(cache_hit_cost, total_cost, 22),
-        format_cost_with_pct(prefill_cost, total_cost, 22),
-        format_cost_with_pct(decoding_cost, total_cost, 22),
-        format_with_100pct_left(total_cost, 22),
+        format_cost_with_row_pct(cache_hit_cost, total_cost, w_cache),
+        format_cost_with_row_pct(prefill_cost, total_cost, w_cache),
+        format_cost_with_row_pct(decoding_cost, total_cost, w_cache),
+        format_cost_with_row_pct(total_cost, total_cost, w_cache),
+        wm = w_model, wn = w_msgs,
     );
     println!("{}{}", p, "=".repeat(table_width));
 }
@@ -635,6 +735,7 @@ fn print_table_medium(
     println!();
     println!("{}{:^width$}", p, "Usage / Cost by Model", width = table_width);
     println!("{}{}", p, "=".repeat(table_width));
+    println!("{}{}", p, dual_pct_legend(table_width));
 
     println!(
         "{}| {:<w_model$} {:>w_msgs$} | {:>w_cache$} {:>w_cache$} {:>w_cache$} {:>w_cache$} |",
@@ -656,15 +757,16 @@ fn print_table_medium(
             w_model,
         );
         let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
+        let row_total = cache_hit + prefill + decoding;
         println!(
             "{}| {:<w_model$} {} | {} {} {} {} |",
             p,
             model_name,
-            format_with_pct(stats.count, sum_messages, w_msgs),
-            format_with_pct(cache_hit, sum_cache_hit, w_cache),
-            format_with_pct(prefill, sum_prefill, w_cache),
-            format_with_pct(decoding, sum_decoding, w_cache),
-            format_with_pct(cache_hit + prefill + decoding, sum_total_with_cache, w_cache),
+            format_with_col_pct(stats.count, sum_messages, w_msgs),
+            format_with_dual_pct(cache_hit, sum_cache_hit, row_total, w_cache, true),
+            format_with_dual_pct(prefill, sum_prefill, row_total, w_cache, true),
+            format_with_dual_pct(decoding, sum_decoding, row_total, w_cache, true),
+            format_with_dual_pct(row_total, sum_total_with_cache, row_total, w_cache, true),
             w_model = w_model,
         );
     }
@@ -674,11 +776,11 @@ fn print_table_medium(
         "{}| {:<w_model$} {} | {} {} {} {} |",
         p,
         "TOTAL",
-        format_with_100pct_up(sum_messages, w_msgs),
-        format_with_100pct_up(sum_cache_hit, w_cache),
-        format_with_100pct_up(sum_prefill, w_cache),
-        format_with_100pct_up(sum_decoding, w_cache),
-        format_with_100pct_up(sum_total_with_cache, w_cache),
+        format_with_col_pct(sum_messages, sum_messages, w_msgs),
+        format_with_dual_pct(sum_cache_hit, sum_cache_hit, sum_total_with_cache, w_cache, true),
+        format_with_dual_pct(sum_prefill, sum_prefill, sum_total_with_cache, w_cache, true),
+        format_with_dual_pct(sum_decoding, sum_decoding, sum_total_with_cache, w_cache, true),
+        format_with_dual_pct(sum_total_with_cache, sum_total_with_cache, sum_total_with_cache, w_cache, true),
         w_model = w_model,
     );
 
@@ -687,10 +789,10 @@ fn print_table_medium(
         p,
         "Cost(API)",
         "",
-        format_cost_with_pct(cache_hit_cost, total_cost, w_cache),
-        format_cost_with_pct(prefill_cost, total_cost, w_cache),
-        format_cost_with_pct(decoding_cost, total_cost, w_cache),
-        format_with_100pct_left(total_cost, w_cache),
+        format_cost_with_row_pct(cache_hit_cost, total_cost, w_cache),
+        format_cost_with_row_pct(prefill_cost, total_cost, w_cache),
+        format_cost_with_row_pct(decoding_cost, total_cost, w_cache),
+        format_cost_with_row_pct(total_cost, total_cost, w_cache),
         w_model = w_model, w_msgs = w_msgs,
     );
     println!("{}{}", p, "=".repeat(table_width));

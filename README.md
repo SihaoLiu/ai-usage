@@ -32,7 +32,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 ## Quick Start
 
 ```bash
-# All vendors, last 7 days (monitor mode)
+# All vendors, last 3 days (monitor mode)
 vibe-usage
 
 # Single snapshot, then exit

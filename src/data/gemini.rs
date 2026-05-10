@@ -78,7 +78,6 @@ fn read_single_gemini_file(path: &Path) -> Vec<UsageEntry> {
             session_end_time: timestamp,
             model,
             effort: None,
-            vendor: "gemini",
             usage: TokenUsage {
                 input_tokens: non_cached_input,
                 output_tokens,

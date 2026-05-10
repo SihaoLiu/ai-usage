@@ -184,7 +184,6 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                                 session_end_time: ts_owned,
                                 model: current_model.clone(),
                                 effort: Some(current_effort.clone()),
-                                vendor: "codex",
                                 usage: TokenUsage {
                                     input_tokens: non_cached_input,
                                     output_tokens: non_reasoning_output,

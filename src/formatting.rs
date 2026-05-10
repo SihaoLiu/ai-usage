@@ -473,7 +473,7 @@ fn get_strategy_costs(
 /// Returns true if table was printed, false if hidden.
 pub fn print_model_breakdown(
     model_stats: &[ModelBreakdownRow],
-    days_in_data: i64,
+    days_in_data: f64,
     terminal_width: Option<u16>,
     terminal_height: Option<u16>,
     vendor: &str,
@@ -567,16 +567,16 @@ pub fn print_model_breakdown(
     }
 
     // Print cost summary
-    let daily_cost = if days_in_data > 0 {
-        total_cost / days_in_data as f64
+    let daily_cost = if days_in_data > 0.0 {
+        total_cost / days_in_data
     } else {
         0.0
     };
     let weekly_cost = daily_cost * 7.0;
     let monthly_cost = daily_cost * 30.0;
     let savings = monthly_cost - subscription_price;
-    let monthly_tokens = if days_in_data > 0 {
-        (sum_total_with_cache as f64 / days_in_data as f64) * 30.0
+    let monthly_tokens = if days_in_data > 0.0 {
+        (sum_total_with_cache as f64 / days_in_data) * 30.0
     } else {
         0.0
     };

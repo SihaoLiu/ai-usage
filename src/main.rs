@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
-use chrono::{Duration, Local};
+use chrono::{DateTime, Local};
 use clap::Parser;
 use crossterm::terminal;
 
@@ -23,6 +23,7 @@ use data::codex::get_codex_dir;
 use data::gemini::get_gemini_dir;
 use formatting::print_model_breakdown;
 use stats::{ModelBreakdownRow, VendorTimeSeries};
+use time_utils::TimeWindow;
 
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 35;
@@ -35,6 +36,7 @@ struct VersionCacheEntry {
 struct AppState {
     vendor: String,
     days: i64,
+    time_window: TimeWindow,
     monitor_interval: u64,
     pricing: AllPricing,
     subscription_fees: SubscriptionFees,
@@ -156,11 +158,16 @@ fn calculate_chart_height(
     }
 }
 
-fn calculate_optimal_interval_minutes(days_back: i64, target_width: usize) -> f64 {
-    let total_minutes = days_back as f64 * 24.0 * 60.0;
+fn calculate_optimal_interval_minutes(
+    range_start: &DateTime<Local>,
+    range_end: &DateTime<Local>,
+    target_width: usize,
+) -> f64 {
+    let total_minutes = ((*range_end - *range_start).num_seconds() as f64 / 60.0).max(1.0);
     let min_interval = total_minutes / 100.0;
     let y_axis_width = 7.0;
-    let chart_width = (target_width as f64 - y_axis_width - days_back as f64).max(50.0);
+    let span_days = (total_minutes / (24.0 * 60.0)).ceil().max(1.0);
+    let chart_width = (target_width as f64 - y_axis_width - span_days).max(50.0);
     let terminal_interval = total_minutes / chart_width;
     min_interval.max(terminal_interval)
 }
@@ -191,8 +198,7 @@ fn get_vendor_data_dir(vendor: &str) -> Option<PathBuf> {
     }
 }
 
-fn read_vendor_data(vendor: &str, days: i64) -> Vec<UsageEntry> {
-    let max_age = Some(days);
+fn read_vendor_data(vendor: &str, max_age: Option<i64>) -> Vec<UsageEntry> {
     match vendor {
         "claude" => read_all_jsonl_files_dedup(max_age),
         "codex" => {
@@ -214,22 +220,24 @@ struct AllVendorData {
     gemini: Vec<UsageEntry>,
 }
 
-fn load_all_vendor_data(state: &AppState) -> AllVendorData {
-    let claude_raw = read_all_jsonl_files_dedup(Some(state.days));
-    let claude = data::filter_usage_data_by_days(&claude_raw, state.days);
+fn load_all_vendor_data(state: &AppState, now: DateTime<Local>) -> AllVendorData {
+    let max_age = state.time_window.file_scan_days(now);
+
+    let claude_raw = read_all_jsonl_files_dedup(max_age);
+    let claude = data::filter_usage_data_by_window(&claude_raw, &state.time_window, now);
 
     let codex_dir = get_codex_dir().join("sessions");
     let codex = if codex_dir.exists() {
-        let raw = data::codex::read_codex_jsonl_files(&codex_dir, Some(state.days));
-        data::filter_usage_data_by_days(&raw, state.days)
+        let raw = data::codex::read_codex_jsonl_files(&codex_dir, max_age);
+        data::filter_usage_data_by_window(&raw, &state.time_window, now)
     } else {
         Vec::new()
     };
 
     let gemini_dir = get_gemini_dir().join("tmp");
     let gemini = if gemini_dir.exists() {
-        let raw = data::gemini::read_gemini_json_files(&gemini_dir, Some(state.days));
-        data::filter_usage_data_by_days(&raw, state.days)
+        let raw = data::gemini::read_gemini_json_files(&gemini_dir, max_age);
+        data::filter_usage_data_by_window(&raw, &state.time_window, now)
     } else {
         Vec::new()
     };
@@ -321,7 +329,7 @@ fn calculate_all_model_breakdown(
 /// Returns (weighted_cost_per_mtok, total_monthly_savings).
 fn calculate_weighted_cost_per_mtok(
     all_data: &AllVendorData,
-    days: i64,
+    days: f64,
     pricing: &AllPricing,
     subscription_fees: &SubscriptionFees,
 ) -> (f64, f64) {
@@ -396,7 +404,7 @@ fn calculate_weighted_cost_per_mtok(
     }
 
     let grand_total: i64 = vendor_data.iter().map(|(t, _, _)| t).sum();
-    if grand_total == 0 || days <= 0 {
+    if grand_total == 0 || days <= 0.0 {
         return (0.0, 0.0);
     }
 
@@ -405,13 +413,13 @@ fn calculate_weighted_cost_per_mtok(
 
     for (tokens, api_cost, sub_price) in &vendor_data {
         let percentage = *tokens as f64 / grand_total as f64;
-        let monthly_tokens = (*tokens as f64 / days as f64) * 30.0;
+        let monthly_tokens = (*tokens as f64 / days) * 30.0;
         let cost_per_mtok = if monthly_tokens > 0.0 {
             sub_price / (monthly_tokens / 1_000_000.0)
         } else {
             0.0
         };
-        let daily_api_cost = api_cost / days as f64;
+        let daily_api_cost = api_cost / days;
         let monthly_api_cost = daily_api_cost * 30.0;
         let savings = monthly_api_cost - sub_price;
 
@@ -508,13 +516,18 @@ fn get_chart_target_width() -> usize {
     (width as f64 * 0.99) as usize
 }
 
-fn print_time_span_info(days: i64, interval_minutes: i64, terminal_width: u16, left_pad: &str) {
+fn print_time_span_info(
+    range_start: &DateTime<Local>,
+    range_end: &DateTime<Local>,
+    interval_minutes: i64,
+    terminal_width: u16,
+    left_pad: &str,
+) {
     let now = Local::now();
-    let start_time = now - Duration::days(days);
-    let start_rounded = time_utils::round_to_interval_start(&start_time, interval_minutes);
+    let start_rounded = time_utils::round_to_interval_start(range_start, interval_minutes);
 
     let data_points = time_utils::generate_interval_times(
-        &start_rounded, &now, interval_minutes,
+        &start_rounded, range_end, interval_minutes,
     ).len();
 
     let interval_str = if interval_minutes >= 60 {
@@ -528,10 +541,10 @@ fn print_time_span_info(days: i64, interval_minutes: i64, terminal_width: u16, l
     };
 
     let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
-    let start_full = now.format("%Y-%m-%d %H:%M").to_string();
-    let end_full = start_rounded.format("%Y-%m-%d %H:%M").to_string();
-    let start_short = now.format("%m/%d %H:%M").to_string();
-    let end_short = start_rounded.format("%m/%d %H:%M").to_string();
+    let start_full = start_rounded.format("%Y-%m-%d %H:%M").to_string();
+    let end_full = range_end.format("%Y-%m-%d %H:%M").to_string();
+    let start_short = start_rounded.format("%m/%d %H:%M").to_string();
+    let end_short = range_end.format("%m/%d %H:%M").to_string();
     let now_short = now.format("%m/%d %H:%M:%S").to_string();
 
     let full_line = format!(
@@ -551,6 +564,22 @@ fn print_time_span_info(days: i64, interval_minutes: i64, terminal_width: u16, l
     println!();
 }
 
+fn showing_data_line(window: &TimeWindow, now: DateTime<Local>) -> String {
+    format!("Showing data from {}", window.display_label(now))
+}
+
+fn parse_time_window_command(command: &str, current_days: i64) -> Option<Result<TimeWindow, String>> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    match parts.as_slice() {
+        ["date", date] => Some(TimeWindow::from_date(date)),
+        ["date"] => Some(Err("Usage: date YYYY-MM-DD".to_string())),
+        ["range", start, end] => Some(TimeWindow::from_range(start, end)),
+        ["range"] | ["range", _] => Some(Err("Usage: range YYYY-MM-DD YYYY-MM-DD".to_string())),
+        ["latest"] | ["last"] => Some(Ok(TimeWindow::rolling_days(current_days))),
+        _ => None,
+    }
+}
+
 fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let (size_ok, width, height) = check_terminal_size();
     if !size_ok {
@@ -558,19 +587,23 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         return None;
     }
 
+    let now = Local::now();
+    let (range_start, range_end) = state.time_window.bounds(now);
+    let projection_days = state.time_window.projection_days(now);
+    let max_age = state.time_window.file_scan_days(now);
     let vendor = &state.vendor;
 
     // Pre-load data to determine model count for height check
-    let usage_data = read_vendor_data(vendor, state.days);
+    let usage_data = read_vendor_data(vendor, max_age);
     if usage_data.is_empty() {
         if !once { print!("\x1b[2J\x1b[H"); }
         println!("No usage data found.");
         return Some(false);
     }
-    let filtered = data::filter_usage_data_by_days(&usage_data, state.days);
+    let filtered = data::filter_usage_data_by_window(&usage_data, &state.time_window, now);
     if filtered.is_empty() {
         if !once { print!("\x1b[2J\x1b[H"); }
-        println!("No usage data found in the last {} days.", state.days);
+        println!("No usage data found in {}.", state.time_window.display_label(now));
         return Some(false);
     }
     let model_stats = match vendor.as_str() {
@@ -610,7 +643,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     };
 
     println!("Calculating {} usage...", vendor_name);
-    println!("Showing data from last {} days", state.days);
+    println!("{}", showing_data_line(&state.time_window, now));
     if !once {
         println!("Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)", state.monitor_interval);
     }
@@ -619,14 +652,14 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let effective_height = if will_print_table { height } else { 0 };
     print_model_breakdown(
         &model_stats,
-        state.days,
+        projection_days,
         Some(width),
         Some(effective_height),
         vendor,
         &state.subscription_fees,
     );
 
-    let optimal = calculate_optimal_interval_minutes(state.days, target_width);
+    let optimal = calculate_optimal_interval_minutes(&range_start, &range_end, target_width);
     let interval_minutes = round_to_nice_interval(optimal);
 
     let model_ts = match vendor.as_str() {
@@ -643,16 +676,16 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let table_pad = formatting::center_pad(width as usize, table_w);
 
     if !model_ts.is_empty() {
-        print_time_span_info(state.days, interval_minutes, width, &table_pad);
+        print_time_span_info(&range_start, &range_end, interval_minutes, width, &table_pad);
     }
 
     charts::print_multi_line_chart(
-        &model_ts, chart_height, state.days, "io", false,
+        &model_ts, chart_height, &range_start, &range_end, "io", false,
         Some(target_width), interval_minutes, vendor, Some(&included_models), true,
         Some(width as usize),
     );
     charts::print_multi_line_chart(
-        &model_ts, chart_height, state.days, "cache", true,
+        &model_ts, chart_height, &range_start, &range_end, "cache", true,
         Some(target_width), interval_minutes, vendor, Some(&included_models), true,
         Some(width as usize),
     );
@@ -667,15 +700,18 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         return None;
     }
 
+    let now = Local::now();
+    let (range_start, range_end) = state.time_window.bounds(now);
+    let projection_days = state.time_window.projection_days(now);
     let target_width = get_chart_target_width();
-    let optimal = calculate_optimal_interval_minutes(state.days, target_width);
+    let optimal = calculate_optimal_interval_minutes(&range_start, &range_end, target_width);
     let interval_minutes = round_to_nice_interval(optimal);
 
-    let all_data = load_all_vendor_data(state);
+    let all_data = load_all_vendor_data(state, now);
 
     // Compute and cache the weighted cost prompt for show_prompt reuse
     let (weighted_cost, total_savings) = calculate_weighted_cost_per_mtok(
-        &all_data, state.days, &state.pricing, &state.subscription_fees,
+        &all_data, projection_days, &state.pricing, &state.subscription_fees,
     );
     state.all_vendor_prompt = if weighted_cost > 0.0 {
         Some(format!(
@@ -715,7 +751,7 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     }
 
     println!("Calculating usage across all vendors...");
-    println!("Showing data from last {} days", state.days);
+    println!("{}", showing_data_line(&state.time_window, now));
     if !once {
         println!("Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)", state.monitor_interval);
     }
@@ -724,7 +760,7 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         let effective_height = if will_print_table { height } else { 0 };
         print_model_breakdown(
             &all_model_stats,
-            state.days,
+            projection_days,
             Some(width),
             Some(effective_height),
             "all",
@@ -742,12 +778,13 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     } else { 0 };
     let table_pad = formatting::center_pad(width as usize, table_w);
 
-    print_time_span_info(state.days, interval_minutes, width, &table_pad);
+    print_time_span_info(&range_start, &range_end, interval_minutes, width, &table_pad);
 
     charts::print_vendor_comparison_chart(
         &vendor_time_series,
         chart_height,
-        state.days,
+        &range_start,
+        &range_end,
         Some(target_width),
         interval_minutes,
         true,
@@ -783,6 +820,7 @@ fn main() {
     let mut state = AppState {
         vendor: args.vendor.clone(),
         days: args.days,
+        time_window: TimeWindow::rolling_days(args.days),
         monitor_interval: 3600,
         pricing,
         subscription_fees,
@@ -803,8 +841,9 @@ fn main() {
         println!("\n{}", "=".repeat(width as usize));
         println!("Interactive Monitor Mode (type h for help)");
         println!("{}", "=".repeat(width as usize));
-        println!("Auto-refresh: {}s | Vendor: {} | Days: {}",
-                 state.monitor_interval, state.vendor, state.days);
+        println!("Auto-refresh: {}s | Vendor: {} | Window: {}",
+                 state.monitor_interval, state.vendor,
+                 state.time_window.display_label(Local::now()));
         println!("{}\n", "=".repeat(width as usize));
 
         // Helper: disable raw mode, run print_stats, re-enable raw mode.
@@ -976,6 +1015,7 @@ fn main() {
                                 "d" | "day" | "days" => {
                                     if state.days != 1 {
                                         state.days = 1;
+                                        state.time_window = TimeWindow::rolling_days(1);
                                         println!("{}\r", "-".repeat(width as usize));
                                         println!("\n\r{}\r", "=".repeat(width as usize));
                                         println!("CHANGED TO 1 DAY\r");
@@ -990,6 +1030,7 @@ fn main() {
                                 "w" | "week" => {
                                     if state.days != 7 {
                                         state.days = 7;
+                                        state.time_window = TimeWindow::rolling_days(7);
                                         println!("{}\r", "-".repeat(width as usize));
                                         println!("\n\r{}\r", "=".repeat(width as usize));
                                         println!("CHANGED TO 7 DAYS (WEEK MODE)\r");
@@ -1004,6 +1045,7 @@ fn main() {
                                 "m" | "month" => {
                                     if state.days != 30 {
                                         state.days = 30;
+                                        state.time_window = TimeWindow::rolling_days(30);
                                         println!("{}\r", "-".repeat(width as usize));
                                         println!("\n\r{}\r", "=".repeat(width as usize));
                                         println!("CHANGED TO 30 DAYS (MONTH MODE)\r");
@@ -1025,21 +1067,46 @@ fn main() {
                                     println!("  d, day, days [N] - Change days (default: 1 if no N)\r");
                                     println!("  w, week          - Week mode (7 days)\r");
                                     println!("  m, month         - Month mode (30 days)\r");
+                                    println!("  date YYYY-MM-DD  - Show one complete local day\r");
+                                    println!("  range A B        - Show inclusive local date span\r");
+                                    println!("  latest           - Return to rolling days window\r");
                                     println!("  i, interval <N>  - Change refresh interval (seconds)\r");
                                     println!("  h, help          - Show this help\r");
                                     println!("  e, exit          - Exit monitor mode\r");
                                     println!("  Ctrl+C, Ctrl+D   - Exit monitor mode\r");
                                     println!("{}\r", "-".repeat(width as usize));
-                                    println!("Current: vendor={}, days={}, interval={}s\r",
-                                             state.vendor, state.days, state.monitor_interval);
+                                    println!("Current: vendor={}, window={}, interval={}s\r",
+                                             state.vendor,
+                                             state.time_window.display_label(Local::now()),
+                                             state.monitor_interval);
                                 }
                                 "e" | "exit" => {
                                     cleanup_and_break("Exiting monitor mode...");
                                     break 'monitor;
                                 }
                                 _ => {
-                                    let parts: Vec<&str> = command.splitn(2, ' ').collect();
-                                    match parts[0] {
+                                    if let Some(parsed) = parse_time_window_command(&command, state.days) {
+                                        match parsed {
+                                            Ok(window) => {
+                                                state.time_window = window;
+                                                println!("{}\r", "-".repeat(width as usize));
+                                                println!("\n\r{}\r", "=".repeat(width as usize));
+                                                println!(
+                                                    "SET TIME WINDOW: {}\r",
+                                                    state.time_window.display_label(Local::now())
+                                                );
+                                                println!("{}\n\r", "=".repeat(width as usize));
+                                                let result = refresh_display(&mut state);
+                                                terminal_too_small = result.is_none();
+                                                did_refresh = true;
+                                            }
+                                            Err(err) => {
+                                                println!("{}\r", err);
+                                            }
+                                        }
+                                    } else {
+                                        let parts: Vec<&str> = command.splitn(2, ' ').collect();
+                                        match parts[0] {
                                         "v" | "vendor" if parts.len() == 2 => {
                                             let nv = parts[1];
                                             if ["claude", "codex", "gemini", "all"].contains(&nv) {
@@ -1067,6 +1134,7 @@ fn main() {
                                             if let Ok(n) = parts[1].parse::<i64>() {
                                                 if n >= 1 {
                                                     state.days = n;
+                                                    state.time_window = TimeWindow::rolling_days(n);
                                                     println!("{}\r", "-".repeat(width as usize));
                                                     println!("\n\r{}\r", "=".repeat(width as usize));
                                                     println!("CHANGED TO {} DAYS\r", n);
@@ -1105,6 +1173,7 @@ fn main() {
                                         }
                                         _ => {
                                             println!("Unknown command: '{}'. Type h for help.\r", command);
+                                        }
                                         }
                                     }
                                 }
@@ -1163,5 +1232,45 @@ fn main() {
             }
         }
         crossterm::terminal::disable_raw_mode().ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_command_selects_single_inclusive_day() {
+        let command = parse_time_window_command("date 2026-05-07", 3)
+            .expect("recognized command")
+            .expect("valid date");
+        let TimeWindow::ExplicitRange { start, end, projection_days } = command else {
+            panic!("date command should create an explicit window");
+        };
+
+        assert_eq!(start.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-05-07 00:00:00");
+        assert_eq!(end.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-05-07 23:59:59");
+        assert_eq!(projection_days, 1.0);
+    }
+
+    #[test]
+    fn range_command_selects_inclusive_date_span() {
+        let command = parse_time_window_command("range 2026-05-01 2026-05-07", 3)
+            .expect("recognized command")
+            .expect("valid range");
+
+        assert_eq!(command.projection_days(Local::now()), 7.0);
+    }
+
+    #[test]
+    fn latest_command_returns_to_rolling_days() {
+        let command = parse_time_window_command("latest", 5)
+            .expect("recognized command")
+            .expect("valid latest command");
+        let TimeWindow::RollingDays { days } = command else {
+            panic!("latest should create a rolling window");
+        };
+
+        assert_eq!(days, 5);
     }
 }

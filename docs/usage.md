@@ -7,11 +7,11 @@ vibe-usage [OPTIONS]
 
 Options:
   --once              Show stats once and exit (no monitor loop)
-  --days <N>          Number of days to analyze (default: 7)
+  --days <N>          Number of days to analyze (default: 3)
   --vendor <VENDOR>   Filter to a single vendor: claude, codex, or gemini
 ```
 
-Default behavior (no flags) enters monitor mode showing all vendors for the last 7 days.
+Default behavior (no flags) enters monitor mode showing all vendors for the last 3 days.
 
 ## Monitor Mode Controls
 
@@ -24,6 +24,12 @@ Default behavior (no flags) enters monitor mode showing all vendors for the last
 | `d <N>` | Change days range |
 | `a` | Switch to all vendors |
 | `d` / `w` / `m` | Switch to 1 day / 7 days / 30 days |
+| `date YYYY-MM-DD` | Show one complete local day |
+| `range YYYY-MM-DD YYYY-MM-DD` | Show an inclusive local date span |
+| `range YYYY-MM-DDTHH:MM YYYY-MM-DDTHH:MM` | Show an explicit local date-time span |
+| `latest` / `last` | Return to the current rolling days range |
+
+Monitor mode date and date-time inputs are interpreted in the running machine's local timezone. For date-only ranges, the ending date is included for the full local day. For example, `range 2026-05-01 2026-05-07` covers local time from `2026-05-01 00:00:00` through the end of `2026-05-07`.
 
 ## Data Sources
 

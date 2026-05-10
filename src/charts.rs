@@ -136,15 +136,14 @@ struct ChartLayout {
 }
 
 fn build_chart_layout(
-    days_back: i64,
+    range_start: &DateTime<Local>,
+    range_end: &DateTime<Local>,
     interval_minutes: i64,
     target_width: Option<usize>,
 ) -> ChartLayout {
-    let now = Local::now();
-    let start_time = now - Duration::days(days_back);
-    let start_rounded = round_to_interval_start(&start_time, interval_minutes);
+    let start_rounded = round_to_interval_start(range_start, interval_minutes);
 
-    let mut sorted_times = generate_interval_times(&start_rounded, &now, interval_minutes);
+    let mut sorted_times = generate_interval_times(&start_rounded, range_end, interval_minutes);
 
     if sorted_times.len() > 500 {
         let step = sorted_times.len() / 500;
@@ -332,7 +331,7 @@ fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) 
     println!();
 
     let first_time = layout.sorted_times.last().unwrap(); // oldest (reversed)
-    let last_time = Local::now();
+    let last_time = *layout.sorted_times.first().unwrap();
     let time_span_minutes = (last_time - *first_time).num_seconds() as f64 / 60.0;
     let target_tick = time_span_minutes * 0.05;
 
@@ -540,7 +539,8 @@ struct LineConfig {
 pub fn print_multi_line_chart(
     time_series: &ModelTimeSeries,
     height: usize,
-    days_back: i64,
+    range_start: &DateTime<Local>,
+    range_end: &DateTime<Local>,
     chart_type: &str,
     show_x_axis: bool,
     target_width: Option<usize>,
@@ -555,7 +555,7 @@ pub fn print_multi_line_chart(
         return;
     }
 
-    let layout = build_chart_layout(days_back, interval_minutes, target_width);
+    let layout = build_chart_layout(range_start, range_end, interval_minutes, target_width);
 
     if layout.sorted_times.len() < 2 {
         println!("Not enough data points for chart.");
@@ -713,7 +713,8 @@ pub fn print_multi_line_chart(
 pub fn print_vendor_comparison_chart(
     time_series: &VendorTimeSeries,
     height: usize,
-    days_back: i64,
+    range_start: &DateTime<Local>,
+    range_end: &DateTime<Local>,
     target_width: Option<usize>,
     interval_minutes: i64,
     show_legend: bool,
@@ -724,7 +725,7 @@ pub fn print_vendor_comparison_chart(
         return;
     }
 
-    let layout = build_chart_layout(days_back, interval_minutes, target_width);
+    let layout = build_chart_layout(range_start, range_end, interval_minutes, target_width);
 
     if layout.sorted_times.len() < 2 {
         println!("Not enough data points for chart.");

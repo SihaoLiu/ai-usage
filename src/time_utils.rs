@@ -1,4 +1,140 @@
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
+
+/// Time range selected for usage aggregation and display.
+#[derive(Clone, Debug)]
+pub enum TimeWindow {
+    RollingDays {
+        days: i64,
+    },
+    ExplicitRange {
+        start: DateTime<Local>,
+        end: DateTime<Local>,
+        projection_days: f64,
+    },
+}
+
+impl TimeWindow {
+    pub fn rolling_days(days: i64) -> Self {
+        Self::RollingDays { days }
+    }
+
+    pub fn from_date(input: &str) -> Result<Self, String> {
+        let date = NaiveDate::parse_from_str(input, "%Y-%m-%d")
+            .map_err(|_| "Usage: date YYYY-MM-DD".to_string())?;
+        let start = local_midnight(date)?;
+        let end = local_day_end(date)?;
+        Ok(Self::ExplicitRange {
+            start,
+            end,
+            projection_days: 1.0,
+        })
+    }
+
+    pub fn from_range(start_input: &str, end_input: &str) -> Result<Self, String> {
+        let (start, start_date) = parse_range_endpoint(start_input, false)?;
+        let (end, end_date) = parse_range_endpoint(end_input, true)?;
+        if end < start {
+            return Err("End time must be after start time.".to_string());
+        }
+
+        let projection_days = match (start_date, end_date) {
+            (Some(s), Some(e)) => e
+                .signed_duration_since(s)
+                .num_days()
+                .saturating_add(1)
+                .max(1) as f64,
+            _ => ((end - start).num_seconds() as f64 / 86_400.0).max(1.0 / 1440.0),
+        };
+
+        Ok(Self::ExplicitRange {
+            start,
+            end,
+            projection_days,
+        })
+    }
+
+    pub fn bounds(&self, now: DateTime<Local>) -> (DateTime<Local>, DateTime<Local>) {
+        match self {
+            Self::RollingDays { days } => (now - Duration::days(*days), now),
+            Self::ExplicitRange { start, end, .. } => (*start, *end),
+        }
+    }
+
+    pub fn projection_days(&self, _now: DateTime<Local>) -> f64 {
+        match self {
+            Self::RollingDays { days } => (*days).max(1) as f64,
+            Self::ExplicitRange {
+                projection_days, ..
+            } => *projection_days,
+        }
+    }
+
+    pub fn file_scan_days(&self, _now: DateTime<Local>) -> Option<i64> {
+        match self {
+            Self::RollingDays { days } => Some(*days),
+            Self::ExplicitRange { .. } => None,
+        }
+    }
+
+    pub fn display_label(&self, _now: DateTime<Local>) -> String {
+        match self {
+            Self::RollingDays { days } => format!("last {} days", days),
+            Self::ExplicitRange { start, end, .. } => {
+                format!(
+                    "{} to {}",
+                    start.format("%Y-%m-%d %H:%M"),
+                    end.format("%Y-%m-%d %H:%M")
+                )
+            }
+        }
+    }
+}
+
+fn local_from_naive(naive: NaiveDateTime) -> Result<DateTime<Local>, String> {
+    match Local.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(dt) => Ok(dt),
+        chrono::LocalResult::Ambiguous(dt, _) => Ok(dt),
+        chrono::LocalResult::None => Err("Local time does not exist in this timezone.".to_string()),
+    }
+}
+
+fn local_midnight(date: NaiveDate) -> Result<DateTime<Local>, String> {
+    let naive = date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| "Invalid date.".to_string())?;
+    local_from_naive(naive)
+}
+
+fn local_day_end(date: NaiveDate) -> Result<DateTime<Local>, String> {
+    let next_date = date
+        .succ_opt()
+        .ok_or_else(|| "Date is out of supported range.".to_string())?;
+    local_midnight(next_date)?
+        .checked_sub_signed(Duration::nanoseconds(1))
+        .ok_or_else(|| "Date is out of supported range.".to_string())
+}
+
+fn parse_range_endpoint(
+    input: &str,
+    is_end: bool,
+) -> Result<(DateTime<Local>, Option<NaiveDate>), String> {
+    if let Ok(date) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
+        let dt = if is_end {
+            local_day_end(date)?
+        } else {
+            local_midnight(date)?
+        };
+        return Ok((dt, Some(date)));
+    }
+
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(input, fmt) {
+            return local_from_naive(naive).map(|dt| (dt, None));
+        }
+    }
+
+    Err("Use YYYY-MM-DD or YYYY-MM-DDTHH:MM.".to_string())
+}
 
 /// Parse an ISO timestamp string to a local DateTime.
 /// Handles formats like "2025-12-11T23:18:08.351Z" and "2025-12-11T23:18:08+00:00".
@@ -146,4 +282,70 @@ pub fn distribute_tokens_to_intervals(
             (interval_time, fraction)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Datelike, Timelike};
+
+    #[test]
+    fn date_window_includes_the_whole_local_day() {
+        let window = TimeWindow::from_date("2026-05-07").expect("valid date");
+        let (start, end) = window.bounds(Local::now());
+
+        assert_eq!(start.year(), 2026);
+        assert_eq!(start.month(), 5);
+        assert_eq!(start.day(), 7);
+        assert_eq!(start.hour(), 0);
+        assert_eq!(start.minute(), 0);
+        assert_eq!(start.second(), 0);
+
+        assert_eq!(end.year(), 2026);
+        assert_eq!(end.month(), 5);
+        assert_eq!(end.day(), 7);
+        assert_eq!(end.hour(), 23);
+        assert_eq!(end.minute(), 59);
+        assert_eq!(end.second(), 59);
+    }
+
+    #[test]
+    fn date_range_includes_the_whole_end_date() {
+        let window = TimeWindow::from_range("2026-05-01", "2026-05-07").expect("valid date range");
+        let (start, end) = window.bounds(Local::now());
+
+        assert_eq!(
+            start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-01 00:00:00"
+        );
+        assert_eq!(
+            end.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-07 23:59:59"
+        );
+        assert_eq!(window.projection_days(Local::now()), 7.0);
+    }
+
+    #[test]
+    fn date_time_range_is_interpreted_as_local_time() {
+        let window = TimeWindow::from_range("2026-05-01T08:30", "2026-05-01T10:00")
+            .expect("valid local date-time range");
+        let (start, end) = window.bounds(Local::now());
+
+        assert_eq!(
+            start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-01 08:30:00"
+        );
+        assert_eq!(
+            end.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-01 10:00:00"
+        );
+    }
+
+    #[test]
+    fn inverted_range_is_rejected() {
+        let err = TimeWindow::from_range("2026-05-07", "2026-05-01")
+            .expect_err("end before start should fail");
+
+        assert!(err.contains("End time must be after start time"));
+    }
 }

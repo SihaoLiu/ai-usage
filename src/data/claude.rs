@@ -169,7 +169,6 @@ fn read_single_jsonl_file_with_keys(path: &Path) -> Vec<(String, UsageEntry)> {
                 session_end_time: timestamp,
                 model,
                 effort: None,
-                vendor: "claude",
                 usage: TokenUsage {
                     input_tokens: usage
                         .get("input_tokens")

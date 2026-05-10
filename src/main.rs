@@ -1256,10 +1256,6 @@ fn main() {
                                     println!("  latest           - Return to rolling days window\r");
                                     println!("  i, interval <N>  - Change refresh interval (seconds)\r");
                                     println!("  h, help          - Show this help\r");
-                                    println!("  Up / Down arrows - Recall previous / next command\r");
-                                    println!("  Left / Right     - Move cursor within the prompt\r");
-                                    println!("  e, exit          - Exit monitor mode\r");
-                                    println!("  Ctrl+C, Ctrl+D   - Exit monitor mode\r");
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!("Current: vendor={}, window={}, interval={}s\r",
                                              state.vendor,

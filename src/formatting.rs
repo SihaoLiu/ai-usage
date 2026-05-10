@@ -70,25 +70,26 @@ fn gemini_short_model_names() -> HashMap<&'static str, &'static str> {
 pub fn get_short_model_name(model: &str, vendor: &str) -> String {
     match vendor {
         "codex" => {
-            // Codex model names may include effort level like "gpt-5-codex (high)"
-            if model.contains(" (") && model.ends_with(')') {
-                if let Some(idx) = model.rfind(" (") {
-                    let base_model = &model[..idx];
-                    let effort = &model[idx + 2..model.len() - 1];
-                    let names = codex_short_model_names();
-                    let short_base = names
-                        .get(base_model)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| truncate(base_model, 10));
-                    let effort_short = match effort {
-                        "low" => "L",
-                        "medium" => "M",
-                        "high" => "H",
-                        "xhigh" => "XH",
-                        _ => &effort[..1],
-                    };
-                    return format!("{}({})", short_base, effort_short);
-                }
+            // Some model names may include effort level in parentheses.
+            if model.contains(" (")
+                && model.ends_with(')')
+                && let Some(idx) = model.rfind(" (")
+            {
+                let base_model = &model[..idx];
+                let effort = &model[idx + 2..model.len() - 1];
+                let names = codex_short_model_names();
+                let short_base = names
+                    .get(base_model)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| truncate(base_model, 10));
+                let effort_short = match effort {
+                    "low" => "L",
+                    "medium" => "M",
+                    "high" => "H",
+                    "xhigh" => "XH",
+                    _ => &effort[..1],
+                };
+                return format!("{}({})", short_base, effort_short);
             }
             let names = codex_short_model_names();
             names
@@ -162,7 +163,7 @@ pub fn format_number(num: i64) -> String {
     let mut result = Vec::new();
     let len = bytes.len();
     for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 && b != b'-' {
+        if i > 0 && (len - i).is_multiple_of(3) && b != b'-' {
             result.push(b',');
         }
         result.push(b);
@@ -337,8 +338,7 @@ fn format_with_dual_pct(
     let col_str = format!("{:.0}%", col_pct);
     let row_str = format!("{:.0}%", row_pct);
     // Visible: value + "(" + "↑" + col + "·" + "←" + row + ")" -> 5 fixed chars
-    let visible =
-        value_str.chars().count() + col_str.chars().count() + row_str.chars().count() + 5;
+    let visible = value_str.chars().count() + col_str.chars().count() + row_str.chars().count() + 5;
     let pad = pad_left(visible, width);
     format!(
         "{pad}{val}(\u{2191}{cc}{col}{rst}\u{00B7}\u{2190}{rc}{row}{rst})",
@@ -377,7 +377,9 @@ fn format_cost_with_row_pct(cost: f64, row_total: f64, width: usize) -> String {
 
 /// Centered legend line explaining the dual-percentage color coding.
 fn dual_pct_legend(table_width: usize) -> String {
-    let visible = "Legend:  \u{2191} % across models   \u{00B7}   \u{2190} % within model".chars().count();
+    let visible = "Legend:  \u{2191} % across models   \u{00B7}   \u{2190} % within model"
+        .chars()
+        .count();
     let lpad = if visible < table_width {
         " ".repeat((table_width - visible) / 2)
     } else {
@@ -547,24 +549,64 @@ pub fn print_model_breakdown(
     // Print table based on mode (display rows only, sums include all data)
     match mode {
         "full" => print_table_full(
-            &display_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
-            sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
-            decoding_cost, vendor, show_vendor_prefix, tw,
+            &display_stats,
+            sum_messages,
+            sum_cache_hit,
+            sum_prefill,
+            sum_decoding,
+            sum_total_with_cache,
+            total_cost,
+            cache_hit_cost,
+            prefill_cost,
+            decoding_cost,
+            vendor,
+            show_vendor_prefix,
+            tw,
         ),
         "medium" => print_table_medium(
-            &display_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
-            sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
-            decoding_cost, vendor, show_vendor_prefix, tw,
+            &display_stats,
+            sum_messages,
+            sum_cache_hit,
+            sum_prefill,
+            sum_decoding,
+            sum_total_with_cache,
+            total_cost,
+            cache_hit_cost,
+            prefill_cost,
+            decoding_cost,
+            vendor,
+            show_vendor_prefix,
+            tw,
         ),
         "compact" => print_table_compact(
-            &display_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
-            sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
-            decoding_cost, vendor, show_vendor_prefix, tw,
+            &display_stats,
+            sum_messages,
+            sum_cache_hit,
+            sum_prefill,
+            sum_decoding,
+            sum_total_with_cache,
+            total_cost,
+            cache_hit_cost,
+            prefill_cost,
+            decoding_cost,
+            vendor,
+            show_vendor_prefix,
+            tw,
         ),
         "minimal" => print_table_minimal(
-            &display_stats, sum_messages, sum_cache_hit, sum_prefill, sum_decoding,
-            sum_total_with_cache, total_cost, cache_hit_cost, prefill_cost,
-            decoding_cost, vendor, show_vendor_prefix, tw,
+            &display_stats,
+            sum_messages,
+            sum_cache_hit,
+            sum_prefill,
+            sum_decoding,
+            sum_total_with_cache,
+            total_cost,
+            cache_hit_cost,
+            prefill_cost,
+            decoding_cost,
+            vendor,
+            show_vendor_prefix,
+            tw,
         ),
         _ => {}
     }
@@ -600,7 +642,10 @@ pub fn print_model_breakdown(
     if mode == "full" || mode == "medium" {
         let line = format!(
             "Daily: ${:.2}, Weekly: ${:.2}, Monthly(30d): ${:.2}, Monthly Saving ${:.2}, {} / MTok",
-            daily_cost, weekly_cost, monthly_cost, savings,
+            daily_cost,
+            weekly_cost,
+            monthly_cost,
+            savings,
             format_cost_per_mtok(cost_per_mtok)
         );
         println!("{}{}", cost_pad, line);
@@ -624,6 +669,7 @@ pub fn center_pad(terminal_width: usize, content_width: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_table_full(
     model_stats: &[&ModelBreakdownRow],
     sum_messages: i64,
@@ -646,14 +692,27 @@ fn print_table_full(
     let table_width = 2 + w_model + 1 + w_msgs + 3 + 4 * w_cache + 3 + 2;
     let p = center_pad(terminal_width, table_width);
     println!();
-    println!("{}{:^width$}", p, "Usage / Cost by Model", width = table_width);
+    println!(
+        "{}{:^width$}",
+        p,
+        "Usage / Cost by Model",
+        width = table_width
+    );
     println!("{}{}", p, "=".repeat(table_width));
     println!("{}{}", p, dual_pct_legend(table_width));
 
     println!(
         "{}| {:<wm$} {:>wn$} | {:>wc$} {:>wc$} {:>wc$} {:>wc$} |",
-        p, "Model", "Messages", "Cache Hit", "Prefill", "Decoding", "Total",
-        wm = w_model, wn = w_msgs, wc = w_cache,
+        p,
+        "Model",
+        "Messages",
+        "Cache Hit",
+        "Prefill",
+        "Decoding",
+        "Total",
+        wm = w_model,
+        wn = w_msgs,
+        wc = w_cache,
     );
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
@@ -690,10 +749,34 @@ fn print_table_full(
         p,
         "TOTAL",
         format_with_col_pct(sum_messages, sum_messages, w_msgs),
-        format_with_dual_pct(sum_cache_hit, sum_cache_hit, sum_total_with_cache, w_cache, false),
-        format_with_dual_pct(sum_prefill, sum_prefill, sum_total_with_cache, w_cache, false),
-        format_with_dual_pct(sum_decoding, sum_decoding, sum_total_with_cache, w_cache, false),
-        format_with_dual_pct(sum_total_with_cache, sum_total_with_cache, sum_total_with_cache, w_cache, false),
+        format_with_dual_pct(
+            sum_cache_hit,
+            sum_cache_hit,
+            sum_total_with_cache,
+            w_cache,
+            false
+        ),
+        format_with_dual_pct(
+            sum_prefill,
+            sum_prefill,
+            sum_total_with_cache,
+            w_cache,
+            false
+        ),
+        format_with_dual_pct(
+            sum_decoding,
+            sum_decoding,
+            sum_total_with_cache,
+            w_cache,
+            false
+        ),
+        format_with_dual_pct(
+            sum_total_with_cache,
+            sum_total_with_cache,
+            sum_total_with_cache,
+            w_cache,
+            false
+        ),
         wm = w_model,
     );
 
@@ -706,11 +789,13 @@ fn print_table_full(
         format_cost_with_row_pct(prefill_cost, total_cost, w_cache),
         format_cost_with_row_pct(decoding_cost, total_cost, w_cache),
         format_cost_with_row_pct(total_cost, total_cost, w_cache),
-        wm = w_model, wn = w_msgs,
+        wm = w_model,
+        wn = w_msgs,
     );
     println!("{}{}", p, "=".repeat(table_width));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_table_medium(
     model_stats: &[&ModelBreakdownRow],
     sum_messages: i64,
@@ -733,14 +818,27 @@ fn print_table_medium(
     let p = center_pad(terminal_width, table_width);
 
     println!();
-    println!("{}{:^width$}", p, "Usage / Cost by Model", width = table_width);
+    println!(
+        "{}{:^width$}",
+        p,
+        "Usage / Cost by Model",
+        width = table_width
+    );
     println!("{}{}", p, "=".repeat(table_width));
     println!("{}{}", p, dual_pct_legend(table_width));
 
     println!(
         "{}| {:<w_model$} {:>w_msgs$} | {:>w_cache$} {:>w_cache$} {:>w_cache$} {:>w_cache$} |",
-        p, "Model", "Msgs", "CacheHit", "Prefill", "Decode", "Total",
-        w_model = w_model, w_msgs = w_msgs, w_cache = w_cache,
+        p,
+        "Model",
+        "Msgs",
+        "CacheHit",
+        "Prefill",
+        "Decode",
+        "Total",
+        w_model = w_model,
+        w_msgs = w_msgs,
+        w_cache = w_cache,
     );
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
@@ -777,10 +875,34 @@ fn print_table_medium(
         p,
         "TOTAL",
         format_with_col_pct(sum_messages, sum_messages, w_msgs),
-        format_with_dual_pct(sum_cache_hit, sum_cache_hit, sum_total_with_cache, w_cache, true),
-        format_with_dual_pct(sum_prefill, sum_prefill, sum_total_with_cache, w_cache, true),
-        format_with_dual_pct(sum_decoding, sum_decoding, sum_total_with_cache, w_cache, true),
-        format_with_dual_pct(sum_total_with_cache, sum_total_with_cache, sum_total_with_cache, w_cache, true),
+        format_with_dual_pct(
+            sum_cache_hit,
+            sum_cache_hit,
+            sum_total_with_cache,
+            w_cache,
+            true
+        ),
+        format_with_dual_pct(
+            sum_prefill,
+            sum_prefill,
+            sum_total_with_cache,
+            w_cache,
+            true
+        ),
+        format_with_dual_pct(
+            sum_decoding,
+            sum_decoding,
+            sum_total_with_cache,
+            w_cache,
+            true
+        ),
+        format_with_dual_pct(
+            sum_total_with_cache,
+            sum_total_with_cache,
+            sum_total_with_cache,
+            w_cache,
+            true
+        ),
         w_model = w_model,
     );
 
@@ -793,11 +915,13 @@ fn print_table_medium(
         format_cost_with_row_pct(prefill_cost, total_cost, w_cache),
         format_cost_with_row_pct(decoding_cost, total_cost, w_cache),
         format_cost_with_row_pct(total_cost, total_cost, w_cache),
-        w_model = w_model, w_msgs = w_msgs,
+        w_model = w_model,
+        w_msgs = w_msgs,
     );
     println!("{}{}", p, "=".repeat(table_width));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_table_compact(
     model_stats: &[&ModelBreakdownRow],
     sum_messages: i64,
@@ -820,13 +944,26 @@ fn print_table_compact(
     let p = center_pad(terminal_width, table_width);
 
     println!();
-    println!("{}{:^width$}", p, "Usage / Cost by Model", width = table_width);
+    println!(
+        "{}{:^width$}",
+        p,
+        "Usage / Cost by Model",
+        width = table_width
+    );
     println!("{}{}", p, "=".repeat(table_width));
 
     println!(
         "{}| {:<w_model$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} |",
-        p, "Model", "Msgs", "CacheHit", "Prefill", "Decode", "Total",
-        w_model = w_model, w_msgs = w_msgs, w_val = w_val,
+        p,
+        "Model",
+        "Msgs",
+        "CacheHit",
+        "Prefill",
+        "Decode",
+        "Total",
+        w_model = w_model,
+        w_msgs = w_msgs,
+        w_val = w_val,
     );
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
@@ -852,7 +989,9 @@ fn print_table_compact(
             format_number_compact(prefill),
             format_number_compact(decoding),
             format_number_compact(cache_hit + prefill + decoding),
-            w_model = w_model, w_msgs = w_msgs, w_val = w_val,
+            w_model = w_model,
+            w_msgs = w_msgs,
+            w_val = w_val,
         );
     }
 
@@ -866,7 +1005,9 @@ fn print_table_compact(
         format_number_compact(sum_prefill),
         format_number_compact(sum_decoding),
         format_number_compact(sum_total_with_cache),
-        w_model = w_model, w_msgs = w_msgs, w_val = w_val,
+        w_model = w_model,
+        w_msgs = w_msgs,
+        w_val = w_val,
     );
 
     println!(
@@ -878,11 +1019,14 @@ fn print_table_compact(
         prefill_cost,
         decoding_cost,
         total_cost,
-        w_model = w_model, w_msgs = w_msgs, w_cost = w_val - 1,
+        w_model = w_model,
+        w_msgs = w_msgs,
+        w_cost = w_val - 1,
     );
     println!("{}{}", p, "=".repeat(table_width));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_table_minimal(
     model_stats: &[&ModelBreakdownRow],
     sum_messages: i64,
@@ -910,8 +1054,16 @@ fn print_table_minimal(
 
     println!(
         "{}| {:<w_model$} {:>w_msgs$} | {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} |",
-        p, "Model", "Msgs", "Cache Hit", "Prefill", "Decode", "All",
-        w_model = w_model, w_msgs = w_msgs, w_strategy = w_strategy,
+        p,
+        "Model",
+        "Msgs",
+        "Cache Hit",
+        "Prefill",
+        "Decode",
+        "All",
+        w_model = w_model,
+        w_msgs = w_msgs,
+        w_strategy = w_strategy,
     );
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
@@ -937,7 +1089,9 @@ fn print_table_minimal(
             format_number_compact(prefill),
             format_number_compact(decoding),
             format_number_compact(cache_hit + prefill + decoding),
-            w_model = w_model, w_msgs = w_msgs, w_strategy = w_strategy,
+            w_model = w_model,
+            w_msgs = w_msgs,
+            w_strategy = w_strategy,
         );
     }
 
@@ -951,14 +1105,24 @@ fn print_table_minimal(
         format_number_compact(sum_prefill),
         format_number_compact(sum_decoding),
         format_number_compact(sum_total_with_cache),
-        w_model = w_model, w_msgs = w_msgs, w_strategy = w_strategy,
+        w_model = w_model,
+        w_msgs = w_msgs,
+        w_strategy = w_strategy,
     );
 
     println!(
         "{}| {:<w_model$} {:>w_msgs$} | {:>w_strategy$} {:>w_strategy$} {:>w_strategy$} ${:>w_cost$.2} |",
-        p, "Cost", "", "", "", "",
+        p,
+        "Cost",
+        "",
+        "",
+        "",
+        "",
         total_cost,
-        w_model = w_model, w_msgs = w_msgs, w_strategy = w_strategy, w_cost = w_strategy - 1,
+        w_model = w_model,
+        w_msgs = w_msgs,
+        w_strategy = w_strategy,
+        w_cost = w_strategy - 1,
     );
     println!("{}{}", p, "=".repeat(table_width));
 }

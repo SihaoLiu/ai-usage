@@ -232,16 +232,16 @@ pub fn parse_timestamp(timestamp_str: &str) -> Option<DateTime<Local>> {
         return Some(dt.with_timezone(&Local));
     }
     // Try parsing with milliseconds but no timezone (assume UTC)
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%S%.f") {
-        if let Some(utc_dt) = Utc.from_local_datetime(&ndt).single() {
-            return Some(utc_dt.with_timezone(&Local));
-        }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%S%.f")
+        && let Some(utc_dt) = Utc.from_local_datetime(&ndt).single()
+    {
+        return Some(utc_dt.with_timezone(&Local));
     }
     // Try epoch milliseconds (numeric string)
-    if let Ok(ms) = timestamp_str.parse::<i64>() {
-        if let Some(dt) = DateTime::from_timestamp_millis(ms) {
-            return Some(dt.with_timezone(&Local));
-        }
+    if let Ok(ms) = timestamp_str.parse::<i64>()
+        && let Some(dt) = DateTime::from_timestamp_millis(ms)
+    {
+        return Some(dt.with_timezone(&Local));
     }
     None
 }
@@ -539,8 +539,8 @@ mod tests {
 
     #[test]
     fn mixed_endpoint_kinds_pick_outermost_bounds() {
-        let window = TimeWindow::from_range("2026-05-07", "2026-05-01T08:30")
-            .expect("mixed-endpoint range");
+        let window =
+            TimeWindow::from_range("2026-05-07", "2026-05-01T08:30").expect("mixed-endpoint range");
         let (start, end) = window.bounds(Local::now());
 
         assert_eq!(

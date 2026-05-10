@@ -63,10 +63,7 @@ fn read_single_gemini_file(path: &Path) -> Vec<UsageEntry> {
         let total_input = tokens.get("input").and_then(|v| v.as_i64()).unwrap_or(0);
         let cached_input = tokens.get("cached").and_then(|v| v.as_i64()).unwrap_or(0);
         let output_tokens = tokens.get("output").and_then(|v| v.as_i64()).unwrap_or(0);
-        let thoughts_tokens = tokens
-            .get("thoughts")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let thoughts_tokens = tokens.get("thoughts").and_then(|v| v.as_i64()).unwrap_or(0);
 
         let non_cached_input = total_input - cached_input;
         let parsed_ts = parse_timestamp(&timestamp);
@@ -97,9 +94,8 @@ pub fn read_gemini_json_files(tmp_dir: &Path, max_age_days: Option<i64>) -> Vec<
         return Vec::new();
     }
 
-    let cutoff = max_age_days.map(|days| {
-        SystemTime::now() - std::time::Duration::from_secs((days as u64 + 1) * 86400)
-    });
+    let cutoff = max_age_days
+        .map(|days| SystemTime::now() - std::time::Duration::from_secs((days as u64 + 1) * 86400));
 
     let mut files: Vec<PathBuf> = WalkDir::new(tmp_dir)
         .into_iter()
@@ -121,12 +117,11 @@ pub fn read_gemini_json_files(tmp_dir: &Path, max_age_days: Option<i64>) -> Vec<
             {
                 return false;
             }
-            if let Some(cutoff_time) = cutoff {
-                if let Ok(meta) = e.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        return mtime >= cutoff_time;
-                    }
-                }
+            if let Some(cutoff_time) = cutoff
+                && let Ok(meta) = e.metadata()
+                && let Ok(mtime) = meta.modified()
+            {
+                return mtime >= cutoff_time;
             }
             true
         })

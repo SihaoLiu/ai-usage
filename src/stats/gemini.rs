@@ -1,6 +1,6 @@
 use crate::constants::AllPricing;
 use crate::data::UsageEntry;
-use crate::stats::{ModelBreakdownRow, ModelTimeSeries, _calc_breakdown, _calc_time_series};
+use crate::stats::{_calc_breakdown, _calc_time_series, ModelBreakdownRow, ModelTimeSeries};
 
 pub fn calculate_gemini_model_breakdown(
     usage_data: &[UsageEntry],

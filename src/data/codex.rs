@@ -112,10 +112,8 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                         }
                     }
                     "token_count" => {
-                        let entry_timestamp = data
-                            .get("timestamp")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let entry_timestamp =
+                            data.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
                         let parsed_ts = parse_timestamp(entry_timestamp);
 
                         if is_replayed_event(
@@ -255,9 +253,8 @@ pub fn read_codex_jsonl_files(sessions_dir: &Path, max_age_days: Option<i64>) ->
         return Vec::new();
     }
 
-    let cutoff = max_age_days.map(|days| {
-        SystemTime::now() - std::time::Duration::from_secs((days as u64 + 1) * 86400)
-    });
+    let cutoff = max_age_days
+        .map(|days| SystemTime::now() - std::time::Duration::from_secs((days as u64 + 1) * 86400));
 
     let mut files: Vec<PathBuf> = WalkDir::new(sessions_dir)
         .into_iter()
@@ -266,15 +263,14 @@ pub fn read_codex_jsonl_files(sessions_dir: &Path, max_age_days: Option<i64>) ->
             if !e.file_type().is_file() {
                 return false;
             }
-            if !e.path().extension().is_some_and(|ext| ext == "jsonl") {
+            if e.path().extension().is_none_or(|ext| ext != "jsonl") {
                 return false;
             }
-            if let Some(cutoff_time) = cutoff {
-                if let Ok(meta) = e.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        return mtime >= cutoff_time;
-                    }
-                }
+            if let Some(cutoff_time) = cutoff
+                && let Ok(meta) = e.metadata()
+                && let Ok(mtime) = meta.modified()
+            {
+                return mtime >= cutoff_time;
             }
             true
         })
@@ -331,7 +327,11 @@ mod tests {
     fn started_at_at_or_after_fork_is_fresh() {
         let fork = 10_000_000_i64;
         assert!(!is_replayed_event(Some(fork), Some(fork + 10_000), fork));
-        assert!(!is_replayed_event(Some(fork), Some(fork + 10_000), fork + 5_000));
+        assert!(!is_replayed_event(
+            Some(fork),
+            Some(fork + 10_000),
+            fork + 5_000
+        ));
     }
 
     #[test]

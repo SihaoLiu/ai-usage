@@ -13,13 +13,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
 
 use chrono::{DateTime, Local};
 use clap::Parser;
 use crossterm::terminal;
 
-use constants::{AllPricing, ModelPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees};
+use constants::{
+    AllPricing, ModelPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees,
+};
 use data::UsageEntry;
 use data::claude::read_all_jsonl_files_dedup;
 use data::codex::get_codex_dir;
@@ -30,6 +31,7 @@ use time_utils::TimeWindow;
 
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 35;
+const PREFETCH_PAGE_WINDOWS: i32 = 8;
 
 /// Render `body` into an off-screen buffer (by redirecting stdout into a
 /// pipe), then write the whole frame in a single `write_all` so the terminal
@@ -114,7 +116,6 @@ fn render_frame<F: FnOnce()>(body: F) -> io::Result<()> {
 
 struct VersionCacheEntry {
     version_str: String,
-    timestamp: Instant,
 }
 
 struct AppState {
@@ -317,10 +318,14 @@ fn get_terminal_size() -> (u16, u16) {
     match terminal::size() {
         Ok(size) => size,
         Err(_) => {
-            let cols = std::env::var("COLUMNS").ok()
-                .and_then(|v| v.parse::<u16>().ok()).unwrap_or(80);
-            let rows = std::env::var("LINES").ok()
-                .and_then(|v| v.parse::<u16>().ok()).unwrap_or(24);
+            let cols = std::env::var("COLUMNS")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(80);
+            let rows = std::env::var("LINES")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(24);
             (cols, rows)
         }
     }
@@ -328,7 +333,11 @@ fn get_terminal_size() -> (u16, u16) {
 
 fn check_terminal_size() -> (bool, u16, u16) {
     let (width, height) = get_terminal_size();
-    (width >= MIN_TERMINAL_WIDTH && height >= MIN_TERMINAL_HEIGHT, width, height)
+    (
+        width >= MIN_TERMINAL_WIDTH && height >= MIN_TERMINAL_HEIGHT,
+        width,
+        height,
+    )
 }
 
 fn print_terminal_too_small(width: u16, height: u16) {
@@ -339,7 +348,10 @@ fn print_terminal_too_small(width: u16, height: u16) {
         format!("  Width = {}  Height = {}", width, height),
         String::new(),
         "Needed for current config:".to_string(),
-        format!("  Width = {}  Height = {}", MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT),
+        format!(
+            "  Width = {}  Height = {}",
+            MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT
+        ),
     ];
 
     let max_line_len = lines.iter().map(|l| l.len()).max().unwrap_or(0);
@@ -392,8 +404,12 @@ fn calculate_chart_height(
 
     if is_all_vendor {
         // Single chart
-        let fixed = header_lines + table_lines + time_span_lines
-            + chart_overhead + x_axis_label_lines + prompt_lines;
+        let fixed = header_lines
+            + table_lines
+            + time_span_lines
+            + chart_overhead
+            + x_axis_label_lines
+            + prompt_lines;
         let available = th.saturating_sub(fixed);
         let chart_height = available.max(min_chart).min(60);
         let fits = th >= fixed + min_chart;
@@ -402,8 +418,12 @@ fn calculate_chart_height(
         // Two charts: chart1 (io, no x-axis labels) + chart2 (cache, with x-axis labels)
         let chart1_fixed = chart_overhead;
         let chart2_fixed = chart_overhead + x_axis_label_lines;
-        let fixed = header_lines + table_lines + time_span_lines
-            + chart1_fixed + chart2_fixed + prompt_lines;
+        let fixed = header_lines
+            + table_lines
+            + time_span_lines
+            + chart1_fixed
+            + chart2_fixed
+            + prompt_lines;
         let available = th.saturating_sub(fixed);
         let per_chart = (available / 2).max(min_chart).min(60);
         let fits = th >= fixed + min_chart * 2;
@@ -442,21 +462,23 @@ fn get_vendor_data_dir(vendor: &str) -> Option<PathBuf> {
         "gemini" => Some(get_gemini_dir().join("tmp")),
         "claude" => {
             let dirs = data::claude::get_claude_dirs();
-            Some(dirs.into_iter()
-                .map(|d| d.join("projects"))
-                .find(|p| p.exists())
-                .unwrap_or_else(|| PathBuf::from("~/.claude/projects")))
+            Some(
+                dirs.into_iter()
+                    .map(|d| d.join("projects"))
+                    .find(|p| p.exists())
+                    .unwrap_or_else(|| PathBuf::from("~/.claude/projects")),
+            )
         }
         _ => None, // "all" has no single directory
     }
 }
 
 /// Days of history that must be on disk to render the current window and
-/// also serve one prefetched PageUp without going back to the filesystem.
+/// several prefetched PageUp windows without going back to the filesystem.
 fn compute_required_horizon(window: &TimeWindow, now: DateTime<Local>) -> i64 {
     let (start, _) = window.bounds(now);
     let step = window.page_step();
-    let prefetch_start = start - step;
+    let prefetch_start = start - step * PREFETCH_PAGE_WINDOWS;
     let days = now.signed_duration_since(prefetch_start).num_days() + 2;
     days.max(1)
 }
@@ -498,13 +520,20 @@ fn ensure_raw_cache(state: &mut AppState, required_horizon: i64) -> &RawDataCach
         Some(cache) => cache.horizon_days < required_horizon,
     };
     if needs_load {
-        let horizon = match &state.raw_cache {
-            Some(c) => c.horizon_days.max(required_horizon),
-            None => required_horizon,
-        };
+        let horizon = next_cache_horizon(
+            state.raw_cache.as_ref().map(|cache| cache.horizon_days),
+            required_horizon,
+        );
         state.raw_cache = Some(read_all_vendor_raw(horizon));
     }
     state.raw_cache.as_ref().unwrap()
+}
+
+fn next_cache_horizon(current_horizon: Option<i64>, required_horizon: i64) -> i64 {
+    match current_horizon {
+        Some(current) => current.saturating_mul(2).max(required_horizon),
+        None => required_horizon,
+    }
 }
 
 fn invalidate_raw_cache(state: &mut AppState) {
@@ -543,18 +572,21 @@ fn calculate_vendor_aggregate_time_series(
 
             let total = match vendor_label {
                 "Codex" => {
-                    entry.usage.input_tokens + entry.usage.output_tokens
+                    entry.usage.input_tokens
+                        + entry.usage.output_tokens
                         + entry.usage.cache_read_input_tokens
                         + entry.usage.reasoning_output_tokens
                 }
                 _ => {
-                    entry.usage.input_tokens + entry.usage.output_tokens
+                    entry.usage.input_tokens
+                        + entry.usage.output_tokens
                         + entry.usage.cache_read_input_tokens
                         + entry.usage.cache_creation_input_tokens
                 }
             } as f64;
 
-            let parsed = entry.parsed_timestamp
+            let parsed = entry
+                .parsed_timestamp
                 .or_else(|| time_utils::parse_timestamp(&entry.timestamp));
 
             if let Some(dt) = parsed {
@@ -715,18 +747,14 @@ fn calculate_weighted_cost_per_mtok(
 }
 
 fn get_version(state: &mut AppState, vendor: &str) -> String {
-    let cache_ttl = std::time::Duration::from_secs(300);
-
     if let Some(cached) = state.version_cache.get(vendor) {
-        if cached.timestamp.elapsed() < cache_ttl {
-            return cached.version_str.clone();
-        }
+        return cached.version_str.clone();
     }
 
-    let (cmd, npm_pkg, display_name) = match vendor {
-        "claude" => ("claude", "@anthropic-ai/claude-code", "Claude Code"),
-        "codex" => ("codex", "@openai/codex", "Codex"),
-        "gemini" => ("gemini", "@google/gemini-cli", "Gemini CLI"),
+    let (cmd, display_name) = match vendor {
+        "claude" => ("claude", "Claude Code"),
+        "codex" => ("codex", "Codex"),
+        "gemini" => ("gemini", "Gemini CLI"),
         _ => return String::new(),
     };
 
@@ -737,62 +765,53 @@ fn get_version(state: &mut AppState, vendor: &str) -> String {
         .and_then(|output| {
             if output.status.success() {
                 let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                s.split_whitespace().next()
+                s.split_whitespace()
+                    .next()
                     .and_then(|v| {
-                        if v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                        if v.chars()
+                            .next()
+                            .map(|c| c.is_ascii_digit())
+                            .unwrap_or(false)
+                        {
                             Some(v.to_string())
                         } else {
                             None
                         }
                     })
                     .or_else(|| {
-                        let re_match: String = s.chars()
+                        let re_match: String = s
+                            .chars()
                             .skip_while(|c| !c.is_ascii_digit())
                             .take_while(|c| c.is_ascii_digit() || *c == '.')
                             .collect();
-                        if re_match.is_empty() { None } else { Some(re_match) }
+                        if re_match.is_empty() {
+                            None
+                        } else {
+                            Some(re_match)
+                        }
                     })
             } else {
                 None
             }
         });
 
-    let version_str = match current_version {
-        Some(ref ver) => {
-            let latest = fetch_npm_version(npm_pkg);
-            match latest {
-                Some(ref latest_ver) if latest_ver == ver => {
-                    format!("{} ({}, up-to-date)", display_name, ver)
-                }
-                Some(ref latest_ver) => {
-                    format!("{} ({}, a newer version {} available)", display_name, ver, latest_ver)
-                }
-                None => format!("{} ({})", display_name, ver),
-            }
-        }
-        None => display_name.to_string(),
-    };
+    let version_str = format_local_version_label(display_name, current_version);
 
-    state.version_cache.insert(vendor.to_string(), VersionCacheEntry {
-        version_str: version_str.clone(),
-        timestamp: Instant::now(),
-    });
+    state.version_cache.insert(
+        vendor.to_string(),
+        VersionCacheEntry {
+            version_str: version_str.clone(),
+        },
+    );
 
     version_str
 }
 
-fn fetch_npm_version(package: &str) -> Option<String> {
-    let url = format!("https://registry.npmjs.org/{}/latest", package);
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(10)))
-        .build()
-        .new_agent();
-    let body: String = agent.get(&url)
-        .call().ok()?
-        .body_mut().read_to_string().ok()?;
-    serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v.get("version").and_then(|v| v.as_str()).map(String::from))
+fn format_local_version_label(display_name: &str, current_version: Option<String>) -> String {
+    match current_version {
+        Some(ver) => format!("{} ({})", display_name, ver),
+        None => display_name.to_string(),
+    }
 }
 
 fn get_chart_target_width() -> usize {
@@ -810,9 +829,8 @@ fn print_time_span_info(
     let now = Local::now();
     let start_rounded = time_utils::round_to_interval_start(range_start, interval_minutes);
 
-    let data_points = time_utils::generate_interval_times(
-        &start_rounded, range_end, interval_minutes,
-    ).len();
+    let data_points =
+        time_utils::generate_interval_times(&start_rounded, range_end, interval_minutes).len();
 
     let interval_str = if interval_minutes >= 60 {
         if interval_minutes % 60 == 0 {
@@ -852,7 +870,10 @@ fn showing_data_line(window: &TimeWindow, now: DateTime<Local>) -> String {
     format!("Showing data from {}", window.display_label(now))
 }
 
-fn parse_time_window_command(command: &str, current_days: i64) -> Option<Result<TimeWindow, String>> {
+fn parse_time_window_command(
+    command: &str,
+    current_days: i64,
+) -> Option<Result<TimeWindow, String>> {
     let parts: Vec<&str> = command.split_whitespace().collect();
     match parts.as_slice() {
         ["date", date] => Some(TimeWindow::from_date(date)),
@@ -887,14 +908,21 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         _ => &cache.claude,
     };
     if raw_for_vendor.is_empty() {
-        if !once { print!("\x1b[2J\x1b[H"); }
+        if !once {
+            print!("\x1b[2J\x1b[H");
+        }
         println!("No usage data found.");
         return Some(false);
     }
     let filtered = data::filter_usage_data_by_window(raw_for_vendor, &state.time_window, now);
     if filtered.is_empty() {
-        if !once { print!("\x1b[2J\x1b[H"); }
-        println!("No usage data found in {}.", state.time_window.display_label(now));
+        if !once {
+            print!("\x1b[2J\x1b[H");
+        }
+        println!(
+            "No usage data found in {}.",
+            state.time_window.display_label(now)
+        );
         return Some(false);
     }
     let vendor = &vendor;
@@ -909,9 +937,8 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let mut will_print_table = table_mode != "hidden";
 
     let target_width = get_chart_target_width();
-    let (mut chart_height, mut fits) = calculate_chart_height(
-        !once, will_print_table, model_stats.len(), false,
-    );
+    let (mut chart_height, mut fits) =
+        calculate_chart_height(!once, will_print_table, model_stats.len(), false);
     // If it doesn't fit with table, try without
     if !fits && will_print_table {
         will_print_table = false;
@@ -954,30 +981,64 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let interval_minutes = round_to_nice_interval(optimal);
 
     let model_ts = match vendor.as_str() {
-        "codex" => stats::calculate_codex_model_token_breakdown_time_series(&filtered, interval_minutes),
-        "gemini" => stats::calculate_gemini_model_token_breakdown_time_series(&filtered, interval_minutes),
+        "codex" => {
+            stats::calculate_codex_model_token_breakdown_time_series(&filtered, interval_minutes)
+        }
+        "gemini" => {
+            stats::calculate_gemini_model_token_breakdown_time_series(&filtered, interval_minutes)
+        }
         _ => stats::calculate_claude_model_token_breakdown_time_series(&filtered, interval_minutes),
     };
 
     let included_models: HashSet<String> = model_stats.iter().map(|s| s.model.clone()).collect();
 
     let table_w = if will_print_table {
-        formatting::get_table_width(&formatting::get_table_display_mode(width, height, model_stats.len()))
-    } else { 0 };
+        formatting::get_table_width(formatting::get_table_display_mode(
+            width,
+            height,
+            model_stats.len(),
+        ))
+    } else {
+        0
+    };
     let table_pad = formatting::center_pad(width as usize, table_w);
 
     if !model_ts.is_empty() {
-        print_time_span_info(&range_start, &range_end, interval_minutes, width, &table_pad);
+        print_time_span_info(
+            &range_start,
+            &range_end,
+            interval_minutes,
+            width,
+            &table_pad,
+        );
     }
 
     charts::print_multi_line_chart(
-        &model_ts, chart_height, &range_start, &range_end, "io", false,
-        Some(target_width), interval_minutes, vendor, Some(&included_models), true,
+        &model_ts,
+        chart_height,
+        &range_start,
+        &range_end,
+        "io",
+        false,
+        Some(target_width),
+        interval_minutes,
+        vendor,
+        Some(&included_models),
+        true,
         Some(width as usize),
     );
     charts::print_multi_line_chart(
-        &model_ts, chart_height, &range_start, &range_end, "cache", true,
-        Some(target_width), interval_minutes, vendor, Some(&included_models), true,
+        &model_ts,
+        chart_height,
+        &range_start,
+        &range_end,
+        "cache",
+        true,
+        Some(target_width),
+        interval_minutes,
+        vendor,
+        Some(&included_models),
+        true,
         Some(width as usize),
     );
 
@@ -1002,7 +1063,10 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
 
     // Compute and cache the weighted cost prompt for show_prompt reuse
     let (weighted_cost, total_savings) = calculate_weighted_cost_per_mtok(
-        &all_data, projection_days, &state.pricing, &state.subscription_fees,
+        &all_data,
+        projection_days,
+        &state.pricing,
+        &state.subscription_fees,
     );
     state.all_vendor_prompt = if weighted_cost > 0.0 {
         Some(format!(
@@ -1022,9 +1086,8 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     let mut will_print_table = table_mode != "hidden" && !all_model_stats.is_empty();
 
     // Check total height fits before printing anything
-    let (mut chart_height, mut fits) = calculate_chart_height(
-        !once, will_print_table, all_model_stats.len(), true,
-    );
+    let (mut chart_height, mut fits) =
+        calculate_chart_height(!once, will_print_table, all_model_stats.len(), true);
     // If it doesn't fit with table, try without
     if !fits && will_print_table {
         will_print_table = false;
@@ -1064,11 +1127,23 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     }
 
     let table_w = if will_print_table {
-        formatting::get_table_width(&formatting::get_table_display_mode(width, height, all_model_stats.len()))
-    } else { 0 };
+        formatting::get_table_width(formatting::get_table_display_mode(
+            width,
+            height,
+            all_model_stats.len(),
+        ))
+    } else {
+        0
+    };
     let table_pad = formatting::center_pad(width as usize, table_w);
 
-    print_time_span_info(&range_start, &range_end, interval_minutes, width, &table_pad);
+    print_time_span_info(
+        &range_start,
+        &range_end,
+        interval_minutes,
+        width,
+        &table_pad,
+    );
 
     charts::print_vendor_comparison_chart(
         &vendor_time_series,
@@ -1096,15 +1171,14 @@ fn main() {
     let args = Args::parse();
 
     let pricing = pricing::load_layered();
-    let subscription_fees = load_subscription_fees()
-        .unwrap_or_else(|| prompt_subscription_fees());
+    let subscription_fees = load_subscription_fees().unwrap_or_else(prompt_subscription_fees);
 
     // Validate vendor data directory on startup (matches Python behavior)
-    if let Some(data_dir) = get_vendor_data_dir(&args.vendor) {
-        if !data_dir.exists() {
-            eprintln!("Error: Data directory not found at {}", data_dir.display());
-            std::process::exit(1);
-        }
+    if let Some(data_dir) = get_vendor_data_dir(&args.vendor)
+        && !data_dir.exists()
+    {
+        eprintln!("Error: Data directory not found at {}", data_dir.display());
+        std::process::exit(1);
     }
 
     let mut state = AppState {
@@ -1132,9 +1206,12 @@ fn main() {
         println!("\n{}", "=".repeat(width as usize));
         println!("Interactive Monitor Mode (type h for help)");
         println!("{}", "=".repeat(width as usize));
-        println!("Auto-refresh: {}s | Vendor: {} | Window: {}",
-                 state.monitor_interval, state.vendor,
-                 state.time_window.display_label(Local::now()));
+        println!(
+            "Auto-refresh: {}s | Vendor: {} | Window: {}",
+            state.monitor_interval,
+            state.vendor,
+            state.time_window.display_label(Local::now())
+        );
         println!("{}\n", "=".repeat(width as usize));
 
         // Helper: disable raw mode, render the next frame off-screen into a
@@ -1169,7 +1246,9 @@ fn main() {
             }
             let (width, _) = get_terminal_size();
             let version = if state.vendor == "all" {
-                state.all_vendor_prompt.clone()
+                state
+                    .all_vendor_prompt
+                    .clone()
                     .unwrap_or_else(|| "All Vendors Comparison".to_string())
             } else {
                 get_version(state, &state.vendor.clone())
@@ -1190,8 +1269,8 @@ fn main() {
 
         show_prompt(&mut state, terminal_too_small);
 
-        let mut next_refresh = std::time::Instant::now()
-            + std::time::Duration::from_secs(state.monitor_interval);
+        let mut next_refresh =
+            std::time::Instant::now() + std::time::Duration::from_secs(state.monitor_interval);
         let mut input = InputLine::new();
         let mut history = CommandHistory::new();
 
@@ -1236,7 +1315,10 @@ fn main() {
                     println!("\r{}\r", " ".repeat(width as usize + 2));
                     println!("{}\r", "-".repeat(width as usize));
                     println!("\n\r{}\r", "=".repeat(width as usize));
-                    println!("TERMINAL RESIZED (width: {}, height: {})\r", current_size.0, current_size.1);
+                    println!(
+                        "TERMINAL RESIZED (width: {}, height: {})\r",
+                        current_size.0, current_size.1
+                    );
                     println!("{}\n\r", "=".repeat(width as usize));
                 }
                 let result = refresh_display(&mut state);
@@ -1271,19 +1353,26 @@ fn main() {
                 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
                 if let Ok(event) = crossterm::event::read() {
                     match event {
-                        Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. })
-                            if modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Char('c'),
+                            modifiers,
+                            ..
+                        }) if modifiers.contains(KeyModifiers::CONTROL) => {
                             cleanup_and_break("Monitoring stopped.");
                             break 'monitor;
                         }
-                        Event::Key(KeyEvent { code: KeyCode::Char('d'), modifiers, .. })
-                            if modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Char('d'),
+                            modifiers,
+                            ..
+                        }) if modifiers.contains(KeyModifiers::CONTROL) => {
                             cleanup_and_break("Exiting monitor mode...");
                             break 'monitor;
                         }
-                        Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Enter,
+                            ..
+                        }) => {
                             println!("\r");
                             let command = input.snapshot().trim().to_string();
                             history.record(&command);
@@ -1304,17 +1393,23 @@ fn main() {
                                 }
                                 "n" => {
                                     let rotation = ["all", "claude", "codex", "gemini"];
-                                    let idx = rotation.iter().position(|&v| v == state.vendor).unwrap_or(0);
+                                    let idx = rotation
+                                        .iter()
+                                        .position(|&v| v == state.vendor)
+                                        .unwrap_or(0);
                                     let mut new_vendor = rotation[(idx + 1) % rotation.len()];
                                     // Validate directory; skip missing vendors
                                     for _ in 0..rotation.len() {
-                                        if let Some(dir) = get_vendor_data_dir(new_vendor) {
-                                            if !dir.exists() {
-                                                println!("Skipping {} (no data dir)...\r", new_vendor);
-                                                let skip_idx = rotation.iter().position(|&v| v == new_vendor).unwrap_or(0);
-                                                new_vendor = rotation[(skip_idx + 1) % rotation.len()];
-                                                continue;
-                                            }
+                                        if let Some(dir) = get_vendor_data_dir(new_vendor)
+                                            && !dir.exists()
+                                        {
+                                            println!("Skipping {} (no data dir)...\r", new_vendor);
+                                            let skip_idx = rotation
+                                                .iter()
+                                                .position(|&v| v == new_vendor)
+                                                .unwrap_or(0);
+                                            new_vendor = rotation[(skip_idx + 1) % rotation.len()];
+                                            continue;
                                         }
                                         break;
                                     }
@@ -1389,31 +1484,51 @@ fn main() {
                                 "h" | "help" => {
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!("Available Commands:\r");
-                                    println!("  r, refresh       - Refresh statistics immediately\r");
-                                    println!("  v, vendor [X]    - Switch vendor (claude|codex|gemini|all)\r");
+                                    println!(
+                                        "  r, refresh       - Refresh statistics immediately\r"
+                                    );
+                                    println!(
+                                        "  v, vendor [X]    - Switch vendor (claude|codex|gemini|all)\r"
+                                    );
                                     println!("  n                - Rotate to next vendor\r");
                                     println!("  a                - Jump to vendor=all\r");
-                                    println!("  d, day, days [N] - Change days (default: 1 if no N)\r");
+                                    println!(
+                                        "  d, day, days [N] - Change days (default: 1 if no N)\r"
+                                    );
                                     println!("  w, week          - Week mode (7 days)\r");
                                     println!("  m, month         - Month mode (30 days)\r");
                                     println!("  date YYYY-MM-DD  - Show one complete local day\r");
-                                    println!("  range A B        - Show inclusive local date span (any order)\r");
-                                    println!("  latest           - Return to rolling days window\r");
-                                    println!("  i, interval <N>  - Change refresh interval (seconds)\r");
-                                    println!("  PgUp / PgDn      - Slide the time window back / forward by its width\r");
-                                    println!("                     (PgDn snaps to the present once you reach it)\r");
+                                    println!(
+                                        "  range A B        - Show inclusive local date span (any order)\r"
+                                    );
+                                    println!(
+                                        "  latest           - Return to rolling days window\r"
+                                    );
+                                    println!(
+                                        "  i, interval <N>  - Change refresh interval (seconds)\r"
+                                    );
+                                    println!(
+                                        "  PgUp / PgDn      - Slide the time window back / forward by its width\r"
+                                    );
+                                    println!(
+                                        "                     (PgDn snaps to the present once you reach it)\r"
+                                    );
                                     println!("{}\r", "-".repeat(width as usize));
-                                    println!("Current: vendor={}, window={}, interval={}s\r",
-                                             state.vendor,
-                                             state.time_window.display_label(Local::now()),
-                                             state.monitor_interval);
+                                    println!(
+                                        "Current: vendor={}, window={}, interval={}s\r",
+                                        state.vendor,
+                                        state.time_window.display_label(Local::now()),
+                                        state.monitor_interval
+                                    );
                                 }
                                 "e" | "exit" => {
                                     cleanup_and_break("Exiting monitor mode...");
                                     break 'monitor;
                                 }
                                 _ => {
-                                    if let Some(parsed) = parse_time_window_command(&command, state.days) {
+                                    if let Some(parsed) =
+                                        parse_time_window_command(&command, state.days)
+                                    {
                                         match parsed {
                                             Ok(window) => {
                                                 state.time_window = window;
@@ -1435,73 +1550,106 @@ fn main() {
                                     } else {
                                         let parts: Vec<&str> = command.splitn(2, ' ').collect();
                                         match parts[0] {
-                                        "v" | "vendor" if parts.len() == 2 => {
-                                            let nv = parts[1];
-                                            if ["claude", "codex", "gemini", "all"].contains(&nv) {
-                                                // Validate directory before switching
-                                                if let Some(dir) = get_vendor_data_dir(nv) {
-                                                    if !dir.exists() {
-                                                        println!("Error: Data directory not found at {}\r", dir.display());
+                                            "v" | "vendor" if parts.len() == 2 => {
+                                                let nv = parts[1];
+                                                if ["claude", "codex", "gemini", "all"]
+                                                    .contains(&nv)
+                                                {
+                                                    // Validate directory before switching
+                                                    if let Some(dir) = get_vendor_data_dir(nv)
+                                                        && !dir.exists()
+                                                    {
+                                                        println!(
+                                                            "Error: Data directory not found at {}\r",
+                                                            dir.display()
+                                                        );
                                                         show_prompt(&mut state, terminal_too_small);
                                                         continue 'monitor;
                                                     }
-                                                }
-                                                state.vendor = nv.to_string();
-                                                println!("{}\r", "-".repeat(width as usize));
-                                                println!("\n\r{}\r", "=".repeat(width as usize));
-                                                println!("SWITCHED TO {}\r", nv.to_uppercase());
-                                                println!("{}\n\r", "=".repeat(width as usize));
-                                                let result = refresh_display(&mut state);
-                                                terminal_too_small = result.is_none();
-                                                did_refresh = true;
-                                            } else {
-                                                println!("Usage: v, vendor [claude|codex|gemini|all]\r");
-                                            }
-                                        }
-                                        "d" | "day" | "days" if parts.len() == 2 => {
-                                            if let Ok(n) = parts[1].parse::<i64>() {
-                                                if n >= 1 {
-                                                    state.days = n;
-                                                    state.time_window = TimeWindow::rolling_days(n);
+                                                    state.vendor = nv.to_string();
                                                     println!("{}\r", "-".repeat(width as usize));
-                                                    println!("\n\r{}\r", "=".repeat(width as usize));
-                                                    println!("CHANGED TO {} DAYS\r", n);
+                                                    println!(
+                                                        "\n\r{}\r",
+                                                        "=".repeat(width as usize)
+                                                    );
+                                                    println!("SWITCHED TO {}\r", nv.to_uppercase());
                                                     println!("{}\n\r", "=".repeat(width as usize));
                                                     let result = refresh_display(&mut state);
                                                     terminal_too_small = result.is_none();
                                                     did_refresh = true;
                                                 } else {
-                                                    println!("Days must be at least 1.\r");
+                                                    println!(
+                                                        "Usage: v, vendor [claude|codex|gemini|all]\r"
+                                                    );
                                                 }
-                                            } else {
-                                                println!("Invalid days value.\r");
                                             }
-                                        }
-                                        "i" | "interval" if parts.len() == 2 => {
-                                            if let Ok(n) = parts[1].parse::<u64>() {
-                                                if n >= 1 {
-                                                    state.monitor_interval = n;
-                                                    next_refresh = std::time::Instant::now()
-                                                        + std::time::Duration::from_secs(n);
-                                                    println!("Refresh interval changed to {} seconds.\r", n);
+                                            "d" | "day" | "days" if parts.len() == 2 => {
+                                                if let Ok(n) = parts[1].parse::<i64>() {
+                                                    if n >= 1 {
+                                                        state.days = n;
+                                                        state.time_window =
+                                                            TimeWindow::rolling_days(n);
+                                                        println!(
+                                                            "{}\r",
+                                                            "-".repeat(width as usize)
+                                                        );
+                                                        println!(
+                                                            "\n\r{}\r",
+                                                            "=".repeat(width as usize)
+                                                        );
+                                                        println!("CHANGED TO {} DAYS\r", n);
+                                                        println!(
+                                                            "{}\n\r",
+                                                            "=".repeat(width as usize)
+                                                        );
+                                                        let result = refresh_display(&mut state);
+                                                        terminal_too_small = result.is_none();
+                                                        did_refresh = true;
+                                                    } else {
+                                                        println!("Days must be at least 1.\r");
+                                                    }
                                                 } else {
-                                                    println!("Interval must be at least 1 second.\r");
+                                                    println!("Invalid days value.\r");
                                                 }
-                                            } else {
-                                                println!("Invalid interval value.\r");
                                             }
-                                        }
-                                        "v" | "vendor" => {
-                                            println!("Current vendor: {}\r", state.vendor);
-                                            println!("Usage: v, vendor [claude|codex|gemini|all]\r");
-                                        }
-                                        "i" | "interval" => {
-                                            println!("Current interval: {} seconds\r", state.monitor_interval);
-                                            println!("Usage: i <N> or interval <N>\r");
-                                        }
-                                        _ => {
-                                            println!("Unknown command: '{}'. Type h for help.\r", command);
-                                        }
+                                            "i" | "interval" if parts.len() == 2 => {
+                                                if let Ok(n) = parts[1].parse::<u64>() {
+                                                    if n >= 1 {
+                                                        state.monitor_interval = n;
+                                                        next_refresh = std::time::Instant::now()
+                                                            + std::time::Duration::from_secs(n);
+                                                        println!(
+                                                            "Refresh interval changed to {} seconds.\r",
+                                                            n
+                                                        );
+                                                    } else {
+                                                        println!(
+                                                            "Interval must be at least 1 second.\r"
+                                                        );
+                                                    }
+                                                } else {
+                                                    println!("Invalid interval value.\r");
+                                                }
+                                            }
+                                            "v" | "vendor" => {
+                                                println!("Current vendor: {}\r", state.vendor);
+                                                println!(
+                                                    "Usage: v, vendor [claude|codex|gemini|all]\r"
+                                                );
+                                            }
+                                            "i" | "interval" => {
+                                                println!(
+                                                    "Current interval: {} seconds\r",
+                                                    state.monitor_interval
+                                                );
+                                                println!("Usage: i <N> or interval <N>\r");
+                                            }
+                                            _ => {
+                                                println!(
+                                                    "Unknown command: '{}'. Type h for help.\r",
+                                                    command
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1512,19 +1660,27 @@ fn main() {
                             }
                             show_prompt(&mut state, terminal_too_small);
                         }
-                        Event::Key(KeyEvent { code: KeyCode::Up, .. }) => {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Up, ..
+                        }) => {
                             if let Some(recalled) = history.navigate_up(input.snapshot()) {
                                 input.replace(recalled);
                                 render_input(&input, terminal_too_small);
                             }
                         }
-                        Event::Key(KeyEvent { code: KeyCode::Down, .. }) => {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Down,
+                            ..
+                        }) => {
                             if let Some(recalled) = history.navigate_down() {
                                 input.replace(recalled);
                                 render_input(&input, terminal_too_small);
                             }
                         }
-                        Event::Key(KeyEvent { code: KeyCode::PageUp, .. }) => {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::PageUp,
+                            ..
+                        }) => {
                             let now = Local::now();
                             if let Some(new_window) = state.time_window.slide_back(now) {
                                 state.time_window = new_window;
@@ -1536,7 +1692,10 @@ fn main() {
                                 render_input(&input, terminal_too_small);
                             }
                         }
-                        Event::Key(KeyEvent { code: KeyCode::PageDown, .. }) => {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::PageDown,
+                            ..
+                        }) => {
                             let now = Local::now();
                             if let Some(new_window) = state.time_window.slide_forward(now) {
                                 state.time_window = new_window;
@@ -1548,26 +1707,37 @@ fn main() {
                                 render_input(&input, terminal_too_small);
                             }
                         }
-                        Event::Key(KeyEvent { code: KeyCode::Left, .. }) => {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Left,
+                            ..
+                        }) => {
                             if input.move_left() {
                                 print!("\x1b[D");
                                 io::stdout().flush().unwrap();
                             }
                         }
-                        Event::Key(KeyEvent { code: KeyCode::Right, .. }) => {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Right,
+                            ..
+                        }) => {
                             if input.move_right() {
                                 print!("\x1b[C");
                                 io::stdout().flush().unwrap();
                             }
                         }
-                        Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Backspace,
+                            ..
+                        }) => {
                             if input.backspace() {
                                 render_input(&input, terminal_too_small);
                             }
                         }
-                        Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers, .. })
-                            if !modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Char(c),
+                            modifiers,
+                            ..
+                        }) if !modifiers.contains(KeyModifiers::CONTROL) => {
                             input.insert_char(c);
                             render_input(&input, terminal_too_small);
                         }
@@ -1598,18 +1768,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn date_command_selects_single_inclusive_day() {
         let command = parse_time_window_command("date 2026-05-07", 3)
             .expect("recognized command")
             .expect("valid date");
-        let TimeWindow::ExplicitRange { start, end, projection_days, .. } = command else {
+        let TimeWindow::ExplicitRange {
+            start,
+            end,
+            projection_days,
+            ..
+        } = command
+        else {
             panic!("date command should create an explicit window");
         };
 
-        assert_eq!(start.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-05-07 00:00:00");
-        assert_eq!(end.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-05-07 23:59:59");
+        assert_eq!(
+            start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-07 00:00:00"
+        );
+        assert_eq!(
+            end.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-07 23:59:59"
+        );
         assert_eq!(projection_days, 1.0);
     }
 
@@ -1620,6 +1803,33 @@ mod tests {
             .expect("valid range");
 
         assert_eq!(command.projection_days(Local::now()), 7.0);
+    }
+
+    #[test]
+    fn horizon_prefetches_multiple_page_windows() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+
+        assert!(compute_required_horizon(&window, now) >= 29);
+    }
+
+    #[test]
+    fn local_version_label_does_not_include_remote_update_state() {
+        assert_eq!(
+            format_local_version_label("Codex", Some("1.2.3".to_string())),
+            "Codex (1.2.3)"
+        );
+        assert_eq!(format_local_version_label("Codex", None), "Codex");
+    }
+
+    #[test]
+    fn cache_horizon_growth_is_exponential_after_initial_load() {
+        assert_eq!(next_cache_horizon(None, 29), 29);
+        assert_eq!(next_cache_horizon(Some(29), 31), 58);
+        assert_eq!(next_cache_horizon(Some(29), 90), 90);
     }
 
     #[test]

@@ -34,11 +34,11 @@ pub fn load_layered() -> AllPricing {
         combined.overlay(cached.claude, cached.codex, cached.gemini);
     }
 
-    if cache_is_stale() {
-        if let Some(live) = fetch_live(FETCH_TIMEOUT) {
-            let _ = write_cache_file(&live);
-            combined.overlay(live.claude, live.codex, live.gemini);
-        }
+    if cache_is_stale()
+        && let Some(live) = fetch_live(FETCH_TIMEOUT)
+    {
+        let _ = write_cache_file(&live);
+        combined.overlay(live.claude, live.codex, live.gemini);
     }
 
     combined.finalize()
@@ -99,8 +99,7 @@ fn write_cache_file(tables: &VendorTables) -> std::io::Result<()> {
     let Some(path) = cache_path() else {
         return Ok(());
     };
-    let json = serde_json::to_string_pretty(tables)
-        .unwrap_or_else(|_| "{}".to_string());
+    let json = serde_json::to_string_pretty(tables).unwrap_or_else(|_| "{}".to_string());
     fs::write(&path, json)
 }
 
@@ -162,10 +161,10 @@ fn parse_litellm_payload(s: &str) -> Option<VendorTables> {
 
         // Filter to chat-like modes when the field is present; LiteLLM uses
         // it to mark embeddings / image / audio models we don't want.
-        if let Some(mode) = entry.mode.as_deref() {
-            if !matches!(mode, "chat" | "responses" | "completion") {
-                continue;
-            }
+        if let Some(mode) = entry.mode.as_deref()
+            && !matches!(mode, "chat" | "responses" | "completion")
+        {
+            continue;
         }
 
         let (Some(input), Some(output)) = (entry.input_cost_per_token, entry.output_cost_per_token)
@@ -279,7 +278,10 @@ mod tests {
             Some("claude")
         );
         assert_eq!(classify_vendor("gpt-5", Some("openai")), Some("codex"));
-        assert_eq!(classify_vendor("gemini-2.5-pro", Some("vertex_ai")), Some("gemini"));
+        assert_eq!(
+            classify_vendor("gemini-2.5-pro", Some("vertex_ai")),
+            Some("gemini")
+        );
         assert_eq!(classify_vendor("o1", None), Some("codex"));
         assert_eq!(classify_vendor("claude-opus-4-7", None), Some("claude"));
         assert_eq!(classify_vendor("mistral-large", Some("mistral")), None);

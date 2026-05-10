@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::time_utils::{generate_interval_times, round_to_interval_start};
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
-use crate::time_utils::{round_to_interval_start, generate_interval_times};
 
-use crate::formatting::{format_y_axis_value, format_total_value, center_pad};
+use crate::formatting::{center_pad, format_total_value, format_y_axis_value};
 use crate::stats::{ModelTimeSeries, VendorTimeSeries};
 
 const RESET_COLOR: &str = "\x1b[0m";
@@ -23,11 +23,17 @@ fn model_config() -> Vec<(&'static str, &'static str, usize)> {
 }
 
 fn model_order(model: &str) -> Option<usize> {
-    model_config().iter().find(|(m, _, _)| *m == model).map(|(_, _, o)| *o)
+    model_config()
+        .iter()
+        .find(|(m, _, _)| *m == model)
+        .map(|(_, _, o)| *o)
 }
 
 fn model_short_name(model: &str) -> Option<&'static str> {
-    model_config().iter().find(|(m, _, _)| *m == model).map(|(_, s, _)| *s)
+    model_config()
+        .iter()
+        .find(|(m, _, _)| *m == model)
+        .map(|(_, s, _)| *s)
 }
 
 // Line color configuration (ANSI 256-color)
@@ -69,19 +75,20 @@ fn get_short_model_name_for_chart(model: &str) -> String {
     if let Some(short) = model_short_name(model) {
         return short.to_string();
     }
-    if model.contains(" (") && model.ends_with(')') {
-        if let Some(idx) = model.rfind(" (") {
-            let base = &model[..idx];
-            let effort = &model[idx + 2..model.len() - 1];
-            let effort_short = match effort {
-                "low" => "L",
-                "medium" => "M",
-                "high" => "H",
-                "xhigh" => "XH",
-                _ => &effort[..1],
-            };
-            return format!("{}({})", base, effort_short);
-        }
+    if model.contains(" (")
+        && model.ends_with(')')
+        && let Some(idx) = model.rfind(" (")
+    {
+        let base = &model[..idx];
+        let effort = &model[idx + 2..model.len() - 1];
+        let effort_short = match effort {
+            "low" => "L",
+            "medium" => "M",
+            "high" => "H",
+            "xhigh" => "XH",
+            _ => &effort[..1],
+        };
+        return format!("{}({})", base, effort_short);
     }
     if model.len() > 12 {
         model[..12].to_string()
@@ -155,7 +162,9 @@ fn build_chart_layout(
     sorted_times.reverse();
 
     let num_data_points = sorted_times.len();
-    let separator_count = sorted_times.iter().enumerate()
+    let separator_count = sorted_times
+        .iter()
+        .enumerate()
         .filter(|(i, t)| t.hour() == 0 && t.minute() == 0 && *i > 0)
         .count();
 
@@ -172,8 +181,7 @@ fn build_chart_layout(
     let mut col_idx = 0usize;
     let mut accumulated = 0.0f64;
 
-    for i in 0..num_data_points {
-        let time = sorted_times[i];
+    for (i, &time) in sorted_times.iter().enumerate().take(num_data_points) {
         if time.hour() == 0 && time.minute() == 0 && i > 0 {
             columns.push(ChartColumn::Separator);
             col_idx += 1;
@@ -189,22 +197,28 @@ fn build_chart_layout(
         data_to_col.insert(i, col_idx);
 
         for sub_col in 0..cols {
-            columns.push(ChartColumn::Data { data_idx: i, sub_col });
+            columns.push(ChartColumn::Data {
+                data_idx: i,
+                sub_col,
+            });
             col_idx += 1;
         }
     }
 
-    ChartLayout { columns, data_to_col, sorted_times }
+    ChartLayout {
+        columns,
+        data_to_col,
+        sorted_times,
+    }
 }
 
-fn print_daily_header(
-    layout: &ChartLayout,
-    line_values_fn: &dyn Fn(usize) -> f64,
-    pad: &str,
-) {
+fn print_daily_header(layout: &ChartLayout, line_values_fn: &dyn Fn(usize) -> f64, pad: &str) {
     // Build visual segments between day-boundary separators
     let total_cols = layout.columns.len();
-    let sep_positions: Vec<usize> = layout.columns.iter().enumerate()
+    let sep_positions: Vec<usize> = layout
+        .columns
+        .iter()
+        .enumerate()
         .filter(|(_, col)| matches!(col, ChartColumn::Separator))
         .map(|(i, _)| i)
         .collect();
@@ -242,9 +256,8 @@ fn print_daily_header(
             if let ChartColumn::Data { data_idx, sub_col } = &layout.columns[col_idx] {
                 let time = layout.sorted_times[*data_idx];
                 // Prefer non-midnight time as representative date
-                let dominated = repr_time.map_or(true, |r| {
-                    r.hour() == 0 && r.minute() == 0
-                        && (time.hour() != 0 || time.minute() != 0)
+                let dominated = repr_time.is_none_or(|r| {
+                    r.hour() == 0 && r.minute() == 0 && (time.hour() != 0 || time.minute() != 0)
                 });
                 if dominated {
                     repr_time = Some(time);
@@ -262,7 +275,11 @@ fn print_daily_header(
 
     // Determine display mode based on minimum inner segment width
     let inner_min = if segments.len() > 2 {
-        segments[1..segments.len() - 1].iter().map(|(s, e)| e - s + 1).min().unwrap_or(0)
+        segments[1..segments.len() - 1]
+            .iter()
+            .map(|(s, e)| e - s + 1)
+            .min()
+            .unwrap_or(0)
     } else {
         segments.iter().map(|(s, e)| e - s + 1).min().unwrap_or(0)
     };
@@ -282,12 +299,20 @@ fn print_daily_header(
         let wd_idx = day_start.weekday().num_days_from_monday() as usize;
         let (mut weekday_total, mut date_str) = if compact {
             (
-                format!("{}:{}", weekday_compact[wd_idx], format_total_compact(*total)),
+                format!(
+                    "{}:{}",
+                    weekday_compact[wd_idx],
+                    format_total_compact(*total)
+                ),
                 day_start.format("%m/%d").to_string(),
             )
         } else {
             (
-                format!("{} : {}", weekday_normal[wd_idx], format_total_value(*total)),
+                format!(
+                    "{} : {}",
+                    weekday_normal[wd_idx],
+                    format_total_value(*total)
+                ),
                 day_start.format(" %m / %d").to_string(),
             )
         };
@@ -311,11 +336,7 @@ fn print_daily_header(
         } else {
             0
         };
-        let padding = if start_pos > prev_end {
-            start_pos - prev_end
-        } else {
-            0
-        };
+        let padding = start_pos.saturating_sub(prev_end);
 
         weekday_line.push_str(&" ".repeat(padding));
         date_line.push_str(&" ".repeat(padding));
@@ -337,19 +358,24 @@ fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) 
     let target_tick = time_span_minutes * 0.05;
 
     let standard_intervals = [15, 30, 60, 120, 180, 240, 360, 480, 720, 1440];
-    let tick_interval = *standard_intervals.iter()
+    let tick_interval = *standard_intervals
+        .iter()
         .min_by_key(|&&x| ((x as f64 - target_tick).abs() * 1000.0) as i64)
         .unwrap_or(&60);
 
     let mut current_tick = first_time
-        .with_hour(0).unwrap()
-        .with_minute(0).unwrap()
-        .with_second(0).unwrap()
-        .with_nanosecond(0).unwrap();
+        .with_hour(0)
+        .unwrap()
+        .with_minute(0)
+        .unwrap()
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
 
     let minutes_since_midnight = first_time.hour() as i64 * 60 + first_time.minute() as i64;
     let ticks_since = (minutes_since_midnight + tick_interval - 1) / tick_interval;
-    current_tick = current_tick + Duration::minutes(ticks_since * tick_interval);
+    current_tick += Duration::minutes(ticks_since * tick_interval);
 
     let mut labels: Vec<String> = Vec::new();
     let mut positions: Vec<usize> = Vec::new();
@@ -367,22 +393,21 @@ fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) 
             }
         }
 
-        if let Some(idx) = closest_idx {
-            if let Some(&pos) = layout.data_to_col.get(&idx) {
-                if !used_positions.contains(&pos) {
-                    let label = if tick_interval < 60 {
-                        current_tick.format("%H:%M").to_string()
-                    } else {
-                        current_tick.format("%H").to_string()
-                    };
-                    labels.push(label);
-                    positions.push(pos);
-                    used_positions.insert(pos);
-                }
-            }
+        if let Some(idx) = closest_idx
+            && let Some(&pos) = layout.data_to_col.get(&idx)
+            && !used_positions.contains(&pos)
+        {
+            let label = if tick_interval < 60 {
+                current_tick.format("%H:%M").to_string()
+            } else {
+                current_tick.format("%H").to_string()
+            };
+            labels.push(label);
+            positions.push(pos);
+            used_positions.insert(pos);
         }
 
-        current_tick = current_tick + Duration::minutes(tick_interval);
+        current_tick += Duration::minutes(tick_interval);
     }
 
     let max_label_len = labels.iter().map(|l| l.len()).max().unwrap_or(0);
@@ -428,6 +453,7 @@ fn print_window_pager_hint(layout: &ChartLayout, pad: &str) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_grid(
     layout: &ChartLayout,
     chart_height: usize,
@@ -442,10 +468,12 @@ fn render_grid(
         if max_value == min_value {
             return 0;
         }
-        ((value - min_value as f64) / (max_value - min_value) as f64 * (chart_height - 1) as f64) as usize
+        ((value - min_value as f64) / (max_value - min_value) as f64 * (chart_height - 1) as f64)
+            as usize
     };
 
-    let line_rows: HashMap<usize, Vec<usize>> = line_values.iter()
+    let line_rows: HashMap<usize, Vec<usize>> = line_values
+        .iter()
         .map(|(&i, values)| (i, values.iter().map(|v| value_to_row(*v)).collect()))
         .collect();
 
@@ -459,24 +487,29 @@ fn render_grid(
         let rows = &line_rows[&line_idx];
 
         for (col_idx, col) in layout.columns.iter().enumerate() {
-            if let ChartColumn::Data { data_idx, sub_col, .. } = col {
+            if let ChartColumn::Data {
+                data_idx, sub_col, ..
+            } = col
+            {
                 let curr_row = rows[*data_idx];
-                let prev_row = if *data_idx > 0 { rows[*data_idx - 1] } else { curr_row };
+                let prev_row = if *data_idx > 0 {
+                    rows[*data_idx - 1]
+                } else {
+                    curr_row
+                };
 
-                if *sub_col > 0 {
-                    grid[curr_row][col_idx] = Some((line_idx, "flat"));
-                } else if prev_row == curr_row {
+                if *sub_col > 0 || prev_row == curr_row {
                     grid[curr_row][col_idx] = Some((line_idx, "flat"));
                 } else if prev_row < curr_row {
                     grid[prev_row][col_idx] = Some((line_idx, "up_to_right"));
-                    for row in (prev_row + 1)..curr_row {
-                        grid[row][col_idx] = Some((line_idx, "vertical"));
+                    for row in grid.iter_mut().take(curr_row).skip(prev_row + 1) {
+                        row[col_idx] = Some((line_idx, "vertical"));
                     }
                     grid[curr_row][col_idx] = Some((line_idx, "up_from_left"));
                 } else {
                     grid[prev_row][col_idx] = Some((line_idx, "down_to_right"));
-                    for row in (curr_row + 1)..prev_row {
-                        grid[row][col_idx] = Some((line_idx, "vertical"));
+                    for row in grid.iter_mut().take(prev_row).skip(curr_row + 1) {
+                        row[col_idx] = Some((line_idx, "vertical"));
                     }
                     grid[curr_row][col_idx] = Some((line_idx, "down_from_left"));
                 }
@@ -510,7 +543,8 @@ fn render_grid(
 
     // Draw chart from top to bottom
     for row in (0..chart_height).rev() {
-        let y_val = min_value as f64 + (max_value - min_value) as f64 * row as f64 / (chart_height - 1) as f64;
+        let y_val = min_value as f64
+            + (max_value - min_value) as f64 * row as f64 / (chart_height - 1) as f64;
         let y_label = format!("{} |", format_y_axis_value(y_val));
 
         let mut line_str = String::new();
@@ -557,6 +591,7 @@ struct LineConfig {
 }
 
 /// Print a multi-line chart with multiple lines (models x token types).
+#[allow(clippy::too_many_arguments)]
 pub fn print_multi_line_chart(
     time_series: &ModelTimeSeries,
     height: usize,
@@ -591,16 +626,29 @@ pub fn print_multi_line_chart(
         )
     } else {
         let labels = match vendor {
-            "codex" => HashMap::from([("cache_read", "Cache Read In"), ("cache_creation", "Reasoning Out")]),
-            "gemini" => HashMap::from([("cache_read", "Cache Read In"), ("cache_creation", "Thinking Out")]),
-            _ => HashMap::from([("cache_read", "Cache Read In"), ("cache_creation", "Cache Create In")]),
+            "codex" => HashMap::from([
+                ("cache_read", "Cache Read In"),
+                ("cache_creation", "Reasoning Out"),
+            ]),
+            "gemini" => HashMap::from([
+                ("cache_read", "Cache Read In"),
+                ("cache_creation", "Thinking Out"),
+            ]),
+            _ => HashMap::from([
+                ("cache_read", "Cache Read In"),
+                ("cache_creation", "Cache Create In"),
+            ]),
         };
         let title = match vendor {
             "codex" => "Models Cache Read Input / Reasoning Output Token Consumption",
             "gemini" => "Models Cache Read Input / Thinking Output Token Consumption",
             _ => "Models Cache Read Input / Cache Creation Input Token Consumption",
         };
-        (vec!["cache_read", "cache_creation"], labels, title.to_string())
+        (
+            vec!["cache_read", "cache_creation"],
+            labels,
+            title.to_string(),
+        )
     };
 
     // Collect all models
@@ -617,13 +665,21 @@ pub fn print_multi_line_chart(
     let config = model_config();
     let known_set: HashSet<&str> = config.iter().map(|(m, _, _)| *m).collect();
 
-    let mut known_models: Vec<String> = all_models.iter().filter(|m| known_set.contains(m.as_str())).cloned().collect();
-    let mut other_models: Vec<String> = all_models.iter().filter(|m| !known_set.contains(m.as_str())).cloned().collect();
+    let mut known_models: Vec<String> = all_models
+        .iter()
+        .filter(|m| known_set.contains(m.as_str()))
+        .cloned()
+        .collect();
+    let mut other_models: Vec<String> = all_models
+        .iter()
+        .filter(|m| !known_set.contains(m.as_str()))
+        .cloned()
+        .collect();
 
     known_models.sort_by_key(|m| model_order(m).unwrap_or(99));
     other_models.sort();
 
-    let all_models_sorted: Vec<String> = known_models.into_iter().chain(other_models.into_iter()).collect();
+    let all_models_sorted: Vec<String> = known_models.into_iter().chain(other_models).collect();
 
     if all_models_sorted.is_empty() {
         println!("No models found in data.");
@@ -677,29 +733,40 @@ pub fn print_multi_line_chart(
     let mut all_values: Vec<f64> = Vec::new();
 
     for (i, line) in lines.iter().enumerate() {
-        let values: Vec<f64> = layout.sorted_times.iter().map(|time| {
-            time_series.get(time)
-                .and_then(|model_map| model_map.get(&line.model))
-                .map(|breakdown| {
-                    match line.token_type.as_str() {
+        let values: Vec<f64> = layout
+            .sorted_times
+            .iter()
+            .map(|time| {
+                time_series
+                    .get(time)
+                    .and_then(|model_map| model_map.get(&line.model))
+                    .map(|breakdown| match line.token_type.as_str() {
                         "input" => breakdown.input,
                         "output" => breakdown.output,
                         "cache_creation" => breakdown.cache_creation,
                         "cache_read" => breakdown.cache_read,
                         _ => 0.0,
-                    }
-                })
-                .unwrap_or(0.0)
-        }).collect();
+                    })
+                    .unwrap_or(0.0)
+            })
+            .collect();
         all_values.extend_from_slice(&values);
         line_values.insert(i, values);
     }
 
     let max_value_raw = all_values.iter().cloned().fold(0.0f64, f64::max);
-    let max_value_raw = if max_value_raw == 0.0 { 1.0 } else { max_value_raw };
+    let max_value_raw = if max_value_raw == 0.0 {
+        1.0
+    } else {
+        max_value_raw
+    };
     let max_value = round_to_nice(max_value_raw, true);
     let min_value = 0i64;
-    let max_value = if max_value == min_value { min_value + 5000 } else { max_value };
+    let max_value = if max_value == min_value {
+        min_value + 5000
+    } else {
+        max_value
+    };
 
     // Print title
     let chart_width = layout.columns.len() + 7;
@@ -712,18 +779,36 @@ pub fn print_multi_line_chart(
     println!("{}{}", pad, "=".repeat(chart_width));
 
     // Daily header - sum all lines for daily totals
-    print_daily_header(&layout, &|data_idx| {
-        lines.iter().enumerate().map(|(i, _)| line_values[&i][data_idx]).sum::<f64>()
-    }, &pad);
+    print_daily_header(
+        &layout,
+        &|data_idx| {
+            lines
+                .iter()
+                .enumerate()
+                .map(|(i, _)| line_values[&i][data_idx])
+                .sum::<f64>()
+        },
+        &pad,
+    );
 
-    render_grid(&layout, height, max_value, min_value, &lines, &line_values, false, &pad);
+    render_grid(
+        &layout,
+        height,
+        max_value,
+        min_value,
+        &lines,
+        &line_values,
+        false,
+        &pad,
+    );
 
     if show_x_axis {
         print_x_axis_labels(&layout, interval_minutes, &pad);
     }
 
     if show_legend {
-        let legend_parts: Vec<String> = lines.iter()
+        let legend_parts: Vec<String> = lines
+            .iter()
             .map(|l| format!("{}\u{2500}{} {}", l.color, RESET_COLOR, l.label))
             .collect();
         println!("{}Legend: {}", pad, legend_parts.join("  "));
@@ -731,6 +816,7 @@ pub fn print_multi_line_chart(
 }
 
 /// Print a vendor comparison chart.
+#[allow(clippy::too_many_arguments)]
 pub fn print_vendor_comparison_chart(
     time_series: &VendorTimeSeries,
     height: usize,
@@ -762,11 +848,13 @@ pub fn print_vendor_comparison_chart(
     }
 
     let vendor_order = ["Claude", "Codex", "Gemini"];
-    let mut vendors_sorted: Vec<String> = vendor_order.iter()
+    let mut vendors_sorted: Vec<String> = vendor_order
+        .iter()
         .filter(|v| all_vendors.contains(**v))
         .map(|v| v.to_string())
         .collect();
-    let mut remaining: Vec<&String> = all_vendors.iter()
+    let mut remaining: Vec<&String> = all_vendors
+        .iter()
         .filter(|v| !vendor_order.contains(&v.as_str()))
         .collect();
     remaining.sort_unstable();
@@ -788,47 +876,67 @@ pub fn print_vendor_comparison_chart(
         if vendor == "All" {
             continue;
         }
-        let values: Vec<f64> = layout.sorted_times.iter().map(|time| {
-            time_series.get(time)
-                .and_then(|vm| vm.get(vendor))
-                .copied()
-                .unwrap_or(0.0)
-        }).collect();
+        let values: Vec<f64> = layout
+            .sorted_times
+            .iter()
+            .map(|time| {
+                time_series
+                    .get(time)
+                    .and_then(|vm| vm.get(vendor))
+                    .copied()
+                    .unwrap_or(0.0)
+            })
+            .collect();
         vendor_data.insert(vendor.clone(), values);
     }
 
     // Calculate "All" as sum
-    let all_values: Vec<f64> = (0..layout.sorted_times.len()).map(|i| {
-        vendors_sorted.iter()
-            .filter(|v| *v != "All")
-            .map(|v| vendor_data.get(v).map(|vals| vals[i]).unwrap_or(0.0))
-            .sum()
-    }).collect();
+    let all_values: Vec<f64> = (0..layout.sorted_times.len())
+        .map(|i| {
+            vendors_sorted
+                .iter()
+                .filter(|v| *v != "All")
+                .map(|v| vendor_data.get(v).map(|vals| vals[i]).unwrap_or(0.0))
+                .sum()
+        })
+        .collect();
     vendor_data.insert("All".to_string(), all_values);
 
     // Find max value
-    let max_value_raw = vendor_data.values()
+    let max_value_raw = vendor_data
+        .values()
         .flat_map(|vals| vals.iter())
         .cloned()
         .fold(0.0f64, f64::max);
-    let max_value_raw = if max_value_raw == 0.0 { 1.0 } else { max_value_raw };
+    let max_value_raw = if max_value_raw == 0.0 {
+        1.0
+    } else {
+        max_value_raw
+    };
     let max_value = round_to_nice(max_value_raw, true);
     let min_value = 0i64;
-    let max_value = if max_value == min_value { min_value + 5000 } else { max_value };
+    let max_value = if max_value == min_value {
+        min_value + 5000
+    } else {
+        max_value
+    };
 
     // Build line configs
-    let lines: Vec<LineConfig> = vendors_sorted.iter().map(|v| {
-        LineConfig {
+    let lines: Vec<LineConfig> = vendors_sorted
+        .iter()
+        .map(|v| LineConfig {
             model: v.clone(),
             token_type: String::new(),
             color: vendor_color(v).to_string(),
             label: v.clone(),
-        }
-    }).collect();
+        })
+        .collect();
 
-    let line_values: HashMap<usize, Vec<f64>> = vendors_sorted.iter().enumerate().map(|(i, v)| {
-        (i, vendor_data[v].clone())
-    }).collect();
+    let line_values: HashMap<usize, Vec<f64>> = vendors_sorted
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i, vendor_data[v].clone()))
+        .collect();
 
     let chart_title = "Total Token Consumption by Vendor";
     let chart_width = layout.columns.len() + 7;
@@ -839,17 +947,25 @@ pub fn print_vendor_comparison_chart(
     println!("{}{}", pad, "=".repeat(chart_width));
 
     // Daily header using "All" totals
-    print_daily_header(&layout, &|data_idx| {
-        vendor_data["All"][data_idx]
-    }, &pad);
+    print_daily_header(&layout, &|data_idx| vendor_data["All"][data_idx], &pad);
 
-    render_grid(&layout, height, max_value, min_value, &lines, &line_values, true, &pad);
+    render_grid(
+        &layout,
+        height,
+        max_value,
+        min_value,
+        &lines,
+        &line_values,
+        true,
+        &pad,
+    );
 
     print_x_axis_labels(&layout, interval_minutes, &pad);
 
     if show_legend {
         // Calculate vendor totals and percentages
-        let vendor_totals: HashMap<String, f64> = vendors_sorted.iter()
+        let vendor_totals: HashMap<String, f64> = vendors_sorted
+            .iter()
             .filter(|v| *v != "All")
             .map(|v| (v.clone(), vendor_data[v].iter().sum::<f64>()))
             .collect();
@@ -863,7 +979,10 @@ pub fn print_vendor_comparison_chart(
             } else {
                 0.0
             };
-            legend_items.push(format!("{}\u{2500}{} {}({:.1}%)", color, RESET_COLOR, v, pct));
+            legend_items.push(format!(
+                "{}\u{2500}{} {}({:.1}%)",
+                color, RESET_COLOR, v, pct
+            ));
         }
         let all_color = vendor_color("All");
         legend_items.push(format!("{}\u{2501}{} All(100%)", all_color, RESET_COLOR));

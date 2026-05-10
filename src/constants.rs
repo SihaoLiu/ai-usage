@@ -43,13 +43,12 @@ impl ModelPricing {
         if tokens <= 0 {
             return 0.0;
         }
-        if let Some(above) = above_per_mtok {
-            if tokens > TIER_THRESHOLD {
-                let below = TIER_THRESHOLD as f64;
-                let extra = (tokens - TIER_THRESHOLD) as f64;
-                return below * base_per_mtok / 1_000_000.0
-                    + extra * above / 1_000_000.0;
-            }
+        if let Some(above) = above_per_mtok
+            && tokens > TIER_THRESHOLD
+        {
+            let below = TIER_THRESHOLD as f64;
+            let extra = (tokens - TIER_THRESHOLD) as f64;
+            return below * base_per_mtok / 1_000_000.0 + extra * above / 1_000_000.0;
         }
         tokens as f64 * base_per_mtok / 1_000_000.0
     }
@@ -139,20 +138,17 @@ impl AllPricing {
         // Mirrors ccusage's prefix-tolerant matching so e.g. a future
         // claude-sonnet-4-5-20251201 still resolves to claude-sonnet-4-5
         // pricing rather than the vendor default.
-        if let Some(stripped) = strip_date_suffix(model) {
-            if let Some(p) = table.get(stripped) {
-                return p;
-            }
+        if let Some(stripped) = strip_date_suffix(model)
+            && let Some(p) = table.get(stripped)
+        {
+            return p;
         }
 
         default
     }
 }
 
-fn overlay_table(
-    target: &mut HashMap<String, ModelPricing>,
-    src: HashMap<String, ModelPricing>,
-) {
+fn overlay_table(target: &mut HashMap<String, ModelPricing>, src: HashMap<String, ModelPricing>) {
     for (key, mut new) in src {
         if let Some(existing) = target.get(&key) {
             if new.input_above_200k.is_none() {
@@ -190,9 +186,7 @@ fn expand_date_aliases(map: HashMap<String, ModelPricing>) -> HashMap<String, Mo
     let mut result = map;
     let aliases: Vec<(String, ModelPricing)> = result
         .iter()
-        .filter_map(|(k, v)| {
-            strip_date_suffix(k).map(|stripped| (stripped.to_string(), v.clone()))
-        })
+        .filter_map(|(k, v)| strip_date_suffix(k).map(|stripped| (stripped.to_string(), v.clone())))
         .filter(|(stripped, _)| !result.contains_key(stripped))
         .collect();
     for (k, v) in aliases {
@@ -277,10 +271,10 @@ pub fn load_subscription_fees() -> Option<SubscriptionFees> {
             let key = key.trim();
             let value = value.trim();
             for &(fee_key, vendor) in FEE_KEYS {
-                if key == fee_key {
-                    if let Ok(v) = value.parse::<f64>() {
-                        fees.insert(vendor.to_string(), v);
-                    }
+                if key == fee_key
+                    && let Ok(v) = value.parse::<f64>()
+                {
+                    fees.insert(vendor.to_string(), v);
                 }
             }
         }

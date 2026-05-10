@@ -8,7 +8,9 @@ use chrono::{DateTime, Local};
 
 use crate::constants::{AllPricing, ModelPricing};
 use crate::data::UsageEntry;
-use crate::time_utils::{parse_timestamp, to_interval, distribute_tokens_to_intervals, TokenFractions};
+use crate::time_utils::{
+    TokenFractions, distribute_tokens_to_intervals, parse_timestamp, to_interval,
+};
 
 /// Model breakdown row (shared across all vendors).
 ///
@@ -73,8 +75,9 @@ pub(crate) fn calculate_model_breakdown_generic(
             entry.model.clone()
         };
 
-        let row = model_stats.entry(model_key.clone()).or_insert_with(|| {
-            ModelBreakdownRow {
+        let row = model_stats
+            .entry(model_key.clone())
+            .or_insert_with(|| ModelBreakdownRow {
                 model: model_key,
                 vendor: vendor.to_string(),
                 count: 0,
@@ -90,8 +93,7 @@ pub(crate) fn calculate_model_breakdown_generic(
                 output_cost: 0.0,
                 cache_read_cost: 0.0,
                 cache_creation_cost: 0.0,
-            }
-        });
+            });
 
         row.count += 1;
         row.input += entry.usage.input_tokens;
@@ -207,9 +209,7 @@ pub(crate) fn calculate_model_token_breakdown_time_series_generic(
         if !distributed.is_empty() {
             for (interval_time, fraction) in distributed {
                 let model_map = time_series.entry(interval_time).or_default();
-                let breakdown = model_map
-                    .entry(model_key.clone())
-                    .or_insert_with(IntervalTokenBreakdown::default);
+                let breakdown = model_map.entry(model_key.clone()).or_default();
                 breakdown.input += fraction.input;
                 breakdown.output += fraction.output;
                 breakdown.cache_creation += fraction.cache_creation;
@@ -224,9 +224,7 @@ pub(crate) fn calculate_model_token_breakdown_time_series_generic(
             if let Some(ts) = timestamp_local {
                 let interval_time = to_interval(&ts, interval_minutes);
                 let model_map = time_series.entry(interval_time).or_default();
-                let breakdown = model_map
-                    .entry(model_key.clone())
-                    .or_insert_with(IntervalTokenBreakdown::default);
+                let breakdown = model_map.entry(model_key.clone()).or_default();
                 breakdown.input += tokens.input;
                 breakdown.output += tokens.output;
                 breakdown.cache_creation += tokens.cache_creation;
@@ -239,12 +237,16 @@ pub(crate) fn calculate_model_token_breakdown_time_series_generic(
 }
 
 // Public wrappers for each vendor
-pub use claude::{calculate_model_breakdown as calculate_claude_model_breakdown,
-                 calculate_model_token_breakdown_time_series as calculate_claude_model_token_breakdown_time_series};
-pub use codex::{calculate_codex_model_breakdown,
-                calculate_codex_model_token_breakdown_time_series};
-pub use gemini::{calculate_gemini_model_breakdown,
-                 calculate_gemini_model_token_breakdown_time_series};
+pub use claude::{
+    calculate_model_breakdown as calculate_claude_model_breakdown,
+    calculate_model_token_breakdown_time_series as calculate_claude_model_token_breakdown_time_series,
+};
+pub use codex::{
+    calculate_codex_model_breakdown, calculate_codex_model_token_breakdown_time_series,
+};
+pub use gemini::{
+    calculate_gemini_model_breakdown, calculate_gemini_model_token_breakdown_time_series,
+};
 
 // Re-export the generic functions for use by vendor modules
 pub(crate) use self::calculate_model_breakdown_generic as _calc_breakdown;

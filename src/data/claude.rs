@@ -22,10 +22,7 @@ pub fn get_claude_dirs() -> Vec<PathBuf> {
     }
 
     let home = dirs_home();
-    vec![
-        home.join(".config/claude"),
-        home.join(".claude"),
-    ]
+    vec![home.join(".config/claude"), home.join(".claude")]
 }
 
 fn dirs_home() -> PathBuf {
@@ -37,9 +34,8 @@ fn dirs_home() -> PathBuf {
 /// Collect all JSONL file paths under the given directory,
 /// optionally filtering by mtime (files modified within `max_age_days`).
 fn collect_jsonl_files(dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
-    let cutoff = max_age_days.map(|days| {
-        SystemTime::now() - std::time::Duration::from_secs((days as u64 + 1) * 86400)
-    });
+    let cutoff = max_age_days
+        .map(|days| SystemTime::now() - std::time::Duration::from_secs((days as u64 + 1) * 86400));
 
     WalkDir::new(dir)
         .into_iter()
@@ -48,15 +44,14 @@ fn collect_jsonl_files(dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
             if !e.file_type().is_file() {
                 return false;
             }
-            if !e.path().extension().is_some_and(|ext| ext == "jsonl") {
+            if e.path().extension().is_none_or(|ext| ext != "jsonl") {
                 return false;
             }
-            if let Some(cutoff_time) = cutoff {
-                if let Ok(meta) = e.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        return mtime >= cutoff_time;
-                    }
-                }
+            if let Some(cutoff_time) = cutoff
+                && let Ok(meta) = e.metadata()
+                && let Ok(mtime) = meta.modified()
+            {
+                return mtime >= cutoff_time;
             }
             true
         })
@@ -143,14 +138,8 @@ fn read_single_jsonl_file_with_keys(path: &Path) -> Vec<(String, UsageEntry)> {
             .to_string();
 
         // Build dedup key from message_id:request_id
-        let message_id = message
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let request_id = data
-            .get("requestId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let message_id = message.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let request_id = data.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
 
         let dedup_key = if !message_id.is_empty() && !request_id.is_empty() {
             format!("{}:{}", message_id, request_id)

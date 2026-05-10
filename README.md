@@ -16,7 +16,7 @@ A fast terminal dashboard for tracking token usage and costs across **Claude Cod
 
 ### Option 1: Download binary
 
-Download the pre-built static binary from [Releases](https://github.com/shinezyy/ai-usage/releases) and place it anywhere in your `$PATH`. No dependencies required.
+Download the pre-built static binary from [Releases](https://github.com/SihaoLiu/ai-usage/releases) and place it anywhere in your `$PATH`. No dependencies required.
 
 ### Option 2: Build from source
 

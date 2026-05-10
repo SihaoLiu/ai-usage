@@ -6,10 +6,16 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Local};
 
+use crate::constants::{AllPricing, ModelPricing};
 use crate::data::UsageEntry;
 use crate::time_utils::{parse_timestamp, to_interval, distribute_tokens_to_intervals, TokenFractions};
 
 /// Model breakdown row (shared across all vendors).
+///
+/// Cost component fields are populated during aggregation by applying tiered
+/// pricing on each individual entry, then summing. This is the only correct
+/// way to handle Claude's 1M-context >200k-tier pricing — applying the tier
+/// post-aggregation overstates cost when many entries are below the threshold.
 #[derive(Debug, Clone)]
 pub struct ModelBreakdownRow {
     pub model: String,
@@ -23,6 +29,10 @@ pub struct ModelBreakdownRow {
     pub thinking: i64,
     pub total: i64,
     pub total_with_cache: i64,
+    pub input_cost: f64,
+    pub output_cost: f64,
+    pub cache_read_cost: f64,
+    pub cache_creation_cost: f64,
 }
 
 /// Token breakdown for a time interval (per model).
@@ -41,10 +51,14 @@ pub type ModelTimeSeries = HashMap<DateTime<Local>, HashMap<String, IntervalToke
 pub type VendorTimeSeries = HashMap<DateTime<Local>, HashMap<String, f64>>;
 
 /// Calculate model breakdown with 1% threshold filtering.
+///
+/// Cost is computed per-entry using `ModelPricing::tier_cost` so that the
+/// 200k-tier premium for Claude 1M-context models is applied correctly.
 pub(crate) fn calculate_model_breakdown_generic(
     usage_data: &[UsageEntry],
     vendor: &str,
     combine_effort: bool,
+    pricing: &AllPricing,
 ) -> Vec<ModelBreakdownRow> {
     let mut model_stats: HashMap<String, ModelBreakdownRow> = HashMap::new();
 
@@ -72,6 +86,10 @@ pub(crate) fn calculate_model_breakdown_generic(
                 thinking: 0,
                 total: 0,
                 total_with_cache: 0,
+                input_cost: 0.0,
+                output_cost: 0.0,
+                cache_read_cost: 0.0,
+                cache_creation_cost: 0.0,
             }
         });
 
@@ -92,6 +110,39 @@ pub(crate) fn calculate_model_breakdown_generic(
                 row.cache_creation += entry.usage.cache_creation_input_tokens;
             }
         }
+
+        // Apply tiered pricing per-entry. Use entry.model (without the effort
+        // suffix) so the lookup matches pricing.json keys.
+        let p = pricing.get_pricing(vendor, &entry.model);
+        row.input_cost +=
+            ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
+        row.output_cost +=
+            ModelPricing::tier_cost(entry.usage.output_tokens, p.output, p.output_above_200k);
+        row.cache_read_cost += ModelPricing::tier_cost(
+            entry.usage.cache_read_input_tokens,
+            p.cache_input,
+            p.cache_input_above_200k,
+        );
+        row.cache_creation_cost += match vendor {
+            // Codex bills reasoning at the output rate; tier rules track output.
+            "codex" => ModelPricing::tier_cost(
+                entry.usage.reasoning_output_tokens,
+                p.output,
+                p.output_above_200k,
+            ),
+            // Gemini's "thoughts" land in cache_creation_input_tokens and bill
+            // at the output rate.
+            "gemini" => ModelPricing::tier_cost(
+                entry.usage.cache_creation_input_tokens,
+                p.output,
+                p.output_above_200k,
+            ),
+            _ => ModelPricing::tier_cost(
+                entry.usage.cache_creation_input_tokens,
+                p.cache_output,
+                p.cache_output_above_200k,
+            ),
+        };
     }
 
     let mut result: Vec<ModelBreakdownRow> = model_stats

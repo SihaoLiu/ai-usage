@@ -2,6 +2,7 @@ mod charts;
 mod constants;
 mod data;
 mod formatting;
+mod pricing;
 mod stats;
 mod time_utils;
 
@@ -15,7 +16,7 @@ use chrono::{Duration, Local};
 use clap::Parser;
 use crossterm::terminal;
 
-use constants::{AllPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees};
+use constants::{AllPricing, ModelPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees};
 use data::UsageEntry;
 use data::claude::read_all_jsonl_files_dedup;
 use data::codex::get_codex_dir;
@@ -287,17 +288,29 @@ fn calculate_vendor_aggregate_time_series(
     time_series
 }
 
-fn calculate_all_model_breakdown(all_data: &AllVendorData) -> Vec<ModelBreakdownRow> {
+fn calculate_all_model_breakdown(
+    all_data: &AllVendorData,
+    pricing: &AllPricing,
+) -> Vec<ModelBreakdownRow> {
     let mut all_stats: Vec<ModelBreakdownRow> = Vec::new();
 
     if !all_data.claude.is_empty() {
-        all_stats.extend(stats::calculate_claude_model_breakdown(&all_data.claude));
+        all_stats.extend(stats::calculate_claude_model_breakdown(
+            &all_data.claude,
+            pricing,
+        ));
     }
     if !all_data.codex.is_empty() {
-        all_stats.extend(stats::calculate_codex_model_breakdown(&all_data.codex));
+        all_stats.extend(stats::calculate_codex_model_breakdown(
+            &all_data.codex,
+            pricing,
+        ));
     }
     if !all_data.gemini.is_empty() {
-        all_stats.extend(stats::calculate_gemini_model_breakdown(&all_data.gemini));
+        all_stats.extend(stats::calculate_gemini_model_breakdown(
+            &all_data.gemini,
+            pricing,
+        ));
     }
 
     all_stats.sort_by(|a, b| b.count.cmp(&a.count));
@@ -325,58 +338,58 @@ fn calculate_weighted_cost_per_mtok(
             continue;
         }
 
-        // Accumulate per-model stats
-        let mut model_stats: HashMap<String, (i64, i64, i64, i64)> = HashMap::new();
         let mut total_tokens: i64 = 0;
+        let mut api_cost: f64 = 0.0;
 
+        // Compute cost per-entry so tiered pricing (Claude 1M-context >200k
+        // premium) is applied correctly. Aggregating tokens first and then
+        // multiplying by the tier rate would overstate cost when many entries
+        // are individually below 200k.
         for entry in entries {
             if entry.model.contains("<synthetic>") {
                 continue;
             }
-            let model = &entry.model;
-            let e = model_stats.entry(model.clone()).or_insert((0, 0, 0, 0));
-            e.0 += entry.usage.input_tokens;
-            e.1 += entry.usage.output_tokens;
-            e.2 += entry.usage.cache_read_input_tokens;
-            match vendor {
-                "codex" => {
-                    e.3 += entry.usage.reasoning_output_tokens;
-                    total_tokens += entry.usage.input_tokens + entry.usage.output_tokens
-                        + entry.usage.cache_read_input_tokens + entry.usage.reasoning_output_tokens;
-                }
-                "gemini" => {
-                    e.3 += entry.usage.cache_creation_input_tokens; // thinking stored here
-                    total_tokens += entry.usage.input_tokens + entry.usage.output_tokens
-                        + entry.usage.cache_read_input_tokens + entry.usage.cache_creation_input_tokens;
-                }
-                _ => {
-                    e.3 += entry.usage.cache_creation_input_tokens;
-                    total_tokens += entry.usage.input_tokens + entry.usage.output_tokens
-                        + entry.usage.cache_read_input_tokens + entry.usage.cache_creation_input_tokens;
-                }
-            }
+
+            let extra = match vendor {
+                "codex" => entry.usage.reasoning_output_tokens,
+                _ => entry.usage.cache_creation_input_tokens,
+            };
+            total_tokens += entry.usage.input_tokens
+                + entry.usage.output_tokens
+                + entry.usage.cache_read_input_tokens
+                + extra;
+
+            let p = pricing.get_pricing(vendor, &entry.model);
+            api_cost +=
+                ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
+            api_cost +=
+                ModelPricing::tier_cost(entry.usage.output_tokens, p.output, p.output_above_200k);
+            api_cost += ModelPricing::tier_cost(
+                entry.usage.cache_read_input_tokens,
+                p.cache_input,
+                p.cache_input_above_200k,
+            );
+            api_cost += match vendor {
+                "codex" => ModelPricing::tier_cost(
+                    entry.usage.reasoning_output_tokens,
+                    p.output,
+                    p.output_above_200k,
+                ),
+                "gemini" => ModelPricing::tier_cost(
+                    entry.usage.cache_creation_input_tokens,
+                    p.output,
+                    p.output_above_200k,
+                ),
+                _ => ModelPricing::tier_cost(
+                    entry.usage.cache_creation_input_tokens,
+                    p.cache_output,
+                    p.cache_output_above_200k,
+                ),
+            };
         }
 
         if total_tokens == 0 {
             continue;
-        }
-
-        // Calculate API cost
-        let mut api_cost = 0.0;
-        for (model, (input, output, cache_read, extra)) in &model_stats {
-            let base_model = if vendor == "codex" && model.contains(" (") && model.ends_with(')') {
-                model.rsplit_once(" (").map(|(base, _)| base).unwrap_or(model)
-            } else {
-                model.as_str()
-            };
-            let p = pricing.get_pricing(vendor, base_model);
-            api_cost += *input as f64 * p.input / 1_000_000.0;
-            api_cost += *output as f64 * p.output / 1_000_000.0;
-            api_cost += *cache_read as f64 * p.cache_input / 1_000_000.0;
-            api_cost += match vendor {
-                "codex" | "gemini" => *extra as f64 * p.output / 1_000_000.0,
-                _ => *extra as f64 * p.cache_output / 1_000_000.0,
-            };
         }
 
         vendor_data.push((total_tokens, api_cost, sub_price));
@@ -561,9 +574,9 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         return Some(false);
     }
     let model_stats = match vendor.as_str() {
-        "codex" => stats::calculate_codex_model_breakdown(&filtered),
-        "gemini" => stats::calculate_gemini_model_breakdown(&filtered),
-        _ => stats::calculate_claude_model_breakdown(&filtered),
+        "codex" => stats::calculate_codex_model_breakdown(&filtered, &state.pricing),
+        "gemini" => stats::calculate_gemini_model_breakdown(&filtered, &state.pricing),
+        _ => stats::calculate_claude_model_breakdown(&filtered, &state.pricing),
     };
 
     // Pre-check whether table will be displayed and total height fits
@@ -611,7 +624,6 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         Some(effective_height),
         vendor,
         &state.subscription_fees,
-        &state.pricing,
     );
 
     let optimal = calculate_optimal_interval_minutes(state.days, target_width);
@@ -676,7 +688,7 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     };
 
     let vendor_time_series = calculate_vendor_aggregate_time_series(&all_data, interval_minutes);
-    let all_model_stats = calculate_all_model_breakdown(&all_data);
+    let all_model_stats = calculate_all_model_breakdown(&all_data, &state.pricing);
 
     // Pre-check whether table will be displayed
     let table_mode = formatting::get_table_display_mode(width, height, all_model_stats.len());
@@ -717,7 +729,6 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
             Some(effective_height),
             "all",
             &state.subscription_fees,
-            &state.pricing,
         );
     }
 
@@ -757,7 +768,7 @@ fn print_stats(state: &mut AppState, once: bool) -> Option<bool> {
 fn main() {
     let args = Args::parse();
 
-    let pricing = AllPricing::load();
+    let pricing = pricing::load_layered();
     let subscription_fees = load_subscription_fees()
         .unwrap_or_else(|| prompt_subscription_fees());
 

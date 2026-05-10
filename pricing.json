@@ -10,31 +10,56 @@
         "input": 5.00,
         "output": 25.00,
         "cache_input": 0.50,
-        "cache_output": 6.25
+        "cache_output": 6.25,
+        "input_above_200k": 10.00,
+        "output_above_200k": 50.00,
+        "cache_input_above_200k": 1.00,
+        "cache_output_above_200k": 12.50,
+        "_comment": "1M context model: 2x tier above 200k tokens per request"
       },
       "claude-opus-4-6": {
         "input": 5.00,
         "output": 25.00,
         "cache_input": 0.50,
-        "cache_output": 6.25
+        "cache_output": 6.25,
+        "input_above_200k": 10.00,
+        "output_above_200k": 50.00,
+        "cache_input_above_200k": 1.00,
+        "cache_output_above_200k": 12.50,
+        "_comment": "1M context model: 2x tier above 200k tokens per request"
       },
       "claude-opus-4-5-20251101": {
         "input": 5.00,
         "output": 25.00,
         "cache_input": 0.50,
-        "cache_output": 6.25
+        "cache_output": 6.25,
+        "input_above_200k": 10.00,
+        "output_above_200k": 50.00,
+        "cache_input_above_200k": 1.00,
+        "cache_output_above_200k": 12.50,
+        "_comment": "1M context model: 2x tier above 200k tokens per request"
       },
       "claude-sonnet-4-6": {
         "input": 3.00,
         "output": 15.00,
         "cache_input": 0.30,
-        "cache_output": 3.75
+        "cache_output": 3.75,
+        "input_above_200k": 6.00,
+        "output_above_200k": 22.50,
+        "cache_input_above_200k": 0.60,
+        "cache_output_above_200k": 7.50,
+        "_comment": "1M context model: 2x tier above 200k tokens per request"
       },
       "claude-sonnet-4-5-20250929": {
         "input": 3.00,
         "output": 15.00,
         "cache_input": 0.30,
-        "cache_output": 3.75
+        "cache_output": 3.75,
+        "input_above_200k": 6.00,
+        "output_above_200k": 22.50,
+        "cache_input_above_200k": 0.60,
+        "cache_output_above_200k": 7.50,
+        "_comment": "1M context model: 2x tier above 200k tokens per request"
       },
       "claude-haiku-4-5-20251001": {
         "input": 1.00,

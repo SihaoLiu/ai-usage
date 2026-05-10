@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::constants::{AllPricing, SubscriptionFees};
+use crate::constants::SubscriptionFees;
 use crate::stats::ModelBreakdownRow;
 
 // Short model name mappings for Claude
@@ -478,7 +478,6 @@ pub fn print_model_breakdown(
     terminal_height: Option<u16>,
     vendor: &str,
     subscription_fees: &SubscriptionFees,
-    pricing: &AllPricing,
 ) -> bool {
     // Calculate sums
     let mut sum_messages: i64 = 0;
@@ -521,28 +520,15 @@ pub fn print_model_breakdown(
     let subscription_price = subscription_fees.get(vendor);
 
     for stats in model_stats {
-        let resolved_vendor = &stats.vendor;
-        let model = &stats.model;
-
-        // For Codex, extract base model name
-        let base_model = if resolved_vendor == "codex" && model.contains(" (") && model.ends_with(')') {
-            model.rsplit_once(" (").map(|(base, _)| base).unwrap_or(model)
-        } else {
-            model.as_str()
-        };
-
-        let p = pricing.get_pricing(resolved_vendor, base_model);
-        let row_input_cost = stats.input as f64 * p.input / 1_000_000.0;
-        let row_output_cost = stats.output as f64 * p.output / 1_000_000.0;
-        let row_cache_input_cost = stats.cache_read as f64 * p.cache_input / 1_000_000.0;
-        let row_cache_output_cost = match resolved_vendor.as_str() {
-            "codex" => stats.reasoning as f64 * p.output / 1_000_000.0,
-            "gemini" => stats.thinking as f64 * p.output / 1_000_000.0,
-            _ => stats.cache_creation as f64 * p.cache_output / 1_000_000.0,
-        };
-
+        // Costs are pre-computed per-entry during aggregation (so tiered
+        // pricing for Claude 1M-context models is correct), so we just
+        // re-bucket the four components into the display strategy.
         let (row_ch, row_pf, row_dc) = get_strategy_costs(
-            row_input_cost, row_output_cost, row_cache_output_cost, row_cache_input_cost, resolved_vendor,
+            stats.input_cost,
+            stats.output_cost,
+            stats.cache_creation_cost,
+            stats.cache_read_cost,
+            &stats.vendor,
         );
         cache_hit_cost += row_ch;
         prefill_cost += row_pf;

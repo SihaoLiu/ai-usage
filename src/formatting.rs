@@ -270,7 +270,10 @@ const COLOR_RESET: &str = "\x1b[0m";
 /// Returns `(colored_string, visible_width)`. The visible width is needed by
 /// callers so they can move the cursor back over the watermark after rendering it.
 pub fn prompt_watermark() -> (String, usize) {
-    let text = format!("ai-usage by SihaoLiu, v{}", env!("CARGO_PKG_VERSION"));
+    let text = format!(
+        "ai-usage by SihaoLiu, v{}, enter h or help for usage",
+        env!("CARGO_PKG_VERSION")
+    );
     let visible = text.chars().count();
     let colored = format!("{}{}{}", WATERMARK_COLOR, text, COLOR_RESET);
     (colored, visible)

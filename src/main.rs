@@ -7,9 +7,12 @@ mod stats;
 mod time_utils;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Instant;
 
 use chrono::{DateTime, Local};
@@ -27,6 +30,87 @@ use time_utils::TimeWindow;
 
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 35;
+
+/// Render `body` into an off-screen buffer (by redirecting stdout into a
+/// pipe), then write the whole frame in a single `write_all` so the terminal
+/// only redraws once. Every captured newline gets a `\x1b[K` injected before
+/// it so each line wipes the previous frame's leftover characters, and the
+/// frame is bracketed with cursor-hide/home + clear-to-end/cursor-show.
+fn render_frame<F: FnOnce()>(body: F) -> io::Result<()> {
+    let _ = io::stdout().flush();
+    let stdout_fd: libc::c_int = 1;
+
+    let saved = unsafe { libc::dup(stdout_fd) };
+    if saved < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut fds: [libc::c_int; 2] = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(saved);
+        }
+        return Err(err);
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+
+    if unsafe { libc::dup2(write_fd, stdout_fd) } < 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+            libc::close(saved);
+        }
+        return Err(err);
+    }
+    unsafe {
+        libc::close(write_fd);
+    }
+
+    // Drain the pipe on a background thread so writes never block on a
+    // full kernel buffer (default ~64 KiB on Linux).
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let drain = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut reader = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let _ = reader.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    body();
+    let _ = io::stdout().flush();
+
+    // Restoring stdout drops the dup'd write end so the reader hits EOF.
+    if unsafe { libc::dup2(saved, stdout_fd) } < 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(saved);
+        }
+        let _ = drain.join();
+        return Err(err);
+    }
+    unsafe {
+        libc::close(saved);
+    }
+    let _ = drain.join();
+    let captured = rx.recv().unwrap_or_default();
+
+    let mut frame = Vec::with_capacity(captured.len() + 32);
+    frame.extend_from_slice(b"\x1b[?25l\x1b[H");
+    for &byte in &captured {
+        if byte == b'\n' {
+            frame.extend_from_slice(b"\x1b[K");
+        }
+        frame.push(byte);
+    }
+    frame.extend_from_slice(b"\x1b[J\x1b[?25h");
+
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&frame)?;
+    stdout.flush()
+}
 
 struct VersionCacheEntry {
     version_str: String,
@@ -840,10 +924,6 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         return None;
     }
 
-    if !once {
-        print!("\x1b[2J\x1b[H");
-    }
-
     let vendor_name = match vendor.as_str() {
         "codex" => "Codex",
         "gemini" => "Gemini CLI",
@@ -853,7 +933,10 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     println!("Calculating {} usage...", vendor_name);
     println!("{}", showing_data_line(&state.time_window, now));
     if !once {
-        println!("Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)", state.monitor_interval);
+        println!(
+            "Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)",
+            state.monitor_interval
+        );
     }
 
     // Only print table if height allows it
@@ -954,14 +1037,13 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         return None;
     }
 
-    if !once {
-        print!("\x1b[2J\x1b[H");
-    }
-
     println!("Calculating usage across all vendors...");
     println!("{}", showing_data_line(&state.time_window, now));
     if !once {
-        println!("Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)", state.monitor_interval);
+        println!(
+            "Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)",
+            state.monitor_interval
+        );
     }
 
     if !all_model_stats.is_empty() {
@@ -1055,13 +1137,23 @@ fn main() {
                  state.time_window.display_label(Local::now()));
         println!("{}\n", "=".repeat(width as usize));
 
-        // Helper: disable raw mode, run print_stats, re-enable raw mode.
-        // This ensures println! in formatting/charts code outputs \r\n properly.
+        // Helper: disable raw mode, render the next frame off-screen into a
+        // buffer, then write it atomically with per-line clears so the new
+        // content fully overwrites the previous frame (no residue, no flash).
         let refresh_display = |state: &mut AppState| -> Option<bool> {
             crossterm::terminal::disable_raw_mode().ok();
-            let result = print_stats(state, false);
+            let mut result: Option<Option<bool>> = None;
+            let captured = render_frame(|| {
+                result = Some(print_stats(state, false));
+            });
+            if let Err(err) = captured {
+                eprintln!("render_frame failed: {err}. Falling back to direct draw.");
+                // Fall back so the user still sees something even if the
+                // pipe-capture path errors out for some reason.
+                result = Some(print_stats(state, false));
+            }
             crossterm::terminal::enable_raw_mode().ok();
-            result
+            result.flatten()
         };
 
         // Enable raw mode for non-blocking input
@@ -1308,7 +1400,6 @@ fn main() {
                                     println!("  range A B        - Show inclusive local date span (any order)\r");
                                     println!("  latest           - Return to rolling days window\r");
                                     println!("  i, interval <N>  - Change refresh interval (seconds)\r");
-                                    println!("  h, help          - Show this help\r");
                                     println!("  PgUp / PgDn      - Slide the time window back / forward by its width\r");
                                     println!("                     (PgDn snaps to the present once you reach it)\r");
                                     println!("{}\r", "-".repeat(width as usize));
@@ -1437,15 +1528,6 @@ fn main() {
                             let now = Local::now();
                             if let Some(new_window) = state.time_window.slide_back(now) {
                                 state.time_window = new_window;
-                                let (width, _) = get_terminal_size();
-                                println!("\r");
-                                println!("{}\r", "-".repeat(width as usize));
-                                println!("\n\r{}\r", "=".repeat(width as usize));
-                                println!(
-                                    "SLID WINDOW BACK: {}\r",
-                                    state.time_window.display_label(now)
-                                );
-                                println!("{}\n\r", "=".repeat(width as usize));
                                 let result = refresh_display(&mut state);
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
@@ -1458,15 +1540,6 @@ fn main() {
                             let now = Local::now();
                             if let Some(new_window) = state.time_window.slide_forward(now) {
                                 state.time_window = new_window;
-                                let (width, _) = get_terminal_size();
-                                println!("\r");
-                                println!("{}\r", "-".repeat(width as usize));
-                                println!("\n\r{}\r", "=".repeat(width as usize));
-                                println!(
-                                    "SLID WINDOW FORWARD: {}\r",
-                                    state.time_window.display_label(now)
-                                );
-                                println!("{}\n\r", "=".repeat(width as usize));
                                 let result = refresh_display(&mut state);
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()

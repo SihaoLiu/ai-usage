@@ -44,6 +44,77 @@ struct AppState {
     all_vendor_prompt: Option<String>,
 }
 
+/// Shell-like in-memory command history for the monitor prompt.
+///
+/// `cursor == None` means the user is editing a fresh line. `Up` saves that
+/// line into `draft` and moves to the most recent entry. `Down` walks back
+/// toward the draft, ending with `cursor = None` and `input_buf = draft`.
+struct CommandHistory {
+    entries: Vec<String>,
+    cursor: Option<usize>,
+    draft: String,
+}
+
+impl CommandHistory {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: None,
+            draft: String::new(),
+        }
+    }
+
+    /// Append `command` to history (unless empty or identical to the last
+    /// entry) and always reset navigation state to the fresh-line position.
+    fn record(&mut self, command: &str) {
+        self.cursor = None;
+        self.draft.clear();
+        if command.is_empty() {
+            return;
+        }
+        if self.entries.last().map(|s| s.as_str()) == Some(command) {
+            return;
+        }
+        self.entries.push(command.to_string());
+    }
+
+    /// Return the previous entry to display, or `None` if there is nothing
+    /// older to walk to. When stepping off the fresh line, `current_buf` is
+    /// saved as the draft so `navigate_down` can restore it later.
+    fn navigate_up(&mut self, current_buf: &str) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let new_cursor = match self.cursor {
+            None => {
+                self.draft = current_buf.to_string();
+                self.entries.len() - 1
+            }
+            Some(0) => return None,
+            Some(n) => n - 1,
+        };
+        self.cursor = Some(new_cursor);
+        Some(self.entries[new_cursor].clone())
+    }
+
+    /// Return the next entry to display, or the saved draft when stepping
+    /// back to the fresh-line position. `None` means the cursor is already
+    /// at the fresh line and nothing changes.
+    fn navigate_down(&mut self) -> Option<String> {
+        match self.cursor {
+            None => None,
+            Some(n) if n + 1 < self.entries.len() => {
+                self.cursor = Some(n + 1);
+                Some(self.entries[n + 1].clone())
+            }
+            Some(_) => {
+                self.cursor = None;
+                Some(std::mem::take(&mut self.draft))
+            }
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "Analyze AI coding assistant usage statistics")]
 struct Args {
@@ -892,6 +963,26 @@ fn main() {
         let mut next_refresh = std::time::Instant::now()
             + std::time::Duration::from_secs(state.monitor_interval);
         let mut input_buf = String::new();
+        let mut history = CommandHistory::new();
+
+        // Redraw the prompt line in place with the current buffer. Used when
+        // Up/Down arrows recall an entry: clears the current line, reprints
+        // "> {buf}", and restores the dimmed watermark when the buffer is
+        // empty so the line behaves like the fresh prompt from `show_prompt`.
+        let redraw_input_line = |buf: &str, too_small: bool| {
+            if too_small {
+                return;
+            }
+            let (width, _) = get_terminal_size();
+            print!("\r\x1b[K> {}", buf);
+            if buf.is_empty() {
+                let (mark, mark_visible) = formatting::prompt_watermark();
+                if (width as usize) >= 2 + mark_visible {
+                    print!("{}\x1b[{}D", mark, mark_visible);
+                }
+            }
+            io::stdout().flush().unwrap();
+        };
 
         let cleanup_and_break = |msg: &str| {
             crossterm::terminal::disable_raw_mode().ok();
@@ -959,6 +1050,7 @@ fn main() {
                         Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
                             println!("\r");
                             let command = input_buf.trim().to_string();
+                            history.record(&command);
                             input_buf.clear();
                             let (width, _) = get_terminal_size();
 
@@ -1072,6 +1164,7 @@ fn main() {
                                     println!("  latest           - Return to rolling days window\r");
                                     println!("  i, interval <N>  - Change refresh interval (seconds)\r");
                                     println!("  h, help          - Show this help\r");
+                                    println!("  Up / Down arrows - Recall previous / next command\r");
                                     println!("  e, exit          - Exit monitor mode\r");
                                     println!("  Ctrl+C, Ctrl+D   - Exit monitor mode\r");
                                     println!("{}\r", "-".repeat(width as usize));
@@ -1184,6 +1277,18 @@ fn main() {
                             }
                             show_prompt(&mut state, terminal_too_small);
                         }
+                        Event::Key(KeyEvent { code: KeyCode::Up, .. }) => {
+                            if let Some(recalled) = history.navigate_up(&input_buf) {
+                                input_buf = recalled;
+                                redraw_input_line(&input_buf, terminal_too_small);
+                            }
+                        }
+                        Event::Key(KeyEvent { code: KeyCode::Down, .. }) => {
+                            if let Some(recalled) = history.navigate_down() {
+                                input_buf = recalled;
+                                redraw_input_line(&input_buf, terminal_too_small);
+                            }
+                        }
                         Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
                             if !input_buf.is_empty() {
                                 input_buf.pop();
@@ -1260,6 +1365,73 @@ mod tests {
             .expect("valid range");
 
         assert_eq!(command.projection_days(Local::now()), 7.0);
+    }
+
+    #[test]
+    fn history_navigate_up_walks_back_then_stops_at_oldest() {
+        let mut history = CommandHistory::new();
+        history.record("v claude");
+        history.record("range 2026-05-01 2026-05-07");
+        history.record("w");
+
+        assert_eq!(history.navigate_up("draft"), Some("w".to_string()));
+        assert_eq!(
+            history.navigate_up("ignored"),
+            Some("range 2026-05-01 2026-05-07".to_string())
+        );
+        assert_eq!(history.navigate_up("ignored"), Some("v claude".to_string()));
+        assert_eq!(history.navigate_up("ignored"), None);
+    }
+
+    #[test]
+    fn history_navigate_down_walks_forward_and_restores_draft() {
+        let mut history = CommandHistory::new();
+        history.record("w");
+        history.record("m");
+
+        assert_eq!(history.navigate_up("typed"), Some("m".to_string()));
+        assert_eq!(history.navigate_up("ignored"), Some("w".to_string()));
+        assert_eq!(history.navigate_down(), Some("m".to_string()));
+        assert_eq!(history.navigate_down(), Some("typed".to_string()));
+        assert_eq!(history.navigate_down(), None);
+    }
+
+    #[test]
+    fn history_record_dedupes_consecutive_repeats_and_skips_empty() {
+        let mut history = CommandHistory::new();
+        history.record("w");
+        history.record("w");
+        history.record("");
+        history.record("m");
+        history.record("w");
+
+        assert_eq!(history.navigate_up(""), Some("w".to_string()));
+        assert_eq!(history.navigate_up(""), Some("m".to_string()));
+        assert_eq!(history.navigate_up(""), Some("w".to_string()));
+        assert_eq!(history.navigate_up(""), None);
+    }
+
+    #[test]
+    fn history_navigate_down_on_fresh_line_is_noop() {
+        let mut history = CommandHistory::new();
+        history.record("w");
+
+        assert_eq!(history.navigate_down(), None);
+    }
+
+    #[test]
+    fn history_record_after_navigation_resets_cursor() {
+        let mut history = CommandHistory::new();
+        history.record("a");
+        history.record("b");
+
+        assert_eq!(history.navigate_up("draft"), Some("b".to_string()));
+        assert_eq!(history.navigate_up("ignored"), Some("a".to_string()));
+
+        history.record("c");
+
+        // After recording, Up should start at the newest entry "c" again.
+        assert_eq!(history.navigate_up("fresh"), Some("c".to_string()));
     }
 
     #[test]

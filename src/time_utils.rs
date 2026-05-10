@@ -30,20 +30,34 @@ impl TimeWindow {
         })
     }
 
-    pub fn from_range(start_input: &str, end_input: &str) -> Result<Self, String> {
-        let (start, start_date) = parse_range_endpoint(start_input, false)?;
-        let (end, end_date) = parse_range_endpoint(end_input, true)?;
-        if end < start {
-            return Err("End time must be after start time.".to_string());
-        }
+    /// Build an explicit range from two endpoints. The caller may pass them
+    /// in either chronological order; this function picks the earlier as the
+    /// start and the later as the end so the user never has to remember
+    /// which argument comes first. For date-only inputs the bounds expand to
+    /// cover the entire local day (midnight to 23:59:59).
+    pub fn from_range(first_input: &str, second_input: &str) -> Result<Self, String> {
+        let first = parse_range_endpoint(first_input)?;
+        let second = parse_range_endpoint(second_input)?;
 
-        let projection_days = match (start_date, end_date) {
-            (Some(s), Some(e)) => e
-                .signed_duration_since(s)
+        let (earlier, later) = if first.start <= second.start {
+            (first, second)
+        } else {
+            (second, first)
+        };
+
+        let start = earlier.start;
+        let end = later.end;
+
+        let projection_days = if earlier.is_date_only && later.is_date_only {
+            let s_date = start.date_naive();
+            let e_date = end.date_naive();
+            e_date
+                .signed_duration_since(s_date)
                 .num_days()
                 .saturating_add(1)
-                .max(1) as f64,
-            _ => ((end - start).num_seconds() as f64 / 86_400.0).max(1.0 / 1440.0),
+                .max(1) as f64
+        } else {
+            ((end - start).num_seconds() as f64 / 86_400.0).max(1.0 / 1440.0)
         };
 
         Ok(Self::ExplicitRange {
@@ -114,22 +128,33 @@ fn local_day_end(date: NaiveDate) -> Result<DateTime<Local>, String> {
         .ok_or_else(|| "Date is out of supported range.".to_string())
 }
 
-fn parse_range_endpoint(
-    input: &str,
-    is_end: bool,
-) -> Result<(DateTime<Local>, Option<NaiveDate>), String> {
+/// Span covered by a single range endpoint. Date-only inputs expand to the
+/// full local day so callers can pick the outermost bounds regardless of
+/// which argument was typed first; date-time inputs collapse to a single
+/// instant (`start == end`).
+struct EndpointSpan {
+    start: DateTime<Local>,
+    end: DateTime<Local>,
+    is_date_only: bool,
+}
+
+fn parse_range_endpoint(input: &str) -> Result<EndpointSpan, String> {
     if let Ok(date) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
-        let dt = if is_end {
-            local_day_end(date)?
-        } else {
-            local_midnight(date)?
-        };
-        return Ok((dt, Some(date)));
+        return Ok(EndpointSpan {
+            start: local_midnight(date)?,
+            end: local_day_end(date)?,
+            is_date_only: true,
+        });
     }
 
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(input, fmt) {
-            return local_from_naive(naive).map(|dt| (dt, None));
+            let dt = local_from_naive(naive)?;
+            return Ok(EndpointSpan {
+                start: dt,
+                end: dt,
+                is_date_only: false,
+            });
         }
     }
 
@@ -342,10 +367,50 @@ mod tests {
     }
 
     #[test]
-    fn inverted_range_is_rejected() {
-        let err = TimeWindow::from_range("2026-05-07", "2026-05-01")
-            .expect_err("end before start should fail");
+    fn reversed_date_range_is_silently_swapped() {
+        let forward = TimeWindow::from_range("2026-05-01", "2026-05-07").expect("forward");
+        let reversed = TimeWindow::from_range("2026-05-07", "2026-05-01").expect("reversed");
 
-        assert!(err.contains("End time must be after start time"));
+        let (fwd_start, fwd_end) = forward.bounds(Local::now());
+        let (rev_start, rev_end) = reversed.bounds(Local::now());
+
+        assert_eq!(fwd_start, rev_start);
+        assert_eq!(fwd_end, rev_end);
+        assert_eq!(
+            forward.projection_days(Local::now()),
+            reversed.projection_days(Local::now())
+        );
+    }
+
+    #[test]
+    fn reversed_date_time_range_is_silently_swapped() {
+        let reversed = TimeWindow::from_range("2026-05-01T10:00", "2026-05-01T08:30")
+            .expect("reversed date-time range should be accepted");
+        let (start, end) = reversed.bounds(Local::now());
+
+        assert_eq!(
+            start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-01 08:30:00"
+        );
+        assert_eq!(
+            end.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-01 10:00:00"
+        );
+    }
+
+    #[test]
+    fn mixed_endpoint_kinds_pick_outermost_bounds() {
+        let window = TimeWindow::from_range("2026-05-07", "2026-05-01T08:30")
+            .expect("mixed-endpoint range");
+        let (start, end) = window.bounds(Local::now());
+
+        assert_eq!(
+            start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-01 08:30:00"
+        );
+        assert_eq!(
+            end.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-07 23:59:59"
+        );
     }
 }

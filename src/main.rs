@@ -115,6 +115,93 @@ impl CommandHistory {
     }
 }
 
+/// Editable prompt buffer with a char-aligned cursor. Drives the shell-style
+/// editing behavior (insert at cursor, backspace before cursor, left/right
+/// arrows moving the cursor without changing the text).
+struct InputLine {
+    buf: String,
+    cursor_chars: usize,
+}
+
+impl InputLine {
+    fn new() -> Self {
+        Self {
+            buf: String::new(),
+            cursor_chars: 0,
+        }
+    }
+
+    fn snapshot(&self) -> &str {
+        &self.buf
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    fn char_count(&self) -> usize {
+        self.buf.chars().count()
+    }
+
+    fn cursor_chars(&self) -> usize {
+        self.cursor_chars
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let byte_pos = byte_index_for_char(&self.buf, self.cursor_chars);
+        self.buf.insert(byte_pos, c);
+        self.cursor_chars += 1;
+    }
+
+    /// Delete the char immediately before the cursor. Returns whether the
+    /// buffer changed.
+    fn backspace(&mut self) -> bool {
+        if self.cursor_chars == 0 {
+            return false;
+        }
+        let prev = self.cursor_chars - 1;
+        let byte_pos = byte_index_for_char(&self.buf, prev);
+        self.buf.remove(byte_pos);
+        self.cursor_chars = prev;
+        true
+    }
+
+    fn move_left(&mut self) -> bool {
+        if self.cursor_chars == 0 {
+            return false;
+        }
+        self.cursor_chars -= 1;
+        true
+    }
+
+    fn move_right(&mut self) -> bool {
+        if self.cursor_chars >= self.char_count() {
+            return false;
+        }
+        self.cursor_chars += 1;
+        true
+    }
+
+    /// Replace the buffer (used by history recall) and park the cursor at
+    /// the end so the user can keep typing immediately.
+    fn replace(&mut self, s: String) {
+        self.cursor_chars = s.chars().count();
+        self.buf = s;
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.cursor_chars = 0;
+    }
+}
+
+fn byte_index_for_char(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "Analyze AI coding assistant usage statistics")]
 struct Args {
@@ -962,23 +1049,28 @@ fn main() {
 
         let mut next_refresh = std::time::Instant::now()
             + std::time::Duration::from_secs(state.monitor_interval);
-        let mut input_buf = String::new();
+        let mut input = InputLine::new();
         let mut history = CommandHistory::new();
 
-        // Redraw the prompt line in place with the current buffer. Used when
-        // Up/Down arrows recall an entry: clears the current line, reprints
-        // "> {buf}", and restores the dimmed watermark when the buffer is
-        // empty so the line behaves like the fresh prompt from `show_prompt`.
-        let redraw_input_line = |buf: &str, too_small: bool| {
+        // Redraw the prompt line in place: clears it, reprints "> {buf}",
+        // restores the dimmed watermark when empty, and finally moves the
+        // terminal cursor to match `input`'s logical position so left/right
+        // arrows feel like a real shell.
+        let render_input = |input: &InputLine, too_small: bool| {
             if too_small {
                 return;
             }
             let (width, _) = get_terminal_size();
-            print!("\r\x1b[K> {}", buf);
-            if buf.is_empty() {
+            print!("\r\x1b[K> {}", input.snapshot());
+            if input.is_empty() {
                 let (mark, mark_visible) = formatting::prompt_watermark();
                 if (width as usize) >= 2 + mark_visible {
                     print!("{}\x1b[{}D", mark, mark_visible);
+                }
+            } else {
+                let trailing = input.char_count().saturating_sub(input.cursor_chars());
+                if trailing > 0 {
+                    print!("\x1b[{}D", trailing);
                 }
             }
             io::stdout().flush().unwrap();
@@ -1049,9 +1141,9 @@ fn main() {
                         }
                         Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
                             println!("\r");
-                            let command = input_buf.trim().to_string();
+                            let command = input.snapshot().trim().to_string();
                             history.record(&command);
-                            input_buf.clear();
+                            input.clear();
                             let (width, _) = get_terminal_size();
 
                             let mut did_refresh = false;
@@ -1160,11 +1252,12 @@ fn main() {
                                     println!("  w, week          - Week mode (7 days)\r");
                                     println!("  m, month         - Month mode (30 days)\r");
                                     println!("  date YYYY-MM-DD  - Show one complete local day\r");
-                                    println!("  range A B        - Show inclusive local date span\r");
+                                    println!("  range A B        - Show inclusive local date span (any order)\r");
                                     println!("  latest           - Return to rolling days window\r");
                                     println!("  i, interval <N>  - Change refresh interval (seconds)\r");
                                     println!("  h, help          - Show this help\r");
                                     println!("  Up / Down arrows - Recall previous / next command\r");
+                                    println!("  Left / Right     - Move cursor within the prompt\r");
                                     println!("  e, exit          - Exit monitor mode\r");
                                     println!("  Ctrl+C, Ctrl+D   - Exit monitor mode\r");
                                     println!("{}\r", "-".repeat(width as usize));
@@ -1278,43 +1371,39 @@ fn main() {
                             show_prompt(&mut state, terminal_too_small);
                         }
                         Event::Key(KeyEvent { code: KeyCode::Up, .. }) => {
-                            if let Some(recalled) = history.navigate_up(&input_buf) {
-                                input_buf = recalled;
-                                redraw_input_line(&input_buf, terminal_too_small);
+                            if let Some(recalled) = history.navigate_up(input.snapshot()) {
+                                input.replace(recalled);
+                                render_input(&input, terminal_too_small);
                             }
                         }
                         Event::Key(KeyEvent { code: KeyCode::Down, .. }) => {
                             if let Some(recalled) = history.navigate_down() {
-                                input_buf = recalled;
-                                redraw_input_line(&input_buf, terminal_too_small);
+                                input.replace(recalled);
+                                render_input(&input, terminal_too_small);
+                            }
+                        }
+                        Event::Key(KeyEvent { code: KeyCode::Left, .. }) => {
+                            if input.move_left() {
+                                print!("\x1b[D");
+                                io::stdout().flush().unwrap();
+                            }
+                        }
+                        Event::Key(KeyEvent { code: KeyCode::Right, .. }) => {
+                            if input.move_right() {
+                                print!("\x1b[C");
+                                io::stdout().flush().unwrap();
                             }
                         }
                         Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
-                            if !input_buf.is_empty() {
-                                input_buf.pop();
-                                print!("\x08 \x08");
-                                if input_buf.is_empty() {
-                                    // Restore the placeholder watermark, unless the
-                                    // terminal is too narrow to fit it after "> ".
-                                    let (mark, mark_visible) = formatting::prompt_watermark();
-                                    let (w, _) = get_terminal_size();
-                                    if (w as usize) >= 2 + mark_visible {
-                                        print!("{}\x1b[{}D", mark, mark_visible);
-                                    }
-                                }
-                                io::stdout().flush().unwrap();
+                            if input.backspace() {
+                                render_input(&input, terminal_too_small);
                             }
                         }
                         Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers, .. })
                             if !modifiers.contains(KeyModifiers::CONTROL) =>
                         {
-                            if input_buf.is_empty() {
-                                // First keystroke: wipe the watermark from cursor to EOL.
-                                print!("\x1b[K");
-                            }
-                            input_buf.push(c);
-                            print!("{}", c);
-                            io::stdout().flush().unwrap();
+                            input.insert_char(c);
+                            render_input(&input, terminal_too_small);
                         }
                         Event::Resize(w, h) => {
                             last_size = (w, h);
@@ -1432,6 +1521,87 @@ mod tests {
 
         // After recording, Up should start at the newest entry "c" again.
         assert_eq!(history.navigate_up("fresh"), Some("c".to_string()));
+    }
+
+    #[test]
+    fn input_line_insert_advances_cursor_and_appends_to_buffer() {
+        let mut input = InputLine::new();
+        input.insert_char('a');
+        input.insert_char('b');
+        input.insert_char('c');
+
+        assert_eq!(input.snapshot(), "abc");
+        assert_eq!(input.cursor_chars(), 3);
+    }
+
+    #[test]
+    fn input_line_left_right_arrows_move_cursor_without_changing_text() {
+        let mut input = InputLine::new();
+        for c in "hello".chars() {
+            input.insert_char(c);
+        }
+
+        assert!(input.move_left());
+        assert!(input.move_left());
+        assert_eq!(input.cursor_chars(), 3);
+        assert_eq!(input.snapshot(), "hello");
+
+        assert!(input.move_right());
+        assert_eq!(input.cursor_chars(), 4);
+        assert_eq!(input.snapshot(), "hello");
+    }
+
+    #[test]
+    fn input_line_left_at_start_and_right_at_end_are_noops() {
+        let mut input = InputLine::new();
+        assert!(!input.move_left());
+        assert!(!input.move_right());
+
+        input.insert_char('x');
+        assert!(!input.move_right());
+        assert!(input.move_left());
+        assert!(!input.move_left());
+    }
+
+    #[test]
+    fn input_line_insert_in_middle_splits_and_keeps_tail() {
+        let mut input = InputLine::new();
+        for c in "ac".chars() {
+            input.insert_char(c);
+        }
+        input.move_left();
+        input.insert_char('b');
+
+        assert_eq!(input.snapshot(), "abc");
+        assert_eq!(input.cursor_chars(), 2);
+    }
+
+    #[test]
+    fn input_line_backspace_deletes_char_before_cursor() {
+        let mut input = InputLine::new();
+        for c in "abc".chars() {
+            input.insert_char(c);
+        }
+        input.move_left();
+        assert!(input.backspace());
+
+        assert_eq!(input.snapshot(), "ac");
+        assert_eq!(input.cursor_chars(), 1);
+
+        assert!(input.backspace());
+        assert_eq!(input.snapshot(), "c");
+        assert_eq!(input.cursor_chars(), 0);
+        assert!(!input.backspace());
+    }
+
+    #[test]
+    fn input_line_replace_parks_cursor_at_end() {
+        let mut input = InputLine::new();
+        input.insert_char('x');
+        input.replace("recalled command".to_string());
+
+        assert_eq!(input.snapshot(), "recalled command");
+        assert_eq!(input.cursor_chars(), "recalled command".chars().count());
     }
 
     #[test]

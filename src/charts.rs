@@ -7,6 +7,7 @@ use crate::formatting::{format_y_axis_value, format_total_value, center_pad};
 use crate::stats::{ModelTimeSeries, VendorTimeSeries};
 
 const RESET_COLOR: &str = "\x1b[0m";
+const DIM_COLOR: &str = "\x1b[38;5;240m";
 
 // Model display configuration for Claude (order matters)
 fn model_config() -> Vec<(&'static str, &'static str, usize)> {
@@ -405,6 +406,26 @@ fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) 
         }
         println!("{}{}", pad, line);
     }
+
+    print_window_pager_hint(layout, pad);
+}
+
+/// Persistent reminder anchored to the bottom-right of the chart that
+/// PgUp/PgDn slide the time window. The chart width is the y-axis prefix
+/// ("       " = 7 cols) plus one column per `layout.columns` entry.
+fn print_window_pager_hint(layout: &ChartLayout, pad: &str) {
+    const HINT: &str = "PgUp/PgDn: slide window <- / -> by its width";
+    let chart_width = 7 + layout.columns.len();
+    let hint_visible = HINT.chars().count();
+    let lead = chart_width.saturating_sub(hint_visible);
+    println!(
+        "{}{}{}{}{}",
+        pad,
+        " ".repeat(lead),
+        DIM_COLOR,
+        HINT,
+        RESET_COLOR
+    );
 }
 
 fn render_grid(

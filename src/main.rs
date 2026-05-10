@@ -42,6 +42,17 @@ struct AppState {
     subscription_fees: SubscriptionFees,
     version_cache: HashMap<String, VersionCacheEntry>,
     all_vendor_prompt: Option<String>,
+    raw_cache: Option<RawDataCache>,
+}
+
+/// In-memory snapshot of raw vendor entries, scoped to a known scan
+/// horizon (in days back from `now`). PageUp/PageDown reuse this cache so
+/// they feel instant; only manual `r` and auto-refresh invalidate it.
+struct RawDataCache {
+    claude: Vec<UsageEntry>,
+    codex: Vec<UsageEntry>,
+    gemini: Vec<UsageEntry>,
+    horizon_days: i64,
 }
 
 /// Shell-like in-memory command history for the monitor prompt.
@@ -288,7 +299,7 @@ fn calculate_chart_height(
     //                     + 1 x-axis bottom line + 1 legend = 7
     // X-axis labels: typically 2 lines (blank + label chars), up to 5
     let chart_overhead = 7;
-    let x_axis_label_lines = 3; // blank + typically 2 label rows
+    let x_axis_label_lines = 4; // blank + typically 2 label rows + 1 pager hint
 
     // Monitor prompt: 1 blank + 1 version + 1 separator + 1 "> " = 4
     let prompt_lines = if is_monitor_mode { 4 } else { 0 };
@@ -356,19 +367,64 @@ fn get_vendor_data_dir(vendor: &str) -> Option<PathBuf> {
     }
 }
 
-fn read_vendor_data(vendor: &str, max_age: Option<i64>) -> Vec<UsageEntry> {
-    match vendor {
-        "claude" => read_all_jsonl_files_dedup(max_age),
-        "codex" => {
-            let dir = get_codex_dir().join("sessions");
-            data::codex::read_codex_jsonl_files(&dir, max_age)
-        }
-        "gemini" => {
-            let dir = get_gemini_dir().join("tmp");
-            data::gemini::read_gemini_json_files(&dir, max_age)
-        }
-        _ => Vec::new(),
+/// Days of history that must be on disk to render the current window and
+/// also serve one prefetched PageUp without going back to the filesystem.
+fn compute_required_horizon(window: &TimeWindow, now: DateTime<Local>) -> i64 {
+    let (start, _) = window.bounds(now);
+    let step = window.page_step();
+    let prefetch_start = start - step;
+    let days = now.signed_duration_since(prefetch_start).num_days() + 2;
+    days.max(1)
+}
+
+/// Read raw entries for every vendor with the given horizon. Each vendor
+/// directory that is absent simply yields an empty vec.
+fn read_all_vendor_raw(horizon_days: i64) -> RawDataCache {
+    let max_age = Some(horizon_days);
+    let claude = read_all_jsonl_files_dedup(max_age);
+
+    let codex_dir = get_codex_dir().join("sessions");
+    let codex = if codex_dir.exists() {
+        data::codex::read_codex_jsonl_files(&codex_dir, max_age)
+    } else {
+        Vec::new()
+    };
+
+    let gemini_dir = get_gemini_dir().join("tmp");
+    let gemini = if gemini_dir.exists() {
+        data::gemini::read_gemini_json_files(&gemini_dir, max_age)
+    } else {
+        Vec::new()
+    };
+
+    RawDataCache {
+        claude,
+        codex,
+        gemini,
+        horizon_days,
     }
+}
+
+/// Ensure `state.raw_cache` covers at least `required_horizon` days back.
+/// Returns a reference to the populated cache so callers can filter without
+/// touching the filesystem again.
+fn ensure_raw_cache(state: &mut AppState, required_horizon: i64) -> &RawDataCache {
+    let needs_load = match &state.raw_cache {
+        None => true,
+        Some(cache) => cache.horizon_days < required_horizon,
+    };
+    if needs_load {
+        let horizon = match &state.raw_cache {
+            Some(c) => c.horizon_days.max(required_horizon),
+            None => required_horizon,
+        };
+        state.raw_cache = Some(read_all_vendor_raw(horizon));
+    }
+    state.raw_cache.as_ref().unwrap()
+}
+
+fn invalidate_raw_cache(state: &mut AppState) {
+    state.raw_cache = None;
 }
 
 /// Loaded and filtered data for all vendors.
@@ -378,29 +434,15 @@ struct AllVendorData {
     gemini: Vec<UsageEntry>,
 }
 
-fn load_all_vendor_data(state: &AppState, now: DateTime<Local>) -> AllVendorData {
-    let max_age = state.time_window.file_scan_days(now);
-
-    let claude_raw = read_all_jsonl_files_dedup(max_age);
-    let claude = data::filter_usage_data_by_window(&claude_raw, &state.time_window, now);
-
-    let codex_dir = get_codex_dir().join("sessions");
-    let codex = if codex_dir.exists() {
-        let raw = data::codex::read_codex_jsonl_files(&codex_dir, max_age);
-        data::filter_usage_data_by_window(&raw, &state.time_window, now)
-    } else {
-        Vec::new()
-    };
-
-    let gemini_dir = get_gemini_dir().join("tmp");
-    let gemini = if gemini_dir.exists() {
-        let raw = data::gemini::read_gemini_json_files(&gemini_dir, max_age);
-        data::filter_usage_data_by_window(&raw, &state.time_window, now)
-    } else {
-        Vec::new()
-    };
-
-    AllVendorData { claude, codex, gemini }
+fn load_all_vendor_data(state: &mut AppState, now: DateTime<Local>) -> AllVendorData {
+    let horizon = compute_required_horizon(&state.time_window, now);
+    let window = state.time_window.clone();
+    let cache = ensure_raw_cache(state, horizon);
+    AllVendorData {
+        claude: data::filter_usage_data_by_window(&cache.claude, &window, now),
+        codex: data::filter_usage_data_by_window(&cache.codex, &window, now),
+        gemini: data::filter_usage_data_by_window(&cache.gemini, &window, now),
+    }
 }
 
 fn calculate_vendor_aggregate_time_series(
@@ -748,22 +790,30 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let now = Local::now();
     let (range_start, range_end) = state.time_window.bounds(now);
     let projection_days = state.time_window.projection_days(now);
-    let max_age = state.time_window.file_scan_days(now);
-    let vendor = &state.vendor;
 
-    // Pre-load data to determine model count for height check
-    let usage_data = read_vendor_data(vendor, max_age);
-    if usage_data.is_empty() {
+    // Cache feeds both the raw-emptiness check and the filtered slice.
+    let horizon = compute_required_horizon(&state.time_window, now);
+    let _ = ensure_raw_cache(state, horizon);
+    let cache = state.raw_cache.as_ref().expect("cache populated");
+    let vendor = state.vendor.clone();
+    let raw_for_vendor: &[UsageEntry] = match vendor.as_str() {
+        "claude" => &cache.claude,
+        "codex" => &cache.codex,
+        "gemini" => &cache.gemini,
+        _ => &cache.claude,
+    };
+    if raw_for_vendor.is_empty() {
         if !once { print!("\x1b[2J\x1b[H"); }
         println!("No usage data found.");
         return Some(false);
     }
-    let filtered = data::filter_usage_data_by_window(&usage_data, &state.time_window, now);
+    let filtered = data::filter_usage_data_by_window(raw_for_vendor, &state.time_window, now);
     if filtered.is_empty() {
         if !once { print!("\x1b[2J\x1b[H"); }
         println!("No usage data found in {}.", state.time_window.display_label(now));
         return Some(false);
     }
+    let vendor = &vendor;
     let model_stats = match vendor.as_str() {
         "codex" => stats::calculate_codex_model_breakdown(&filtered, &state.pricing),
         "gemini" => stats::calculate_gemini_model_breakdown(&filtered, &state.pricing),
@@ -984,6 +1034,7 @@ fn main() {
         subscription_fees,
         version_cache: HashMap::new(),
         all_vendor_prompt: None,
+        raw_cache: None,
     };
 
     if args.once {
@@ -1113,6 +1164,7 @@ fn main() {
                     println!("AUTO-REFRESH\r");
                     println!("{}\n\r", "=".repeat(width as usize));
                 }
+                invalidate_raw_cache(&mut state);
                 let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
                 next_refresh = std::time::Instant::now()
@@ -1153,6 +1205,7 @@ fn main() {
                                     println!("\n\r{}\r", "=".repeat(width as usize));
                                     println!("MANUAL REFRESH\r");
                                     println!("{}\n\r", "=".repeat(width as usize));
+                                    invalidate_raw_cache(&mut state);
                                     let result = refresh_display(&mut state);
                                     terminal_too_small = result.is_none();
                                     did_refresh = true;
@@ -1256,6 +1309,8 @@ fn main() {
                                     println!("  latest           - Return to rolling days window\r");
                                     println!("  i, interval <N>  - Change refresh interval (seconds)\r");
                                     println!("  h, help          - Show this help\r");
+                                    println!("  PgUp / PgDn      - Slide the time window back / forward by its width\r");
+                                    println!("                     (PgDn snaps to the present once you reach it)\r");
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!("Current: vendor={}, window={}, interval={}s\r",
                                              state.vendor,
@@ -1378,6 +1433,48 @@ fn main() {
                                 render_input(&input, terminal_too_small);
                             }
                         }
+                        Event::Key(KeyEvent { code: KeyCode::PageUp, .. }) => {
+                            let now = Local::now();
+                            if let Some(new_window) = state.time_window.slide_back(now) {
+                                state.time_window = new_window;
+                                let (width, _) = get_terminal_size();
+                                println!("\r");
+                                println!("{}\r", "-".repeat(width as usize));
+                                println!("\n\r{}\r", "=".repeat(width as usize));
+                                println!(
+                                    "SLID WINDOW BACK: {}\r",
+                                    state.time_window.display_label(now)
+                                );
+                                println!("{}\n\r", "=".repeat(width as usize));
+                                let result = refresh_display(&mut state);
+                                terminal_too_small = result.is_none();
+                                next_refresh = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval);
+                                show_prompt(&mut state, terminal_too_small);
+                                render_input(&input, terminal_too_small);
+                            }
+                        }
+                        Event::Key(KeyEvent { code: KeyCode::PageDown, .. }) => {
+                            let now = Local::now();
+                            if let Some(new_window) = state.time_window.slide_forward(now) {
+                                state.time_window = new_window;
+                                let (width, _) = get_terminal_size();
+                                println!("\r");
+                                println!("{}\r", "-".repeat(width as usize));
+                                println!("\n\r{}\r", "=".repeat(width as usize));
+                                println!(
+                                    "SLID WINDOW FORWARD: {}\r",
+                                    state.time_window.display_label(now)
+                                );
+                                println!("{}\n\r", "=".repeat(width as usize));
+                                let result = refresh_display(&mut state);
+                                terminal_too_small = result.is_none();
+                                next_refresh = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval);
+                                show_prompt(&mut state, terminal_too_small);
+                                render_input(&input, terminal_too_small);
+                            }
+                        }
                         Event::Key(KeyEvent { code: KeyCode::Left, .. }) => {
                             if input.move_left() {
                                 print!("\x1b[D");
@@ -1434,7 +1531,7 @@ mod tests {
         let command = parse_time_window_command("date 2026-05-07", 3)
             .expect("recognized command")
             .expect("valid date");
-        let TimeWindow::ExplicitRange { start, end, projection_days } = command else {
+        let TimeWindow::ExplicitRange { start, end, projection_days, .. } = command else {
             panic!("date command should create an explicit window");
         };
 

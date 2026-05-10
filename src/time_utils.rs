@@ -10,6 +10,10 @@ pub enum TimeWindow {
         start: DateTime<Local>,
         end: DateTime<Local>,
         projection_days: f64,
+        /// How far to translate the window when the user pages back or
+        /// forward. Date-only ranges use whole-day steps so paging stays
+        /// aligned to midnight; date-time ranges use the exact window span.
+        page_step: Duration,
     },
 }
 
@@ -27,6 +31,7 @@ impl TimeWindow {
             start,
             end,
             projection_days: 1.0,
+            page_step: Duration::days(1),
         })
     }
 
@@ -48,22 +53,31 @@ impl TimeWindow {
         let start = earlier.start;
         let end = later.end;
 
-        let projection_days = if earlier.is_date_only && later.is_date_only {
+        let (projection_days, page_step) = if earlier.is_date_only && later.is_date_only {
             let s_date = start.date_naive();
             let e_date = end.date_naive();
-            e_date
+            let n = e_date
                 .signed_duration_since(s_date)
                 .num_days()
                 .saturating_add(1)
-                .max(1) as f64
+                .max(1);
+            (n as f64, Duration::days(n))
         } else {
-            ((end - start).num_seconds() as f64 / 86_400.0).max(1.0 / 1440.0)
+            let span = end - start;
+            let proj = ((end - start).num_seconds() as f64 / 86_400.0).max(1.0 / 1440.0);
+            let step = if span <= Duration::zero() {
+                Duration::seconds(1)
+            } else {
+                span
+            };
+            (proj, step)
         };
 
         Ok(Self::ExplicitRange {
             start,
             end,
             projection_days,
+            page_step,
         })
     }
 
@@ -83,10 +97,11 @@ impl TimeWindow {
         }
     }
 
-    pub fn file_scan_days(&self, _now: DateTime<Local>) -> Option<i64> {
+    /// Span used for PageUp/PageDown paging. Always positive.
+    pub fn page_step(&self) -> Duration {
         match self {
-            Self::RollingDays { days } => Some(*days),
-            Self::ExplicitRange { .. } => None,
+            Self::RollingDays { days } => Duration::days((*days).max(1)),
+            Self::ExplicitRange { page_step, .. } => *page_step,
         }
     }
 
@@ -101,6 +116,49 @@ impl TimeWindow {
                 )
             }
         }
+    }
+
+    /// Translate the window backward by `page_step`. Always returns an
+    /// `ExplicitRange` so the new bounds are no longer anchored to `now`.
+    pub fn slide_back(&self, now: DateTime<Local>) -> Option<Self> {
+        let step = self.page_step();
+        if step <= Duration::zero() {
+            return None;
+        }
+        let (start, end) = self.bounds(now);
+        Some(Self::ExplicitRange {
+            start: start - step,
+            end: end - step,
+            projection_days: self.projection_days(now),
+            page_step: step,
+        })
+    }
+
+    /// Translate the window forward by `page_step`. Clamps so the new end
+    /// never exceeds `now`, which makes paging into the future a no-op
+    /// (returns `None`) when the window already touches the present.
+    pub fn slide_forward(&self, now: DateTime<Local>) -> Option<Self> {
+        let step = self.page_step();
+        if step <= Duration::zero() {
+            return None;
+        }
+        let (start, end) = self.bounds(now);
+        let mut new_start = start + step;
+        let mut new_end = end + step;
+        if new_end > now {
+            let overshoot = new_end - now;
+            new_end -= overshoot;
+            new_start -= overshoot;
+        }
+        if new_start == start && new_end == end {
+            return None;
+        }
+        Some(Self::ExplicitRange {
+            start: new_start,
+            end: new_end,
+            projection_days: self.projection_days(now),
+            page_step: step,
+        })
     }
 }
 
@@ -396,6 +454,87 @@ mod tests {
             end.format("%Y-%m-%d %H:%M:%S").to_string(),
             "2026-05-01 10:00:00"
         );
+    }
+
+    #[test]
+    fn slide_back_from_rolling_keeps_width_and_drops_anchor() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+
+        let slid = window.slide_back(now).expect("slide back");
+        let (start, end) = slid.bounds(now);
+
+        // The new window covers (now - 6d, now - 3d).
+        assert_eq!(end, now - Duration::days(3));
+        assert_eq!(start, now - Duration::days(6));
+        assert_eq!(slid.page_step(), Duration::days(3));
+    }
+
+    #[test]
+    fn slide_back_on_date_range_steps_in_whole_days() {
+        let window = TimeWindow::from_range("2026-05-01", "2026-05-07").expect("range");
+        let slid = window.slide_back(Local::now()).expect("slide back");
+
+        let (start, end) = slid.bounds(Local::now());
+        assert_eq!(
+            start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-04-24 00:00:00"
+        );
+        // The new end is the previous start minus 1ns, i.e. end-of-day 4-30.
+        assert_eq!(end.format("%Y-%m-%d").to_string(), "2026-04-30");
+        assert_eq!(end.hour(), 23);
+        assert_eq!(end.minute(), 59);
+        assert_eq!(end.second(), 59);
+    }
+
+    #[test]
+    fn slide_forward_on_rolling_window_is_a_no_op_due_to_now_clamp() {
+        let now = Local::now();
+        let window = TimeWindow::rolling_days(3);
+
+        assert!(window.slide_forward(now).is_none());
+    }
+
+    #[test]
+    fn slide_forward_after_back_returns_to_anchor() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+
+        let back = window.slide_back(now).expect("slide back");
+        let forward = back.slide_forward(now).expect("slide forward");
+
+        let (orig_start, orig_end) = window.bounds(now);
+        let (start, end) = forward.bounds(now);
+        assert_eq!(start, orig_start);
+        assert_eq!(end, orig_end);
+    }
+
+    #[test]
+    fn slide_forward_clamps_end_at_now_preserving_width() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(7);
+
+        // Slide back twice, then slide forward; result should still be 7
+        // days wide and end no later than `now`.
+        let back2 = window
+            .slide_back(now)
+            .expect("back")
+            .slide_back(now)
+            .expect("back2");
+        let forward = back2.slide_forward(now).expect("forward");
+        let (start, end) = forward.bounds(now);
+
+        assert_eq!(end - start, Duration::days(7));
+        assert!(end <= now);
     }
 
     #[test]

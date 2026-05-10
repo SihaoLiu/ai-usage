@@ -11,6 +11,11 @@ try:
 except ImportError as exc:
     raise SystemExit("Missing Python dependency: install Pillow to render docs/demo.png") from exc
 
+try:
+    from wcwidth import wcwidth
+except ImportError:
+    wcwidth = None
+
 
 DEFAULT_FG = (238, 238, 238)
 BG = (0, 0, 0)
@@ -174,7 +179,30 @@ def parse_ansi_line(line):
 
 
 def visible_len(line):
-    return len(ANSI_ANY_RE.sub("", line))
+    return cell_width(ANSI_ANY_RE.sub("", line))
+
+
+def char_cell_width(char):
+    if wcwidth is None:
+        return 0 if ord(char) < 32 else 1
+
+    width = wcwidth(char)
+    return max(width, 0)
+
+
+def cell_width(text):
+    return sum(char_cell_width(char) for char in text)
+
+
+def draw_cells(draw, origin_x, origin_y, text, font, fill, char_width):
+    x_cols = 0
+    for char in text:
+        width = char_cell_width(char)
+        if width == 0:
+            continue
+        draw.text((origin_x + x_cols * char_width, origin_y), char, font=font, fill=fill)
+        x_cols += width
+    return x_cols
 
 
 def render_png(ansi_text, output, font_path, font_size, padding):
@@ -202,8 +230,7 @@ def render_png(ansi_text, output, font_path, font_size, padding):
         x_cols = 0
         for text, fg, is_bold in parse_ansi_line(line):
             font = bold if is_bold else normal
-            draw.text((padding + x_cols * char_width, y), text, font=font, fill=fg)
-            x_cols += len(text)
+            x_cols += draw_cells(draw, padding + x_cols * char_width, y, text, font, fg, char_width)
         y += line_height
 
     output.parent.mkdir(parents=True, exist_ok=True)

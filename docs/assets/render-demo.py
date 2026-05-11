@@ -9,7 +9,7 @@ from pathlib import Path
 try:
     from PIL import Image, ImageDraw, ImageFont
 except ImportError as exc:
-    raise SystemExit("Missing Python dependency: install Pillow to render docs/demo.png") from exc
+    raise SystemExit("Missing Python dependency: install Pillow to render docs/assets/demo.png") from exc
 
 try:
     from wcwidth import wcwidth
@@ -60,7 +60,11 @@ ANSI_ANY_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 def find_repo_root():
-    return Path(__file__).resolve().parents[1]
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "Cargo.toml").exists():
+            return parent
+
+    raise SystemExit("Could not find repository root")
 
 
 def find_font(repo_root, name):
@@ -239,8 +243,8 @@ def render_png(ansi_text, output, font_path, font_size, padding):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Render the current dashboard to docs/demo.png")
-    parser.add_argument("--output", default="docs/demo.png")
+    parser = argparse.ArgumentParser(description="Render the current dashboard to docs/assets/demo.png")
+    parser.add_argument("--output", default="docs/assets/demo.png")
     parser.add_argument("--columns", type=int, default=160)
     parser.add_argument("--lines", type=int, default=80)
     parser.add_argument("--vendor", default="all")

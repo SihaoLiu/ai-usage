@@ -2,7 +2,7 @@
 
 A fast terminal dashboard for tracking token usage and costs across **Claude Code**, **OpenAI Codex**, and **Google Gemini CLI**. Written in Rust.
 
-[![AI Usage Monitor demo](docs/assets/demo.png)](docs/assets/ai-usage.mp4)
+<img src="docs/assets/ai-usage.gif" alt="AI Usage Monitor demo" width="100%">
 
 ## Features
 

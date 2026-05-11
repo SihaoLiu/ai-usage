@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 import argparse
+import errno
+import fcntl
 import os
-import re
-import subprocess
+import pty
+import select
+import signal
+import struct
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
     from PIL import Image, ImageDraw, ImageFont
 except ImportError as exc:
-    raise SystemExit("Missing Python dependency: install Pillow to render docs/assets/demo.png") from exc
+    raise SystemExit("Missing Python dependency: install Pillow to render docs/assets/ai-usage.gif") from exc
 
 try:
     from wcwidth import wcwidth
@@ -19,6 +25,11 @@ except ImportError:
 
 DEFAULT_FG = (238, 238, 238)
 BG = (0, 0, 0)
+KEY_RIGHT = "\x1b[C"
+KEY_LEFT = "\x1b[D"
+KEY_PAGE_UP = "\x1b[5~"
+KEY_PAGE_DOWN = "\x1b[6~"
+KEY_CTRL_C = "\x03"
 
 
 def xterm_palette():
@@ -55,8 +66,225 @@ def xterm_palette():
 
 
 PALETTE = xterm_palette()
-ANSI_RE = re.compile(r"\x1b\[([0-9;]*)m")
-ANSI_ANY_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+@dataclass(frozen=True)
+class InputEvent:
+    at: float
+    data: str
+
+
+@dataclass
+class Cell:
+    char: str = " "
+    fg: tuple[int, int, int] = DEFAULT_FG
+    bold: bool = False
+
+
+@dataclass
+class ScreenLine:
+    text: str
+    cells: list[Cell]
+
+
+class TerminalScreen:
+    def __init__(self, columns, rows):
+        self.columns = columns
+        self.rows = rows
+        self.cursor_col = 0
+        self.cursor_row = 0
+        self.saved_cursor = (0, 0)
+        self.fg = DEFAULT_FG
+        self.bold = False
+        self.pending = ""
+        self.pending_wrap = False
+        self.cells = [[self.blank_cell() for _ in range(columns)] for _ in range(rows)]
+
+    def blank_cell(self):
+        return Cell()
+
+    def feed(self, data):
+        if isinstance(data, bytes):
+            text = data.decode("utf-8", errors="replace")
+        else:
+            text = data
+
+        text = self.pending + text
+        self.pending = ""
+        i = 0
+        while i < len(text):
+            char = text[i]
+            if char == "\x1b":
+                parsed = self.consume_escape(text, i)
+                if parsed is None:
+                    self.pending = text[i:]
+                    break
+                i = parsed
+                continue
+            if char == "\r":
+                self.cursor_col = 0
+                self.pending_wrap = False
+            elif char == "\n":
+                self.newline()
+            elif char == "\b":
+                self.cursor_col = max(0, self.cursor_col - 1)
+                self.pending_wrap = False
+            elif char == "\t":
+                spaces = 8 - (self.cursor_col % 8)
+                for _ in range(spaces):
+                    self.put_char(" ")
+            elif ord(char) >= 32:
+                self.put_char(char)
+            i += 1
+
+    def consume_escape(self, text, start):
+        if start + 1 >= len(text):
+            return None
+
+        introducer = text[start + 1]
+        if introducer != "[":
+            if introducer in "78":
+                if introducer == "7":
+                    self.saved_cursor = (self.cursor_row, self.cursor_col)
+                else:
+                    self.cursor_row, self.cursor_col = self.saved_cursor
+                    self.clamp_cursor()
+                return start + 2
+            return start + 2
+
+        end = start + 2
+        while end < len(text):
+            final = text[end]
+            if "@" <= final <= "~":
+                self.handle_csi(text[start + 2 : end], final)
+                return end + 1
+            end += 1
+        return None
+
+    def handle_csi(self, body, final):
+        if final == "m":
+            self.fg, self.bold = parse_sgr(body, self.fg, self.bold)
+            return
+        if final in "hl":
+            return
+
+        values = self.csi_numbers(body)
+        first = values[0] if values else 0
+        if final in "Hf":
+            row = (values[0] if len(values) >= 1 and values[0] else 1) - 1
+            col = (values[1] if len(values) >= 2 and values[1] else 1) - 1
+            self.cursor_row = row
+            self.cursor_col = col
+            self.clamp_cursor()
+        elif final == "A":
+            self.cursor_row -= first or 1
+            self.clamp_cursor()
+        elif final == "B":
+            self.cursor_row += first or 1
+            self.clamp_cursor()
+        elif final == "C":
+            self.cursor_col += first or 1
+            self.clamp_cursor()
+        elif final == "D":
+            self.cursor_col -= first or 1
+            self.clamp_cursor()
+        elif final == "G":
+            self.cursor_col = (first or 1) - 1
+            self.clamp_cursor()
+        elif final == "d":
+            self.cursor_row = (first or 1) - 1
+            self.clamp_cursor()
+        elif final == "J":
+            self.clear_display(first)
+        elif final == "K":
+            self.clear_line(first)
+        elif final == "s":
+            self.saved_cursor = (self.cursor_row, self.cursor_col)
+        elif final == "u":
+            self.cursor_row, self.cursor_col = self.saved_cursor
+            self.clamp_cursor()
+        self.pending_wrap = False
+
+    def csi_numbers(self, body):
+        body = body.lstrip("?=>")
+        if not body:
+            return [0]
+        values = []
+        for part in body.split(";"):
+            if part == "":
+                values.append(0)
+                continue
+            try:
+                values.append(int(part))
+            except ValueError:
+                values.append(0)
+        return values
+
+    def clear_display(self, mode):
+        if mode in (2, 3):
+            self.cells = [[self.blank_cell() for _ in range(self.columns)] for _ in range(self.rows)]
+        elif mode == 1:
+            for row in range(0, self.cursor_row):
+                self.cells[row] = [self.blank_cell() for _ in range(self.columns)]
+            for col in range(0, self.cursor_col + 1):
+                self.cells[self.cursor_row][col] = self.blank_cell()
+        else:
+            for col in range(self.cursor_col, self.columns):
+                self.cells[self.cursor_row][col] = self.blank_cell()
+            for row in range(self.cursor_row + 1, self.rows):
+                self.cells[row] = [self.blank_cell() for _ in range(self.columns)]
+
+    def clear_line(self, mode):
+        if mode == 1:
+            start, end = 0, self.cursor_col + 1
+        elif mode == 2:
+            start, end = 0, self.columns
+        else:
+            start, end = self.cursor_col, self.columns
+        for col in range(start, end):
+            self.cells[self.cursor_row][col] = self.blank_cell()
+
+    def put_char(self, char):
+        if self.pending_wrap:
+            self.newline()
+
+        width = char_cell_width(char)
+        if width <= 0:
+            return
+        if width > self.columns:
+            return
+
+        if self.cursor_col + width > self.columns:
+            self.newline()
+
+        self.cells[self.cursor_row][self.cursor_col] = Cell(char, self.fg, self.bold)
+        for col in range(self.cursor_col + 1, min(self.columns, self.cursor_col + width)):
+            self.cells[self.cursor_row][col] = Cell(" ", self.fg, self.bold)
+
+        if self.cursor_col + width >= self.columns:
+            self.cursor_col = self.columns - 1
+            self.pending_wrap = True
+        else:
+            self.cursor_col += width
+
+    def newline(self):
+        self.pending_wrap = False
+        self.cursor_row += 1
+        if self.cursor_row >= self.rows:
+            self.cells.pop(0)
+            self.cells.append([self.blank_cell() for _ in range(self.columns)])
+            self.cursor_row = self.rows - 1
+
+    def clamp_cursor(self):
+        self.cursor_row = min(max(self.cursor_row, 0), self.rows - 1)
+        self.cursor_col = min(max(self.cursor_col, 0), self.columns - 1)
+        self.pending_wrap = False
+
+    def has_visible_content(self):
+        return any(cell.char != " " for row in self.cells for cell in row)
+
+    def render_lines(self):
+        return [ScreenLine("".join(cell.char for cell in row), row[:]) for row in self.cells]
 
 
 def find_repo_root():
@@ -87,45 +315,6 @@ def find_font(repo_root, name):
             return path
 
     raise SystemExit("No monospace font found; pass --font PATH")
-
-
-def run_dashboard(repo_root, columns, lines, vendor, days, timeout):
-    binary = repo_root / "target" / "release" / "vibe-usage"
-    if not binary.exists():
-        raise SystemExit(f"Missing {binary}; run `cargo build --release` first")
-
-    env = os.environ.copy()
-    env.update(
-        {
-            "COLUMNS": str(columns),
-            "LINES": str(lines),
-            "TERM": "xterm-256color",
-        }
-    )
-
-    cmd = [
-        str(binary),
-        "--once",
-        "--vendor",
-        vendor,
-        "--days",
-        str(days),
-    ]
-    result = subprocess.run(
-        cmd,
-        cwd=repo_root,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
-    if result.returncode != 0:
-        sys.stderr.write(result.stdout)
-        sys.stderr.write(result.stderr)
-        raise SystemExit(result.returncode)
-
-    return result.stdout
 
 
 def parse_sgr(params, fg, bold):
@@ -159,33 +348,6 @@ def parse_sgr(params, fg, bold):
     return fg, bold
 
 
-def parse_ansi_line(line):
-    spans = []
-    fg = DEFAULT_FG
-    bold = False
-    pos = 0
-
-    while pos < len(line):
-        match = ANSI_RE.search(line, pos)
-        if not match:
-            text = ANSI_ANY_RE.sub("", line[pos:])
-            if text:
-                spans.append((text, fg, bold))
-            break
-
-        text = ANSI_ANY_RE.sub("", line[pos : match.start()])
-        if text:
-            spans.append((text, fg, bold))
-        fg, bold = parse_sgr(match.group(1), fg, bold)
-        pos = match.end()
-
-    return spans
-
-
-def visible_len(line):
-    return cell_width(ANSI_ANY_RE.sub("", line))
-
-
 def char_cell_width(char):
     if wcwidth is None:
         return 0 if ord(char) < 32 else 1
@@ -194,75 +356,232 @@ def char_cell_width(char):
     return max(width, 0)
 
 
-def cell_width(text):
-    return sum(char_cell_width(char) for char in text)
-
-
-def draw_cells(draw, origin_x, origin_y, text, font, fill, char_width):
-    x_cols = 0
-    for char in text:
-        width = char_cell_width(char)
-        if width == 0:
-            continue
-        draw.text((origin_x + x_cols * char_width, origin_y), char, font=font, fill=fill)
-        x_cols += width
-    return x_cols
-
-
-def render_png(ansi_text, output, font_path, font_size, padding):
+def load_fonts(font_path, font_size):
     normal = ImageFont.truetype(str(font_path), font_size)
     bold_path = Path(str(font_path).replace(".ttf", "-Bold.ttf"))
     bold = ImageFont.truetype(str(bold_path), font_size) if bold_path.exists() else normal
+    return normal, bold
 
+
+def font_metrics(normal):
     probe = Image.new("RGB", (1, 1), BG)
     draw = ImageDraw.Draw(probe)
     char_box = draw.textbbox((0, 0), "M", font=normal)
     line_box = draw.textbbox((0, 0), "Hg|", font=normal)
     char_width = char_box[2] - char_box[0]
     line_height = int((line_box[3] - line_box[1]) * 1.35)
+    return char_width, line_height
 
-    lines = ansi_text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
-    max_cols = max((visible_len(line) for line in lines), default=1)
-    width = padding * 2 + max_cols * char_width
-    height = padding * 2 + max(1, len(lines)) * line_height
 
+def render_screen_image(screen, font_path, font_size, padding):
+    normal, bold = load_fonts(font_path, font_size)
+    char_width, line_height = font_metrics(normal)
+    width = padding * 2 + screen.columns * char_width
+    height = padding * 2 + screen.rows * line_height
     image = Image.new("RGB", (width, height), BG)
     draw = ImageDraw.Draw(image)
 
-    y = padding
-    for line in lines:
-        x_cols = 0
-        for text, fg, is_bold in parse_ansi_line(line):
-            font = bold if is_bold else normal
-            x_cols += draw_cells(draw, padding + x_cols * char_width, y, text, font, fg, char_width)
-        y += line_height
+    for row_index, line in enumerate(screen.render_lines()):
+        y = padding + row_index * line_height
+        for col_index, cell in enumerate(line.cells):
+            if cell.char == " ":
+                continue
+            font = bold if cell.bold else normal
+            draw.text(
+                (padding + col_index * char_width, y),
+                cell.char,
+                font=font,
+                fill=cell.fg,
+            )
 
+    return image
+
+
+def build_demo_events(duration=15.0, step_interval=0.75):
+    events = []
+
+    at = 1.0
+    while at < 6.0:
+        events.append(InputEvent(round(at, 3), KEY_RIGHT))
+        at += step_interval
+
+    at = 6.0
+    while at < 11.0:
+        events.append(InputEvent(round(at, 3), KEY_LEFT))
+        at += step_interval
+
+    events.append(InputEvent(11.8, KEY_PAGE_UP))
+    events.append(InputEvent(13.2, KEY_PAGE_DOWN))
+    events.append(InputEvent(duration, KEY_CTRL_C))
+    return sorted(events, key=lambda event: event.at)
+
+
+def set_pty_size(fd, columns, rows):
+    winsize = struct.pack("HHHH", rows, columns, 0, 0)
+    fcntl.ioctl(fd, termios_tiocswinsz(), winsize)
+
+
+def termios_tiocswinsz():
+    import termios
+
+    return termios.TIOCSWINSZ
+
+
+def spawn_monitor(repo_root, columns, rows, vendor, days):
+    binary = repo_root / "target" / "release" / "vibe-usage"
+    if not binary.exists():
+        raise SystemExit(f"Missing {binary}; run `cargo build --release` first")
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        env = os.environ.copy()
+        env.update(
+            {
+                "COLUMNS": str(columns),
+                "LINES": str(rows),
+                "TERM": "xterm-256color",
+            }
+        )
+        os.chdir(repo_root)
+        cmd = [str(binary), "--vendor", vendor, "--days", str(days)]
+        try:
+            os.execvpe(cmd[0], cmd, env)
+        except OSError as exc:
+            print(f"exec failed: {exc}", file=sys.stderr)
+            os._exit(127)
+
+    set_pty_size(master_fd, columns, rows)
+    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    return pid, master_fd
+
+
+def read_available(fd, screen):
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.EIO, errno.EBADF):
+                return False
+            raise
+        if not chunk:
+            return False
+        screen.feed(chunk)
+
+
+def wait_for_child(pid, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waited, _status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    os.waitpid(pid, 0)
+
+
+def capture_demo_frames(repo_root, args, font_path):
+    screen = TerminalScreen(args.columns, args.lines)
+    events = build_demo_events(args.duration, args.key_interval)
+    frames = []
+    frame_period = 1.0 / args.fps
+    next_frame_at = 0.0
+    event_index = 0
+    pid, master_fd = spawn_monitor(repo_root, args.columns, args.lines, args.vendor, args.days)
+    start = time.monotonic()
+
+    try:
+        while True:
+            elapsed = time.monotonic() - start
+            read_available(master_fd, screen)
+
+            while event_index < len(events) and events[event_index].at <= elapsed:
+                os.write(master_fd, events[event_index].data.encode("ascii"))
+                event_index += 1
+
+            while next_frame_at <= elapsed and next_frame_at <= args.duration:
+                if screen.has_visible_content():
+                    frames.append(render_screen_image(screen, font_path, args.font_size, args.padding))
+                next_frame_at += frame_period
+
+            if elapsed >= args.duration:
+                break
+
+            next_event_at = events[event_index].at if event_index < len(events) else args.duration
+            next_wakeup = min(next_frame_at, next_event_at, args.duration)
+            timeout = max(0.0, min(0.05, next_wakeup - elapsed))
+            select.select([master_fd], [], [], timeout)
+    finally:
+        try:
+            os.write(master_fd, KEY_CTRL_C.encode("ascii"))
+        except OSError:
+            pass
+        read_available(master_fd, screen)
+        os.close(master_fd)
+        wait_for_child(pid)
+
+    if not frames:
+        frames.append(render_screen_image(screen, font_path, args.font_size, args.padding))
+    return frames
+
+
+def frame_duration_ms(fps, speed):
+    if fps <= 0:
+        raise ValueError("fps must be greater than zero")
+    if speed <= 0:
+        raise ValueError("speed must be greater than zero")
+    return max(1, round(1000 / (fps * speed)))
+
+
+def save_gif(frames, output, fps, speed):
     output.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output)
-    return width, height, len(lines)
+    duration_ms = frame_duration_ms(fps, speed)
+    frames[0].save(
+        output,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=True,
+        disposal=2,
+    )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Render the current dashboard to docs/assets/demo.png")
-    parser.add_argument("--output", default="docs/assets/demo.png")
+def build_parser():
+    parser = argparse.ArgumentParser(description="Record the monitor dashboard to docs/assets/ai-usage.gif")
+    parser.add_argument("--output", default="docs/assets/ai-usage.gif")
     parser.add_argument("--columns", type=int, default=160)
-    parser.add_argument("--lines", type=int, default=80)
+    parser.add_argument("--lines", type=int, default=54)
     parser.add_argument("--vendor", default="all")
     parser.add_argument("--days", type=int, default=3)
     parser.add_argument("--font")
     parser.add_argument("--font-size", type=int, default=12)
     parser.add_argument("--padding", type=int, default=6)
-    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--duration", type=float, default=15.0)
+    parser.add_argument("--fps", type=float, default=8.0)
+    parser.add_argument("--speed", type=float, default=3.0)
+    parser.add_argument("--key-interval", type=float, default=0.75)
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     repo_root = find_repo_root()
     output = (repo_root / args.output).resolve()
     font_path = find_font(repo_root, args.font)
-    ansi_text = run_dashboard(repo_root, args.columns, args.lines, args.vendor, args.days, args.timeout)
-    width, height, line_count = render_png(ansi_text, output, font_path, args.font_size, args.padding)
+    frames = capture_demo_frames(repo_root, args, font_path)
+    save_gif(frames, output, args.fps, args.speed)
 
     rel_output = output.relative_to(repo_root)
-    print(f"Rendered {rel_output} ({width}x{height}, {line_count} lines)")
+    width, height = frames[0].size
+    print(f"Rendered {rel_output} ({width}x{height}, {len(frames)} frames, {args.speed:g}x speed)")
 
 
 if __name__ == "__main__":

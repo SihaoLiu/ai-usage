@@ -1,7 +1,7 @@
 BIN := vibe-usage
 MUSL_TARGET := x86_64-unknown-linux-musl
 INSTALL_DIR ?= $(HOME)/.local/bin
-DEMO := docs/demo.png
+DEMO := docs/assets/ai-usage.gif
 
 .PHONY: all build demo release install clean
 
@@ -12,7 +12,7 @@ build:
 	@echo "Built: target/release/$(BIN)"
 
 demo: build
-	scripts/render-demo.py --output $(DEMO)
+	docs/assets/render-demo.py --output $(DEMO)
 	@echo "Updated: $(DEMO)"
 
 release: demo

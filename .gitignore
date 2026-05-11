@@ -1,3 +1,6 @@
 .fee.env
 /target
+/temp
+__pycache__/
+*.py[cod]
 tests/snapshots/rust/

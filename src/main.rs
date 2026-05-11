@@ -14,7 +14,7 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Duration, Local};
 use clap::Parser;
 use crossterm::terminal;
 
@@ -453,6 +453,36 @@ fn round_to_nice_interval(optimal: f64) -> i64 {
         }
     }
     *nice.last().unwrap()
+}
+
+#[derive(Clone, Copy)]
+enum IntervalSlideDirection {
+    Older,
+    Newer,
+}
+
+fn display_interval_minutes_for_window(
+    window: &TimeWindow,
+    now: DateTime<Local>,
+    target_width: usize,
+) -> i64 {
+    let (range_start, range_end) = window.bounds(now);
+    let optimal = calculate_optimal_interval_minutes(&range_start, &range_end, target_width);
+    round_to_nice_interval(optimal)
+}
+
+fn slide_window_by_display_interval(
+    window: &TimeWindow,
+    now: DateTime<Local>,
+    target_width: usize,
+    direction: IntervalSlideDirection,
+) -> Option<TimeWindow> {
+    let interval_minutes = display_interval_minutes_for_window(window, now, target_width);
+    let step = Duration::minutes(interval_minutes.max(1));
+    match direction {
+        IntervalSlideDirection::Older => window.slide_back_by(now, step),
+        IntervalSlideDirection::Newer => window.slide_forward_by(now, step),
+    }
 }
 
 /// Get the data directory for a vendor, or None for "all".
@@ -1513,6 +1543,9 @@ fn main() {
                                     println!(
                                         "                     (PgDn snaps to the present once you reach it)\r"
                                     );
+                                    println!(
+                                        "  Left / Right     - Empty prompt: newer / older by interval; text: move cursor\r"
+                                    );
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!(
                                         "Current: vendor={}, window={}, interval={}s\r",
@@ -1711,7 +1744,23 @@ fn main() {
                             code: KeyCode::Left,
                             ..
                         }) => {
-                            if input.move_left() {
+                            if input.is_empty() {
+                                let now = Local::now();
+                                if let Some(new_window) = slide_window_by_display_interval(
+                                    &state.time_window,
+                                    now,
+                                    get_chart_target_width(),
+                                    IntervalSlideDirection::Newer,
+                                ) {
+                                    state.time_window = new_window;
+                                    let result = refresh_display(&mut state);
+                                    terminal_too_small = result.is_none();
+                                    next_refresh = std::time::Instant::now()
+                                        + std::time::Duration::from_secs(state.monitor_interval);
+                                    show_prompt(&mut state, terminal_too_small);
+                                    render_input(&input, terminal_too_small);
+                                }
+                            } else if input.move_left() {
                                 print!("\x1b[D");
                                 io::stdout().flush().unwrap();
                             }
@@ -1720,7 +1769,23 @@ fn main() {
                             code: KeyCode::Right,
                             ..
                         }) => {
-                            if input.move_right() {
+                            if input.is_empty() {
+                                let now = Local::now();
+                                if let Some(new_window) = slide_window_by_display_interval(
+                                    &state.time_window,
+                                    now,
+                                    get_chart_target_width(),
+                                    IntervalSlideDirection::Older,
+                                ) {
+                                    state.time_window = new_window;
+                                    let result = refresh_display(&mut state);
+                                    terminal_too_small = result.is_none();
+                                    next_refresh = std::time::Instant::now()
+                                        + std::time::Duration::from_secs(state.monitor_interval);
+                                    show_prompt(&mut state, terminal_too_small);
+                                    render_input(&input, terminal_too_small);
+                                }
+                            } else if input.move_right() {
                                 print!("\x1b[C");
                                 io::stdout().flush().unwrap();
                             }
@@ -1830,6 +1895,61 @@ mod tests {
         assert_eq!(next_cache_horizon(None, 29), 29);
         assert_eq!(next_cache_horizon(Some(29), 31), 58);
         assert_eq!(next_cache_horizon(Some(29), 90), 90);
+    }
+
+    #[test]
+    fn interval_slide_older_moves_rolling_window_by_display_interval() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+
+        let slid =
+            slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Older)
+                .expect("slide older");
+        let (start, end) = slid.bounds(now);
+
+        assert_eq!(end, now - chrono::Duration::hours(1));
+        assert_eq!(
+            start,
+            now - chrono::Duration::days(3) - chrono::Duration::hours(1)
+        );
+        assert_eq!(slid.page_step(), chrono::Duration::days(3));
+    }
+
+    #[test]
+    fn interval_slide_newer_clamps_to_present() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+        let older =
+            slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Older)
+                .expect("slide older");
+
+        let newer =
+            slide_window_by_display_interval(&older, now, 160, IntervalSlideDirection::Newer)
+                .expect("slide newer");
+        let (start, end) = newer.bounds(now);
+
+        assert_eq!(end, now);
+        assert_eq!(start, now - chrono::Duration::days(3));
+    }
+
+    #[test]
+    fn interval_slide_newer_on_current_window_is_noop() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+
+        assert!(
+            slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Newer)
+                .is_none()
+        );
     }
 
     #[test]

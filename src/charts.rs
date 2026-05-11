@@ -22,6 +22,53 @@ fn model_config() -> Vec<(&'static str, &'static str, usize)> {
     ]
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn daily_header_lines_do_not_exceed_chart_width_at_right_boundary() {
+        let day = Local
+            .with_ymd_and_hms(2026, 5, 7, 12, 0, 0)
+            .single()
+            .expect("fixed local time");
+        let mut columns = Vec::new();
+        for sub_col in 0..7 {
+            columns.push(ChartColumn::Data {
+                data_idx: 0,
+                sub_col,
+            });
+        }
+        columns.push(ChartColumn::Separator);
+        for sub_col in 0..13 {
+            columns.push(ChartColumn::Data {
+                data_idx: 0,
+                sub_col,
+            });
+        }
+        columns.push(ChartColumn::Separator);
+        columns.push(ChartColumn::Data {
+            data_idx: 0,
+            sub_col: 0,
+        });
+        let layout = ChartLayout {
+            columns,
+            data_to_col: HashMap::new(),
+            sorted_times: vec![day],
+        };
+        let chart_width = 7 + layout.columns.len();
+
+        let Some((weekday_line, date_line)) = daily_header_lines(&layout, &|_| 0.0) else {
+            panic!("header should render");
+        };
+
+        assert!(weekday_line.len() <= chart_width);
+        assert!(date_line.len() <= chart_width);
+        assert!(date_line.ends_with("05 / 07"));
+    }
+}
+
 fn model_order(model: &str) -> Option<usize> {
     model_config()
         .iter()
@@ -213,6 +260,16 @@ fn build_chart_layout(
 }
 
 fn print_daily_header(layout: &ChartLayout, line_values_fn: &dyn Fn(usize) -> f64, pad: &str) {
+    if let Some((weekday_line, date_line)) = daily_header_lines(layout, line_values_fn) {
+        println!("{}{}", pad, weekday_line);
+        println!("{}{}", pad, date_line);
+    }
+}
+
+fn daily_header_lines(
+    layout: &ChartLayout,
+    line_values_fn: &dyn Fn(usize) -> f64,
+) -> Option<(String, String)> {
     // Build visual segments between day-boundary separators
     let total_cols = layout.columns.len();
     let sep_positions: Vec<usize> = layout
@@ -285,7 +342,7 @@ fn print_daily_header(layout: &ChartLayout, line_values_fn: &dyn Fn(usize) -> f6
     };
     let compact = inner_min < 13;
     if compact && inner_min < 7 {
-        return;
+        return None;
     }
 
     let weekday_normal = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -295,6 +352,7 @@ fn print_daily_header(layout: &ChartLayout, line_values_fn: &dyn Fn(usize) -> f6
     let mut date_line = " ".repeat(7);
     let mut prev_end = 0usize;
 
+    let chart_width = 7 + total_cols;
     for (mid_col, total, day_start) in &daily_totals {
         let wd_idx = day_start.weekday().num_days_from_monday() as usize;
         let (mut weekday_total, mut date_str) = if compact {
@@ -336,6 +394,10 @@ fn print_daily_header(layout: &ChartLayout, line_values_fn: &dyn Fn(usize) -> f6
         } else {
             0
         };
+        let start_pos = start_pos.min(total_cols.saturating_sub(max_len));
+        if start_pos < prev_end {
+            continue;
+        }
         let padding = start_pos.saturating_sub(prev_end);
 
         weekday_line.push_str(&" ".repeat(padding));
@@ -345,8 +407,9 @@ fn print_daily_header(layout: &ChartLayout, line_values_fn: &dyn Fn(usize) -> f6
         prev_end = start_pos + max_len;
     }
 
-    println!("{}{}", pad, weekday_line);
-    println!("{}{}", pad, date_line);
+    weekday_line.truncate(chart_width);
+    date_line.truncate(chart_width);
+    Some((weekday_line, date_line))
 }
 
 fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) {
@@ -435,11 +498,11 @@ fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) 
     print_window_pager_hint(layout, pad);
 }
 
-/// Persistent reminder anchored to the bottom-right of the chart that
-/// PgUp/PgDn slide the time window. The chart width is the y-axis prefix
-/// ("       " = 7 cols) plus one column per `layout.columns` entry.
+/// Persistent reminder anchored to the bottom-right of the chart. The chart
+/// width is the y-axis prefix ("       " = 7 cols) plus one column per
+/// `layout.columns` entry.
 fn print_window_pager_hint(layout: &ChartLayout, pad: &str) {
-    const HINT: &str = "PgUp/PgDn: slide window <- / -> by its width";
+    const HINT: &str = "PgUp/PgDn: page | empty <- newer / -> older";
     let chart_width = 7 + layout.columns.len();
     let hint_visible = HINT.chars().count();
     let lead = chart_width.saturating_sub(hint_visible);

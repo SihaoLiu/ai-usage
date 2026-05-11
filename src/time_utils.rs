@@ -121,7 +121,12 @@ impl TimeWindow {
     /// Translate the window backward by `page_step`. Always returns an
     /// `ExplicitRange` so the new bounds are no longer anchored to `now`.
     pub fn slide_back(&self, now: DateTime<Local>) -> Option<Self> {
-        let step = self.page_step();
+        self.slide_back_by(now, self.page_step())
+    }
+
+    /// Translate the window backward by an arbitrary positive duration while
+    /// keeping the PageUp/PageDown step tied to the original window width.
+    pub fn slide_back_by(&self, now: DateTime<Local>, step: Duration) -> Option<Self> {
         if step <= Duration::zero() {
             return None;
         }
@@ -130,7 +135,7 @@ impl TimeWindow {
             start: start - step,
             end: end - step,
             projection_days: self.projection_days(now),
-            page_step: step,
+            page_step: self.page_step(),
         })
     }
 
@@ -138,7 +143,12 @@ impl TimeWindow {
     /// never exceeds `now`, which makes paging into the future a no-op
     /// (returns `None`) when the window already touches the present.
     pub fn slide_forward(&self, now: DateTime<Local>) -> Option<Self> {
-        let step = self.page_step();
+        self.slide_forward_by(now, self.page_step())
+    }
+
+    /// Translate the window forward by an arbitrary positive duration while
+    /// preserving the original window width and PageUp/PageDown step.
+    pub fn slide_forward_by(&self, now: DateTime<Local>, step: Duration) -> Option<Self> {
         if step <= Duration::zero() {
             return None;
         }
@@ -157,7 +167,7 @@ impl TimeWindow {
             start: new_start,
             end: new_end,
             projection_days: self.projection_days(now),
-            page_step: step,
+            page_step: self.page_step(),
         })
     }
 }

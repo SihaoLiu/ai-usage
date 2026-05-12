@@ -31,6 +31,7 @@ Default behavior (no flags) enters monitor mode showing all vendors for the last
 | Up / Down arrows | Recall previous / next typed command (shell-style history) |
 | Left / Right arrows | Empty prompt: slide newer / older by one chart interval; text prompt: move cursor |
 | PgUp / PgDn | Slide the time window backward / forward by its width (PgDn snaps to the present) |
+| + / - | Empty prompt: zoom the time window in / out |
 
 Monitor mode date and date-time inputs are interpreted in the running machine's local timezone. For date-only ranges, the ending date is included for the full local day. For example, `range 2026-05-01 2026-05-07` covers local time from `2026-05-01 00:00:00` through the end of `2026-05-07`. The two arguments to `range` may be supplied in any order; the earlier instant is treated as the start and the later one as the end.
 

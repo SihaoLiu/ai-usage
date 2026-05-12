@@ -29,6 +29,8 @@ KEY_RIGHT = "\x1b[C"
 KEY_LEFT = "\x1b[D"
 KEY_PAGE_UP = "\x1b[5~"
 KEY_PAGE_DOWN = "\x1b[6~"
+KEY_PLUS = "+"
+KEY_MINUS = "-"
 KEY_CTRL_C = "\x03"
 
 
@@ -397,21 +399,22 @@ def render_screen_image(screen, font_path, font_size, padding):
     return image
 
 
-def build_demo_events(duration=15.0, step_interval=0.75):
+def build_demo_events(duration=5.0, step_interval=0.1):
     events = []
+    at = 0.8
 
-    at = 1.0
-    while at < 6.0:
-        events.append(InputEvent(round(at, 3), KEY_RIGHT))
-        at += step_interval
+    for key, count in [
+        (KEY_RIGHT, 10),
+        (KEY_LEFT, 5),
+        (KEY_PAGE_UP, 10),
+        (KEY_PAGE_DOWN, 5),
+        (KEY_PLUS, 3),
+        (KEY_MINUS, 3),
+    ]:
+        for _ in range(count):
+            events.append(InputEvent(round(at, 3), key))
+            at += step_interval
 
-    at = 6.0
-    while at < 11.0:
-        events.append(InputEvent(round(at, 3), KEY_LEFT))
-        at += step_interval
-
-    events.append(InputEvent(11.8, KEY_PAGE_UP))
-    events.append(InputEvent(13.2, KEY_PAGE_DOWN))
     events.append(InputEvent(duration, KEY_CTRL_C))
     return sorted(events, key=lambda event: event.at)
 
@@ -562,10 +565,10 @@ def build_parser():
     parser.add_argument("--font")
     parser.add_argument("--font-size", type=int, default=12)
     parser.add_argument("--padding", type=int, default=6)
-    parser.add_argument("--duration", type=float, default=15.0)
+    parser.add_argument("--duration", type=float, default=5.0)
     parser.add_argument("--fps", type=float, default=8.0)
-    parser.add_argument("--speed", type=float, default=3.0)
-    parser.add_argument("--key-interval", type=float, default=0.75)
+    parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--key-interval", type=float, default=0.1)
     return parser
 
 

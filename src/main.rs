@@ -1698,6 +1698,9 @@ fn main() {
                                     println!(
                                         "  Left / Right     - Empty prompt: newer / older by interval; text: move cursor\r"
                                     );
+                                    println!(
+                                        "  + / -            - Empty prompt: zoom the time window in / out\r"
+                                    );
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!(
                                         "Current: vendor={}, window={}, interval={}s\r",
@@ -1992,6 +1995,48 @@ fn main() {
                         }) => {
                             if input.backspace() {
                                 prompt_notice = None;
+                                render_input(
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    state.integrity_status,
+                                );
+                            }
+                        }
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Char('+'),
+                            modifiers,
+                            ..
+                        }) if input.is_empty() && !modifiers.contains(KeyModifiers::CONTROL) => {
+                            let now = Local::now();
+                            if let Some(new_window) = state.time_window.zoom_in(now) {
+                                state.time_window = new_window;
+                                let result = refresh_display(&mut state);
+                                terminal_too_small = result.is_none();
+                                next_refresh = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval);
+                                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                                render_input(
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    state.integrity_status,
+                                );
+                            }
+                        }
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Char('-'),
+                            modifiers,
+                            ..
+                        }) if input.is_empty() && !modifiers.contains(KeyModifiers::CONTROL) => {
+                            let now = Local::now();
+                            if let Some(new_window) = state.time_window.zoom_out(now) {
+                                state.time_window = new_window;
+                                let result = refresh_display(&mut state);
+                                terminal_too_small = result.is_none();
+                                next_refresh = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval);
+                                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
                                 render_input(
                                     &input,
                                     terminal_too_small,

@@ -502,7 +502,7 @@ fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) 
 /// width is the y-axis prefix ("       " = 7 cols) plus one column per
 /// `layout.columns` entry.
 fn print_window_pager_hint(layout: &ChartLayout, pad: &str) {
-    const HINT: &str = "PgUp/PgDn: page | empty <- newer / -> older";
+    const HINT: &str = "PgUp/PgDn: page | <-/->: move | +/-: zoom";
     let chart_width = 7 + layout.columns.len();
     let hint_visible = HINT.chars().count();
     let lead = chart_width.saturating_sub(hint_visible);

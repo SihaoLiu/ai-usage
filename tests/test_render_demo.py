@@ -21,28 +21,29 @@ class RenderDemoTests(unittest.TestCase):
     def test_default_output_is_readme_gif(self):
         args = self.render_demo.build_parser().parse_args([])
         self.assertEqual(args.output, "docs/assets/ai-usage.gif")
-        self.assertEqual(args.speed, 3.0)
+        self.assertEqual(args.duration, 5.0)
+        self.assertEqual(args.speed, 1.0)
+        self.assertEqual(args.key_interval, 0.1)
 
     def test_frame_duration_uses_playback_speed(self):
         self.assertEqual(self.render_demo.frame_duration_ms(fps=8.0, speed=3.0), 42)
 
-    def test_demo_events_cover_arrows_pages_and_exit(self):
-        events = self.render_demo.build_demo_events(duration=15.0, step_interval=1.0)
+    def test_demo_events_match_viewport_navigation_sequence(self):
+        events = self.render_demo.build_demo_events(duration=5.0, step_interval=0.1)
 
-        right_times = [event.at for event in events if event.data == self.render_demo.KEY_RIGHT]
-        left_times = [event.at for event in events if event.data == self.render_demo.KEY_LEFT]
-        page_up_times = [event.at for event in events if event.data == self.render_demo.KEY_PAGE_UP]
-        page_down_times = [event.at for event in events if event.data == self.render_demo.KEY_PAGE_DOWN]
+        expected_sequence = (
+            [self.render_demo.KEY_RIGHT] * 10
+            + [self.render_demo.KEY_LEFT] * 5
+            + [self.render_demo.KEY_PAGE_UP] * 10
+            + [self.render_demo.KEY_PAGE_DOWN] * 5
+            + [self.render_demo.KEY_PLUS] * 3
+            + [self.render_demo.KEY_MINUS] * 3
+            + [self.render_demo.KEY_CTRL_C]
+        )
 
-        self.assertGreaterEqual(len(right_times), 4)
-        self.assertGreaterEqual(len(left_times), 4)
-        self.assertTrue(all(1.0 <= at < 6.0 for at in right_times))
-        self.assertTrue(all(6.0 <= at < 11.0 for at in left_times))
-        self.assertEqual(len(page_up_times), 1)
-        self.assertEqual(len(page_down_times), 1)
-        self.assertLess(page_up_times[0], page_down_times[0])
+        self.assertEqual([event.data for event in events], expected_sequence)
         self.assertEqual(events[-1].data, self.render_demo.KEY_CTRL_C)
-        self.assertAlmostEqual(events[-1].at, 15.0)
+        self.assertAlmostEqual(events[-1].at, 5.0)
 
     def test_terminal_screen_handles_clear_line_and_cursor_home(self):
         screen = self.render_demo.TerminalScreen(columns=10, rows=3)

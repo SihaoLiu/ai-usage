@@ -170,6 +170,67 @@ impl TimeWindow {
             page_step: self.page_step(),
         })
     }
+
+    pub fn zoom_in(&self, now: DateTime<Local>) -> Option<Self> {
+        let span = self.span(now)?;
+        let min_span = min_zoom_span();
+        if span <= min_span {
+            return None;
+        }
+        let new_span = (span / 2).max(min_span);
+        self.zoom_to_span(now, new_span)
+    }
+
+    pub fn zoom_out(&self, now: DateTime<Local>) -> Option<Self> {
+        let span = self.span(now)?;
+        self.zoom_to_span(now, span * 2)
+    }
+
+    fn span(&self, now: DateTime<Local>) -> Option<Duration> {
+        let (start, end) = self.bounds(now);
+        let span = end - start;
+        if span <= Duration::zero() {
+            return None;
+        }
+        Some(span)
+    }
+
+    fn zoom_to_span(&self, now: DateTime<Local>, new_span: Duration) -> Option<Self> {
+        if new_span <= Duration::zero() {
+            return None;
+        }
+        let (start, end) = self.bounds(now);
+        let span = end - start;
+
+        let (new_start, new_end) = if matches!(self, Self::RollingDays { .. }) {
+            (now - new_span, now)
+        } else {
+            let center = start + span / 2;
+            let mut new_start = center - new_span / 2;
+            let mut new_end = new_start + new_span;
+            if new_end > now {
+                let overshoot = new_end - now;
+                new_start -= overshoot;
+                new_end -= overshoot;
+            }
+            (new_start, new_end)
+        };
+
+        Some(Self::ExplicitRange {
+            start: new_start,
+            end: new_end,
+            projection_days: projection_days_for_span(new_span),
+            page_step: new_span,
+        })
+    }
+}
+
+fn min_zoom_span() -> Duration {
+    Duration::minutes(1)
+}
+
+fn projection_days_for_span(span: Duration) -> f64 {
+    (span.num_seconds() as f64 / 86_400.0).max(1.0 / 1440.0)
 }
 
 fn local_from_naive(naive: NaiveDateTime) -> Result<DateTime<Local>, String> {
@@ -545,6 +606,63 @@ mod tests {
 
         assert_eq!(end - start, Duration::days(7));
         assert!(end <= now);
+    }
+
+    #[test]
+    fn zoom_in_on_rolling_window_keeps_present_edge() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(4);
+
+        let zoomed = window.zoom_in(now).expect("zoom in");
+        let (start, end) = zoomed.bounds(now);
+
+        assert_eq!(end, now);
+        assert_eq!(start, now - Duration::days(2));
+        assert_eq!(zoomed.page_step(), Duration::days(2));
+        assert_eq!(zoomed.projection_days(now), 2.0);
+    }
+
+    #[test]
+    fn zoom_in_on_explicit_window_keeps_center() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::from_range("2026-05-01T00:00", "2026-05-03T00:00").expect("range");
+
+        let zoomed = window.zoom_in(now).expect("zoom in");
+        let (start, end) = zoomed.bounds(now);
+
+        assert_eq!(
+            start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-01 12:00:00"
+        );
+        assert_eq!(
+            end.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-02 12:00:00"
+        );
+        assert_eq!(zoomed.page_step(), Duration::days(1));
+        assert_eq!(zoomed.projection_days(now), 1.0);
+    }
+
+    #[test]
+    fn zoom_out_clamps_to_present_while_preserving_new_width() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+
+        let zoomed = window.zoom_out(now).expect("zoom out");
+        let (start, end) = zoomed.bounds(now);
+
+        assert_eq!(end, now);
+        assert_eq!(start, now - Duration::days(6));
+        assert_eq!(zoomed.page_step(), Duration::days(6));
+        assert_eq!(zoomed.projection_days(now), 6.0);
     }
 
     #[test]

@@ -22,7 +22,6 @@ use constants::{
     AllPricing, ModelPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees,
 };
 use data::UsageEntry;
-use data::claude::read_all_jsonl_files_dedup;
 use data::codex::get_codex_dir;
 use data::gemini::get_gemini_dir;
 use formatting::print_model_breakdown;
@@ -32,6 +31,8 @@ use time_utils::TimeWindow;
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 35;
 const PREFETCH_PAGE_WINDOWS: i32 = 8;
+const FULL_CACHE_HORIZON: i64 = i64::MAX / 4;
+const DATA_LOADED_NOTICE_MS: u64 = 3_000;
 
 /// Render `body` into an off-screen buffer (by redirecting stdout into a
 /// pipe), then write the whole frame in a single `write_all` so the terminal
@@ -118,6 +119,12 @@ struct VersionCacheEntry {
     version_str: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntegrityStatus {
+    Checking,
+    Checked { duration: std::time::Duration },
+}
+
 struct AppState {
     vendor: String,
     days: i64,
@@ -128,6 +135,9 @@ struct AppState {
     version_cache: HashMap<String, VersionCacheEntry>,
     all_vendor_prompt: Option<String>,
     raw_cache: Option<RawDataCache>,
+    raw_refresh: Option<mpsc::Receiver<RawDataCache>>,
+    integrity_status: IntegrityStatus,
+    integrity_started_at: Option<std::time::Instant>,
 }
 
 /// In-memory snapshot of raw vendor entries, scoped to a known scan
@@ -138,6 +148,11 @@ struct RawDataCache {
     codex: Vec<UsageEntry>,
     gemini: Vec<UsageEntry>,
     horizon_days: i64,
+}
+
+struct PromptNotice {
+    message: String,
+    expires_at: std::time::Instant,
 }
 
 /// Shell-like in-memory command history for the monitor prompt.
@@ -367,6 +382,26 @@ fn print_terminal_too_small(width: u16, height: u16) {
     }
 }
 
+fn print_loading_data_screen(width: u16, height: u16) {
+    print!("\x1b[2J\x1b[H\x1b[?25l");
+
+    let lines = [
+        "Loading data...".to_string(),
+        "Reading cache and preparing the first view.".to_string(),
+    ];
+    let max_line_len = lines.iter().map(|line| line.len()).max().unwrap_or(0);
+    let top_padding = ((height as usize).saturating_sub(lines.len())) / 2;
+
+    for _ in 0..top_padding {
+        println!();
+    }
+    for line in &lines {
+        let left_padding = ((width as usize).saturating_sub(max_line_len)) / 2;
+        println!("{}{}", " ".repeat(left_padding), line);
+    }
+    let _ = io::stdout().flush();
+}
+
 /// Calculate chart height(s) that fit within the terminal.
 /// For single vendor: returns per-chart height (2 charts displayed).
 /// For all vendor: returns the single chart height.
@@ -513,31 +548,46 @@ fn compute_required_horizon(window: &TimeWindow, now: DateTime<Local>) -> i64 {
     days.max(1)
 }
 
-/// Read raw entries for every vendor with the given horizon. Each vendor
-/// directory that is absent simply yields an empty vec.
-fn read_all_vendor_raw(horizon_days: i64) -> RawDataCache {
-    let max_age = Some(horizon_days);
-    let claude = read_all_jsonl_files_dedup(max_age);
+fn read_all_vendor_cached_snapshot() -> RawDataCache {
+    let cache_root = data::cache::default_cache_dir();
+    RawDataCache {
+        claude: data::cache::load_vendor_cached_snapshot(&cache_root, "claude"),
+        codex: data::cache::load_vendor_cached_snapshot(&cache_root, "codex"),
+        gemini: data::cache::load_vendor_cached_snapshot(&cache_root, "gemini"),
+        horizon_days: FULL_CACHE_HORIZON,
+    }
+}
+
+fn refresh_all_vendor_raw_full() -> RawDataCache {
+    let cache_root = data::cache::default_cache_dir();
+    let claude = data::cache::refresh_full_vendor_cache(
+        &cache_root,
+        "claude",
+        data::claude::collect_usage_files(None),
+        data::claude::read_jsonl_file_records,
+    );
 
     let codex_dir = get_codex_dir().join("sessions");
-    let codex = if codex_dir.exists() {
-        data::codex::read_codex_jsonl_files(&codex_dir, max_age)
-    } else {
-        Vec::new()
-    };
+    let codex = data::cache::refresh_full_vendor_cache(
+        &cache_root,
+        "codex",
+        data::codex::collect_usage_files(&codex_dir, None),
+        data::codex::read_codex_file_records,
+    );
 
     let gemini_dir = get_gemini_dir().join("tmp");
-    let gemini = if gemini_dir.exists() {
-        data::gemini::read_gemini_json_files(&gemini_dir, max_age)
-    } else {
-        Vec::new()
-    };
+    let gemini = data::cache::refresh_full_vendor_cache(
+        &cache_root,
+        "gemini",
+        data::gemini::collect_usage_files(&gemini_dir, None),
+        data::gemini::read_gemini_file_records,
+    );
 
     RawDataCache {
         claude,
         codex,
         gemini,
-        horizon_days,
+        horizon_days: FULL_CACHE_HORIZON,
     }
 }
 
@@ -550,24 +600,126 @@ fn ensure_raw_cache(state: &mut AppState, required_horizon: i64) -> &RawDataCach
         Some(cache) => cache.horizon_days < required_horizon,
     };
     if needs_load {
-        let horizon = next_cache_horizon(
-            state.raw_cache.as_ref().map(|cache| cache.horizon_days),
-            required_horizon,
-        );
-        state.raw_cache = Some(read_all_vendor_raw(horizon));
+        state.raw_cache = Some(read_all_vendor_cached_snapshot());
     }
     state.raw_cache.as_ref().unwrap()
 }
 
-fn next_cache_horizon(current_horizon: Option<i64>, required_horizon: i64) -> i64 {
-    match current_horizon {
-        Some(current) => current.saturating_mul(2).max(required_horizon),
-        None => required_horizon,
+fn start_background_raw_refresh(state: &mut AppState) {
+    if state.raw_refresh.is_some() {
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    state.raw_refresh = Some(rx);
+    state.integrity_status = IntegrityStatus::Checking;
+    state.integrity_started_at = Some(std::time::Instant::now());
+    thread::spawn(move || {
+        let refreshed = refresh_all_vendor_raw_full();
+        let _ = tx.send(refreshed);
+    });
+}
+
+fn poll_background_raw_refresh(state: &mut AppState) -> bool {
+    let Some(rx) = state.raw_refresh.take() else {
+        return false;
+    };
+    match rx.try_recv() {
+        Ok(cache) => {
+            state.raw_cache = Some(cache);
+            let duration = state
+                .integrity_started_at
+                .take()
+                .map(|started_at| started_at.elapsed())
+                .unwrap_or_default();
+            state.integrity_status = IntegrityStatus::Checked { duration };
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            state.raw_refresh = Some(rx);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => false,
     }
 }
 
-fn invalidate_raw_cache(state: &mut AppState) {
-    state.raw_cache = None;
+fn data_loaded_notice(load_duration: std::time::Duration) -> PromptNotice {
+    PromptNotice {
+        message: format!("Data loaded in {} ms", load_duration.as_millis()),
+        expires_at: std::time::Instant::now()
+            + std::time::Duration::from_millis(DATA_LOADED_NOTICE_MS),
+    }
+}
+
+fn active_prompt_placeholder(notice: Option<&PromptNotice>) -> (String, usize) {
+    if let Some(notice) = notice {
+        formatting::prompt_placeholder(&notice.message)
+    } else {
+        formatting::prompt_watermark()
+    }
+}
+
+fn integrity_status_marker(status: IntegrityStatus) -> (String, usize) {
+    match status {
+        IntegrityStatus::Checking => formatting::integrity_checking_marker(),
+        IntegrityStatus::Checked { duration } => {
+            formatting::integrity_checked_marker(&format_integrity_duration(duration))
+        }
+    }
+}
+
+fn format_integrity_duration(duration: std::time::Duration) -> String {
+    if duration.as_millis() < 1_000 {
+        format!("{} ms", duration.as_millis())
+    } else {
+        format!("{:.2} s", duration.as_secs_f64())
+    }
+}
+
+fn prompt_notice_expired(notice: &Option<PromptNotice>, now: std::time::Instant) -> bool {
+    notice
+        .as_ref()
+        .map(|notice| now >= notice.expires_at)
+        .unwrap_or(false)
+}
+
+fn render_prompt_line(
+    input: &InputLine,
+    too_small: bool,
+    notice: Option<&PromptNotice>,
+    integrity_status: IntegrityStatus,
+) {
+    if too_small {
+        return;
+    }
+
+    let (width, _) = get_terminal_size();
+    let width = width as usize;
+    let input_visible = 2 + input.char_count();
+    let (status, status_visible) = integrity_status_marker(integrity_status);
+    let status_fits = width >= input_visible + 2 + status_visible;
+
+    print!("\r\x1b[K> {}", input.snapshot());
+
+    if input.is_empty() {
+        let (mark, mark_visible) = active_prompt_placeholder(notice);
+        let watermark_fits = if status_fits {
+            width >= 2 + mark_visible + 2 + status_visible
+        } else {
+            width >= 2 + mark_visible
+        };
+        if watermark_fits {
+            print!("{}", mark);
+        }
+    }
+
+    if status_fits {
+        let status_col = width.saturating_sub(status_visible) + 1;
+        print!("\x1b[{}G{}", status_col, status);
+    }
+
+    let cursor_col = (3 + input.cursor_chars()).min(width.max(1));
+    print!("\x1b[{}G", cursor_col);
+    io::stdout().flush().unwrap();
 }
 
 /// Loaded and filtered data for all vendors.
@@ -1221,9 +1373,13 @@ fn main() {
         version_cache: HashMap::new(),
         all_vendor_prompt: None,
         raw_cache: None,
+        raw_refresh: None,
+        integrity_status: IntegrityStatus::Checking,
+        integrity_started_at: None,
     };
 
     if args.once {
+        state.raw_cache = Some(refresh_all_vendor_raw_full());
         let result = print_stats(&mut state, true);
         match result {
             None => std::process::exit(1),
@@ -1232,17 +1388,12 @@ fn main() {
         }
     } else {
         // Monitor mode
-        let (width, _) = get_terminal_size();
-        println!("\n{}", "=".repeat(width as usize));
-        println!("Interactive Monitor Mode (type h for help)");
-        println!("{}", "=".repeat(width as usize));
-        println!(
-            "Auto-refresh: {}s | Vendor: {} | Window: {}",
-            state.monitor_interval,
-            state.vendor,
-            state.time_window.display_label(Local::now())
-        );
-        println!("{}\n", "=".repeat(width as usize));
+        let (width, height) = get_terminal_size();
+        let load_started = std::time::Instant::now();
+        print_loading_data_screen(width, height);
+        state.raw_cache = Some(read_all_vendor_cached_snapshot());
+        let mut prompt_notice = Some(data_loaded_notice(load_started.elapsed()));
+        start_background_raw_refresh(&mut state);
 
         // Helper: disable raw mode, render the next frame off-screen into a
         // buffer, then write it atomically with per-line clears so the new
@@ -1270,7 +1421,7 @@ fn main() {
         let mut terminal_too_small = result.is_none();
         let mut last_size = get_terminal_size();
 
-        let show_prompt = |state: &mut AppState, too_small: bool| {
+        let show_prompt = |state: &mut AppState, too_small: bool, notice: Option<&PromptNotice>| {
             if too_small {
                 return;
             }
@@ -1285,19 +1436,10 @@ fn main() {
             };
             println!("\n\r{}\r", version);
             println!("\r{}\r", "-".repeat(width as usize));
-            print!("\r> ");
-            // Render dimmed watermark as placeholder, then move cursor back so the
-            // first keystroke lands right after "> ". The watermark is wiped via
-            // \x1b[K when the user starts typing (see Char handler below). Skip the
-            // watermark if it would not fit on the prompt line and wrap awkwardly.
-            let (mark, mark_visible) = formatting::prompt_watermark();
-            if (width as usize) >= 2 + mark_visible {
-                print!("{}\x1b[{}D", mark, mark_visible);
-            }
-            io::stdout().flush().unwrap();
+            render_prompt_line(&InputLine::new(), too_small, notice, state.integrity_status);
         };
 
-        show_prompt(&mut state, terminal_too_small);
+        show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
 
         let mut next_refresh =
             std::time::Instant::now() + std::time::Duration::from_secs(state.monitor_interval);
@@ -1308,24 +1450,11 @@ fn main() {
         // restores the dimmed watermark when empty, and finally moves the
         // terminal cursor to match `input`'s logical position so left/right
         // arrows feel like a real shell.
-        let render_input = |input: &InputLine, too_small: bool| {
-            if too_small {
-                return;
-            }
-            let (width, _) = get_terminal_size();
-            print!("\r\x1b[K> {}", input.snapshot());
-            if input.is_empty() {
-                let (mark, mark_visible) = formatting::prompt_watermark();
-                if (width as usize) >= 2 + mark_visible {
-                    print!("{}\x1b[{}D", mark, mark_visible);
-                }
-            } else {
-                let trailing = input.char_count().saturating_sub(input.cursor_chars());
-                if trailing > 0 {
-                    print!("\x1b[{}D", trailing);
-                }
-            }
-            io::stdout().flush().unwrap();
+        let render_input = |input: &InputLine,
+                            too_small: bool,
+                            notice: Option<&PromptNotice>,
+                            integrity_status: IntegrityStatus| {
+            render_prompt_line(input, too_small, notice, integrity_status);
         };
 
         let cleanup_and_break = |msg: &str| {
@@ -1336,6 +1465,28 @@ fn main() {
         };
 
         'monitor: loop {
+            if poll_background_raw_refresh(&mut state) {
+                let result = refresh_display(&mut state);
+                terminal_too_small = result.is_none();
+                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                render_input(
+                    &input,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    state.integrity_status,
+                );
+            }
+
+            if prompt_notice_expired(&prompt_notice, std::time::Instant::now()) {
+                prompt_notice = None;
+                render_input(
+                    &input,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    state.integrity_status,
+                );
+            }
+
             // Check terminal resize
             let current_size = get_terminal_size();
             if current_size != last_size {
@@ -1355,7 +1506,7 @@ fn main() {
                 terminal_too_small = result.is_none();
                 next_refresh = std::time::Instant::now()
                     + std::time::Duration::from_secs(state.monitor_interval);
-                show_prompt(&mut state, terminal_too_small);
+                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
             }
 
             // Check auto-refresh
@@ -1368,12 +1519,12 @@ fn main() {
                     println!("AUTO-REFRESH\r");
                     println!("{}\n\r", "=".repeat(width as usize));
                 }
-                invalidate_raw_cache(&mut state);
+                start_background_raw_refresh(&mut state);
                 let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
                 next_refresh = std::time::Instant::now()
                     + std::time::Duration::from_secs(state.monitor_interval);
-                show_prompt(&mut state, terminal_too_small);
+                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
             }
 
             // Poll for input with 1s timeout
@@ -1403,6 +1554,7 @@ fn main() {
                             code: KeyCode::Enter,
                             ..
                         }) => {
+                            prompt_notice = None;
                             println!("\r");
                             let command = input.snapshot().trim().to_string();
                             history.record(&command);
@@ -1416,7 +1568,7 @@ fn main() {
                                     println!("\n\r{}\r", "=".repeat(width as usize));
                                     println!("MANUAL REFRESH\r");
                                     println!("{}\n\r", "=".repeat(width as usize));
-                                    invalidate_raw_cache(&mut state);
+                                    start_background_raw_refresh(&mut state);
                                     let result = refresh_display(&mut state);
                                     terminal_too_small = result.is_none();
                                     did_refresh = true;
@@ -1596,7 +1748,11 @@ fn main() {
                                                             "Error: Data directory not found at {}\r",
                                                             dir.display()
                                                         );
-                                                        show_prompt(&mut state, terminal_too_small);
+                                                        show_prompt(
+                                                            &mut state,
+                                                            terminal_too_small,
+                                                            prompt_notice.as_ref(),
+                                                        );
                                                         continue 'monitor;
                                                     }
                                                     state.vendor = nv.to_string();
@@ -1691,14 +1847,20 @@ fn main() {
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
                             }
-                            show_prompt(&mut state, terminal_too_small);
+                            show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
                         }
                         Event::Key(KeyEvent {
                             code: KeyCode::Up, ..
                         }) => {
                             if let Some(recalled) = history.navigate_up(input.snapshot()) {
+                                prompt_notice = None;
                                 input.replace(recalled);
-                                render_input(&input, terminal_too_small);
+                                render_input(
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    state.integrity_status,
+                                );
                             }
                         }
                         Event::Key(KeyEvent {
@@ -1706,8 +1868,14 @@ fn main() {
                             ..
                         }) => {
                             if let Some(recalled) = history.navigate_down() {
+                                prompt_notice = None;
                                 input.replace(recalled);
-                                render_input(&input, terminal_too_small);
+                                render_input(
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    state.integrity_status,
+                                );
                             }
                         }
                         Event::Key(KeyEvent {
@@ -1721,8 +1889,13 @@ fn main() {
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
-                                show_prompt(&mut state, terminal_too_small);
-                                render_input(&input, terminal_too_small);
+                                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                                render_input(
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    state.integrity_status,
+                                );
                             }
                         }
                         Event::Key(KeyEvent {
@@ -1736,8 +1909,13 @@ fn main() {
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
-                                show_prompt(&mut state, terminal_too_small);
-                                render_input(&input, terminal_too_small);
+                                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                                render_input(
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    state.integrity_status,
+                                );
                             }
                         }
                         Event::Key(KeyEvent {
@@ -1757,8 +1935,17 @@ fn main() {
                                     terminal_too_small = result.is_none();
                                     next_refresh = std::time::Instant::now()
                                         + std::time::Duration::from_secs(state.monitor_interval);
-                                    show_prompt(&mut state, terminal_too_small);
-                                    render_input(&input, terminal_too_small);
+                                    show_prompt(
+                                        &mut state,
+                                        terminal_too_small,
+                                        prompt_notice.as_ref(),
+                                    );
+                                    render_input(
+                                        &input,
+                                        terminal_too_small,
+                                        prompt_notice.as_ref(),
+                                        state.integrity_status,
+                                    );
                                 }
                             } else if input.move_left() {
                                 print!("\x1b[D");
@@ -1782,8 +1969,17 @@ fn main() {
                                     terminal_too_small = result.is_none();
                                     next_refresh = std::time::Instant::now()
                                         + std::time::Duration::from_secs(state.monitor_interval);
-                                    show_prompt(&mut state, terminal_too_small);
-                                    render_input(&input, terminal_too_small);
+                                    show_prompt(
+                                        &mut state,
+                                        terminal_too_small,
+                                        prompt_notice.as_ref(),
+                                    );
+                                    render_input(
+                                        &input,
+                                        terminal_too_small,
+                                        prompt_notice.as_ref(),
+                                        state.integrity_status,
+                                    );
                                 }
                             } else if input.move_right() {
                                 print!("\x1b[C");
@@ -1795,7 +1991,13 @@ fn main() {
                             ..
                         }) => {
                             if input.backspace() {
-                                render_input(&input, terminal_too_small);
+                                prompt_notice = None;
+                                render_input(
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    state.integrity_status,
+                                );
                             }
                         }
                         Event::Key(KeyEvent {
@@ -1803,8 +2005,14 @@ fn main() {
                             modifiers,
                             ..
                         }) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                            prompt_notice = None;
                             input.insert_char(c);
-                            render_input(&input, terminal_too_small);
+                            render_input(
+                                &input,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                state.integrity_status,
+                            );
                         }
                         Event::Resize(w, h) => {
                             last_size = (w, h);
@@ -1819,7 +2027,7 @@ fn main() {
                             terminal_too_small = result.is_none();
                             next_refresh = std::time::Instant::now()
                                 + std::time::Duration::from_secs(state.monitor_interval);
-                            show_prompt(&mut state, terminal_too_small);
+                            show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
                         }
                         _ => {}
                     }
@@ -1891,10 +2099,39 @@ mod tests {
     }
 
     #[test]
-    fn cache_horizon_growth_is_exponential_after_initial_load() {
-        assert_eq!(next_cache_horizon(None, 29), 29);
-        assert_eq!(next_cache_horizon(Some(29), 31), 58);
-        assert_eq!(next_cache_horizon(Some(29), 90), 90);
+    fn data_loaded_notice_formats_milliseconds_and_expires() {
+        let notice = data_loaded_notice(std::time::Duration::from_millis(42));
+
+        assert_eq!(notice.message, "Data loaded in 42 ms");
+        assert!(prompt_notice_expired(
+            &Some(notice),
+            std::time::Instant::now() + std::time::Duration::from_secs(4)
+        ));
+    }
+
+    #[test]
+    fn integrity_status_marker_uses_expected_text_width_and_color() {
+        let (checking, checking_visible) = integrity_status_marker(IntegrityStatus::Checking);
+        assert!(checking.contains("\x1b[38;5;143mIntegrity Checking\x1b[0m"));
+        assert_eq!(checking_visible, "Integrity Checking".chars().count());
+
+        let (checked_ms, checked_ms_visible) = integrity_status_marker(IntegrityStatus::Checked {
+            duration: std::time::Duration::from_millis(842),
+        });
+        assert!(checked_ms.contains("\x1b[38;5;108mIntegrity Checked in 842 ms\x1b[0m"));
+        assert_eq!(
+            checked_ms_visible,
+            "Integrity Checked in 842 ms".chars().count()
+        );
+
+        let (checked_s, checked_s_visible) = integrity_status_marker(IntegrityStatus::Checked {
+            duration: std::time::Duration::from_millis(1_234),
+        });
+        assert!(checked_s.contains("\x1b[38;5;108mIntegrity Checked in 1.23 s\x1b[0m"));
+        assert_eq!(
+            checked_s_visible,
+            "Integrity Checked in 1.23 s".chars().count()
+        );
     }
 
     #[test]

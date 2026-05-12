@@ -1,12 +1,10 @@
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use crate::data::{TokenUsage, UsageEntry};
+use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
 use crate::time_utils::parse_timestamp;
 
 /// When a Codex session is resumed via `--fork`, the new rollout file replays every
@@ -246,9 +244,7 @@ fn is_replayed_event(
     }
 }
 
-/// Read all Codex JSONL files from the sessions directory, applying both per-file
-/// replay filtering and a cross-file dedup pass as a safety net.
-pub fn read_codex_jsonl_files(sessions_dir: &Path, max_age_days: Option<i64>) -> Vec<UsageEntry> {
+pub fn collect_usage_files(sessions_dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
     if !sessions_dir.exists() {
         return Vec::new();
     }
@@ -278,21 +274,17 @@ pub fn read_codex_jsonl_files(sessions_dir: &Path, max_age_days: Option<i64>) ->
         .collect();
 
     files.sort();
+    files
+}
 
-    let per_file: Vec<Vec<RawEntry>> = files
-        .par_iter()
-        .map(|path| read_single_codex_file(path))
-        .collect();
-
-    let total: usize = per_file.iter().map(|v| v.len()).sum();
-    let mut seen: HashSet<DedupKey> = HashSet::with_capacity(total);
-    let mut deduped: Vec<UsageEntry> = Vec::with_capacity(total);
-    for raw in per_file.into_iter().flatten() {
-        if seen.insert(raw.dedup_key) {
-            deduped.push(raw.entry);
-        }
-    }
-    deduped
+pub fn read_codex_file_records(path: &Path) -> Vec<SourceUsageRecord> {
+    read_single_codex_file(path)
+        .into_iter()
+        .map(|raw| SourceUsageRecord {
+            dedup_key: serde_json::to_string(&raw.dedup_key).unwrap_or_default(),
+            entry: raw.entry,
+        })
+        .collect()
 }
 
 #[cfg(test)]

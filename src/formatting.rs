@@ -265,6 +265,8 @@ pub fn format_cost_per_mtok(value: f64) -> String {
 const COL_PCT_COLOR: &str = "\x1b[36m"; // cyan
 const ROW_PCT_COLOR: &str = "\x1b[33m"; // yellow
 const WATERMARK_COLOR: &str = "\x1b[38;5;240m"; // muted gray for background watermark
+const INTEGRITY_CHECKING_COLOR: &str = "\x1b[38;5;143m"; // muted yellow
+const INTEGRITY_CHECKED_COLOR: &str = "\x1b[38;5;108m"; // muted green
 const COLOR_RESET: &str = "\x1b[0m";
 
 /// Watermark text shown as a dimmed placeholder in the monitor-mode prompt.
@@ -275,8 +277,27 @@ pub fn prompt_watermark() -> (String, usize) {
         "ai-usage by SihaoLiu, v{}, enter h or help for usage",
         env!("CARGO_PKG_VERSION")
     );
+    prompt_placeholder(&text)
+}
+
+pub fn prompt_placeholder(text: &str) -> (String, usize) {
+    colored_prompt_placeholder(text, WATERMARK_COLOR)
+}
+
+pub fn integrity_checking_marker() -> (String, usize) {
+    colored_prompt_placeholder("Integrity Checking", INTEGRITY_CHECKING_COLOR)
+}
+
+pub fn integrity_checked_marker(duration: &str) -> (String, usize) {
+    colored_prompt_placeholder(
+        &format!("Integrity Checked in {duration}"),
+        INTEGRITY_CHECKED_COLOR,
+    )
+}
+
+fn colored_prompt_placeholder(text: &str, color: &str) -> (String, usize) {
     let visible = text.chars().count();
-    let colored = format!("{}{}{}", WATERMARK_COLOR, text, COLOR_RESET);
+    let colored = format!("{}{}{}", color, text, COLOR_RESET);
     (colored, visible)
 }
 

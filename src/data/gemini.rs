@@ -2,10 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use crate::data::{TokenUsage, UsageEntry};
+use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
 use crate::time_utils::parse_timestamp;
 
 /// Get the Gemini configuration directory.
@@ -88,8 +87,7 @@ fn read_single_gemini_file(path: &Path) -> Vec<UsageEntry> {
     entries
 }
 
-/// Read all Gemini session JSON files from the tmp directory.
-pub fn read_gemini_json_files(tmp_dir: &Path, max_age_days: Option<i64>) -> Vec<UsageEntry> {
+pub fn collect_usage_files(tmp_dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
     if !tmp_dir.exists() {
         return Vec::new();
     }
@@ -129,11 +127,15 @@ pub fn read_gemini_json_files(tmp_dir: &Path, max_age_days: Option<i64>) -> Vec<
         .collect();
 
     files.sort();
+    files
+}
 
-    let all_entries: Vec<Vec<UsageEntry>> = files
-        .par_iter()
-        .map(|path| read_single_gemini_file(path))
-        .collect();
-
-    all_entries.into_iter().flatten().collect()
+pub fn read_gemini_file_records(path: &Path) -> Vec<SourceUsageRecord> {
+    read_single_gemini_file(path)
+        .into_iter()
+        .map(|entry| SourceUsageRecord {
+            dedup_key: String::new(),
+            entry,
+        })
+        .collect()
 }

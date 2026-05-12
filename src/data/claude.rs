@@ -1,12 +1,10 @@
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use crate::data::{TokenUsage, UsageEntry};
+use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
 use crate::time_utils::parse_timestamp;
 
 /// Get Claude configuration directories.
@@ -59,8 +57,7 @@ fn collect_jsonl_files(dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Read all Claude JSONL files with full deduplication by message_id:request_id.
-pub fn read_all_jsonl_files_dedup(max_age_days: Option<i64>) -> Vec<UsageEntry> {
+pub fn collect_usage_files(max_age_days: Option<i64>) -> Vec<PathBuf> {
     let dirs = get_claude_dirs();
     let mut all_files: Vec<PathBuf> = Vec::new();
 
@@ -72,33 +69,11 @@ pub fn read_all_jsonl_files_dedup(max_age_days: Option<i64>) -> Vec<UsageEntry> 
     }
 
     all_files.sort();
-
-    // Parse files in parallel, returning entries with dedup keys
-    let all_entries: Vec<Vec<(String, UsageEntry)>> = all_files
-        .par_iter()
-        .map(|path| read_single_jsonl_file_with_keys(path))
-        .collect();
-
-    let mut seen_hashes: HashSet<String> = HashSet::new();
-    let mut result = Vec::new();
-
-    for file_entries in all_entries {
-        for (key, entry) in file_entries {
-            if !key.is_empty() {
-                if seen_hashes.contains(&key) {
-                    continue;
-                }
-                seen_hashes.insert(key);
-            }
-            result.push(entry);
-        }
-    }
-
-    result
+    all_files
 }
 
 /// Read a single JSONL file and return entries with deduplication keys.
-fn read_single_jsonl_file_with_keys(path: &Path) -> Vec<(String, UsageEntry)> {
+pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -149,9 +124,9 @@ fn read_single_jsonl_file_with_keys(path: &Path) -> Vec<(String, UsageEntry)> {
 
         let parsed_ts = parse_timestamp(&timestamp);
 
-        entries.push((
+        entries.push(SourceUsageRecord {
             dedup_key,
-            UsageEntry {
+            entry: UsageEntry {
                 timestamp: timestamp.clone(),
                 parsed_timestamp: parsed_ts,
                 session_start_time: timestamp.clone(),
@@ -178,7 +153,7 @@ fn read_single_jsonl_file_with_keys(path: &Path) -> Vec<(String, UsageEntry)> {
                     reasoning_output_tokens: 0,
                 },
             },
-        ));
+        });
     }
 
     entries

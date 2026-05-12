@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
@@ -26,6 +27,13 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
     pub reasoning_output_tokens: i64,
+}
+
+/// Normalized usage entry paired with a stable source-level deduplication key.
+#[derive(Debug, Clone)]
+pub struct SourceUsageRecord {
+    pub dedup_key: String,
+    pub entry: UsageEntry,
 }
 
 /// Filter usage data to the selected local time window.

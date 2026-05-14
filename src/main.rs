@@ -729,6 +729,29 @@ struct AllVendorData {
     gemini: Vec<UsageEntry>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowDataState {
+    NoSourceData,
+    EmptyWindow,
+    Populated,
+}
+
+fn classify_window_data(has_source_data: bool, has_window_data: bool) -> WindowDataState {
+    match (has_source_data, has_window_data) {
+        (false, _) => WindowDataState::NoSourceData,
+        (true, false) => WindowDataState::EmptyWindow,
+        (true, true) => WindowDataState::Populated,
+    }
+}
+
+fn raw_cache_has_any_vendor_data(cache: &RawDataCache) -> bool {
+    !cache.claude.is_empty() || !cache.codex.is_empty() || !cache.gemini.is_empty()
+}
+
+fn all_vendor_data_has_window_data(all_data: &AllVendorData) -> bool {
+    !all_data.claude.is_empty() || !all_data.codex.is_empty() || !all_data.gemini.is_empty()
+}
+
 fn load_all_vendor_data(state: &mut AppState, now: DateTime<Local>) -> AllVendorData {
     let horizon = compute_required_horizon(&state.time_window, now);
     let window = state.time_window.clone();
@@ -1089,22 +1112,14 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         "gemini" => &cache.gemini,
         _ => &cache.claude,
     };
-    if raw_for_vendor.is_empty() {
+    let filtered = data::filter_usage_data_by_window(raw_for_vendor, &state.time_window, now);
+    if classify_window_data(!raw_for_vendor.is_empty(), !filtered.is_empty())
+        == WindowDataState::NoSourceData
+    {
         if !once {
             print!("\x1b[2J\x1b[H");
         }
         println!("No usage data found.");
-        return Some(false);
-    }
-    let filtered = data::filter_usage_data_by_window(raw_for_vendor, &state.time_window, now);
-    if filtered.is_empty() {
-        if !once {
-            print!("\x1b[2J\x1b[H");
-        }
-        println!(
-            "No usage data found in {}.",
-            state.time_window.display_label(now)
-        );
         return Some(false);
     }
     let vendor = &vendor;
@@ -1185,15 +1200,13 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     };
     let table_pad = formatting::center_pad(width as usize, table_w);
 
-    if !model_ts.is_empty() {
-        print_time_span_info(
-            &range_start,
-            &range_end,
-            interval_minutes,
-            width,
-            &table_pad,
-        );
-    }
+    print_time_span_info(
+        &range_start,
+        &range_end,
+        interval_minutes,
+        width,
+        &table_pad,
+    );
 
     charts::print_multi_line_chart(
         &model_ts,
@@ -1262,10 +1275,20 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
 
     let vendor_time_series = calculate_vendor_aggregate_time_series(&all_data, interval_minutes);
     let all_model_stats = calculate_all_model_breakdown(&all_data, &state.pricing);
+    let has_source_data = state
+        .raw_cache
+        .as_ref()
+        .is_some_and(raw_cache_has_any_vendor_data);
+    let data_state =
+        classify_window_data(has_source_data, all_vendor_data_has_window_data(&all_data));
+    if data_state == WindowDataState::NoSourceData {
+        println!("No usage data found from any vendor.");
+        return Some(false);
+    }
 
     // Pre-check whether table will be displayed
     let table_mode = formatting::get_table_display_mode(width, height, all_model_stats.len());
-    let mut will_print_table = table_mode != "hidden" && !all_model_stats.is_empty();
+    let mut will_print_table = table_mode != "hidden";
 
     // Check total height fits before printing anything
     let (mut chart_height, mut fits) =
@@ -1291,22 +1314,15 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         );
     }
 
-    if !all_model_stats.is_empty() {
-        let effective_height = if will_print_table { height } else { 0 };
-        print_model_breakdown(
-            &all_model_stats,
-            projection_days,
-            Some(width),
-            Some(effective_height),
-            "all",
-            &state.subscription_fees,
-        );
-    }
-
-    if vendor_time_series.is_empty() {
-        println!("No usage data found from any vendor.");
-        return Some(false);
-    }
+    let effective_height = if will_print_table { height } else { 0 };
+    print_model_breakdown(
+        &all_model_stats,
+        projection_days,
+        Some(width),
+        Some(effective_height),
+        "all",
+        &state.subscription_fees,
+    );
 
     let table_w = if will_print_table {
         formatting::get_table_width(formatting::get_table_display_mode(
@@ -2177,6 +2193,19 @@ mod tests {
             checked_s_visible,
             "Integrity Checked in 1.23 s".chars().count()
         );
+    }
+
+    #[test]
+    fn window_data_state_distinguishes_empty_window_from_missing_source_data() {
+        assert_eq!(
+            classify_window_data(false, false),
+            WindowDataState::NoSourceData
+        );
+        assert_eq!(
+            classify_window_data(true, false),
+            WindowDataState::EmptyWindow
+        );
+        assert_eq!(classify_window_data(true, true), WindowDataState::Populated);
     }
 
     #[test]

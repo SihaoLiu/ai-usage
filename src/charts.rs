@@ -669,11 +669,6 @@ pub fn print_multi_line_chart(
     show_legend: bool,
     terminal_width: Option<usize>,
 ) {
-    if time_series.is_empty() {
-        println!("No time series data available.");
-        return;
-    }
-
     let layout = build_chart_layout(range_start, range_end, interval_minutes, target_width);
 
     if layout.sorted_times.len() < 2 {
@@ -743,11 +738,6 @@ pub fn print_multi_line_chart(
     other_models.sort();
 
     let all_models_sorted: Vec<String> = known_models.into_iter().chain(other_models).collect();
-
-    if all_models_sorted.is_empty() {
-        println!("No models found in data.");
-        return;
-    }
 
     // Build line configurations
     let mut lines: Vec<LineConfig> = Vec::new();
@@ -869,7 +859,7 @@ pub fn print_multi_line_chart(
         print_x_axis_labels(&layout, interval_minutes, &pad);
     }
 
-    if show_legend {
+    if show_legend && !lines.is_empty() {
         let legend_parts: Vec<String> = lines
             .iter()
             .map(|l| format!("{}\u{2500}{} {}", l.color, RESET_COLOR, l.label))
@@ -890,11 +880,6 @@ pub fn print_vendor_comparison_chart(
     show_legend: bool,
     terminal_width: Option<usize>,
 ) {
-    if time_series.is_empty() {
-        println!("No time series data available.");
-        return;
-    }
-
     let layout = build_chart_layout(range_start, range_end, interval_minutes, target_width);
 
     if layout.sorted_times.len() < 2 {
@@ -925,13 +910,10 @@ pub fn print_vendor_comparison_chart(
         vendors_sorted.push(v.clone());
     }
 
-    if vendors_sorted.is_empty() {
-        println!("No vendor data available.");
-        return;
-    }
-
     // Add "All" as last entry
-    vendors_sorted.push("All".to_string());
+    if !vendors_sorted.is_empty() {
+        vendors_sorted.push("All".to_string());
+    }
 
     // Build vendor data
     let mut vendor_data: HashMap<String, Vec<f64>> = HashMap::new();
@@ -963,7 +945,9 @@ pub fn print_vendor_comparison_chart(
                 .sum()
         })
         .collect();
-    vendor_data.insert("All".to_string(), all_values);
+    if vendors_sorted.iter().any(|v| v == "All") {
+        vendor_data.insert("All".to_string(), all_values.clone());
+    }
 
     // Find max value
     let max_value_raw = vendor_data
@@ -1010,7 +994,7 @@ pub fn print_vendor_comparison_chart(
     println!("{}{}", pad, "=".repeat(chart_width));
 
     // Daily header using "All" totals
-    print_daily_header(&layout, &|data_idx| vendor_data["All"][data_idx], &pad);
+    print_daily_header(&layout, &|data_idx| all_values[data_idx], &pad);
 
     render_grid(
         &layout,
@@ -1025,7 +1009,7 @@ pub fn print_vendor_comparison_chart(
 
     print_x_axis_labels(&layout, interval_minutes, &pad);
 
-    if show_legend {
+    if show_legend && !vendors_sorted.is_empty() {
         // Calculate vendor totals and percentages
         let vendor_totals: HashMap<String, f64> = vendors_sorted
             .iter()

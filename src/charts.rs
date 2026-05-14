@@ -133,6 +133,42 @@ mod tests {
     }
 
     #[test]
+    fn hour_header_aligns_date_slash_under_total_separator() {
+        let hour = Local
+            .with_ymd_and_hms(2026, 5, 11, 12, 30, 0)
+            .single()
+            .expect("fixed local time");
+        let mut columns = Vec::new();
+        for sub_col in 0..20 {
+            columns.push(ChartColumn::Data {
+                data_idx: 0,
+                sub_col,
+            });
+        }
+        let layout = ChartLayout {
+            columns,
+            data_to_col: HashMap::new(),
+            sorted_times: vec![hour],
+        };
+
+        let Some((time_line, date_line)) =
+            segment_header_lines(&layout, ChartGranularity::Hour, &|_| 3_260_000.0)
+        else {
+            panic!("header should render");
+        };
+
+        assert!(time_line.contains("12:00 : 3.26M"));
+        assert!(date_line.contains("05 / 11"));
+
+        let first_colon = time_line.find(':').expect("time colon");
+        let total_separator = time_line.rfind(':').expect("total separator");
+        let date_separator = date_line.find('/').expect("date separator");
+
+        assert_ne!(date_separator, first_colon);
+        assert_eq!(date_separator, total_separator);
+    }
+
+    #[test]
     fn granularity_picks_hour_for_short_spans_and_week_for_wide_spans() {
         assert_eq!(
             ChartGranularity::from_span_minutes(60),
@@ -644,7 +680,7 @@ fn segment_header_lines(
     for (mid_col, total, anchor) in &segment_totals {
         let (mut head, mut date_str) = segment_label(anchor, granularity, *total, compact);
 
-        let colon_idx = head.find(':').unwrap_or(0);
+        let colon_idx = head.rfind(':').unwrap_or(0);
         let slash_idx = date_str.find('/').unwrap_or(0);
 
         if colon_idx > slash_idx {
@@ -657,7 +693,7 @@ fn segment_header_lines(
         head = format!("{:<width$}", head, width = max_len);
         date_str = format!("{:<width$}", date_str, width = max_len);
 
-        let actual_colon = head.find(':').unwrap_or(0);
+        let actual_colon = head.rfind(':').unwrap_or(0);
         let start_pos = if *mid_col > actual_colon {
             mid_col - actual_colon
         } else {

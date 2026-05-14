@@ -480,6 +480,14 @@ fn calculate_optimal_interval_minutes(
     min_interval.max(terminal_interval)
 }
 
+fn display_chart_granularity(
+    range_start: &DateTime<Local>,
+    range_end: &DateTime<Local>,
+) -> charts::ChartGranularity {
+    let span_minutes = ((*range_end - *range_start).num_seconds() / 60).max(1);
+    charts::ChartGranularity::from_span_minutes(span_minutes)
+}
+
 fn round_to_nice_interval(optimal: f64) -> i64 {
     let nice = [1i64, 5, 10, 15, 30, 60, 120, 240, 480, 720, 1440];
     for &n in &nice {
@@ -1176,6 +1184,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
 
     let optimal = calculate_optimal_interval_minutes(&range_start, &range_end, target_width);
     let interval_minutes = round_to_nice_interval(optimal);
+    let granularity = display_chart_granularity(&range_start, &range_end);
 
     let model_ts = match vendor.as_str() {
         "codex" => {
@@ -1217,6 +1226,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         false,
         Some(target_width),
         interval_minutes,
+        granularity,
         vendor,
         Some(&included_models),
         true,
@@ -1231,6 +1241,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         true,
         Some(target_width),
         interval_minutes,
+        granularity,
         vendor,
         Some(&included_models),
         true,
@@ -1253,6 +1264,7 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     let target_width = get_chart_target_width();
     let optimal = calculate_optimal_interval_minutes(&range_start, &range_end, target_width);
     let interval_minutes = round_to_nice_interval(optimal);
+    let granularity = display_chart_granularity(&range_start, &range_end);
 
     let all_data = load_all_vendor_data(state, now);
 
@@ -1350,6 +1362,7 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         &range_end,
         Some(target_width),
         interval_minutes,
+        granularity,
         true,
         Some(width as usize),
     );

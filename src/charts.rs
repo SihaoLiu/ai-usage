@@ -1,13 +1,75 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::time_utils::{generate_interval_times, round_to_interval_start};
-use chrono::{DateTime, Datelike, Duration, Local, Timelike};
+use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Weekday};
 
 use crate::formatting::{center_pad, format_total_value, format_y_axis_value};
 use crate::stats::{ModelTimeSeries, VendorTimeSeries};
 
 const RESET_COLOR: &str = "\x1b[0m";
 const DIM_COLOR: &str = "\x1b[38;5;240m";
+
+/// Visual segmentation unit for time-series charts. Determines where
+/// separators are drawn between data points and how the header labels each
+/// group. The unit is independent from the data bucketing interval — a chart
+/// can bucket data into 5-minute intervals while drawing hour-wide segments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartGranularity {
+    Hour,
+    Day,
+    Week,
+}
+
+impl ChartGranularity {
+    /// Pick a granularity from the span of the time window in minutes. The
+    /// thresholds aim for roughly 3-15 segments per chart so the header has
+    /// room to render labels without overcrowding.
+    pub fn from_span_minutes(span_minutes: i64) -> Self {
+        let span_hours = span_minutes / 60;
+        let span_days = span_minutes / (24 * 60);
+        if span_days >= 18 {
+            ChartGranularity::Week
+        } else if span_hours <= 12 {
+            ChartGranularity::Hour
+        } else {
+            ChartGranularity::Day
+        }
+    }
+
+    /// True when `t` lies on the start of its granularity period (e.g. for
+    /// `Day`, only midnight is a boundary).
+    pub fn is_boundary(self, t: &DateTime<Local>) -> bool {
+        let exact_minute = t.second() == 0 && t.nanosecond() == 0;
+        match self {
+            ChartGranularity::Hour => t.minute() == 0 && exact_minute,
+            ChartGranularity::Day => t.hour() == 0 && t.minute() == 0 && exact_minute,
+            ChartGranularity::Week => {
+                t.hour() == 0 && t.minute() == 0 && exact_minute && t.weekday() == Weekday::Mon
+            }
+        }
+    }
+
+    /// Round `t` down to the start of its enclosing segment. For `Week`, this
+    /// is the most-recent Monday midnight; the lookup is DST-safe.
+    pub fn segment_start(self, t: DateTime<Local>) -> DateTime<Local> {
+        let naive = match self {
+            ChartGranularity::Hour => t
+                .date_naive()
+                .and_hms_opt(t.hour(), 0, 0)
+                .expect("hour anchor"),
+            ChartGranularity::Day => t.date_naive().and_hms_opt(0, 0, 0).expect("day anchor"),
+            ChartGranularity::Week => {
+                let days_from_mon = t.weekday().num_days_from_monday() as i64;
+                let mon_date = t.date_naive() - Duration::days(days_from_mon);
+                mon_date.and_hms_opt(0, 0, 0).expect("week anchor")
+            }
+        };
+        match Local.from_local_datetime(&naive) {
+            chrono::LocalResult::Single(d) | chrono::LocalResult::Ambiguous(d, _) => d,
+            chrono::LocalResult::None => t,
+        }
+    }
+}
 
 // Model display configuration for Claude (order matters)
 fn model_config() -> Vec<(&'static str, &'static str, usize)> {
@@ -59,13 +121,172 @@ mod tests {
         };
         let chart_width = 7 + layout.columns.len();
 
-        let Some((weekday_line, date_line)) = daily_header_lines(&layout, &|_| 0.0) else {
+        let Some((weekday_line, date_line)) =
+            segment_header_lines(&layout, ChartGranularity::Day, &|_| 0.0)
+        else {
             panic!("header should render");
         };
 
         assert!(weekday_line.len() <= chart_width);
         assert!(date_line.len() <= chart_width);
         assert!(date_line.ends_with("05 / 07"));
+    }
+
+    #[test]
+    fn granularity_picks_hour_for_short_spans_and_week_for_wide_spans() {
+        assert_eq!(
+            ChartGranularity::from_span_minutes(60),
+            ChartGranularity::Hour
+        );
+        assert_eq!(
+            ChartGranularity::from_span_minutes(6 * 60),
+            ChartGranularity::Hour
+        );
+        // Boundary: 13 hours falls into Day so daily totals stay legible.
+        assert_eq!(
+            ChartGranularity::from_span_minutes(13 * 60),
+            ChartGranularity::Day
+        );
+        assert_eq!(
+            ChartGranularity::from_span_minutes(3 * 24 * 60),
+            ChartGranularity::Day
+        );
+        assert_eq!(
+            ChartGranularity::from_span_minutes(17 * 24 * 60),
+            ChartGranularity::Day
+        );
+        assert_eq!(
+            ChartGranularity::from_span_minutes(18 * 24 * 60),
+            ChartGranularity::Week
+        );
+        assert_eq!(
+            ChartGranularity::from_span_minutes(90 * 24 * 60),
+            ChartGranularity::Week
+        );
+    }
+
+    #[test]
+    fn week_granularity_anchors_to_monday() {
+        // 2026-05-07 is a Thursday; the week anchor should be Monday 05/04.
+        let thu = Local
+            .with_ymd_and_hms(2026, 5, 7, 15, 30, 0)
+            .single()
+            .expect("fixed local time");
+        let anchor = ChartGranularity::Week.segment_start(thu);
+        assert_eq!(anchor.weekday(), Weekday::Mon);
+        assert_eq!(
+            anchor.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-05-04 00:00"
+        );
+    }
+
+    #[test]
+    fn hour_granularity_treats_only_minute_zero_as_boundary() {
+        let mid = Local
+            .with_ymd_and_hms(2026, 5, 7, 13, 0, 0)
+            .single()
+            .expect("hh:00");
+        let off = Local
+            .with_ymd_and_hms(2026, 5, 7, 13, 5, 0)
+            .single()
+            .expect("hh:05");
+        assert!(ChartGranularity::Hour.is_boundary(&mid));
+        assert!(!ChartGranularity::Hour.is_boundary(&off));
+    }
+
+    #[test]
+    fn hour_granularity_requires_exact_hour_boundary() {
+        let with_seconds = Local
+            .with_ymd_and_hms(2026, 5, 7, 13, 0, 30)
+            .single()
+            .expect("hh:00:ss");
+        let with_nanos = Local
+            .with_ymd_and_hms(2026, 5, 7, 13, 0, 0)
+            .single()
+            .expect("hh:00")
+            .with_nanosecond(1)
+            .expect("nanosecond");
+
+        assert!(!ChartGranularity::Hour.is_boundary(&with_seconds));
+        assert!(!ChartGranularity::Hour.is_boundary(&with_nanos));
+    }
+
+    #[test]
+    fn week_x_axis_ticks_anchor_to_next_monday() {
+        let first_time = Local
+            .with_ymd_and_hms(2026, 5, 13, 9, 0, 0)
+            .single()
+            .expect("fixed local time");
+        let tick = first_x_axis_tick(&first_time, ChartGranularity::Week, 10_080);
+
+        assert_eq!(tick.weekday(), Weekday::Mon);
+        assert_eq!(
+            tick.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-05-18 00:00"
+        );
+    }
+
+    fn count_separators(layout: &ChartLayout) -> usize {
+        layout
+            .columns
+            .iter()
+            .filter(|c| matches!(c, ChartColumn::Separator))
+            .count()
+    }
+
+    #[test]
+    fn hour_granularity_places_separator_at_each_hour_boundary() {
+        // A 6-hour window with 5-minute buckets should produce one
+        // separator per internal hour boundary (i.e. 5 separators for
+        // boundaries at 13:00..17:00 — the first boundary at 18:00 is
+        // skipped because it is the leftmost data point).
+        let start = Local
+            .with_ymd_and_hms(2026, 5, 7, 12, 0, 0)
+            .single()
+            .expect("start");
+        let end = Local
+            .with_ymd_and_hms(2026, 5, 7, 18, 0, 0)
+            .single()
+            .expect("end");
+        let layout = build_chart_layout(&start, &end, 5, ChartGranularity::Hour, Some(160));
+        // The leftmost data point (18:00) and the rightmost data point
+        // (12:00) are both on-boundary; both should be free of an adjacent
+        // separator so the visible chart has 5 internal separators.
+        assert_eq!(count_separators(&layout), 5);
+    }
+
+    #[test]
+    fn week_granularity_places_separators_only_on_internal_mondays() {
+        // A 14-day window with daily buckets should produce separators only
+        // on internal Mondays.
+        let end = Local
+            .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
+            .single()
+            .expect("end");
+        let start = end - Duration::days(14);
+        let layout = build_chart_layout(&start, &end, 1440, ChartGranularity::Week, Some(160));
+        // The internal Mondays are 2026-05-04 and 2026-05-11.
+        assert_eq!(count_separators(&layout), 2);
+    }
+
+    #[test]
+    fn day_granularity_skips_boundary_at_earliest_data_point() {
+        // The window starts exactly at midnight, which is a Day boundary.
+        // Without the skip rule the earliest column would land in its own
+        // singleton segment on the right edge.
+        let start = Local
+            .with_ymd_and_hms(2026, 5, 5, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Local
+            .with_ymd_and_hms(2026, 5, 7, 23, 0, 0)
+            .single()
+            .expect("end");
+        let layout = build_chart_layout(&start, &end, 60, ChartGranularity::Day, Some(160));
+        // 3 days span -> 2 internal Day boundaries (at 05-06 00:00 and
+        // 05-07 00:00). The earliest 00:00 (05-05) is the chronologically
+        // last data point and should not get a leading separator.
+        assert_eq!(count_separators(&layout), 2);
     }
 }
 
@@ -194,6 +415,7 @@ fn build_chart_layout(
     range_start: &DateTime<Local>,
     range_end: &DateTime<Local>,
     interval_minutes: i64,
+    granularity: ChartGranularity,
     target_width: Option<usize>,
 ) -> ChartLayout {
     let start_rounded = round_to_interval_start(range_start, interval_minutes);
@@ -209,10 +431,14 @@ fn build_chart_layout(
     sorted_times.reverse();
 
     let num_data_points = sorted_times.len();
+    // A separator before the chronologically-earliest data point would create
+    // a degenerate single-point segment on the right edge, so the boundary at
+    // `i == num_data_points - 1` is skipped here and in the rendering loop.
+    let last_idx = num_data_points.saturating_sub(1);
     let separator_count = sorted_times
         .iter()
         .enumerate()
-        .filter(|(i, t)| t.hour() == 0 && t.minute() == 0 && *i > 0)
+        .filter(|(i, t)| granularity.is_boundary(t) && *i > 0 && *i != last_idx)
         .count();
 
     let y_axis_width = 7usize;
@@ -229,7 +455,7 @@ fn build_chart_layout(
     let mut accumulated = 0.0f64;
 
     for (i, &time) in sorted_times.iter().enumerate().take(num_data_points) {
-        if time.hour() == 0 && time.minute() == 0 && i > 0 {
+        if granularity.is_boundary(&time) && i > 0 && i != last_idx {
             columns.push(ChartColumn::Separator);
             col_idx += 1;
         }
@@ -259,18 +485,81 @@ fn build_chart_layout(
     }
 }
 
-fn print_daily_header(layout: &ChartLayout, line_values_fn: &dyn Fn(usize) -> f64, pad: &str) {
-    if let Some((weekday_line, date_line)) = daily_header_lines(layout, line_values_fn) {
-        println!("{}{}", pad, weekday_line);
-        println!("{}{}", pad, date_line);
+fn print_segment_header(
+    layout: &ChartLayout,
+    granularity: ChartGranularity,
+    line_values_fn: &dyn Fn(usize) -> f64,
+    pad: &str,
+) {
+    if let Some((line1, line2)) = segment_header_lines(layout, granularity, line_values_fn) {
+        println!("{}{}", pad, line1);
+        println!("{}{}", pad, line2);
     }
 }
 
-fn daily_header_lines(
+fn segment_label(
+    anchor: &DateTime<Local>,
+    granularity: ChartGranularity,
+    total: f64,
+    compact: bool,
+) -> (String, String) {
+    match granularity {
+        ChartGranularity::Hour => {
+            if compact {
+                (
+                    format!("{:02}h:{}", anchor.hour(), format_total_compact(total)),
+                    anchor.format("%m/%d").to_string(),
+                )
+            } else {
+                (
+                    format!("{:02}:00 : {}", anchor.hour(), format_total_value(total)),
+                    anchor.format(" %m / %d").to_string(),
+                )
+            }
+        }
+        ChartGranularity::Day => {
+            let wd_idx = anchor.weekday().num_days_from_monday() as usize;
+            if compact {
+                let weekday_compact = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+                (
+                    format!(
+                        "{}:{}",
+                        weekday_compact[wd_idx],
+                        format_total_compact(total)
+                    ),
+                    anchor.format("%m/%d").to_string(),
+                )
+            } else {
+                let weekday_normal = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+                (
+                    format!("{} : {}", weekday_normal[wd_idx], format_total_value(total)),
+                    anchor.format(" %m / %d").to_string(),
+                )
+            }
+        }
+        ChartGranularity::Week => {
+            let week_num = anchor.iso_week().week();
+            if compact {
+                (
+                    format!("W{:02}:{}", week_num, format_total_compact(total)),
+                    anchor.format("%m/%d").to_string(),
+                )
+            } else {
+                (
+                    format!("Wk {:02} : {}", week_num, format_total_value(total)),
+                    anchor.format(" %m / %d").to_string(),
+                )
+            }
+        }
+    }
+}
+
+fn segment_header_lines(
     layout: &ChartLayout,
+    granularity: ChartGranularity,
     line_values_fn: &dyn Fn(usize) -> f64,
 ) -> Option<(String, String)> {
-    // Build visual segments between day-boundary separators
+    // Build visual segments between granularity-boundary separators
     let total_cols = layout.columns.len();
     let sep_positions: Vec<usize> = layout
         .columns
@@ -302,8 +591,11 @@ fn daily_header_lines(
         }
     }
 
-    // For each visual segment, compute midpoint, sum tokens, and pick a representative date
-    let mut daily_totals: Vec<(usize, f64, DateTime<Local>)> = Vec::new();
+    // For each visual segment, compute midpoint, sum tokens, and pick a
+    // representative timestamp. The boundary point inside a segment (e.g.
+    // 00:00 inside a Day segment) is treated as the prior segment's tail in
+    // the existing convention, so prefer non-boundary times when available.
+    let mut segment_totals: Vec<(usize, f64, DateTime<Local>)> = Vec::new();
     for &(seg_start, seg_end) in &segments {
         let mid = (seg_start + seg_end) / 2;
         let mut total = 0.0;
@@ -312,10 +604,8 @@ fn daily_header_lines(
         for col_idx in seg_start..=seg_end {
             if let ChartColumn::Data { data_idx, sub_col } = &layout.columns[col_idx] {
                 let time = layout.sorted_times[*data_idx];
-                // Prefer non-midnight time as representative date
-                let dominated = repr_time.is_none_or(|r| {
-                    r.hour() == 0 && r.minute() == 0 && (time.hour() != 0 || time.minute() != 0)
-                });
+                let is_b = granularity.is_boundary(&time);
+                let dominated = repr_time.is_none_or(|r| granularity.is_boundary(&r) && !is_b);
                 if dominated {
                     repr_time = Some(time);
                 }
@@ -326,7 +616,8 @@ fn daily_header_lines(
         }
 
         if let Some(time) = repr_time {
-            daily_totals.push((mid, total, time));
+            let anchor = granularity.segment_start(time);
+            segment_totals.push((mid, total, anchor));
         }
     }
 
@@ -345,50 +636,28 @@ fn daily_header_lines(
         return None;
     }
 
-    let weekday_normal = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    let weekday_compact = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
-
-    let mut weekday_line = " ".repeat(7);
-    let mut date_line = " ".repeat(7);
+    let mut line1 = " ".repeat(7);
+    let mut line2 = " ".repeat(7);
     let mut prev_end = 0usize;
 
     let chart_width = 7 + total_cols;
-    for (mid_col, total, day_start) in &daily_totals {
-        let wd_idx = day_start.weekday().num_days_from_monday() as usize;
-        let (mut weekday_total, mut date_str) = if compact {
-            (
-                format!(
-                    "{}:{}",
-                    weekday_compact[wd_idx],
-                    format_total_compact(*total)
-                ),
-                day_start.format("%m/%d").to_string(),
-            )
-        } else {
-            (
-                format!(
-                    "{} : {}",
-                    weekday_normal[wd_idx],
-                    format_total_value(*total)
-                ),
-                day_start.format(" %m / %d").to_string(),
-            )
-        };
+    for (mid_col, total, anchor) in &segment_totals {
+        let (mut head, mut date_str) = segment_label(anchor, granularity, *total, compact);
 
-        let colon_idx = weekday_total.find(':').unwrap_or(0);
+        let colon_idx = head.find(':').unwrap_or(0);
         let slash_idx = date_str.find('/').unwrap_or(0);
 
         if colon_idx > slash_idx {
             date_str = format!("{}{}", " ".repeat(colon_idx - slash_idx), date_str);
         } else if slash_idx > colon_idx {
-            weekday_total = format!("{}{}", " ".repeat(slash_idx - colon_idx), weekday_total);
+            head = format!("{}{}", " ".repeat(slash_idx - colon_idx), head);
         }
 
-        let max_len = weekday_total.len().max(date_str.len());
-        weekday_total = format!("{:<width$}", weekday_total, width = max_len);
+        let max_len = head.len().max(date_str.len());
+        head = format!("{:<width$}", head, width = max_len);
         date_str = format!("{:<width$}", date_str, width = max_len);
 
-        let actual_colon = weekday_total.find(':').unwrap_or(0);
+        let actual_colon = head.find(':').unwrap_or(0);
         let start_pos = if *mid_col > actual_colon {
             mid_col - actual_colon
         } else {
@@ -400,19 +669,56 @@ fn daily_header_lines(
         }
         let padding = start_pos.saturating_sub(prev_end);
 
-        weekday_line.push_str(&" ".repeat(padding));
-        date_line.push_str(&" ".repeat(padding));
-        weekday_line.push_str(&weekday_total);
-        date_line.push_str(&date_str);
+        line1.push_str(&" ".repeat(padding));
+        line2.push_str(&" ".repeat(padding));
+        line1.push_str(&head);
+        line2.push_str(&date_str);
         prev_end = start_pos + max_len;
     }
 
-    weekday_line.truncate(chart_width);
-    date_line.truncate(chart_width);
-    Some((weekday_line, date_line))
+    line1.truncate(chart_width);
+    line2.truncate(chart_width);
+    Some((line1, line2))
 }
 
-fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) {
+fn local_from_naive_with_fallback(
+    naive: chrono::NaiveDateTime,
+    fallback: DateTime<Local>,
+) -> DateTime<Local> {
+    match Local.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(d) | chrono::LocalResult::Ambiguous(d, _) => d,
+        chrono::LocalResult::None => fallback,
+    }
+}
+
+fn add_wall_clock_minutes(anchor: DateTime<Local>, minutes: i64) -> DateTime<Local> {
+    let naive = anchor.naive_local() + Duration::minutes(minutes);
+    local_from_naive_with_fallback(naive, anchor + Duration::minutes(minutes))
+}
+
+fn first_x_axis_tick(
+    first_time: &DateTime<Local>,
+    granularity: ChartGranularity,
+    tick_interval: i64,
+) -> DateTime<Local> {
+    let anchor = granularity.segment_start(*first_time);
+    if anchor >= *first_time {
+        return anchor;
+    }
+
+    let tick_interval = tick_interval.max(1);
+    let elapsed_seconds = (*first_time - anchor).num_seconds().max(0);
+    let interval_seconds = tick_interval * 60;
+    let ticks_since = (elapsed_seconds + interval_seconds - 1) / interval_seconds;
+    add_wall_clock_minutes(anchor, ticks_since * tick_interval)
+}
+
+fn print_x_axis_labels(
+    layout: &ChartLayout,
+    _interval_minutes: i64,
+    granularity: ChartGranularity,
+    pad: &str,
+) {
     println!();
 
     let first_time = layout.sorted_times.last().unwrap(); // oldest (reversed)
@@ -420,25 +726,17 @@ fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) 
     let time_span_minutes = (last_time - *first_time).num_seconds() as f64 / 60.0;
     let target_tick = time_span_minutes * 0.05;
 
-    let standard_intervals = [15, 30, 60, 120, 180, 240, 360, 480, 720, 1440];
+    // Intervals span minutes up to multi-week so very wide windows still get
+    // legible ticks. 1440 = 1 day, 10080 = 1 week.
+    let standard_intervals = [
+        15, 30, 60, 120, 180, 240, 360, 480, 720, 1440, 2880, 4320, 10080, 20160, 40320,
+    ];
     let tick_interval = *standard_intervals
         .iter()
         .min_by_key(|&&x| ((x as f64 - target_tick).abs() * 1000.0) as i64)
         .unwrap_or(&60);
 
-    let mut current_tick = first_time
-        .with_hour(0)
-        .unwrap()
-        .with_minute(0)
-        .unwrap()
-        .with_second(0)
-        .unwrap()
-        .with_nanosecond(0)
-        .unwrap();
-
-    let minutes_since_midnight = first_time.hour() as i64 * 60 + first_time.minute() as i64;
-    let ticks_since = (minutes_since_midnight + tick_interval - 1) / tick_interval;
-    current_tick += Duration::minutes(ticks_since * tick_interval);
+    let mut current_tick = first_x_axis_tick(first_time, granularity, tick_interval);
 
     let mut labels: Vec<String> = Vec::new();
     let mut positions: Vec<usize> = Vec::new();
@@ -462,15 +760,17 @@ fn print_x_axis_labels(layout: &ChartLayout, _interval_minutes: i64, pad: &str) 
         {
             let label = if tick_interval < 60 {
                 current_tick.format("%H:%M").to_string()
-            } else {
+            } else if tick_interval < 1440 {
                 current_tick.format("%H").to_string()
+            } else {
+                current_tick.format("%m/%d").to_string()
             };
             labels.push(label);
             positions.push(pos);
             used_positions.insert(pos);
         }
 
-        current_tick += Duration::minutes(tick_interval);
+        current_tick = add_wall_clock_minutes(current_tick, tick_interval);
     }
 
     let max_label_len = labels.iter().map(|l| l.len()).max().unwrap_or(0);
@@ -664,12 +964,19 @@ pub fn print_multi_line_chart(
     show_x_axis: bool,
     target_width: Option<usize>,
     interval_minutes: i64,
+    granularity: ChartGranularity,
     vendor: &str,
     included_models: Option<&HashSet<String>>,
     show_legend: bool,
     terminal_width: Option<usize>,
 ) {
-    let layout = build_chart_layout(range_start, range_end, interval_minutes, target_width);
+    let layout = build_chart_layout(
+        range_start,
+        range_end,
+        interval_minutes,
+        granularity,
+        target_width,
+    );
 
     if layout.sorted_times.len() < 2 {
         println!("Not enough data points for chart.");
@@ -831,9 +1138,11 @@ pub fn print_multi_line_chart(
     println!("{}{:^width$}", pad, chart_title, width = chart_width);
     println!("{}{}", pad, "=".repeat(chart_width));
 
-    // Daily header - sum all lines for daily totals
-    print_daily_header(
+    // Segment header — sum all lines per data index for the totals shown
+    // next to each segment label.
+    print_segment_header(
         &layout,
+        granularity,
         &|data_idx| {
             lines
                 .iter()
@@ -856,7 +1165,7 @@ pub fn print_multi_line_chart(
     );
 
     if show_x_axis {
-        print_x_axis_labels(&layout, interval_minutes, &pad);
+        print_x_axis_labels(&layout, interval_minutes, granularity, &pad);
     }
 
     if show_legend && !lines.is_empty() {
@@ -877,10 +1186,17 @@ pub fn print_vendor_comparison_chart(
     range_end: &DateTime<Local>,
     target_width: Option<usize>,
     interval_minutes: i64,
+    granularity: ChartGranularity,
     show_legend: bool,
     terminal_width: Option<usize>,
 ) {
-    let layout = build_chart_layout(range_start, range_end, interval_minutes, target_width);
+    let layout = build_chart_layout(
+        range_start,
+        range_end,
+        interval_minutes,
+        granularity,
+        target_width,
+    );
 
     if layout.sorted_times.len() < 2 {
         println!("Not enough data points for chart.");
@@ -993,8 +1309,8 @@ pub fn print_vendor_comparison_chart(
     println!("{}{:^width$}", pad, chart_title, width = chart_width);
     println!("{}{}", pad, "=".repeat(chart_width));
 
-    // Daily header using "All" totals
-    print_daily_header(&layout, &|data_idx| all_values[data_idx], &pad);
+    // Segment header using "All" totals
+    print_segment_header(&layout, granularity, &|data_idx| all_values[data_idx], &pad);
 
     render_grid(
         &layout,
@@ -1007,7 +1323,7 @@ pub fn print_vendor_comparison_chart(
         &pad,
     );
 
-    print_x_axis_labels(&layout, interval_minutes, &pad);
+    print_x_axis_labels(&layout, interval_minutes, granularity, &pad);
 
     if show_legend && !vendors_sorted.is_empty() {
         // Calculate vendor totals and percentages

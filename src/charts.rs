@@ -18,6 +18,7 @@ pub enum ChartGranularity {
     Hour,
     Day,
     Week,
+    Year,
 }
 
 impl ChartGranularity {
@@ -27,7 +28,9 @@ impl ChartGranularity {
     pub fn from_span_minutes(span_minutes: i64) -> Self {
         let span_hours = span_minutes / 60;
         let span_days = span_minutes / (24 * 60);
-        if span_days >= 18 {
+        if span_days >= 365 {
+            ChartGranularity::Year
+        } else if span_days >= 18 {
             ChartGranularity::Week
         } else if span_hours <= 12 {
             ChartGranularity::Hour
@@ -46,6 +49,9 @@ impl ChartGranularity {
             ChartGranularity::Week => {
                 t.hour() == 0 && t.minute() == 0 && exact_minute && t.weekday() == Weekday::Mon
             }
+            ChartGranularity::Year => {
+                t.month() == 1 && t.day() == 1 && t.hour() == 0 && t.minute() == 0 && exact_minute
+            }
         }
     }
 
@@ -63,6 +69,10 @@ impl ChartGranularity {
                 let mon_date = t.date_naive() - Duration::days(days_from_mon);
                 mon_date.and_hms_opt(0, 0, 0).expect("week anchor")
             }
+            ChartGranularity::Year => chrono::NaiveDate::from_ymd_opt(t.year(), 1, 1)
+                .expect("year date")
+                .and_hms_opt(0, 0, 0)
+                .expect("year anchor"),
         };
         match Local.from_local_datetime(&naive) {
             chrono::LocalResult::Single(d) | chrono::LocalResult::Ambiguous(d, _) => d,
@@ -169,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn granularity_picks_hour_for_short_spans_and_week_for_wide_spans() {
+    fn granularity_picks_year_for_annual_spans() {
         assert_eq!(
             ChartGranularity::from_span_minutes(60),
             ChartGranularity::Hour
@@ -199,6 +209,18 @@ mod tests {
             ChartGranularity::from_span_minutes(90 * 24 * 60),
             ChartGranularity::Week
         );
+        assert_eq!(
+            ChartGranularity::from_span_minutes(364 * 24 * 60),
+            ChartGranularity::Week
+        );
+        assert_eq!(
+            ChartGranularity::from_span_minutes(365 * 24 * 60),
+            ChartGranularity::Year
+        );
+        assert_eq!(
+            ChartGranularity::from_span_minutes(730 * 24 * 60),
+            ChartGranularity::Year
+        );
     }
 
     #[test]
@@ -214,6 +236,69 @@ mod tests {
             anchor.format("%Y-%m-%d %H:%M").to_string(),
             "2026-05-04 00:00"
         );
+    }
+
+    #[test]
+    fn year_granularity_anchors_to_january_first() {
+        let may = Local
+            .with_ymd_and_hms(2026, 5, 7, 15, 30, 0)
+            .single()
+            .expect("fixed local time");
+        let anchor = ChartGranularity::Year.segment_start(may);
+        assert_eq!(anchor.month(), 1);
+        assert_eq!(anchor.day(), 1);
+        assert_eq!(
+            anchor.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-01-01 00:00"
+        );
+    }
+
+    #[test]
+    fn year_granularity_treats_only_new_year_midnight_as_boundary() {
+        let boundary = Local
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .expect("new year");
+        let later = Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("same day");
+        let prior = Local
+            .with_ymd_and_hms(2025, 12, 31, 0, 0, 0)
+            .single()
+            .expect("prior day");
+        assert!(ChartGranularity::Year.is_boundary(&boundary));
+        assert!(!ChartGranularity::Year.is_boundary(&later));
+        assert!(!ChartGranularity::Year.is_boundary(&prior));
+    }
+
+    #[test]
+    fn year_header_labels_year_and_anchor_date() {
+        let day = Local
+            .with_ymd_and_hms(2026, 5, 11, 12, 0, 0)
+            .single()
+            .expect("fixed local time");
+        let mut columns = Vec::new();
+        for sub_col in 0..20 {
+            columns.push(ChartColumn::Data {
+                data_idx: 0,
+                sub_col,
+            });
+        }
+        let layout = ChartLayout {
+            columns,
+            data_to_col: HashMap::new(),
+            sorted_times: vec![day],
+        };
+
+        let Some((year_line, date_line)) =
+            segment_header_lines(&layout, ChartGranularity::Year, &|_| 3_260_000.0)
+        else {
+            panic!("header should render");
+        };
+
+        assert!(year_line.contains("2026 : 3.26M"));
+        assert!(date_line.contains("01 / 01"));
     }
 
     #[test]
@@ -302,6 +387,20 @@ mod tests {
         let start = end - Duration::days(14);
         let layout = build_chart_layout(&start, &end, 1440, ChartGranularity::Week, Some(160));
         // The internal Mondays are 2026-05-04 and 2026-05-11.
+        assert_eq!(count_separators(&layout), 2);
+    }
+
+    #[test]
+    fn year_granularity_places_separators_only_on_internal_years() {
+        let start = Local
+            .with_ymd_and_hms(2024, 7, 1, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Local
+            .with_ymd_and_hms(2026, 5, 14, 0, 0, 0)
+            .single()
+            .expect("end");
+        let layout = build_chart_layout(&start, &end, 1440, ChartGranularity::Year, Some(160));
         assert_eq!(count_separators(&layout), 2);
     }
 
@@ -583,6 +682,19 @@ fn segment_label(
             } else {
                 (
                     format!("Wk {:02} : {}", week_num, format_total_value(total)),
+                    anchor.format(" %m / %d").to_string(),
+                )
+            }
+        }
+        ChartGranularity::Year => {
+            if compact {
+                (
+                    format!("{}:{}", anchor.format("%Y"), format_total_compact(total)),
+                    anchor.format("%m/%d").to_string(),
+                )
+            } else {
+                (
+                    format!("{} : {}", anchor.format("%Y"), format_total_value(total)),
                     anchor.format(" %m / %d").to_string(),
                 )
             }

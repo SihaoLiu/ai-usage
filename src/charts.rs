@@ -405,11 +405,12 @@ mod tests {
     }
 
     #[test]
-    fn narrow_left_boundary_segment_stacks_head_and_date_on_shared_left_edge() {
-        // Leftmost segment is too narrow to centre the 13-char week label on
-        // its mid-column. Verify the boundary falls back to natural left
-        // alignment so "Wk NN" and "MM / DD" share the same starting column
-        // rather than appearing visually offset.
+    fn narrow_left_boundary_segment_drops_when_it_would_collide_with_inner() {
+        // Leftmost segment is too narrow to centre the 13-char week label
+        // on its mid-column. Even when shifted flush against the chart's
+        // left edge, the boundary label would overlap the next inner
+        // segment's centred label. The inner segment must win and the
+        // boundary label must vanish so it never displaces a full segment.
         let mon = Local
             .with_ymd_and_hms(2026, 5, 11, 12, 0, 0)
             .single()
@@ -449,6 +450,77 @@ mod tests {
             sorted_times: vec![mon, prev_mon, prev_prev_mon],
         };
 
+        let Some((head_line, _date_line)) =
+            segment_header_lines(&layout, ChartGranularity::Week, &|idx| match idx {
+                0 => 1_030_000_000.0,
+                1 => 1_540_000_000.0,
+                _ => 9_650_000_00.0,
+            })
+        else {
+            panic!("header should render");
+        };
+
+        assert!(
+            !head_line.contains("Wk 20"),
+            "narrow leftmost boundary label should be dropped to preserve Wk 19"
+        );
+        assert!(
+            head_line.contains("Wk 19"),
+            "inner segment must remain visible"
+        );
+        assert!(
+            head_line.contains("Wk 18"),
+            "trailing inner segment must remain visible"
+        );
+    }
+
+    #[test]
+    fn boundary_label_kept_with_one_char_gap_uses_natural_alignment() {
+        // Leftmost segment is narrow enough that its centred label would
+        // run off the left edge, but the inner segment that follows is
+        // positioned so the boundary label still has at least one empty
+        // column of breathing room. The boundary label should render and
+        // stack head/date on a shared left edge (natural alignment), and
+        // the inner segment must remain visible too.
+        let mon = Local
+            .with_ymd_and_hms(2026, 5, 11, 12, 0, 0)
+            .single()
+            .expect("monday");
+        let mut columns = Vec::new();
+        for sub_col in 0..12 {
+            columns.push(ChartColumn::Data {
+                data_idx: 0,
+                sub_col,
+            });
+        }
+        columns.push(ChartColumn::Separator);
+        for sub_col in 0..15 {
+            columns.push(ChartColumn::Data {
+                data_idx: 1,
+                sub_col,
+            });
+        }
+        columns.push(ChartColumn::Separator);
+        for sub_col in 0..13 {
+            columns.push(ChartColumn::Data {
+                data_idx: 2,
+                sub_col,
+            });
+        }
+        let prev_mon = Local
+            .with_ymd_and_hms(2026, 5, 4, 12, 0, 0)
+            .single()
+            .expect("prev monday");
+        let prev_prev_mon = Local
+            .with_ymd_and_hms(2026, 4, 27, 12, 0, 0)
+            .single()
+            .expect("prev prev monday");
+        let layout = ChartLayout {
+            columns,
+            data_to_col: HashMap::new(),
+            sorted_times: vec![mon, prev_mon, prev_prev_mon],
+        };
+
         let Some((head_line, date_line)) =
             segment_header_lines(&layout, ChartGranularity::Week, &|idx| match idx {
                 0 => 1_030_000_000.0,
@@ -459,11 +531,17 @@ mod tests {
             panic!("header should render");
         };
 
-        let head_pos = head_line.find("Wk 20").expect("Wk 20 head present");
-        let date_pos = date_line.find("05 / 11").expect("05 / 11 date present");
+        let boundary_head = head_line.find("Wk 20").expect("Wk 20 head present");
+        let boundary_date = date_line.find("05 / 11").expect("05 / 11 date present");
         assert_eq!(
-            head_pos, date_pos,
-            "narrow leftmost segment should stack head and date on the same column"
+            boundary_head, boundary_date,
+            "kept boundary label should stack head and date on the same column"
+        );
+
+        let inner_head = head_line.find("Wk 19").expect("Wk 19 head present");
+        assert!(
+            inner_head > boundary_head + "Wk 20 : 1.03B".len(),
+            "inner label must be separated from the boundary label by >= 1 column"
         );
     }
 
@@ -897,11 +975,15 @@ fn segment_header_lines(
         return None;
     }
 
-    let mut line1 = " ".repeat(7);
-    let mut line2 = " ".repeat(7);
-    let mut prev_end = 0usize;
+    struct Placement {
+        head: String,
+        date: String,
+        start: usize,
+        len: usize,
+        is_inner: bool,
+    }
 
-    let chart_width = 7 + total_cols;
+    let mut placements: Vec<Placement> = Vec::with_capacity(segment_totals.len());
     for (mid_col, total, anchor) in &segment_totals {
         let (head_raw, date_raw) = segment_label(anchor, granularity, *total, compact);
 
@@ -917,43 +999,108 @@ fn segment_header_lines(
         let centered_len = head_centered.len().max(date_centered.len());
         let centered_colon = head_centered.rfind(':').unwrap_or(0);
 
-        let centered_fits_left = *mid_col >= centered_colon;
-        let centered_start = mid_col.saturating_sub(centered_colon);
-        let centered_fits_right = centered_start + centered_len <= total_cols;
+        let preferred_start = *mid_col as i64 - centered_colon as i64;
+        let preferred_end = preferred_start + centered_len as i64;
+        let fits_left = preferred_start >= 0;
+        let fits_right = preferred_end <= total_cols as i64;
+        let is_inner = fits_left && fits_right;
 
-        let (head, date_str, start_pos) = if centered_fits_left && centered_fits_right {
-            // Inner-style placement: keep '/' aligned under ':'.
-            let head_pad = format!("{:<width$}", head_centered, width = centered_len);
-            let date_pad = format!("{:<width$}", date_centered, width = centered_len);
-            (head_pad, date_pad, centered_start)
+        if is_inner {
+            // Inner placement: '/' aligns under ':'.
+            let head = format!("{:<width$}", head_centered, width = centered_len);
+            let date = format!("{:<width$}", date_centered, width = centered_len);
+            placements.push(Placement {
+                head,
+                date,
+                start: preferred_start as usize,
+                len: centered_len,
+                is_inner: true,
+            });
         } else {
-            // Boundary segment: drop slash/colon padding and stack labels on a
-            // shared left edge so the head and date no longer look offset.
+            // Boundary placement: drop slash/colon padding, stack labels on a
+            // shared left edge, and shift inward to fit within the chart.
             let head_natural = head_raw.clone();
             let date_natural = date_raw.trim_start().to_string();
             let natural_len = head_natural.len().max(date_natural.len());
-            let head_pad = format!("{:<width$}", head_natural, width = natural_len);
-            let date_pad = format!("{:<width$}", date_natural, width = natural_len);
-            let anchor_start = if !centered_fits_left {
+            let head = format!("{:<width$}", head_natural, width = natural_len);
+            let date = format!("{:<width$}", date_natural, width = natural_len);
+            let start = if !fits_left {
                 0
             } else {
                 total_cols.saturating_sub(natural_len)
             };
-            (head_pad, date_pad, anchor_start)
-        };
+            placements.push(Placement {
+                head,
+                date,
+                start,
+                len: natural_len,
+                is_inner: false,
+            });
+        }
+    }
 
-        let max_len = head.len();
-        let start_pos = start_pos.min(total_cols.saturating_sub(max_len));
+    // Decide which segments to keep. Inner (fully centerable) segments are
+    // placed first so they always render their centered label. Boundary
+    // segments are only kept if at least one empty column separates them from
+    // every other kept label.
+    let mut keep = vec![false; placements.len()];
+
+    let mut prev_inner_end: Option<usize> = None;
+    for (i, p) in placements.iter().enumerate() {
+        if !p.is_inner {
+            continue;
+        }
+        if let Some(end) = prev_inner_end
+            && p.start < end
+        {
+            continue;
+        }
+        keep[i] = true;
+        prev_inner_end = Some(p.start + p.len);
+    }
+
+    for i in 0..placements.len() {
+        let p = &placements[i];
+        if p.is_inner {
+            continue;
+        }
+        let p_end = p.start + p.len;
+        let mut ok = true;
+        for (j, q) in placements.iter().enumerate() {
+            if j == i || !keep[j] {
+                continue;
+            }
+            let q_end = q.start + q.len;
+            // Require at least one empty column between any two kept labels.
+            if p.start < q_end + 1 && q.start < p_end + 1 {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            keep[i] = true;
+        }
+    }
+
+    let chart_width = 7 + total_cols;
+    let mut line1 = " ".repeat(7);
+    let mut line2 = " ".repeat(7);
+    let mut prev_end = 0usize;
+
+    for (i, p) in placements.iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
+        let start_pos = p.start.min(total_cols.saturating_sub(p.len));
         if start_pos < prev_end {
             continue;
         }
         let padding = start_pos.saturating_sub(prev_end);
-
         line1.push_str(&" ".repeat(padding));
         line2.push_str(&" ".repeat(padding));
-        line1.push_str(&head);
-        line2.push_str(&date_str);
-        prev_end = start_pos + max_len;
+        line1.push_str(&p.head);
+        line2.push_str(&p.date);
+        prev_end = start_pos + p.len;
     }
 
     line1.truncate(chart_width);

@@ -405,6 +405,37 @@ mod tests {
     }
 
     #[test]
+    fn weekly_layout_honors_target_width_with_multi_day_buckets() {
+        let start = Local
+            .with_ymd_and_hms(2025, 11, 3, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Local
+            .with_ymd_and_hms(2026, 5, 14, 23, 59, 59)
+            .single()
+            .expect("end");
+        let layout = build_chart_layout(&start, &end, 2 * 1440, ChartGranularity::Week, Some(160));
+
+        assert!(layout.sorted_times.len() > 50);
+        assert!(7 + layout.columns.len() <= 160);
+    }
+
+    #[test]
+    fn year_granularity_marks_year_change_with_coarse_buckets() {
+        let start = Local
+            .with_ymd_and_hms(2025, 12, 15, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Local
+            .with_ymd_and_hms(2026, 1, 20, 0, 0, 0)
+            .single()
+            .expect("end");
+        let layout = build_chart_layout(&start, &end, 14 * 1440, ChartGranularity::Year, Some(80));
+
+        assert_eq!(count_separators(&layout), 1);
+    }
+
+    #[test]
     fn day_granularity_skips_boundary_at_earliest_data_point() {
         // The window starts exactly at midnight, which is a Day boundary.
         // Without the skip rule the earliest column would land in its own
@@ -546,6 +577,26 @@ struct ChartLayout {
     sorted_times: Vec<DateTime<Local>>,
 }
 
+fn should_insert_separator(
+    sorted_times: &[DateTime<Local>],
+    index: usize,
+    granularity: ChartGranularity,
+    interval_minutes: i64,
+) -> bool {
+    let last_idx = sorted_times.len().saturating_sub(1);
+    if index == 0 || index == last_idx {
+        return false;
+    }
+
+    let time = sorted_times[index];
+    if interval_minutes > 1440 {
+        return granularity.segment_start(sorted_times[index - 1])
+            != granularity.segment_start(time);
+    }
+
+    granularity.is_boundary(&time)
+}
+
 fn build_chart_layout(
     range_start: &DateTime<Local>,
     range_end: &DateTime<Local>,
@@ -567,13 +618,12 @@ fn build_chart_layout(
 
     let num_data_points = sorted_times.len();
     // A separator before the chronologically-earliest data point would create
-    // a degenerate single-point segment on the right edge, so the boundary at
-    // `i == num_data_points - 1` is skipped here and in the rendering loop.
-    let last_idx = num_data_points.saturating_sub(1);
+    // a degenerate single-point segment on the right edge, so the final data
+    // index is skipped inside `should_insert_separator`.
     let separator_count = sorted_times
         .iter()
         .enumerate()
-        .filter(|(i, t)| granularity.is_boundary(t) && *i > 0 && *i != last_idx)
+        .filter(|(i, _)| should_insert_separator(&sorted_times, *i, granularity, interval_minutes))
         .count();
 
     let y_axis_width = 7usize;
@@ -589,8 +639,8 @@ fn build_chart_layout(
     let mut col_idx = 0usize;
     let mut accumulated = 0.0f64;
 
-    for (i, &time) in sorted_times.iter().enumerate().take(num_data_points) {
-        if granularity.is_boundary(&time) && i > 0 && i != last_idx {
+    for (i, _) in sorted_times.iter().enumerate().take(num_data_points) {
+        if should_insert_separator(&sorted_times, i, granularity, interval_minutes) {
             columns.push(ChartColumn::Separator);
             col_idx += 1;
         }

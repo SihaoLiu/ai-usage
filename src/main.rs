@@ -470,14 +470,31 @@ fn calculate_optimal_interval_minutes(
     range_start: &DateTime<Local>,
     range_end: &DateTime<Local>,
     target_width: usize,
+    granularity: charts::ChartGranularity,
 ) -> f64 {
     let total_minutes = ((*range_end - *range_start).num_seconds() as f64 / 60.0).max(1.0);
     let min_interval = total_minutes / 100.0;
     let y_axis_width = 7.0;
-    let span_days = (total_minutes / (24.0 * 60.0)).ceil().max(1.0);
-    let chart_width = (target_width as f64 - y_axis_width - span_days).max(50.0);
+    let separator_estimate =
+        estimate_chart_separator_count(range_start, range_end, granularity) as f64;
+    let chart_width = (target_width as f64 - y_axis_width - separator_estimate).max(50.0);
     let terminal_interval = total_minutes / chart_width;
     min_interval.max(terminal_interval)
+}
+
+fn estimate_chart_separator_count(
+    range_start: &DateTime<Local>,
+    range_end: &DateTime<Local>,
+    granularity: charts::ChartGranularity,
+) -> usize {
+    let span_minutes = ((*range_end - *range_start).num_seconds() as f64 / 60.0).max(1.0);
+    let segment_minutes = match granularity {
+        charts::ChartGranularity::Hour => 60.0,
+        charts::ChartGranularity::Day => 24.0 * 60.0,
+        charts::ChartGranularity::Week => 7.0 * 24.0 * 60.0,
+        charts::ChartGranularity::Year => 365.0 * 24.0 * 60.0,
+    };
+    (span_minutes / segment_minutes).ceil().max(1.0) as usize
 }
 
 fn display_chart_granularity(
@@ -489,7 +506,10 @@ fn display_chart_granularity(
 }
 
 fn round_to_nice_interval(optimal: f64) -> i64 {
-    let nice = [1i64, 5, 10, 15, 30, 60, 120, 240, 480, 720, 1440];
+    let nice = [
+        1i64, 5, 10, 15, 30, 60, 120, 240, 480, 720, 1440, 2880, 4320, 5760, 10080, 20160, 40320,
+        80640,
+    ];
     for &n in &nice {
         if n as f64 >= optimal {
             return n;
@@ -510,7 +530,9 @@ fn display_interval_minutes_for_window(
     target_width: usize,
 ) -> i64 {
     let (range_start, range_end) = window.bounds(now);
-    let optimal = calculate_optimal_interval_minutes(&range_start, &range_end, target_width);
+    let granularity = display_chart_granularity(&range_start, &range_end);
+    let optimal =
+        calculate_optimal_interval_minutes(&range_start, &range_end, target_width, granularity);
     round_to_nice_interval(optimal)
 }
 
@@ -1182,9 +1204,10 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         &state.subscription_fees,
     );
 
-    let optimal = calculate_optimal_interval_minutes(&range_start, &range_end, target_width);
-    let interval_minutes = round_to_nice_interval(optimal);
     let granularity = display_chart_granularity(&range_start, &range_end);
+    let optimal =
+        calculate_optimal_interval_minutes(&range_start, &range_end, target_width, granularity);
+    let interval_minutes = round_to_nice_interval(optimal);
 
     let model_ts = match vendor.as_str() {
         "codex" => {
@@ -1262,9 +1285,10 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     let (range_start, range_end) = state.time_window.bounds(now);
     let projection_days = state.time_window.projection_days(now);
     let target_width = get_chart_target_width();
-    let optimal = calculate_optimal_interval_minutes(&range_start, &range_end, target_width);
-    let interval_minutes = round_to_nice_interval(optimal);
     let granularity = display_chart_granularity(&range_start, &range_end);
+    let optimal =
+        calculate_optimal_interval_minutes(&range_start, &range_end, target_width, granularity);
+    let interval_minutes = round_to_nice_interval(optimal);
 
     let all_data = load_all_vendor_data(state, now);
 
@@ -2274,6 +2298,34 @@ mod tests {
             slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Newer)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn display_interval_scales_past_daily_for_week_granularity_windows() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::from_range("2025-11-03", "2026-05-14").expect("range");
+
+        let interval = display_interval_minutes_for_window(&window, now, 160);
+
+        assert!(interval > 1440);
+        assert_eq!(interval, 2880);
+    }
+
+    #[test]
+    fn display_interval_scales_past_daily_for_year_granularity_windows() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::from_range("2024-01-01", "2026-05-14").expect("range");
+
+        let interval = display_interval_minutes_for_window(&window, now, 160);
+
+        assert!(interval > 1440);
+        assert_eq!(interval, 20160);
     }
 
     #[test]

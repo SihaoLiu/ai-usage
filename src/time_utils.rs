@@ -1,4 +1,6 @@
-use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc,
+};
 
 /// Time range selected for usage aggregation and display.
 #[derive(Clone, Debug)]
@@ -320,6 +322,12 @@ pub fn parse_timestamp(timestamp_str: &str) -> Option<DateTime<Local>> {
 /// Round a DateTime down to the nearest interval boundary.
 /// DST-safe: uses `from_local_datetime` to handle spring-forward gaps.
 pub fn to_interval(dt: &DateTime<Local>, interval_minutes: i64) -> DateTime<Local> {
+    if interval_minutes >= 1440 {
+        let interval_days = ((interval_minutes + 1439) / 1440).max(1);
+        let date = round_date_to_day_interval(dt.date_naive(), interval_days);
+        return local_midnight_or_fallback(date, *dt);
+    }
+
     let total_minutes = (dt.hour() as i64) * 60 + (dt.minute() as i64);
     let interval_start = (total_minutes / interval_minutes) * interval_minutes;
     let hour = (interval_start / 60) as u32;
@@ -348,6 +356,34 @@ pub fn to_interval(dt: &DateTime<Local>, interval_minutes: i64) -> DateTime<Loca
     }
 }
 
+fn round_date_to_day_interval(date: NaiveDate, interval_days: i64) -> NaiveDate {
+    if interval_days % 7 == 0 {
+        let interval_weeks = (interval_days / 7).max(1);
+        let monday = date - Duration::days(date.weekday().num_days_from_monday() as i64);
+        let epoch_monday = NaiveDate::from_ymd_opt(1970, 1, 5).expect("epoch monday");
+        let weeks_since = monday
+            .signed_duration_since(epoch_monday)
+            .num_days()
+            .div_euclid(7);
+        return epoch_monday
+            + Duration::days(weeks_since.div_euclid(interval_weeks) * interval_weeks * 7);
+    }
+
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch date");
+    let days_since = date.signed_duration_since(epoch).num_days();
+    epoch + Duration::days(days_since.div_euclid(interval_days.max(1)) * interval_days.max(1))
+}
+
+fn local_midnight_or_fallback(date: NaiveDate, fallback: DateTime<Local>) -> DateTime<Local> {
+    let Some(naive) = date.and_hms_opt(0, 0, 0) else {
+        return fallback;
+    };
+    match Local.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(d) | chrono::LocalResult::Ambiguous(d, _) => d,
+        chrono::LocalResult::None => fallback.with_second(0).unwrap().with_nanosecond(0).unwrap(),
+    }
+}
+
 /// Round a start_time down to its interval boundary, handling DST gaps.
 pub fn round_to_interval_start(dt: &DateTime<Local>, interval_minutes: i64) -> DateTime<Local> {
     to_interval(dt, interval_minutes)
@@ -360,6 +396,23 @@ pub fn generate_interval_times(
     end: &DateTime<Local>,
     interval_minutes: i64,
 ) -> Vec<DateTime<Local>> {
+    if interval_minutes >= 1440 {
+        let interval_days = ((interval_minutes + 1439) / 1440).max(1);
+        let mut times = Vec::new();
+        let mut d = start.date_naive();
+        while d <= end.date_naive() {
+            let local_dt = local_midnight_or_fallback(d, *start);
+            if local_dt >= *start && local_dt <= *end {
+                times.push(local_dt);
+            }
+            let Some(next) = d.checked_add_signed(Duration::days(interval_days)) else {
+                break;
+            };
+            d = next;
+        }
+        return times;
+    }
+
     let start_date = start.date_naive();
     let end_date = end.date_naive();
     let intervals_per_day = 1440 / interval_minutes;
@@ -524,6 +577,44 @@ mod tests {
         assert_eq!(
             end.format("%Y-%m-%d %H:%M:%S").to_string(),
             "2026-05-01 10:00:00"
+        );
+    }
+
+    #[test]
+    fn weekly_interval_rounds_to_local_monday() {
+        let dt = Local
+            .with_ymd_and_hms(2026, 5, 14, 12, 30, 0)
+            .single()
+            .expect("fixed local time");
+
+        let rounded = to_interval(&dt, 7 * 24 * 60);
+
+        assert_eq!(
+            rounded.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-05-11 00:00"
+        );
+    }
+
+    #[test]
+    fn weekly_interval_times_advance_by_week() {
+        let start = Local
+            .with_ymd_and_hms(2026, 5, 11, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Local
+            .with_ymd_and_hms(2026, 5, 27, 0, 0, 0)
+            .single()
+            .expect("end");
+
+        let times = generate_interval_times(&start, &end, 7 * 24 * 60);
+        let labels: Vec<String> = times
+            .iter()
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+            .collect();
+
+        assert_eq!(
+            labels,
+            vec!["2026-05-11 00:00", "2026-05-18 00:00", "2026-05-25 00:00"]
         );
     }
 

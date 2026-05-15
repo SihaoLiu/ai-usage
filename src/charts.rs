@@ -405,6 +405,69 @@ mod tests {
     }
 
     #[test]
+    fn narrow_left_boundary_segment_stacks_head_and_date_on_shared_left_edge() {
+        // Leftmost segment is too narrow to centre the 13-char week label on
+        // its mid-column. Verify the boundary falls back to natural left
+        // alignment so "Wk NN" and "MM / DD" share the same starting column
+        // rather than appearing visually offset.
+        let mon = Local
+            .with_ymd_and_hms(2026, 5, 11, 12, 0, 0)
+            .single()
+            .expect("monday");
+        let mut columns = Vec::new();
+        for sub_col in 0..4 {
+            columns.push(ChartColumn::Data {
+                data_idx: 0,
+                sub_col,
+            });
+        }
+        columns.push(ChartColumn::Separator);
+        for sub_col in 0..20 {
+            columns.push(ChartColumn::Data {
+                data_idx: 1,
+                sub_col,
+            });
+        }
+        columns.push(ChartColumn::Separator);
+        for sub_col in 0..20 {
+            columns.push(ChartColumn::Data {
+                data_idx: 2,
+                sub_col,
+            });
+        }
+        let prev_mon = Local
+            .with_ymd_and_hms(2026, 5, 4, 12, 0, 0)
+            .single()
+            .expect("prev monday");
+        let prev_prev_mon = Local
+            .with_ymd_and_hms(2026, 4, 27, 12, 0, 0)
+            .single()
+            .expect("prev prev monday");
+        let layout = ChartLayout {
+            columns,
+            data_to_col: HashMap::new(),
+            sorted_times: vec![mon, prev_mon, prev_prev_mon],
+        };
+
+        let Some((head_line, date_line)) =
+            segment_header_lines(&layout, ChartGranularity::Week, &|idx| match idx {
+                0 => 1_030_000_000.0,
+                1 => 1_540_000_000.0,
+                _ => 9_650_000_00.0,
+            })
+        else {
+            panic!("header should render");
+        };
+
+        let head_pos = head_line.find("Wk 20").expect("Wk 20 head present");
+        let date_pos = date_line.find("05 / 11").expect("05 / 11 date present");
+        assert_eq!(
+            head_pos, date_pos,
+            "narrow leftmost segment should stack head and date on the same column"
+        );
+    }
+
+    #[test]
     fn weekly_layout_honors_target_width_with_multi_day_buckets() {
         let start = Local
             .with_ymd_and_hms(2025, 11, 3, 0, 0, 0)
@@ -840,27 +903,46 @@ fn segment_header_lines(
 
     let chart_width = 7 + total_cols;
     for (mid_col, total, anchor) in &segment_totals {
-        let (mut head, mut date_str) = segment_label(anchor, granularity, *total, compact);
+        let (head_raw, date_raw) = segment_label(anchor, granularity, *total, compact);
 
-        let colon_idx = head.rfind(':').unwrap_or(0);
-        let slash_idx = date_str.find('/').unwrap_or(0);
-
-        if colon_idx > slash_idx {
-            date_str = format!("{}{}", " ".repeat(colon_idx - slash_idx), date_str);
-        } else if slash_idx > colon_idx {
-            head = format!("{}{}", " ".repeat(slash_idx - colon_idx), head);
+        // Slash-colon centered alignment: pad shorter side so '/' sits under ':'.
+        let raw_colon = head_raw.rfind(':').unwrap_or(0);
+        let raw_slash = date_raw.find('/').unwrap_or(0);
+        let (mut head_centered, mut date_centered) = (head_raw.clone(), date_raw.clone());
+        if raw_colon > raw_slash {
+            date_centered = format!("{}{}", " ".repeat(raw_colon - raw_slash), date_centered);
+        } else if raw_slash > raw_colon {
+            head_centered = format!("{}{}", " ".repeat(raw_slash - raw_colon), head_centered);
         }
+        let centered_len = head_centered.len().max(date_centered.len());
+        let centered_colon = head_centered.rfind(':').unwrap_or(0);
 
-        let max_len = head.len().max(date_str.len());
-        head = format!("{:<width$}", head, width = max_len);
-        date_str = format!("{:<width$}", date_str, width = max_len);
+        let centered_fits_left = *mid_col >= centered_colon;
+        let centered_start = mid_col.saturating_sub(centered_colon);
+        let centered_fits_right = centered_start + centered_len <= total_cols;
 
-        let actual_colon = head.rfind(':').unwrap_or(0);
-        let start_pos = if *mid_col > actual_colon {
-            mid_col - actual_colon
+        let (head, date_str, start_pos) = if centered_fits_left && centered_fits_right {
+            // Inner-style placement: keep '/' aligned under ':'.
+            let head_pad = format!("{:<width$}", head_centered, width = centered_len);
+            let date_pad = format!("{:<width$}", date_centered, width = centered_len);
+            (head_pad, date_pad, centered_start)
         } else {
-            0
+            // Boundary segment: drop slash/colon padding and stack labels on a
+            // shared left edge so the head and date no longer look offset.
+            let head_natural = head_raw.clone();
+            let date_natural = date_raw.trim_start().to_string();
+            let natural_len = head_natural.len().max(date_natural.len());
+            let head_pad = format!("{:<width$}", head_natural, width = natural_len);
+            let date_pad = format!("{:<width$}", date_natural, width = natural_len);
+            let anchor_start = if !centered_fits_left {
+                0
+            } else {
+                total_cols.saturating_sub(natural_len)
+            };
+            (head_pad, date_pad, anchor_start)
         };
+
+        let max_len = head.len();
         let start_pos = start_pos.min(total_cols.saturating_sub(max_len));
         if start_pos < prev_end {
             continue;

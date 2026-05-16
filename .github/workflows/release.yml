@@ -37,10 +37,6 @@ jobs:
             os: ubuntu-latest
             asset: vibe-usage-aarch64-linux-gnu
             use_cross: true
-          - target: x86_64-apple-darwin
-            os: macos-13
-            asset: vibe-usage-x86_64-apple-darwin
-            use_cross: false
           - target: aarch64-apple-darwin
             os: macos-14
             asset: vibe-usage-aarch64-apple-darwin

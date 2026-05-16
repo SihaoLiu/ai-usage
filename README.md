@@ -22,6 +22,8 @@ Download the pre-built binary for your platform from [Releases](https://github.c
 |----------|-------|
 | Linux x86_64 (musl, fully static) | `vibe-usage-x86_64-linux-musl` |
 | Linux aarch64 (musl, fully static) | `vibe-usage-aarch64-linux-musl` |
+| Linux x86_64 (glibc) | `vibe-usage-x86_64-linux-gnu` |
+| Linux aarch64 (glibc) | `vibe-usage-aarch64-linux-gnu` |
 | macOS Intel | `vibe-usage-x86_64-apple-darwin` |
 | macOS Apple Silicon | `vibe-usage-aarch64-apple-darwin` |
 

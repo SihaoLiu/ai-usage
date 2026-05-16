@@ -5,6 +5,7 @@ mod formatting;
 mod pricing;
 mod stats;
 mod time_utils;
+mod updater;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
@@ -1754,6 +1755,10 @@ fn main() {
                                     println!(
                                         "  + / -            - Empty prompt: zoom the time window in / out\r"
                                     );
+                                    println!(
+                                        "  update           - Download the latest GitHub release and restart\r"
+                                    );
+                                    println!("  e, exit          - Exit monitor mode\r");
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!(
                                         "Current: vendor={}, window={}, interval={}s\r",
@@ -1765,6 +1770,27 @@ fn main() {
                                 "e" | "exit" => {
                                     cleanup_and_break("Exiting monitor mode...");
                                     break 'monitor;
+                                }
+                                "update" | "upgrade" => {
+                                    crossterm::terminal::disable_raw_mode().ok();
+                                    println!("\r");
+                                    let result = updater::run_update(|msg| {
+                                        println!("{msg}\r");
+                                    });
+                                    match result {
+                                        Ok(updater::UpdateOutcome::AlreadyLatest {
+                                            current,
+                                            latest,
+                                        }) => {
+                                            println!(
+                                                "Already on latest version: v{current} (remote: v{latest}).\r"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            println!("Update failed: {e}\r");
+                                        }
+                                    }
+                                    crossterm::terminal::enable_raw_mode().ok();
                                 }
                                 _ => {
                                     if let Some(parsed) =

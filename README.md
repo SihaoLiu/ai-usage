@@ -16,7 +16,16 @@ A fast terminal dashboard for tracking token usage and costs across **Claude Cod
 
 ### Option 1: Download binary
 
-Download the pre-built static binary from [Releases](https://github.com/SihaoLiu/ai-usage/releases) and place it anywhere in your `$PATH`. No dependencies required.
+Download the pre-built binary for your platform from [Releases](https://github.com/SihaoLiu/ai-usage/releases):
+
+| Platform | Asset |
+|----------|-------|
+| Linux x86_64 (musl, fully static) | `vibe-usage-x86_64-linux-musl` |
+| Linux aarch64 (musl, fully static) | `vibe-usage-aarch64-linux-musl` |
+| macOS Intel | `vibe-usage-x86_64-apple-darwin` |
+| macOS Apple Silicon | `vibe-usage-aarch64-apple-darwin` |
+
+Place it anywhere in your `$PATH` and `chmod +x` it. Once installed, you can keep it up to date by typing `update` in monitor mode (it downloads the matching asset from the latest release and re-execs in place).
 
 ### Option 2: Build from source
 

@@ -32,6 +32,51 @@ pub fn get_codex_dir() -> PathBuf {
         })
 }
 
+/// Read the top-level `service_tier` setting from `~/.codex/config.toml`.
+/// Returns the literal value (e.g. `"fast"`, `"flex"`) if present in the
+/// global section, or `None` when the key is absent or the file is missing.
+///
+/// Codex rollout JSONL files never store this per turn, so the global
+/// config setting is the only deterministic signal we have for whether
+/// `/fast` was active. We deliberately stop at the first `[section]` header
+/// so a per-profile `service_tier` doesn't get mistaken for the active one.
+pub fn detect_service_tier_from_config() -> Option<String> {
+    let path = get_codex_dir().join("config.toml");
+    let content = fs::read_to_string(&path).ok()?;
+    parse_top_level_service_tier(&content)
+}
+
+fn parse_top_level_service_tier(content: &str) -> Option<String> {
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            break;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        if key.trim() != "service_tier" {
+            continue;
+        }
+        let value = value
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 /// Key used for cross-file deduplication. A turn_id (when available) together with
 /// the usage tuple uniquely identifies a Codex billing event: a single turn may emit
 /// many `token_count` events (one per sub-inference call), each with a distinct
@@ -346,5 +391,37 @@ mod tests {
     fn not_replayed_when_not_fork() {
         assert!(!is_replayed_event(None, Some(0), 0));
         assert!(!is_replayed_event(None, Some(100), 50));
+    }
+
+    #[test]
+    fn parses_top_level_service_tier() {
+        let toml = "model = \"gpt-5.5\"\nservice_tier = \"fast\"\n[features]\nfast_mode = true\n";
+        assert_eq!(
+            parse_top_level_service_tier(toml),
+            Some("fast".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_service_tier_inside_section() {
+        // A `service_tier` line nested under `[profiles.foo]` must not be
+        // picked up as the active global tier.
+        let toml = "model = \"gpt-5.5\"\n[profiles.cost-optimized]\nservice_tier = \"flex\"\n";
+        assert_eq!(parse_top_level_service_tier(toml), None);
+    }
+
+    #[test]
+    fn parses_value_with_inline_comment_and_single_quotes() {
+        let toml = "service_tier = 'fast' # default tier\n";
+        assert_eq!(
+            parse_top_level_service_tier(toml),
+            Some("fast".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_service_tier_returns_none() {
+        let toml = "model = \"gpt-5.5\"\n";
+        assert_eq!(parse_top_level_service_tier(toml), None);
     }
 }

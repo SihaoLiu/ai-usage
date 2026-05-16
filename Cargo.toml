@@ -1,6 +1,6 @@
 [package]
 name = "vibe-usage"
-version = "1.5.11"
+version = "1.5.12"
 edition = "2024"
 
 [[bin]]

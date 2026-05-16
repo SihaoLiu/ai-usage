@@ -20,10 +20,11 @@ use clap::Parser;
 use crossterm::terminal;
 
 use constants::{
-    AllPricing, ModelPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees,
+    AllPricing, CodexServiceTier, ModelPricing, SubscriptionFees, load_subscription_fees,
+    prompt_subscription_fees,
 };
 use data::UsageEntry;
-use data::codex::get_codex_dir;
+use data::codex::{detect_service_tier_from_config, get_codex_dir};
 use data::gemini::get_gemini_dir;
 use formatting::print_model_breakdown;
 use stats::{ModelBreakdownRow, VendorTimeSeries};
@@ -328,6 +329,29 @@ struct Args {
     /// Vendor to collect statistics from
     #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "all"])]
     vendor: String,
+
+    /// Override the Codex API service tier used for cost calculation.
+    /// `auto` (default) reads `service_tier` from `~/.codex/config.toml`.
+    /// `fast` (a.k.a. `priority`) applies the fast multipliers (gpt-5.5 = 2.5x,
+    /// gpt-5.4 family = 2x); `flex` applies the ~0.5x discount; `default`
+    /// forces standard API pricing. Has no effect on Claude/Gemini cost.
+    #[arg(
+        long = "codex-service-tier",
+        default_value = "auto",
+        value_parser = ["auto", "default", "standard", "fast", "priority", "flex"],
+    )]
+    codex_service_tier: String,
+}
+
+/// Resolve the effective Codex service tier from CLI args, falling back to
+/// `~/.codex/config.toml` when the caller asked for `auto`.
+fn resolve_codex_service_tier(arg: &str) -> CodexServiceTier {
+    if !arg.eq_ignore_ascii_case("auto") {
+        return CodexServiceTier::from_str(arg).unwrap_or_default();
+    }
+    detect_service_tier_from_config()
+        .and_then(|raw| CodexServiceTier::from_str(&raw))
+        .unwrap_or_default()
 }
 
 fn get_terminal_size() -> (u16, u16) {
@@ -919,7 +943,7 @@ fn calculate_weighted_cost_per_mtok(
                 + entry.usage.cache_read_input_tokens
                 + extra;
 
-            let p = pricing.get_pricing(vendor, &entry.model);
+            let p = pricing.pricing_for_entry(vendor, &entry.model);
             api_cost +=
                 ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
             api_cost +=
@@ -1031,7 +1055,16 @@ fn get_version(state: &mut AppState, vendor: &str) -> String {
             }
         });
 
-    let version_str = format_local_version_label(display_name, current_version);
+    let mut version_str = format_local_version_label(display_name, current_version);
+
+    // Suffix the Codex label with the active API service tier when it deviates
+    // from the standard rate, so the user can tell at a glance whether the
+    // shown cost includes the fast/flex multiplier.
+    if vendor == "codex" && state.pricing.codex_service_tier != CodexServiceTier::Default {
+        version_str.push_str(" [");
+        version_str.push_str(state.pricing.codex_service_tier.label());
+        version_str.push_str(" tier]");
+    }
 
     state.version_cache.insert(
         vendor.to_string(),
@@ -1185,7 +1218,14 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         _ => "Claude Code",
     };
 
-    println!("Calculating {} usage...", vendor_name);
+    let tier_suffix = if vendor.as_str() == "codex"
+        && state.pricing.codex_service_tier != CodexServiceTier::Default
+    {
+        format!(" [{} tier]", state.pricing.codex_service_tier.label())
+    } else {
+        String::new()
+    };
+    println!("Calculating {}{} usage...", vendor_name, tier_suffix);
     println!("{}", showing_data_line(&state.time_window, now));
     if !once {
         println!(
@@ -1406,7 +1446,8 @@ fn print_stats(state: &mut AppState, once: bool) -> Option<bool> {
 fn main() {
     let args = Args::parse();
 
-    let pricing = pricing::load_layered();
+    let mut pricing = pricing::load_layered();
+    pricing.codex_service_tier = resolve_codex_service_tier(&args.codex_service_tier);
     let subscription_fees = load_subscription_fees().unwrap_or_else(prompt_subscription_fees);
 
     // Validate vendor data directory on startup (matches Python behavior)

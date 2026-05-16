@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -9,6 +10,82 @@ const PRICING_JSON: &str = include_str!("../pricing.json");
 /// Token threshold for Claude 1M-context tiered pricing.
 /// Mirrors ccusage's `DEFAULT_TIERED_THRESHOLD` and Anthropic's published 200k tier.
 pub const TIER_THRESHOLD: i64 = 200_000;
+
+/// OpenAI Codex API service tier. Set globally in `~/.codex/config.toml` via
+/// `service_tier = "fast"|"flex"`. Codex rollout JSONL files do not record
+/// this per-turn, so the effective tier is resolved once from the config (or
+/// a CLI override) and applied uniformly to every Codex usage entry.
+///
+/// Multipliers come from the official Codex speed docs
+/// (https://developers.openai.com/codex/speed):
+///   - Fast/Priority: gpt-5.5 = 2.5x, gpt-5.4 family = 2.0x, others = 1.0x
+///   - Flex:           ~0.5x of standard for supported models
+///   - Default/Auto:   1.0x (standard)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodexServiceTier {
+    #[default]
+    Default,
+    Fast,
+    Flex,
+}
+
+impl CodexServiceTier {
+    /// Parse a string value from `config.toml` / CLI flag into a tier.
+    /// Returns `None` for unknown values so the caller can decide how to fall
+    /// back. "priority" is treated as a synonym of "fast" because OpenAI's
+    /// general Responses API exposes priority processing under that name.
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "standard" | "auto" => Some(Self::Default),
+            "fast" | "priority" => Some(Self::Fast),
+            "flex" => Some(Self::Flex),
+            _ => None,
+        }
+    }
+
+    /// Per-model cost multiplier vs the standard API rate.
+    pub fn cost_multiplier(self, model: &str) -> f64 {
+        match self {
+            CodexServiceTier::Default => 1.0,
+            CodexServiceTier::Fast => fast_tier_multiplier(model),
+            CodexServiceTier::Flex => flex_tier_multiplier(model),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CodexServiceTier::Default => "default",
+            CodexServiceTier::Fast => "fast",
+            CodexServiceTier::Flex => "flex",
+        }
+    }
+}
+
+/// Fast-tier multiplier per Codex pricing docs. Models that don't support
+/// fast mode fall back to 1.0x because OpenAI bills them at standard rate
+/// even when the project default is fast.
+fn fast_tier_multiplier(model: &str) -> f64 {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("gpt-5.5") {
+        2.5
+    } else if m.starts_with("gpt-5.4") {
+        2.0
+    } else {
+        1.0
+    }
+}
+
+/// Flex-tier discount. OpenAI describes flex as roughly 50% of standard for
+/// the supported gpt-5 family; we apply 0.5x conservatively to the same model
+/// set that supports fast, and leave older/unsupported SKUs at 1.0x.
+fn flex_tier_multiplier(model: &str) -> f64 {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("gpt-5") {
+        0.5
+    } else {
+        1.0
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ModelPricing {
@@ -52,6 +129,23 @@ impl ModelPricing {
         }
         tokens as f64 * base_per_mtok / 1_000_000.0
     }
+
+    /// Scale every rate (base + tier overrides) by the Codex service-tier
+    /// multiplier for `model`. Returns `self` unchanged when the multiplier
+    /// is 1.0 so non-fast usage stays free of clones.
+    pub fn scaled_by(&self, multiplier: f64) -> ModelPricing {
+        ModelPricing {
+            input: self.input * multiplier,
+            output: self.output * multiplier,
+            cache_input: self.cache_input * multiplier,
+            cache_output: self.cache_output * multiplier,
+            input_above_200k: self.input_above_200k.map(|v| v * multiplier),
+            output_above_200k: self.output_above_200k.map(|v| v * multiplier),
+            cache_input_above_200k: self.cache_input_above_200k.map(|v| v * multiplier),
+            cache_output_above_200k: self.cache_output_above_200k.map(|v| v * multiplier),
+            _comment: self._comment.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +172,10 @@ pub struct AllPricing {
     pub codex_default: ModelPricing,
     pub gemini_models: HashMap<String, ModelPricing>,
     pub gemini_default: ModelPricing,
+    /// Effective Codex API service tier (resolved from config.toml or CLI).
+    /// Drives the per-model `fast`/`flex` multipliers applied in
+    /// `pricing_for_entry`.
+    pub codex_service_tier: CodexServiceTier,
 }
 
 impl AllPricing {
@@ -93,6 +191,7 @@ impl AllPricing {
             codex_default: data.codex.default,
             gemini_models: data.gemini.models,
             gemini_default: data.gemini.default,
+            codex_service_tier: CodexServiceTier::default(),
         }
     }
 
@@ -145,6 +244,24 @@ impl AllPricing {
         }
 
         default
+    }
+
+    /// Pricing for a single usage entry with the Codex service-tier
+    /// multiplier already applied. For Claude/Gemini, and for Codex when the
+    /// effective tier is `Default`, returns a borrow of the raw row so the
+    /// hot aggregation path stays allocation-free. For Codex `Fast`/`Flex`,
+    /// returns an owned, scaled copy.
+    pub fn pricing_for_entry<'a>(&'a self, vendor: &str, model: &str) -> Cow<'a, ModelPricing> {
+        let base = self.get_pricing(vendor, model);
+        if vendor != "codex" {
+            return Cow::Borrowed(base);
+        }
+        let mult = self.codex_service_tier.cost_multiplier(model);
+        if (mult - 1.0).abs() < f64::EPSILON {
+            Cow::Borrowed(base)
+        } else {
+            Cow::Owned(base.scaled_by(mult))
+        }
     }
 }
 
@@ -365,4 +482,94 @@ pub fn prompt_subscription_fees() -> SubscriptionFees {
     }
 
     fees
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_tier_from_str_recognises_codex_and_priority_synonyms() {
+        assert_eq!(
+            CodexServiceTier::from_str("fast"),
+            Some(CodexServiceTier::Fast)
+        );
+        assert_eq!(
+            CodexServiceTier::from_str("PRIORITY"),
+            Some(CodexServiceTier::Fast)
+        );
+        assert_eq!(
+            CodexServiceTier::from_str(" flex "),
+            Some(CodexServiceTier::Flex)
+        );
+        assert_eq!(
+            CodexServiceTier::from_str("default"),
+            Some(CodexServiceTier::Default)
+        );
+        assert_eq!(
+            CodexServiceTier::from_str("standard"),
+            Some(CodexServiceTier::Default)
+        );
+        assert_eq!(CodexServiceTier::from_str("turbo"), None);
+    }
+
+    #[test]
+    fn fast_tier_uses_documented_multipliers() {
+        let fast = CodexServiceTier::Fast;
+        assert!((fast.cost_multiplier("gpt-5.5") - 2.5).abs() < f64::EPSILON);
+        assert!((fast.cost_multiplier("gpt-5.5-codex") - 2.5).abs() < f64::EPSILON);
+        assert!((fast.cost_multiplier("gpt-5.4") - 2.0).abs() < f64::EPSILON);
+        assert!((fast.cost_multiplier("gpt-5.4-codex") - 2.0).abs() < f64::EPSILON);
+        // Unsupported / older models keep standard pricing.
+        assert!((fast.cost_multiplier("gpt-5.3-codex") - 1.0).abs() < f64::EPSILON);
+        assert!((fast.cost_multiplier("gpt-5") - 1.0).abs() < f64::EPSILON);
+        // Default tier never moves the rate.
+        assert!(
+            (CodexServiceTier::Default.cost_multiplier("gpt-5.5") - 1.0).abs() < f64::EPSILON
+        );
+    }
+
+    fn sample_codex_pricing() -> ModelPricing {
+        ModelPricing {
+            input: 1.25,
+            output: 10.0,
+            cache_input: 0.125,
+            cache_output: 0.0,
+            input_above_200k: None,
+            output_above_200k: None,
+            cache_input_above_200k: None,
+            cache_output_above_200k: None,
+            _comment: None,
+        }
+    }
+
+    #[test]
+    fn pricing_for_entry_scales_codex_fast_and_borrows_others() {
+        let mut pricing = AllPricing::load_raw().finalize();
+        pricing
+            .codex_models
+            .insert("gpt-5.5".to_string(), sample_codex_pricing());
+
+        // Default tier: borrow the row as-is, no scaling.
+        pricing.codex_service_tier = CodexServiceTier::Default;
+        let p = pricing.pricing_for_entry("codex", "gpt-5.5");
+        assert!(matches!(p, Cow::Borrowed(_)));
+        assert!((p.input - 1.25).abs() < f64::EPSILON);
+
+        // Fast tier: scale by the gpt-5.5 multiplier (2.5x).
+        pricing.codex_service_tier = CodexServiceTier::Fast;
+        let p = pricing.pricing_for_entry("codex", "gpt-5.5");
+        assert!(matches!(p, Cow::Owned(_)));
+        assert!((p.input - 1.25 * 2.5).abs() < 1e-9);
+        assert!((p.output - 10.0 * 2.5).abs() < 1e-9);
+        assert!((p.cache_input - 0.125 * 2.5).abs() < 1e-9);
+
+        // Fast tier on an unsupported codex model leaves the rate untouched.
+        let p = pricing.pricing_for_entry("codex", "gpt-5.3-codex");
+        assert!(matches!(p, Cow::Borrowed(_)));
+
+        // Fast tier never affects non-codex vendors.
+        let p = pricing.pricing_for_entry("claude", "claude-opus-4-7");
+        assert!(matches!(p, Cow::Borrowed(_)));
+    }
 }

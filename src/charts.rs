@@ -546,6 +546,77 @@ mod tests {
     }
 
     #[test]
+    fn compact_day_partial_edge_drops_when_label_would_touch_inner() {
+        // In compact Day mode the leftmost partial-day segment's centred
+        // label (e.g. "Th:229M") happens to fit within chart bounds, but
+        // its end column collides with the centred label of the adjacent
+        // full inner day ("We:61M"). The narrower partial segment must
+        // drop so the inner label keeps the required one-column buffer.
+        let thu = Local
+            .with_ymd_and_hms(2026, 5, 7, 18, 0, 0)
+            .single()
+            .expect("Thu");
+        let wed = Local
+            .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
+            .single()
+            .expect("Wed");
+        let tue = Local
+            .with_ymd_and_hms(2026, 5, 5, 12, 0, 0)
+            .single()
+            .expect("Tue");
+
+        let mut columns = Vec::new();
+        for sub_col in 0..5 {
+            columns.push(ChartColumn::Data {
+                data_idx: 0,
+                sub_col,
+            });
+        }
+        columns.push(ChartColumn::Separator);
+        for sub_col in 0..7 {
+            columns.push(ChartColumn::Data {
+                data_idx: 1,
+                sub_col,
+            });
+        }
+        columns.push(ChartColumn::Separator);
+        for sub_col in 0..7 {
+            columns.push(ChartColumn::Data {
+                data_idx: 2,
+                sub_col,
+            });
+        }
+        let layout = ChartLayout {
+            columns,
+            data_to_col: HashMap::new(),
+            sorted_times: vec![thu, wed, tue],
+        };
+
+        let Some((head_line, _date_line)) =
+            segment_header_lines(&layout, ChartGranularity::Day, &|idx| match idx {
+                0 => 229_000_000.0,
+                1 => 61_000_000.0,
+                _ => 43_000_000.0,
+            })
+        else {
+            panic!("header should render");
+        };
+
+        assert!(
+            !head_line.contains("Th:229M"),
+            "partial Th label must drop to preserve the one-column gap before We"
+        );
+        assert!(
+            head_line.contains("We:61M"),
+            "inner We label must remain visible"
+        );
+        assert!(
+            head_line.contains("Tu:43M"),
+            "inner Tu label must remain visible"
+        );
+    }
+
+    #[test]
     fn weekly_layout_honors_target_width_with_multi_day_buckets() {
         let start = Local
             .with_ymd_and_hms(2025, 11, 3, 0, 0, 0)
@@ -934,9 +1005,10 @@ fn segment_header_lines(
     // representative timestamp. The boundary point inside a segment (e.g.
     // 00:00 inside a Day segment) is treated as the prior segment's tail in
     // the existing convention, so prefer non-boundary times when available.
-    let mut segment_totals: Vec<(usize, f64, DateTime<Local>)> = Vec::new();
+    let mut segment_totals: Vec<(usize, usize, f64, DateTime<Local>)> = Vec::new();
     for &(seg_start, seg_end) in &segments {
         let mid = (seg_start + seg_end) / 2;
+        let seg_width = seg_end - seg_start + 1;
         let mut total = 0.0;
         let mut repr_time: Option<DateTime<Local>> = None;
 
@@ -956,7 +1028,7 @@ fn segment_header_lines(
 
         if let Some(time) = repr_time {
             let anchor = granularity.segment_start(time);
-            segment_totals.push((mid, total, anchor));
+            segment_totals.push((mid, seg_width, total, anchor));
         }
     }
 
@@ -980,11 +1052,11 @@ fn segment_header_lines(
         date: String,
         start: usize,
         len: usize,
-        is_inner: bool,
+        seg_width: usize,
     }
 
     let mut placements: Vec<Placement> = Vec::with_capacity(segment_totals.len());
-    for (mid_col, total, anchor) in &segment_totals {
+    for (mid_col, seg_width, total, anchor) in &segment_totals {
         let (head_raw, date_raw) = segment_label(anchor, granularity, *total, compact);
 
         // Slash-colon centered alignment: pad shorter side so '/' sits under ':'.
@@ -1003,10 +1075,10 @@ fn segment_header_lines(
         let preferred_end = preferred_start + centered_len as i64;
         let fits_left = preferred_start >= 0;
         let fits_right = preferred_end <= total_cols as i64;
-        let is_inner = fits_left && fits_right;
+        let fits_chart = fits_left && fits_right;
 
-        if is_inner {
-            // Inner placement: '/' aligns under ':'.
+        if fits_chart {
+            // Centered placement: '/' aligns under ':'.
             let head = format!("{:<width$}", head_centered, width = centered_len);
             let date = format!("{:<width$}", date_centered, width = centered_len);
             placements.push(Placement {
@@ -1014,10 +1086,10 @@ fn segment_header_lines(
                 date,
                 start: preferred_start as usize,
                 len: centered_len,
-                is_inner: true,
+                seg_width: *seg_width,
             });
         } else {
-            // Boundary placement: drop slash/colon padding, stack labels on a
+            // Edge placement: drop slash/colon padding, stack labels on a
             // shared left edge, and shift inward to fit within the chart.
             let head_natural = head_raw.clone();
             let date_natural = date_raw.trim_start().to_string();
@@ -1034,36 +1106,27 @@ fn segment_header_lines(
                 date,
                 start,
                 len: natural_len,
-                is_inner: false,
+                seg_width: *seg_width,
             });
         }
     }
 
-    // Decide which segments to keep. Inner (fully centerable) segments are
-    // placed first so they always render their centered label. Boundary
-    // segments are only kept if at least one empty column separates them from
-    // every other kept label.
+    // Resolve label collisions: every kept label must have at least one empty
+    // column between itself and every other kept label. When two labels would
+    // be too close, the one belonging to the narrower underlying segment is
+    // dropped so a full inner segment never loses its label to a partial edge
+    // segment. Equal-width ties go to the lower index for stability.
+    let mut order: Vec<usize> = (0..placements.len()).collect();
+    order.sort_by(|&a, &b| {
+        placements[b]
+            .seg_width
+            .cmp(&placements[a].seg_width)
+            .then(a.cmp(&b))
+    });
+
     let mut keep = vec![false; placements.len()];
-
-    let mut prev_inner_end: Option<usize> = None;
-    for (i, p) in placements.iter().enumerate() {
-        if !p.is_inner {
-            continue;
-        }
-        if let Some(end) = prev_inner_end
-            && p.start < end
-        {
-            continue;
-        }
-        keep[i] = true;
-        prev_inner_end = Some(p.start + p.len);
-    }
-
-    for i in 0..placements.len() {
+    for &i in &order {
         let p = &placements[i];
-        if p.is_inner {
-            continue;
-        }
         let p_end = p.start + p.len;
         let mut ok = true;
         for (j, q) in placements.iter().enumerate() {
@@ -1071,7 +1134,6 @@ fn segment_header_lines(
                 continue;
             }
             let q_end = q.start + q.len;
-            // Require at least one empty column between any two kept labels.
             if p.start < q_end + 1 && q.start < p_end + 1 {
                 ok = false;
                 break;

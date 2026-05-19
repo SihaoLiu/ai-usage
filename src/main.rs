@@ -841,6 +841,17 @@ fn monitor_sync_interval(monitor_interval: std::time::Duration) -> std::time::Du
     (monitor_interval / 3).max(std::time::Duration::from_secs(60))
 }
 
+fn monitor_deadlines_after_interval_change(
+    now: std::time::Instant,
+    monitor_interval_seconds: u64,
+) -> (std::time::Instant, std::time::Instant) {
+    let monitor_interval = std::time::Duration::from_secs(monitor_interval_seconds);
+    (
+        now + monitor_interval,
+        now + monitor_sync_interval(monitor_interval),
+    )
+}
+
 fn format_manual_sync_progress(event: &sync::engine::SyncProgress) -> Option<String> {
     match event {
         sync::engine::SyncProgress::UploadPlanned {
@@ -2480,8 +2491,11 @@ fn main() {
                                                 if let Ok(n) = parts[1].parse::<u64>() {
                                                     if n >= 1 {
                                                         state.monitor_interval = n;
-                                                        next_refresh = std::time::Instant::now()
-                                                            + std::time::Duration::from_secs(n);
+                                                        (next_refresh, next_sync) =
+                                                            monitor_deadlines_after_interval_change(
+                                                                std::time::Instant::now(),
+                                                                n,
+                                                            );
                                                         println!(
                                                             "Refresh interval changed to {} seconds.\r",
                                                             n
@@ -2900,6 +2914,16 @@ mod tests {
             monitor_sync_interval(std::time::Duration::from_secs(30)),
             std::time::Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn interval_change_reschedules_refresh_and_sync_deadlines() {
+        let now = std::time::Instant::now();
+
+        let (next_refresh, next_sync) = monitor_deadlines_after_interval_change(now, 3600);
+
+        assert_eq!(next_refresh, now + std::time::Duration::from_secs(3600));
+        assert_eq!(next_sync, now + std::time::Duration::from_secs(1200));
     }
 
     #[test]

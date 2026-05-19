@@ -107,7 +107,7 @@ fn load_sync_config_from_path(path: &Path, fallback_hostname: &str) -> ConfigLoa
     let Some(server_url) = raw.server_url else {
         return invalid(path, "server_url is required");
     };
-    if !server_url.starts_with("https://") {
+    if !is_allowed_server_url(&server_url) {
         return invalid(path, "server_url must start with https://");
     }
 
@@ -183,6 +183,23 @@ fn sync_config_template(machine_id: &str) -> String {
   request_timeout_seconds: 15
 "#
     )
+}
+
+fn is_allowed_server_url(server_url: &str) -> bool {
+    server_url.starts_with("https://") || allow_loopback_http_for_tests(server_url)
+}
+
+#[cfg(debug_assertions)]
+fn allow_loopback_http_for_tests(server_url: &str) -> bool {
+    std::env::var("VIBE_USAGE_ALLOW_INSECURE_HTTP_FOR_TESTS").as_deref() == Ok("1")
+        && (server_url.starts_with("http://127.0.0.1:")
+            || server_url.starts_with("http://localhost:")
+            || server_url.starts_with("http://[::1]:"))
+}
+
+#[cfg(not(debug_assertions))]
+fn allow_loopback_http_for_tests(_server_url: &str) -> bool {
+    false
 }
 
 fn invalid(path: &Path, reason: impl AsRef<str>) -> ConfigLoadResult {
@@ -511,5 +528,11 @@ mod tests {
 
         let content = fs::read_to_string(&path).expect("read template");
         assert!(content.contains("machine_id: \"second-host\""));
+    }
+
+    #[test]
+    fn server_url_validation_requires_https_by_default() {
+        assert!(is_allowed_server_url("https://usage.example.com"));
+        assert!(!is_allowed_server_url("http://usage.example.com"));
     }
 }

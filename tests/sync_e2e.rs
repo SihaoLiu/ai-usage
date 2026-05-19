@@ -1,0 +1,143 @@
+use chrono::Utc;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
+use vibe_usage_server::{AppState, ServerConfig, build_app};
+
+const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("vibe-usage-e2e-{name}-{stamp}"));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+fn server_config(db_path: PathBuf) -> ServerConfig {
+    ServerConfig {
+        listen: "127.0.0.1:0".to_string(),
+        db_path,
+        shared_token: TOKEN.to_string(),
+        allowed_hosts: Some(HashSet::from(["host-a".to_string(), "host-b".to_string()])),
+        max_body_bytes: 1024 * 1024,
+        max_batch_records: 1000,
+        log_level: "info".to_string(),
+    }
+}
+
+fn write_client_config(home: &Path, server_url: &str, machine_id: &str) {
+    let path = home.join(".secrets").join("ai-usage.yaml");
+    fs::create_dir_all(path.parent().expect("secrets parent")).expect("create secrets dir");
+    fs::write(
+        &path,
+        format!(
+            "sync:\n  enabled: true\n  server_url: \"{server_url}\"\n  token: \"{TOKEN}\"\n  machine_id: \"{machine_id}\"\n  upload_project_hash: false\n  request_timeout_seconds: 5\n"
+        ),
+    )
+    .expect("write client config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("set client config permissions");
+    }
+}
+
+fn write_claude_usage(home: &Path, model: &str, timestamp: &str) {
+    let dir = home
+        .join(".config")
+        .join("claude")
+        .join("projects")
+        .join("e2e");
+    fs::create_dir_all(&dir).expect("create usage dir");
+    let line = format!(
+        r#"{{"timestamp":"{timestamp}","requestId":"req-a","message":{{"id":"msg-a","model":"{model}","usage":{{"input_tokens":123,"output_tokens":45,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+    );
+    fs::write(dir.join("session.jsonl"), format!("{line}\n")).expect("write usage file");
+}
+
+fn ensure_claude_dir(home: &Path) {
+    fs::create_dir_all(home.join(".config").join("claude").join("projects"))
+        .expect("create claude dir");
+}
+
+fn run_cli(home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_vibe-usage"))
+        .args(args)
+        .env("HOME", home)
+        .env("AI_USAGE_CACHE_DIR", home.join(".cache").join("ai-usage"))
+        .env(
+            "VIBE_USAGE_SECRETS",
+            home.join(".secrets").join("ai-usage.yaml"),
+        )
+        .env("VIBE_USAGE_ALLOW_INSECURE_HTTP_FOR_TESTS", "1")
+        .env("COLUMNS", "140")
+        .env("LINES", "50")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("run vibe-usage")
+}
+
+fn assert_success(output: Output, label: &str) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "{label} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    stdout
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_homes_exchange_usage_through_local_server() {
+    let root = unique_temp_dir("exchange");
+    let home_a = root.join("home-a");
+    let home_b = root.join("home-b");
+    fs::create_dir_all(&home_a).expect("create home a");
+    fs::create_dir_all(&home_b).expect("create home b");
+
+    let state = AppState::new(server_config(root.join("server.db"))).expect("server state");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("server addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, build_app(state))
+            .await
+            .expect("server");
+    });
+    let server_url = format!("http://{addr}");
+
+    write_client_config(&home_a, &server_url, "host-a");
+    write_client_config(&home_b, &server_url, "host-b");
+    ensure_claude_dir(&home_b);
+    write_claude_usage(&home_a, "e2e-model", &Utc::now().to_rfc3339());
+
+    assert_success(run_cli(&home_a, &["sync", "push"]), "host-a push");
+    assert_success(run_cli(&home_b, &["sync", "pull"]), "host-b pull");
+    let output = assert_success(
+        run_cli(
+            &home_b,
+            &["--once", "--vendor", "claude", "--host", "host-a"],
+        ),
+        "host-b display",
+    );
+
+    assert!(output.contains("e2e-model"), "{output}");
+    assert!(
+        home_b
+            .join(".cache")
+            .join("ai-usage")
+            .join("remote")
+            .join("host-a.bin")
+            .exists()
+    );
+
+    server.abort();
+}

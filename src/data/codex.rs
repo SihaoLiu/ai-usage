@@ -200,8 +200,7 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                         }
                         last_usage_key = Some(usage_key);
 
-                        let non_cached_input = input_tokens - cached_input;
-                        let non_reasoning_output = output_tokens - reasoning_output;
+                        let non_cached_input = input_tokens.saturating_sub(cached_input).max(0);
 
                         let dedup_id = if !current_turn_id.is_empty() {
                             current_turn_id.clone()
@@ -228,7 +227,7 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                                 effort: Some(current_effort.clone()),
                                 usage: TokenUsage {
                                     input_tokens: non_cached_input,
-                                    output_tokens: non_reasoning_output,
+                                    output_tokens,
                                     cache_read_input_tokens: cached_input,
                                     cache_creation_input_tokens: 0,
                                     reasoning_output_tokens: reasoning_output,
@@ -336,6 +335,17 @@ pub fn read_codex_file_records(path: &Path) -> Vec<SourceUsageRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_file(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("vibe-usage-codex-test-{name}-{stamp}.jsonl"))
+    }
 
     #[test]
     fn non_fork_session_has_no_boundary() {
@@ -397,10 +407,7 @@ mod tests {
     #[test]
     fn parses_top_level_service_tier() {
         let toml = "model = \"gpt-5.5\"\nservice_tier = \"fast\"\n[features]\nfast_mode = true\n";
-        assert_eq!(
-            parse_top_level_service_tier(toml),
-            Some("fast".to_string())
-        );
+        assert_eq!(parse_top_level_service_tier(toml), Some("fast".to_string()));
     }
 
     #[test]
@@ -414,15 +421,32 @@ mod tests {
     #[test]
     fn parses_value_with_inline_comment_and_single_quotes() {
         let toml = "service_tier = 'fast' # default tier\n";
-        assert_eq!(
-            parse_top_level_service_tier(toml),
-            Some("fast".to_string())
-        );
+        assert_eq!(parse_top_level_service_tier(toml), Some("fast".to_string()));
     }
 
     #[test]
     fn missing_service_tier_returns_none() {
         let toml = "model = \"gpt-5.5\"\n";
         assert_eq!(parse_top_level_service_tier(toml), None);
+    }
+
+    #[test]
+    fn reasoning_output_does_not_make_visible_output_negative() {
+        let path = unique_temp_file("reasoning-output");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-19T12:00:00Z","type":"turn_context","payload":{"model":"gpt-5.5","effort":"high"}}
+{"timestamp":"2026-05-19T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779192001}}
+{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":150,"output_tokens":25,"reasoning_output_tokens":64}}}}"#,
+        )
+        .expect("write codex fixture");
+
+        let records = read_codex_file_records(&path);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry.usage.input_tokens, 0);
+        assert_eq!(records[0].entry.usage.cache_read_input_tokens, 150);
+        assert_eq!(records[0].entry.usage.output_tokens, 25);
+        assert_eq!(records[0].entry.usage.reasoning_output_tokens, 64);
     }
 }

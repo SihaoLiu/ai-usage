@@ -197,6 +197,16 @@ impl PersistedSourceRecord {
             },
         }
     }
+
+    fn has_non_negative_token_usage(&self) -> bool {
+        token_counts_are_non_negative([
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+            self.reasoning_output_tokens,
+        ])
+    }
 }
 
 impl PersistedRemoteRecord {
@@ -239,6 +249,20 @@ impl PersistedRemoteRecord {
             },
         }
     }
+
+    fn has_non_negative_token_usage(&self) -> bool {
+        token_counts_are_non_negative([
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+            self.reasoning_output_tokens,
+        ])
+    }
+}
+
+fn token_counts_are_non_negative(values: [i64; 5]) -> bool {
+    values.into_iter().all(|value| value >= 0)
 }
 
 /// Return the persistent cache directory used by the CLI.
@@ -663,6 +687,16 @@ fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
             "unsupported cache entry version",
         ));
     }
+    if decoded
+        .records
+        .iter()
+        .any(|record| !record.has_non_negative_token_usage())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache entry has negative token count",
+        ));
+    }
     Ok(decoded.records)
 }
 
@@ -711,6 +745,16 @@ fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported remote cache entry version",
+        ));
+    }
+    if decoded
+        .records
+        .iter()
+        .any(|record| !record.has_non_negative_token_usage())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote cache entry has negative token count",
         ));
     }
     Ok(decoded.records)
@@ -1202,6 +1246,31 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(entry_tokens(&rebuilt), vec![77]);
+    }
+
+    #[test]
+    fn cached_records_with_negative_tokens_trigger_vendor_rebuild() {
+        let cache_root = unique_temp_dir("negative-tokens");
+        let source = cache_root.join("source.jsonl");
+        write_source(&source, "first");
+        let calls = AtomicUsize::new(0);
+
+        let _ =
+            super::load_or_update_vendor_cache(&cache_root, "test", vec![source.clone()], |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let mut record = usage_record("stable-key", "2026-05-01T00:00:00Z", 42);
+                record.entry.usage.output_tokens = -1;
+                vec![record]
+            });
+
+        let rebuilt = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
+        });
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(entry_tokens(&rebuilt), vec![77]);
+        assert_eq!(rebuilt[0].usage.output_tokens, 2);
     }
 
     #[test]

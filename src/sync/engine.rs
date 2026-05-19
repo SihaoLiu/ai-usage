@@ -15,6 +15,41 @@ const BATCH_SIZE: usize = 1000;
 const PULL_LIMIT: usize = 5000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncProgress {
+    UploadPlanned {
+        total_records: usize,
+        total_batches: usize,
+        skipped_records: usize,
+    },
+    UploadBatchFinished {
+        batch_index: usize,
+        total_batches: usize,
+        uploaded_records: usize,
+        total_records: usize,
+        accepted: usize,
+        ignored: usize,
+    },
+    UploadFinished {
+        uploaded_records: usize,
+        total_records: usize,
+        accepted: usize,
+        ignored: usize,
+    },
+    PullPageFinished {
+        page_index: usize,
+        page_records: usize,
+        pulled_records: usize,
+        max_seq: u64,
+        truncated: bool,
+    },
+    PullFinished {
+        pages: usize,
+        pulled_records: usize,
+        max_seq: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncError {
     message: String,
 }
@@ -51,30 +86,50 @@ pub trait SyncTransport {
     ) -> Result<PullResponse, SyncError>;
 }
 
+#[cfg(test)]
 pub fn run_sync_cycle(
     cache_root: &Path,
     config: &EnabledSyncConfig,
     transport: &impl SyncTransport,
 ) -> Result<(), SyncError> {
-    run_upload_once(cache_root, config, transport)?;
-    run_pull_once(cache_root, config, transport)
+    run_sync_cycle_with_progress(cache_root, config, transport, |_| {})
 }
 
-pub fn run_upload_once(
+pub fn run_sync_cycle_with_progress<F>(
     cache_root: &Path,
     config: &EnabledSyncConfig,
     transport: &impl SyncTransport,
-) -> Result<(), SyncError> {
+    mut on_progress: F,
+) -> Result<(), SyncError>
+where
+    F: FnMut(&SyncProgress),
+{
+    run_upload_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+    run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)
+}
+
+pub fn run_upload_once_with_progress<F>(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    transport: &impl SyncTransport,
+    mut on_progress: F,
+) -> Result<(), SyncError>
+where
+    F: FnMut(&SyncProgress),
+{
     let mut upload_log = state::load_upload_log(cache_root);
     let mut upload_records = Vec::new();
+    let mut skipped_records = 0;
 
     for vendor in VENDORS {
         for record in cache::load_vendor_cached_records(cache_root, vendor) {
             if record.dedup_key.is_empty() {
+                skipped_records += 1;
                 continue;
             }
             let key = (record.vendor.clone(), record.dedup_key.clone());
             if upload_log.contains(&key) {
+                skipped_records += 1;
                 continue;
             }
             let wire = cached_record_to_wire(config, &record)?;
@@ -82,31 +137,75 @@ pub fn run_upload_once(
         }
     }
 
-    for batch in upload_records.chunks(BATCH_SIZE) {
+    let total_records = upload_records.len();
+    let total_batches = total_records.div_ceil(BATCH_SIZE);
+    on_progress(&SyncProgress::UploadPlanned {
+        total_records,
+        total_batches,
+        skipped_records,
+    });
+
+    let mut uploaded_records = 0;
+    let mut accepted = 0;
+    let mut ignored = 0;
+    for (batch_offset, batch) in upload_records.chunks(BATCH_SIZE).enumerate() {
         let wire_records: Vec<WireRecord> =
             batch.iter().map(|(_, record)| record.clone()).collect();
-        transport.upload(&wire_records)?;
+        let response = transport.upload(&wire_records)?;
+        uploaded_records += batch.len();
+        accepted += response.accepted;
+        ignored += response.ignored;
         for (key, _) in batch {
             upload_log.insert(key.clone());
         }
         state::save_upload_log(cache_root, &upload_log)?;
+        on_progress(&SyncProgress::UploadBatchFinished {
+            batch_index: batch_offset + 1,
+            total_batches,
+            uploaded_records,
+            total_records,
+            accepted,
+            ignored,
+        });
     }
+
+    on_progress(&SyncProgress::UploadFinished {
+        uploaded_records,
+        total_records,
+        accepted,
+        ignored,
+    });
 
     Ok(())
 }
 
-pub fn run_pull_once(
+pub fn run_pull_once_with_progress<F>(
     cache_root: &Path,
     config: &EnabledSyncConfig,
     transport: &impl SyncTransport,
-) -> Result<(), SyncError> {
+    mut on_progress: F,
+) -> Result<(), SyncError>
+where
+    F: FnMut(&SyncProgress),
+{
     let mut sync_state = state::load_sync_state(cache_root);
+    let mut page_index = 0;
+    let mut pulled_records = 0;
 
     loop {
         let response = transport.pull(sync_state.last_seen_seq, &config.machine_id, PULL_LIMIT)?;
+        page_index += 1;
+        pulled_records += response.records.len();
         merge_pulled_records(cache_root, &response)?;
         sync_state.last_seen_seq = response.max_seq;
         state::save_sync_state(cache_root, &sync_state)?;
+        on_progress(&SyncProgress::PullPageFinished {
+            page_index,
+            page_records: response.records.len(),
+            pulled_records,
+            max_seq: response.max_seq,
+            truncated: response.truncated,
+        });
         if !response.truncated {
             break;
         }
@@ -115,6 +214,11 @@ pub fn run_pull_once(
     sync_state.last_successful_sync = Some(Utc::now().to_rfc3339());
     sync_state.last_error = None;
     state::save_sync_state(cache_root, &sync_state)?;
+    on_progress(&SyncProgress::PullFinished {
+        pages: page_index,
+        pulled_records,
+        max_seq: sync_state.last_seen_seq,
+    });
     Ok(())
 }
 
@@ -276,6 +380,16 @@ mod tests {
         });
     }
 
+    fn populate_vendor_cache_with_count(cache_root: &Path, vendor: &str, count: usize) {
+        let source = cache_root.join(format!("{vendor}.jsonl"));
+        std::fs::write(&source, "source").expect("write source");
+        crate::data::cache::load_or_update_vendor_cache(cache_root, vendor, vec![source], |_| {
+            (0..count)
+                .map(|idx| usage_record(&format!("dedup-{idx}"), "2026-05-18T12:00:00Z", 10))
+                .collect()
+        });
+    }
+
     fn enabled_config(machine_id: &str) -> crate::sync::config::EnabledSyncConfig {
         crate::sync::config::EnabledSyncConfig {
             server_url: "https://usage.example.com".to_string(),
@@ -309,6 +423,127 @@ mod tests {
         assert!(
             crate::sync::state::load_upload_log(&cache_root)
                 .contains(&("claude".to_string(), "dedup-a".to_string()))
+        );
+    }
+
+    #[test]
+    fn upload_progress_reports_planned_and_finished_batches() {
+        let cache_root = unique_temp_dir("upload-progress");
+        populate_vendor_cache_with_count(&cache_root, "claude", BATCH_SIZE + 1);
+        let transport = FakeTransport::new(Vec::new());
+        let mut events = Vec::new();
+
+        run_upload_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |event| events.push(event.clone()),
+        )
+        .expect("upload");
+
+        assert_eq!(
+            events,
+            vec![
+                SyncProgress::UploadPlanned {
+                    total_records: BATCH_SIZE + 1,
+                    total_batches: 2,
+                    skipped_records: 0,
+                },
+                SyncProgress::UploadBatchFinished {
+                    batch_index: 1,
+                    total_batches: 2,
+                    uploaded_records: BATCH_SIZE,
+                    total_records: BATCH_SIZE + 1,
+                    accepted: BATCH_SIZE,
+                    ignored: 0,
+                },
+                SyncProgress::UploadBatchFinished {
+                    batch_index: 2,
+                    total_batches: 2,
+                    uploaded_records: BATCH_SIZE + 1,
+                    total_records: BATCH_SIZE + 1,
+                    accepted: BATCH_SIZE + 1,
+                    ignored: 0,
+                },
+                SyncProgress::UploadFinished {
+                    uploaded_records: BATCH_SIZE + 1,
+                    total_records: BATCH_SIZE + 1,
+                    accepted: BATCH_SIZE + 1,
+                    ignored: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pull_progress_reports_pages_and_record_totals() {
+        let cache_root = unique_temp_dir("pull-progress");
+        let pulled = SequencedWireRecord {
+            seq: 7,
+            uploaded_at: "2026-05-18T12:10:00Z".to_string(),
+            record: WireRecord {
+                schema_version: SCHEMA_VERSION,
+                host_id: "laptop".to_string(),
+                vendor: "codex".to_string(),
+                dedup_key: "remote-a".to_string(),
+                timestamp: "2026-05-18T12:00:00Z".to_string(),
+                session_start_time: "2026-05-18T12:00:00Z".to_string(),
+                session_end_time: "2026-05-18T12:05:00Z".to_string(),
+                model: "remote-model".to_string(),
+                effort: Some("high".to_string()),
+                input_tokens: 11,
+                output_tokens: 12,
+                cache_read_input_tokens: 13,
+                cache_creation_input_tokens: 14,
+                reasoning_output_tokens: 15,
+                project_path_sha256: None,
+            },
+        };
+        let transport = FakeTransport::new(vec![
+            PullResponse {
+                records: vec![pulled],
+                max_seq: 7,
+                truncated: true,
+            },
+            PullResponse {
+                records: Vec::new(),
+                max_seq: 7,
+                truncated: false,
+            },
+        ]);
+        let mut events = Vec::new();
+
+        run_pull_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |event| events.push(event.clone()),
+        )
+        .expect("pull");
+
+        assert_eq!(
+            events,
+            vec![
+                SyncProgress::PullPageFinished {
+                    page_index: 1,
+                    page_records: 1,
+                    pulled_records: 1,
+                    max_seq: 7,
+                    truncated: true,
+                },
+                SyncProgress::PullPageFinished {
+                    page_index: 2,
+                    page_records: 0,
+                    pulled_records: 1,
+                    max_seq: 7,
+                    truncated: false,
+                },
+                SyncProgress::PullFinished {
+                    pages: 2,
+                    pulled_records: 1,
+                    max_seq: 7,
+                },
+            ]
         );
     }
 

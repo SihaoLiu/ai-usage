@@ -90,9 +90,7 @@ pub fn fetch_latest_release() -> Result<LatestRelease, String> {
 
     let asset = assets
         .iter()
-        .find(|a| {
-            a.get("name").and_then(|n| n.as_str()) == Some(asset_name.as_str())
-        })
+        .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(asset_name.as_str()))
         .ok_or_else(|| {
             format!(
                 "No asset named '{asset_name}' in release {tag}. \
@@ -122,7 +120,11 @@ pub fn fetch_latest_release() -> Result<LatestRelease, String> {
 fn is_newer(latest: &str, current: &str) -> bool {
     fn parts(s: &str) -> Vec<u64> {
         s.split('.')
-            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+            })
             .map(|p| p.parse::<u64>().unwrap_or(0))
             .collect()
     }
@@ -195,14 +197,10 @@ fn exec_self(exe_path: &Path, args: &[OsString]) -> Result<std::convert::Infalli
         .map_err(|e| format!("path contains NUL byte: {e}"))?;
     let c_args: Vec<CString> = args
         .iter()
-        .map(|a| {
-            CString::new(a.as_bytes())
-                .map_err(|e| format!("argv contains NUL byte: {e}"))
-        })
+        .map(|a| CString::new(a.as_bytes()).map_err(|e| format!("argv contains NUL byte: {e}")))
         .collect::<Result<_, _>>()?;
 
-    let mut argv_ptrs: Vec<*const libc::c_char> =
-        c_args.iter().map(|c| c.as_ptr()).collect();
+    let mut argv_ptrs: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
 
     // execv replaces this process; on success it does not return.
@@ -235,8 +233,8 @@ pub fn run_update<F: FnMut(&str)>(mut log: F) -> Result<UpdateOutcome, String> {
         });
     }
 
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("cannot resolve current executable: {e}"))?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("cannot resolve current executable: {e}"))?;
     let install_dir = current_exe
         .parent()
         .ok_or_else(|| "current executable has no parent directory".to_string())?

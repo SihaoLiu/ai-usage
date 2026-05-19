@@ -80,11 +80,7 @@ fn fast_tier_multiplier(model: &str) -> f64 {
 /// set that supports fast, and leave older/unsupported SKUs at 1.0x.
 fn flex_tier_multiplier(model: &str) -> f64 {
     let m = model.to_ascii_lowercase();
-    if m.starts_with("gpt-5") {
-        0.5
-    } else {
-        1.0
-    }
+    if m.starts_with("gpt-5") { 0.5 } else { 1.0 }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -524,9 +520,7 @@ mod tests {
         assert!((fast.cost_multiplier("gpt-5.3-codex") - 1.0).abs() < f64::EPSILON);
         assert!((fast.cost_multiplier("gpt-5") - 1.0).abs() < f64::EPSILON);
         // Default tier never moves the rate.
-        assert!(
-            (CodexServiceTier::Default.cost_multiplier("gpt-5.5") - 1.0).abs() < f64::EPSILON
-        );
+        assert!((CodexServiceTier::Default.cost_multiplier("gpt-5.5") - 1.0).abs() < f64::EPSILON);
     }
 
     fn sample_codex_pricing() -> ModelPricing {

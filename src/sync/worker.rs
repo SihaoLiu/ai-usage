@@ -1,6 +1,6 @@
-use crate::sync::client::SyncHttpClient;
+use crate::sync::client::{HttpProgress, SyncHttpClient};
 use crate::sync::config::EnabledSyncConfig;
-use crate::sync::engine::{self, SyncError};
+use crate::sync::engine::{self, SyncError, SyncProgress};
 use crate::sync::state;
 use chrono::Utc;
 use std::fs::{self, OpenOptions};
@@ -21,10 +21,18 @@ const MAX_PANICS: u32 = 3;
 pub struct SyncStats {
     pub success_count: u64,
     pub error_count: u64,
+    pub revision: u64,
     pub running: bool,
     pub last_started_at: Option<String>,
     pub last_finished_at: Option<String>,
     pub last_error: Option<String>,
+    pub progress: Option<SyncWorkerProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncWorkerProgress {
+    Sync(SyncProgress),
+    Http(HttpProgress),
 }
 
 pub struct SyncWorker {
@@ -68,9 +76,14 @@ impl SyncWorker {
     pub fn spawn(cache_root: PathBuf, config: EnabledSyncConfig) -> Self {
         let runner_root = cache_root.clone();
         let runner_config = config.clone();
-        Self::spawn_with_settings(cache_root, WorkerSettings::default(), move || {
-            let client = SyncHttpClient::new(runner_config.clone());
-            engine::run_sync_cycle(&runner_root, &runner_config, &client)
+        Self::spawn_with_shared_settings(cache_root, WorkerSettings::default(), move |shared| {
+            let http_shared = Arc::clone(&shared);
+            let client = SyncHttpClient::new_with_progress(runner_config.clone(), move |event| {
+                http_shared.mark_progress(SyncWorkerProgress::Http(event.clone()));
+            });
+            engine::run_sync_cycle_with_progress(&runner_root, &runner_config, &client, |event| {
+                shared.mark_progress(SyncWorkerProgress::Sync(event.clone()))
+            })
         })
     }
 
@@ -95,14 +108,30 @@ impl SyncWorker {
         }
     }
 
+    #[cfg(test)]
     fn spawn_with_settings<F>(cache_root: PathBuf, settings: WorkerSettings, run_cycle: F) -> Self
     where
         F: FnMut() -> Result<(), SyncError> + Send + 'static,
     {
+        let mut run_cycle = run_cycle;
+        Self::spawn_with_shared_settings(cache_root, settings, move |_| run_cycle())
+    }
+
+    fn spawn_with_shared_settings<F>(
+        cache_root: PathBuf,
+        settings: WorkerSettings,
+        mut run_cycle: F,
+    ) -> Self
+    where
+        F: FnMut(Arc<WorkerShared>) -> Result<(), SyncError> + Send + 'static,
+    {
         let shared = Arc::new(WorkerShared::new());
         let worker_shared = Arc::clone(&shared);
+        let runner_shared = Arc::clone(&shared);
         let handle = thread::spawn(move || {
-            run_worker_loop(worker_shared, cache_root, settings, run_cycle);
+            run_worker_loop(worker_shared, cache_root, settings, move || {
+                run_cycle(Arc::clone(&runner_shared))
+            });
         });
         Self {
             shared,
@@ -182,23 +211,35 @@ impl WorkerShared {
     fn mark_running(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         inner.stats.running = true;
+        inner.stats.revision += 1;
         inner.stats.last_started_at = Some(Utc::now().to_rfc3339());
+        inner.stats.progress = None;
     }
 
     fn mark_success(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         inner.stats.running = false;
         inner.stats.success_count += 1;
+        inner.stats.revision += 1;
         inner.stats.last_finished_at = Some(Utc::now().to_rfc3339());
         inner.stats.last_error = None;
+        inner.stats.progress = None;
     }
 
     fn mark_error(&self, message: String) {
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         inner.stats.running = false;
         inner.stats.error_count += 1;
+        inner.stats.revision += 1;
         inner.stats.last_finished_at = Some(Utc::now().to_rfc3339());
         inner.stats.last_error = Some(message);
+        inner.stats.progress = None;
+    }
+
+    fn mark_progress(&self, progress: SyncWorkerProgress) {
+        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        inner.stats.progress = Some(progress);
+        inner.stats.revision += 1;
     }
 }
 

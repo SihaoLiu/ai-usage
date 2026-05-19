@@ -787,21 +787,21 @@ fn poll_background_raw_refresh(state: &mut AppState) -> bool {
     }
 }
 
-fn poll_sync_worker_completion(
+fn poll_sync_worker_status(
     worker: Option<&sync::worker::SyncWorker>,
-    observed_events: &mut u64,
-) -> Option<Result<(), String>> {
+    observed_revision: &mut u64,
+) -> Option<sync::worker::SyncStats> {
     let worker = worker?;
     let stats = worker.stats();
-    let events = stats.success_count + stats.error_count;
-    if events == *observed_events {
+    if stats.revision == *observed_revision {
         return None;
     }
-    *observed_events = events;
-    match stats.last_error {
-        Some(error) => Some(Err(error)),
-        None => Some(Ok(())),
-    }
+    *observed_revision = stats.revision;
+    Some(stats)
+}
+
+fn current_sync_status(worker: Option<&sync::worker::SyncWorker>) -> Option<String> {
+    worker.and_then(|worker| format_monitor_sync_status(&worker.stats()))
 }
 
 fn data_loaded_notice(load_duration: std::time::Duration) -> PromptNotice {
@@ -834,6 +834,196 @@ fn format_integrity_duration(duration: std::time::Duration) -> String {
         format!("{} ms", duration.as_millis())
     } else {
         format!("{:.2} s", duration.as_secs_f64())
+    }
+}
+
+fn monitor_sync_interval(monitor_interval: std::time::Duration) -> std::time::Duration {
+    (monitor_interval / 3).max(std::time::Duration::from_secs(60))
+}
+
+fn format_manual_sync_progress(event: &sync::engine::SyncProgress) -> Option<String> {
+    match event {
+        sync::engine::SyncProgress::UploadPlanned {
+            total_records,
+            total_batches,
+            skipped_records,
+        } => {
+            if *skipped_records == 0 {
+                Some(format!(
+                    "sync push: {total_records} records to upload in {total_batches} batches"
+                ))
+            } else {
+                Some(format!(
+                    "sync push: {total_records} records to upload in {total_batches} batches, {skipped_records} already synced"
+                ))
+            }
+        }
+        sync::engine::SyncProgress::UploadBatchFinished {
+            batch_index,
+            total_batches,
+            uploaded_records,
+            total_records,
+            accepted,
+            ignored,
+        } => Some(format!(
+            "sync push: [{}] {batch_index}/{total_batches} batches, {uploaded_records}/{total_records} records, accepted {accepted}, ignored {ignored}",
+            progress_bar(*batch_index, *total_batches)
+        )),
+        sync::engine::SyncProgress::UploadFinished {
+            uploaded_records,
+            total_records,
+            accepted,
+            ignored,
+        } => Some(format!(
+            "sync push: complete, {uploaded_records}/{total_records} records, accepted {accepted}, ignored {ignored}"
+        )),
+        sync::engine::SyncProgress::PullPageFinished {
+            page_index,
+            pulled_records,
+            max_seq,
+            ..
+        } => Some(format!(
+            "sync pull: page {page_index}, {pulled_records} records pulled, latest seq {max_seq}"
+        )),
+        sync::engine::SyncProgress::PullFinished {
+            pages,
+            pulled_records,
+            max_seq,
+        } => Some(format!(
+            "sync pull: complete, {pages} pages, {pulled_records} records pulled, latest seq {max_seq}"
+        )),
+    }
+}
+
+fn format_http_progress(event: &sync::client::HttpProgress) -> String {
+    match event {
+        sync::client::HttpProgress::RateLimited {
+            attempt,
+            retry_after,
+        } => format!(
+            "sync: rate limited, retrying in {} (attempt {attempt})",
+            format_retry_duration(*retry_after)
+        ),
+    }
+}
+
+fn format_monitor_sync_status(stats: &sync::worker::SyncStats) -> Option<String> {
+    format_monitor_sync_status_at(stats, chrono::Utc::now())
+}
+
+fn format_monitor_sync_status_at(
+    stats: &sync::worker::SyncStats,
+    now: DateTime<chrono::Utc>,
+) -> Option<String> {
+    if stats.running {
+        return Some(match stats.progress.as_ref() {
+            Some(progress) => format!("Sync: {}", format_monitor_worker_progress(progress)),
+            None => "Sync: running".to_string(),
+        });
+    }
+
+    if let Some(error) = stats.last_error.as_ref() {
+        return Some(format!("Sync: error: {error}"));
+    }
+
+    if stats.success_count > 0 {
+        let finished = stats
+            .last_finished_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&chrono::Utc));
+        if let Some(finished) = finished {
+            return Some(format!(
+                "Sync: checked {}",
+                format_sync_age(now.signed_duration_since(finished))
+            ));
+        }
+        return Some("Sync: checked".to_string());
+    }
+
+    None
+}
+
+fn format_monitor_worker_progress(progress: &sync::worker::SyncWorkerProgress) -> String {
+    match progress {
+        sync::worker::SyncWorkerProgress::Sync(event) => match event {
+            sync::engine::SyncProgress::UploadPlanned {
+                total_records,
+                total_batches,
+                ..
+            } => format!("push queued {total_records} records in {total_batches} batches"),
+            sync::engine::SyncProgress::UploadBatchFinished {
+                batch_index,
+                total_batches,
+                uploaded_records,
+                total_records,
+                ..
+            } => format!(
+                "push {batch_index}/{total_batches} batches, {uploaded_records}/{total_records} records"
+            ),
+            sync::engine::SyncProgress::UploadFinished {
+                uploaded_records,
+                total_records,
+                ..
+            } => format!("push complete, {uploaded_records}/{total_records} records"),
+            sync::engine::SyncProgress::PullPageFinished {
+                page_index,
+                pulled_records,
+                max_seq,
+                ..
+            } => format!(
+                "pull page {page_index}, {pulled_records} records pulled, latest seq {max_seq}"
+            ),
+            sync::engine::SyncProgress::PullFinished {
+                pages,
+                pulled_records,
+                max_seq,
+            } => format!(
+                "pull complete, {pages} pages, {pulled_records} records pulled, latest seq {max_seq}"
+            ),
+        },
+        sync::worker::SyncWorkerProgress::Http(event) => match event {
+            sync::client::HttpProgress::RateLimited {
+                attempt,
+                retry_after,
+            } => format!(
+                "rate limited, retrying in {} (attempt {attempt})",
+                format_retry_duration(*retry_after)
+            ),
+        },
+    }
+}
+
+fn format_sync_age(age: Duration) -> String {
+    let seconds = age.num_seconds().max(0);
+    if seconds < 60 {
+        "just now".to_string()
+    } else if seconds < 3600 {
+        format!("{} min ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{} h ago", seconds / 3600)
+    } else {
+        format!("{} d ago", seconds / 86_400)
+    }
+}
+
+fn progress_bar(done: usize, total: usize) -> String {
+    const WIDTH: usize = 20;
+    let filled = if total == 0 {
+        WIDTH
+    } else {
+        done.saturating_mul(WIDTH).min(total.saturating_mul(WIDTH)) / total
+    };
+    format!("{}{}", "#".repeat(filled), "-".repeat(WIDTH - filled))
+}
+
+fn format_retry_duration(duration: std::time::Duration) -> String {
+    if duration.as_millis() == 0 {
+        "0s".to_string()
+    } else if duration.as_secs() < 10 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{}s", duration.as_secs())
     }
 }
 
@@ -1583,13 +1773,34 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                 return 1;
             };
             let cache_root = data::cache::default_cache_dir();
-            let client = sync::client::SyncHttpClient::new(config.clone());
+            let client = sync::client::SyncHttpClient::new_with_progress(config.clone(), |event| {
+                eprintln!("{}", format_http_progress(event));
+            });
             let result = match command {
                 SyncCommand::Push => {
+                    eprintln!("sync push: refreshing local cache");
                     let _ = refresh_all_vendor_raw_full();
-                    sync::engine::run_upload_once(&cache_root, &config, &client)
+                    sync::engine::run_upload_once_with_progress(
+                        &cache_root,
+                        &config,
+                        &client,
+                        |event| {
+                            if let Some(message) = format_manual_sync_progress(event) {
+                                eprintln!("{message}");
+                            }
+                        },
+                    )
                 }
-                SyncCommand::Pull => sync::engine::run_pull_once(&cache_root, &config, &client),
+                SyncCommand::Pull => sync::engine::run_pull_once_with_progress(
+                    &cache_root,
+                    &config,
+                    &client,
+                    |event| {
+                        if let Some(message) = format_manual_sync_progress(event) {
+                            eprintln!("{message}");
+                        }
+                    },
+                ),
                 SyncCommand::Status => unreachable!("status handled above"),
                 SyncCommand::Init { .. } => unreachable!("init handled above"),
             };
@@ -1741,7 +1952,7 @@ fn main() {
             )),
             sync::config::SyncConfig::Disabled => None,
         };
-        let mut observed_sync_events = 0_u64;
+        let mut observed_sync_revision = 0_u64;
         let mut prompt_notice = Some(data_loaded_notice(load_started.elapsed()));
         start_background_raw_refresh(&mut state);
 
@@ -1771,7 +1982,10 @@ fn main() {
         let mut terminal_too_small = result.is_none();
         let mut last_size = get_terminal_size();
 
-        let show_prompt = |state: &mut AppState, too_small: bool, notice: Option<&PromptNotice>| {
+        let show_prompt = |state: &mut AppState,
+                           too_small: bool,
+                           notice: Option<&PromptNotice>,
+                           sync_status: Option<String>| {
             if too_small {
                 return;
             }
@@ -1785,14 +1999,24 @@ fn main() {
                 get_version(state, &state.vendor.clone())
             };
             println!("\n\r{}\r", version);
+            if let Some(sync_status) = sync_status {
+                println!("\r{}\r", sync_status);
+            }
             println!("\r{}\r", "-".repeat(width as usize));
             render_prompt_line(&InputLine::new(), too_small, notice, state.integrity_status);
         };
 
-        show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+        show_prompt(
+            &mut state,
+            terminal_too_small,
+            prompt_notice.as_ref(),
+            current_sync_status(sync_worker.as_ref()),
+        );
 
         let mut next_refresh =
             std::time::Instant::now() + std::time::Duration::from_secs(state.monitor_interval);
+        let mut next_sync = std::time::Instant::now()
+            + monitor_sync_interval(std::time::Duration::from_secs(state.monitor_interval));
         let mut input = InputLine::new();
         let mut history = CommandHistory::new();
 
@@ -1818,10 +2042,19 @@ fn main() {
             if poll_background_raw_refresh(&mut state) {
                 if let Some(worker) = sync_worker.as_ref() {
                     worker.request_sync();
+                    next_sync = std::time::Instant::now()
+                        + monitor_sync_interval(std::time::Duration::from_secs(
+                            state.monitor_interval,
+                        ));
                 }
                 let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
-                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                show_prompt(
+                    &mut state,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    current_sync_status(sync_worker.as_ref()),
+                );
                 render_input(
                     &input,
                     terminal_too_small,
@@ -1830,18 +2063,26 @@ fn main() {
                 );
             }
 
-            if let Some(sync_result) =
-                poll_sync_worker_completion(sync_worker.as_ref(), &mut observed_sync_events)
+            if let Some(sync_stats) =
+                poll_sync_worker_status(sync_worker.as_ref(), &mut observed_sync_revision)
             {
-                if sync_result.is_ok() {
+                if !sync_stats.running
+                    && sync_stats.last_error.is_none()
+                    && sync_stats.success_count > 0
+                {
                     state.raw_cache = Some(read_all_vendor_cached_snapshot_for_hosts(
                         state.host.as_deref(),
                         state.local_host_id.as_deref(),
                     ));
                     let result = refresh_display(&mut state);
                     terminal_too_small = result.is_none();
-                    show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
                 }
+                show_prompt(
+                    &mut state,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    format_monitor_sync_status(&sync_stats),
+                );
                 render_input(
                     &input,
                     terminal_too_small,
@@ -1879,7 +2120,14 @@ fn main() {
                 terminal_too_small = result.is_none();
                 next_refresh = std::time::Instant::now()
                     + std::time::Duration::from_secs(state.monitor_interval);
-                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                next_sync = std::time::Instant::now()
+                    + monitor_sync_interval(std::time::Duration::from_secs(state.monitor_interval));
+                show_prompt(
+                    &mut state,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    current_sync_status(sync_worker.as_ref()),
+                );
             }
 
             // Check auto-refresh
@@ -1897,12 +2145,35 @@ fn main() {
                 terminal_too_small = result.is_none();
                 next_refresh = std::time::Instant::now()
                     + std::time::Duration::from_secs(state.monitor_interval);
-                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                show_prompt(
+                    &mut state,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    current_sync_status(sync_worker.as_ref()),
+                );
+            }
+
+            if let Some(worker) = sync_worker.as_ref()
+                && std::time::Instant::now() >= next_sync
+            {
+                worker.request_sync();
+                next_sync = std::time::Instant::now()
+                    + monitor_sync_interval(std::time::Duration::from_secs(state.monitor_interval));
+                show_prompt(
+                    &mut state,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    current_sync_status(sync_worker.as_ref()),
+                );
             }
 
             // Poll for input with 1s timeout
-            let timeout = std::time::Duration::from_secs(1)
+            let mut timeout = std::time::Duration::from_secs(1)
                 .min(next_refresh.saturating_duration_since(std::time::Instant::now()));
+            if sync_worker.is_some() {
+                timeout =
+                    timeout.min(next_sync.saturating_duration_since(std::time::Instant::now()));
+            }
             if crossterm::event::poll(timeout).unwrap_or(false) {
                 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
                 if let Ok(event) = crossterm::event::read() {
@@ -2153,6 +2424,9 @@ fn main() {
                                                             &mut state,
                                                             terminal_too_small,
                                                             prompt_notice.as_ref(),
+                                                            current_sync_status(
+                                                                sync_worker.as_ref(),
+                                                            ),
                                                         );
                                                         continue 'monitor;
                                                     }
@@ -2248,7 +2522,12 @@ fn main() {
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
                             }
-                            show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                            show_prompt(
+                                &mut state,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                current_sync_status(sync_worker.as_ref()),
+                            );
                         }
                         Event::Key(KeyEvent {
                             code: KeyCode::Up, ..
@@ -2290,7 +2569,12 @@ fn main() {
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
-                                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                                show_prompt(
+                                    &mut state,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    current_sync_status(sync_worker.as_ref()),
+                                );
                                 render_input(
                                     &input,
                                     terminal_too_small,
@@ -2310,7 +2594,12 @@ fn main() {
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
-                                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                                show_prompt(
+                                    &mut state,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    current_sync_status(sync_worker.as_ref()),
+                                );
                                 render_input(
                                     &input,
                                     terminal_too_small,
@@ -2340,6 +2629,7 @@ fn main() {
                                         &mut state,
                                         terminal_too_small,
                                         prompt_notice.as_ref(),
+                                        current_sync_status(sync_worker.as_ref()),
                                     );
                                     render_input(
                                         &input,
@@ -2374,6 +2664,7 @@ fn main() {
                                         &mut state,
                                         terminal_too_small,
                                         prompt_notice.as_ref(),
+                                        current_sync_status(sync_worker.as_ref()),
                                     );
                                     render_input(
                                         &input,
@@ -2413,7 +2704,12 @@ fn main() {
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
-                                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                                show_prompt(
+                                    &mut state,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    current_sync_status(sync_worker.as_ref()),
+                                );
                                 render_input(
                                     &input,
                                     terminal_too_small,
@@ -2434,7 +2730,12 @@ fn main() {
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
-                                show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                                show_prompt(
+                                    &mut state,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    current_sync_status(sync_worker.as_ref()),
+                                );
                                 render_input(
                                     &input,
                                     terminal_too_small,
@@ -2470,7 +2771,12 @@ fn main() {
                             terminal_too_small = result.is_none();
                             next_refresh = std::time::Instant::now()
                                 + std::time::Duration::from_secs(state.monitor_interval);
-                            show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                            show_prompt(
+                                &mut state,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                current_sync_status(sync_worker.as_ref()),
+                            );
                         }
                         _ => {}
                     }
@@ -2577,6 +2883,106 @@ mod tests {
         assert_eq!(
             checked_s_visible,
             "Integrity Checked in 1.23 s".chars().count()
+        );
+    }
+
+    #[test]
+    fn sync_interval_is_one_third_of_monitor_interval_with_minimum() {
+        assert_eq!(
+            monitor_sync_interval(std::time::Duration::from_secs(3600)),
+            std::time::Duration::from_secs(1200)
+        );
+        assert_eq!(
+            monitor_sync_interval(std::time::Duration::from_secs(180)),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            monitor_sync_interval(std::time::Duration::from_secs(30)),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn manual_sync_progress_formats_push_pull_and_retry_events() {
+        assert_eq!(
+            format_manual_sync_progress(&sync::engine::SyncProgress::UploadPlanned {
+                total_records: 1001,
+                total_batches: 2,
+                skipped_records: 7,
+            }),
+            Some("sync push: 1001 records to upload in 2 batches, 7 already synced".to_string())
+        );
+        assert_eq!(
+            format_manual_sync_progress(&sync::engine::SyncProgress::UploadBatchFinished {
+                batch_index: 1,
+                total_batches: 2,
+                uploaded_records: 1000,
+                total_records: 1001,
+                accepted: 997,
+                ignored: 3,
+            }),
+            Some(
+                "sync push: [##########----------] 1/2 batches, 1000/1001 records, accepted 997, ignored 3"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            format_manual_sync_progress(&sync::engine::SyncProgress::PullPageFinished {
+                page_index: 2,
+                page_records: 5000,
+                pulled_records: 10000,
+                max_seq: 123,
+                truncated: true,
+            }),
+            Some("sync pull: page 2, 10000 records pulled, latest seq 123".to_string())
+        );
+        assert_eq!(
+            format_http_progress(&sync::client::HttpProgress::RateLimited {
+                attempt: 2,
+                retry_after: std::time::Duration::from_millis(1100),
+            }),
+            "sync: rate limited, retrying in 1.1s (attempt 2)"
+        );
+    }
+
+    #[test]
+    fn monitor_sync_status_formats_running_progress_and_completion() {
+        let running = sync::worker::SyncStats {
+            running: true,
+            progress: Some(sync::worker::SyncWorkerProgress::Sync(
+                sync::engine::SyncProgress::PullPageFinished {
+                    page_index: 2,
+                    page_records: 5000,
+                    pulled_records: 10000,
+                    max_seq: 123,
+                    truncated: true,
+                },
+            )),
+            ..sync::worker::SyncStats::default()
+        };
+        assert_eq!(
+            format_monitor_sync_status_at(
+                &running,
+                chrono::DateTime::parse_from_rfc3339("2026-05-19T12:00:00Z")
+                    .expect("timestamp")
+                    .with_timezone(&chrono::Utc),
+            ),
+            Some("Sync: pull page 2, 10000 records pulled, latest seq 123".to_string())
+        );
+
+        let completed = sync::worker::SyncStats {
+            success_count: 1,
+            last_finished_at: Some("2026-05-19T11:42:00Z".to_string()),
+            ..sync::worker::SyncStats::default()
+        };
+        assert_eq!(
+            format_monitor_sync_status_at(
+                &completed,
+                chrono::DateTime::parse_from_rfc3339("2026-05-19T12:00:00Z")
+                    .expect("timestamp")
+                    .with_timezone(&chrono::Utc),
+            ),
+            Some("Sync: checked 18 min ago".to_string())
         );
     }
 

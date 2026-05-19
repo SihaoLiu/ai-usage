@@ -68,6 +68,7 @@ fn read_single_gemini_file(path: &Path) -> Vec<UsageEntry> {
         let parsed_ts = parse_timestamp(&timestamp);
 
         entries.push(UsageEntry {
+            host_id: None,
             timestamp: timestamp.clone(),
             parsed_timestamp: parsed_ts,
             session_start_time: timestamp.clone(),

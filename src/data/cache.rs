@@ -14,8 +14,10 @@ use crate::time_utils::parse_timestamp;
 
 const CACHE_VERSION: u32 = 1;
 const ENTRY_FILE_MAGIC: &[u8; 8] = b"AIUCACH1";
+const REMOTE_FILE_MAGIC: &[u8; 8] = b"AIUREMT1";
 const MANIFEST_FILE: &str = "manifest.json";
 const ENTRIES_DIR: &str = "entries";
+const REMOTE_DIR: &str = "remote";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheManifest {
@@ -122,6 +124,35 @@ struct PersistedVendorRecords {
     records: Vec<PersistedSourceRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRemoteRecord {
+    vendor: String,
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
+    effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRemoteRecords {
+    format_version: u32,
+    records: Vec<PersistedRemoteRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteUsageRecord {
+    pub vendor: String,
+    pub dedup_key: String,
+    pub entry: UsageEntry,
+}
+
 impl PersistedSourceRecord {
     fn from_source_record(source_path: String, record: SourceUsageRecord) -> Self {
         Self {
@@ -142,6 +173,7 @@ impl PersistedSourceRecord {
 
     fn to_usage_entry(&self) -> UsageEntry {
         UsageEntry {
+            host_id: None,
             timestamp: self.timestamp.clone(),
             parsed_timestamp: parse_timestamp(&self.timestamp),
             session_start_time: self.session_start_time.clone(),
@@ -154,6 +186,48 @@ impl PersistedSourceRecord {
                 cache_read_input_tokens: self.cache_read_input_tokens,
                 cache_creation_input_tokens: self.cache_creation_input_tokens,
                 reasoning_output_tokens: self.reasoning_output_tokens,
+            },
+        }
+    }
+}
+
+impl PersistedRemoteRecord {
+    fn from_remote_record(record: RemoteUsageRecord) -> Self {
+        Self {
+            vendor: record.vendor,
+            dedup_key: record.dedup_key,
+            timestamp: record.entry.timestamp,
+            session_start_time: record.entry.session_start_time,
+            session_end_time: record.entry.session_end_time,
+            model: record.entry.model,
+            effort: record.entry.effort,
+            input_tokens: record.entry.usage.input_tokens,
+            output_tokens: record.entry.usage.output_tokens,
+            cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
+            cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
+            reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+        }
+    }
+
+    fn to_remote_usage_record(&self, host_id: &str) -> RemoteUsageRecord {
+        RemoteUsageRecord {
+            vendor: self.vendor.clone(),
+            dedup_key: self.dedup_key.clone(),
+            entry: UsageEntry {
+                host_id: Some(host_id.to_string()),
+                timestamp: self.timestamp.clone(),
+                parsed_timestamp: parse_timestamp(&self.timestamp),
+                session_start_time: self.session_start_time.clone(),
+                session_end_time: self.session_end_time.clone(),
+                model: self.model.clone(),
+                effort: self.effort.clone(),
+                usage: TokenUsage {
+                    input_tokens: self.input_tokens,
+                    output_tokens: self.output_tokens,
+                    cache_read_input_tokens: self.cache_read_input_tokens,
+                    cache_creation_input_tokens: self.cache_creation_input_tokens,
+                    reasoning_output_tokens: self.reasoning_output_tokens,
+                },
             },
         }
     }
@@ -177,6 +251,67 @@ pub fn load_vendor_cached_snapshot(cache_root: &Path, vendor: &str) -> Vec<Usage
     read_cached_records(&vendor_entries_path(cache_root, vendor))
         .map(|records| aggregate_persisted_records(records.iter()))
         .unwrap_or_default()
+}
+
+pub fn load_remote_entries(
+    cache_root: &Path,
+    hosts_filter: Option<&HashSet<String>>,
+) -> Vec<RemoteUsageRecord> {
+    let remote_root = cache_root.join(REMOTE_DIR);
+    let Ok(entries) = fs::read_dir(remote_root) else {
+        return Vec::new();
+    };
+
+    let mut host_files: Vec<(String, PathBuf)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let host_id = path.file_stem()?.to_str()?.to_string();
+            if hosts_filter.is_some_and(|hosts| !hosts.contains(&host_id)) {
+                return None;
+            }
+            Some((host_id, path))
+        })
+        .collect();
+    host_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut records = Vec::new();
+    for (host_id, path) in host_files {
+        let Ok(host_records) = read_remote_records(&path) else {
+            continue;
+        };
+        records.extend(
+            host_records
+                .iter()
+                .map(|record| record.to_remote_usage_record(&host_id)),
+        );
+    }
+    records
+}
+
+pub fn merge_remote_records(
+    cache_root: &Path,
+    host_id: &str,
+    records: Vec<RemoteUsageRecord>,
+) -> io::Result<()> {
+    let path = remote_entries_path(cache_root, host_id);
+    let mut existing = read_remote_records(&path).unwrap_or_default();
+    let mut seen: HashSet<(String, String)> = existing
+        .iter()
+        .map(|record| (record.vendor.clone(), record.dedup_key.clone()))
+        .collect();
+
+    for record in records {
+        let key = (record.vendor.clone(), record.dedup_key.clone());
+        if seen.insert(key) {
+            existing.push(PersistedRemoteRecord::from_remote_record(record));
+        }
+    }
+
+    write_remote_records(&path, &existing)
 }
 
 /// Load normalized entries for one vendor, parsing only files whose metadata changed.
@@ -427,6 +562,12 @@ fn vendor_entries_path(cache_root: &Path, vendor: &str) -> PathBuf {
         .join(format!("{}.bin", safe_file_stem(vendor)))
 }
 
+fn remote_entries_path(cache_root: &Path, host_id: &str) -> PathBuf {
+    cache_root
+        .join(REMOTE_DIR)
+        .join(format!("{}.bin", safe_file_stem(host_id)))
+}
+
 fn safe_file_stem(value: &str) -> String {
     value
         .chars()
@@ -504,6 +645,56 @@ fn write_cached_records(path: &Path, records: &[PersistedSourceRecord]) -> io::R
     let checksum = fnv1a_bytes(0, &payload);
     let mut content = Vec::with_capacity(ENTRY_FILE_MAGIC.len() + 8 + payload.len());
     content.extend_from_slice(ENTRY_FILE_MAGIC);
+    content.extend_from_slice(&checksum.to_le_bytes());
+    content.extend_from_slice(&payload);
+    atomic_write(path, &content)
+}
+
+fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
+    let content = fs::read(path)?;
+    if content.len() < REMOTE_FILE_MAGIC.len() + 8
+        || &content[..REMOTE_FILE_MAGIC.len()] != REMOTE_FILE_MAGIC
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid remote cache entry header",
+        ));
+    }
+    let checksum_start = REMOTE_FILE_MAGIC.len();
+    let payload_start = checksum_start + 8;
+    let stored_checksum = u64::from_le_bytes(
+        content[checksum_start..payload_start]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid checksum"))?,
+    );
+    let payload = &content[payload_start..];
+    let actual_checksum = fnv1a_bytes(0, payload);
+    if stored_checksum != actual_checksum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote cache entry checksum mismatch",
+        ));
+    }
+    let decoded: PersistedRemoteRecords = bincode::deserialize(payload)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    if decoded.format_version != CACHE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported remote cache entry version",
+        ));
+    }
+    Ok(decoded.records)
+}
+
+fn write_remote_records(path: &Path, records: &[PersistedRemoteRecord]) -> io::Result<()> {
+    let payload = bincode::serialize(&PersistedRemoteRecords {
+        format_version: CACHE_VERSION,
+        records: records.to_vec(),
+    })
+    .map_err(io::Error::other)?;
+    let checksum = fnv1a_bytes(0, &payload);
+    let mut content = Vec::with_capacity(REMOTE_FILE_MAGIC.len() + 8 + payload.len());
+    content.extend_from_slice(REMOTE_FILE_MAGIC);
     content.extend_from_slice(&checksum.to_le_bytes());
     content.extend_from_slice(&payload);
     atomic_write(path, &content)
@@ -612,6 +803,7 @@ fn aggregate_persisted_records<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -637,6 +829,7 @@ mod tests {
         SourceUsageRecord {
             dedup_key: key.to_string(),
             entry: UsageEntry {
+                host_id: None,
                 timestamp: timestamp.to_string(),
                 parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
                 session_start_time: timestamp.to_string(),
@@ -658,6 +851,50 @@ mod tests {
         entries
             .iter()
             .map(|entry| entry.usage.input_tokens)
+            .collect()
+    }
+
+    fn remote_record(
+        vendor: &str,
+        dedup_key: &str,
+        timestamp: &str,
+        input_tokens: i64,
+    ) -> super::RemoteUsageRecord {
+        super::RemoteUsageRecord {
+            vendor: vendor.to_string(),
+            dedup_key: dedup_key.to_string(),
+            entry: UsageEntry {
+                host_id: None,
+                timestamp: timestamp.to_string(),
+                parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
+                session_start_time: timestamp.to_string(),
+                session_end_time: timestamp.to_string(),
+                model: "remote-model".to_string(),
+                effort: None,
+                usage: TokenUsage {
+                    input_tokens,
+                    output_tokens: 2,
+                    cache_read_input_tokens: 3,
+                    cache_creation_input_tokens: 4,
+                    reasoning_output_tokens: 5,
+                },
+            },
+        }
+    }
+
+    fn remote_fingerprints(
+        records: &[super::RemoteUsageRecord],
+    ) -> Vec<(String, String, Option<String>, i64)> {
+        records
+            .iter()
+            .map(|record| {
+                (
+                    record.vendor.clone(),
+                    record.dedup_key.clone(),
+                    record.entry.host_id.clone(),
+                    record.entry.usage.input_tokens,
+                )
+            })
             .collect()
     }
 
@@ -713,6 +950,126 @@ mod tests {
             }
         }
         entries
+    }
+
+    #[test]
+    fn local_cache_entries_have_no_host_id() {
+        let cache_root = unique_temp_dir("local-host");
+        let source = cache_root.join("source.jsonl");
+        write_source(&source, "first");
+
+        let entries = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], |_| {
+            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
+        });
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host_id, None);
+    }
+
+    #[test]
+    fn remote_records_are_loaded_with_host_metadata() {
+        let cache_root = unique_temp_dir("remote-load");
+
+        super::merge_remote_records(
+            &cache_root,
+            "laptop",
+            vec![
+                remote_record("claude", "a", "2026-05-01T00:00:00Z", 10),
+                remote_record("codex", "b", "2026-05-01T00:01:00Z", 20),
+            ],
+        )
+        .expect("merge remote records");
+
+        let records = super::load_remote_entries(&cache_root, None);
+
+        assert_eq!(
+            remote_fingerprints(&records),
+            vec![
+                (
+                    "claude".to_string(),
+                    "a".to_string(),
+                    Some("laptop".to_string()),
+                    10
+                ),
+                (
+                    "codex".to_string(),
+                    "b".to_string(),
+                    Some("laptop".to_string()),
+                    20
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_records_deduplicate_by_vendor_and_key() {
+        let cache_root = unique_temp_dir("remote-dedup");
+
+        super::merge_remote_records(
+            &cache_root,
+            "laptop",
+            vec![
+                remote_record("claude", "same", "2026-05-01T00:00:00Z", 10),
+                remote_record("codex", "same", "2026-05-01T00:01:00Z", 20),
+            ],
+        )
+        .expect("merge first batch");
+        super::merge_remote_records(
+            &cache_root,
+            "laptop",
+            vec![remote_record("claude", "same", "2026-05-01T00:02:00Z", 99)],
+        )
+        .expect("merge duplicate batch");
+
+        let records = super::load_remote_entries(&cache_root, None);
+
+        assert_eq!(
+            remote_fingerprints(&records),
+            vec![
+                (
+                    "claude".to_string(),
+                    "same".to_string(),
+                    Some("laptop".to_string()),
+                    10
+                ),
+                (
+                    "codex".to_string(),
+                    "same".to_string(),
+                    Some("laptop".to_string()),
+                    20
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_load_honors_host_filter() {
+        let cache_root = unique_temp_dir("remote-filter");
+        super::merge_remote_records(
+            &cache_root,
+            "laptop",
+            vec![remote_record("claude", "a", "2026-05-01T00:00:00Z", 10)],
+        )
+        .expect("merge laptop");
+        super::merge_remote_records(
+            &cache_root,
+            "workstation",
+            vec![remote_record("claude", "b", "2026-05-01T00:01:00Z", 20)],
+        )
+        .expect("merge workstation");
+        let filter = HashSet::from(["workstation".to_string()]);
+
+        let records = super::load_remote_entries(&cache_root, Some(&filter));
+
+        assert_eq!(
+            remote_fingerprints(&records),
+            vec![(
+                "claude".to_string(),
+                "b".to_string(),
+                Some("workstation".to_string()),
+                20,
+            )]
+        );
     }
 
     #[test]

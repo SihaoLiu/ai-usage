@@ -127,6 +127,7 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
         entries.push(SourceUsageRecord {
             dedup_key,
             entry: UsageEntry {
+                host_id: None,
                 timestamp: timestamp.clone(),
                 parsed_timestamp: parsed_ts,
                 session_start_time: timestamp.clone(),

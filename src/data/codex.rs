@@ -219,6 +219,7 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                         let ts_owned = entry_timestamp.to_string();
                         results.push(RawEntry {
                             entry: UsageEntry {
+                                host_id: None,
                                 timestamp: ts_owned.clone(),
                                 parsed_timestamp: parsed_ts,
                                 session_start_time: ts_owned.clone(),

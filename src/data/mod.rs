@@ -10,6 +10,7 @@ use chrono::{DateTime, Local};
 /// All vendor-specific data is normalized into this common format.
 #[derive(Debug, Clone)]
 pub struct UsageEntry {
+    pub host_id: Option<String>,
     pub timestamp: String,
     pub parsed_timestamp: Option<DateTime<Local>>,
     pub session_start_time: String,
@@ -66,6 +67,7 @@ mod tests {
     fn entry_at(timestamp: DateTime<Local>, input_tokens: i64) -> UsageEntry {
         let timestamp = timestamp.to_rfc3339();
         UsageEntry {
+            host_id: None,
             timestamp: timestamp.clone(),
             parsed_timestamp: parse_timestamp(&timestamp),
             session_start_time: timestamp.clone(),

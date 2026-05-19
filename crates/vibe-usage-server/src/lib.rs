@@ -9,9 +9,9 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde::Deserialize;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use vibe_usage_proto::{
@@ -21,6 +21,8 @@ use vibe_usage_proto::{
 
 type DbPool = Pool<SqliteConnectionManager>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+const RATE_LIMIT_REFILL_PER_SECOND: f64 = 1.0;
+const RATE_LIMIT_BURST: f64 = 30.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -49,6 +51,13 @@ pub struct AppState {
     config: Arc<ServerConfig>,
     pool: DbPool,
     started_at: Instant,
+    rate_limiter: Arc<Mutex<HashMap<String, BucketState>>>,
+}
+
+#[derive(Debug, Clone)]
+struct BucketState {
+    tokens: f64,
+    last_refill: Instant,
 }
 
 impl ServerConfig {
@@ -98,6 +107,7 @@ impl AppState {
             config: Arc::new(config),
             pool,
             started_at: Instant::now(),
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -405,9 +415,35 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let expected = state.config.shared_token.as_bytes();
     let provided = token.as_bytes();
     if provided.len() == expected.len() && provided.ct_eq(expected).into() {
-        Ok(())
+        check_rate_limit(state, token)
     } else {
         Err(AppError::unauthorized())
+    }
+}
+
+fn check_rate_limit(state: &AppState, token: &str) -> Result<(), AppError> {
+    let now = Instant::now();
+    let mut buckets = state
+        .rate_limiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bucket = buckets.entry(token.to_string()).or_insert(BucketState {
+        tokens: RATE_LIMIT_BURST,
+        last_refill: now,
+    });
+
+    let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+    bucket.tokens = (bucket.tokens + elapsed * RATE_LIMIT_REFILL_PER_SECOND).min(RATE_LIMIT_BURST);
+    bucket.last_refill = now;
+
+    if bucket.tokens >= 1.0 {
+        bucket.tokens -= 1.0;
+        Ok(())
+    } else {
+        Err(AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded",
+        ))
     }
 }
 

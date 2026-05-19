@@ -257,3 +257,50 @@ async fn oversized_body_returns_payload_too_large() {
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+#[tokio::test]
+async fn concurrent_uploads_from_two_clients_succeed() {
+    let app = app("concurrent").await;
+    let first = app.clone().oneshot(authed_request(
+        "POST",
+        "/v1/upload",
+        ndjson(&[record("laptop", "claude", "a", 10)]),
+    ));
+    let second = app.clone().oneshot(authed_request(
+        "POST",
+        "/v1/upload",
+        ndjson(&[record("workstation", "codex", "b", 20)]),
+    ));
+
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(first.expect("first response").status(), StatusCode::OK);
+    assert_eq!(second.expect("second response").status(), StatusCode::OK);
+
+    let pull = app
+        .oneshot(authed_request("GET", "/v1/pull?after_seq=0", Body::empty()))
+        .await
+        .expect("pull response");
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 2);
+}
+
+#[tokio::test]
+async fn token_bucket_rejects_after_burst_is_spent() {
+    let app = app("rate-limit").await;
+
+    for _ in 0..30 {
+        let response = app
+            .clone()
+            .oneshot(authed_request("GET", "/v1/machines", Body::empty()))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = app
+        .oneshot(authed_request("GET", "/v1/machines", Body::empty()))
+        .await
+        .expect("limited response");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}

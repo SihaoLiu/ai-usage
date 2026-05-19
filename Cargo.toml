@@ -35,3 +35,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+vibe-usage-server = { path = "crates/vibe-usage-server" }

@@ -1515,6 +1515,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vibe-usage"
 version = "1.5.12"
 dependencies = [
+ "axum",
  "bincode",
  "chrono",
  "clap",
@@ -1525,8 +1526,10 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "tokio",
  "ureq",
  "vibe-usage-proto",
+ "vibe-usage-server",
  "walkdir",
 ]
 

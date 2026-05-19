@@ -4,6 +4,7 @@ mod data;
 mod formatting;
 mod pricing;
 mod stats;
+mod sync;
 mod time_utils;
 mod updater;
 
@@ -1446,6 +1447,7 @@ fn print_stats(state: &mut AppState, once: bool) -> Option<bool> {
 fn main() {
     let args = Args::parse();
 
+    let _sync_config = sync::config::load_sync_config(false);
     let mut pricing = pricing::load_layered();
     pricing.codex_service_tier = resolve_codex_service_tier(&args.codex_service_tier);
     let subscription_fees = load_subscription_fees().unwrap_or_else(prompt_subscription_fees);

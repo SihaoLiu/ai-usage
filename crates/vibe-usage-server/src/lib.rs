@@ -102,6 +102,7 @@ impl AppState {
         {
             let conn = pool.get()?;
             conn.execute_batch(include_str!("../migrations/0001_init.sql"))?;
+            ensure_fast_tier_column(&conn)?;
         }
         Ok(Self {
             config: Arc::new(config),
@@ -226,10 +227,10 @@ async fn upload(
         let changed = tx.execute(
             "INSERT OR IGNORE INTO records (
                 host_id, vendor, dedup_key, schema_version, timestamp_utc,
-                session_start, session_end, model, effort, input_tokens,
+                session_start, session_end, model, effort, fast_tier, input_tokens,
                 output_tokens, cache_read, cache_creation, reasoning_out,
                 project_hash, uploaded_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 record.host_id,
                 record.vendor,
@@ -240,6 +241,7 @@ async fn upload(
                 record.session_end_time,
                 record.model,
                 record.effort,
+                i64::from(record.fast_tier),
                 record.input_tokens,
                 record.output_tokens,
                 record.cache_read_input_tokens,
@@ -298,7 +300,7 @@ async fn pull(
     let conn = state.pool.get()?;
     let mut sql = String::from(
         "SELECT seq, host_id, vendor, dedup_key, schema_version, timestamp_utc,
-            session_start, session_end, model, effort, input_tokens, output_tokens,
+            session_start, session_end, model, effort, fast_tier, input_tokens, output_tokens,
             cache_read, cache_creation, reasoning_out, project_hash, uploaded_at
          FROM records
          WHERE seq > ?1",
@@ -460,15 +462,30 @@ fn row_to_sequenced_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sequence
             session_end_time: row.get(7)?,
             model: row.get(8)?,
             effort: row.get(9)?,
-            input_tokens: row.get(10)?,
-            output_tokens: row.get(11)?,
-            cache_read_input_tokens: row.get(12)?,
-            cache_creation_input_tokens: row.get(13)?,
-            reasoning_output_tokens: row.get(14)?,
-            project_path_sha256: row.get(15)?,
+            fast_tier: row.get(10)?,
+            input_tokens: row.get(11)?,
+            output_tokens: row.get(12)?,
+            cache_read_input_tokens: row.get(13)?,
+            cache_creation_input_tokens: row.get(14)?,
+            reasoning_output_tokens: row.get(15)?,
+            project_path_sha256: row.get(16)?,
         },
-        uploaded_at: row.get(16)?,
+        uploaded_at: row.get(17)?,
     })
+}
+
+fn ensure_fast_tier_column(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(records)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "fast_tier") {
+        conn.execute(
+            "ALTER TABLE records ADD COLUMN fast_tier INTEGER NOT NULL DEFAULT -1",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn max_seq(conn: &rusqlite::Connection) -> rusqlite::Result<u64> {

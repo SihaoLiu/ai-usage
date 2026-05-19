@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use walkdir::WalkDir;
 
-use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
+use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
 use crate::time_utils::parse_timestamp;
 
 /// Get Claude configuration directories.
@@ -21,6 +21,21 @@ pub fn get_claude_dirs() -> Vec<PathBuf> {
 
     let home = dirs_home();
     vec![home.join(".config/claude"), home.join(".claude")]
+}
+
+pub fn detect_fast_tier_snapshot() -> i8 {
+    get_claude_dirs()
+        .into_iter()
+        .find_map(|dir| {
+            parse_fast_mode_setting(&fs::read_to_string(dir.join("settings.json")).ok()?)
+        })
+        .map(|enabled| if enabled { 1 } else { 0 })
+        .unwrap_or(0)
+}
+
+fn parse_fast_mode_setting(content: &str) -> Option<bool> {
+    let json = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    json.get("fastMode").and_then(|value| value.as_bool())
 }
 
 fn dirs_home() -> PathBuf {
@@ -134,6 +149,7 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
                 session_end_time: timestamp,
                 model,
                 effort: None,
+                fast_tier: UNKNOWN_FAST_TIER,
                 usage: TokenUsage {
                     input_tokens: usage
                         .get("input_tokens")

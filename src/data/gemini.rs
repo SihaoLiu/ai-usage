@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use walkdir::WalkDir;
 
-use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
+use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
 use crate::time_utils::parse_timestamp;
 
 /// Get the Gemini configuration directory.
@@ -75,6 +75,7 @@ fn read_single_gemini_file(path: &Path) -> Vec<UsageEntry> {
             session_end_time: timestamp,
             model,
             effort: None,
+            fast_tier: UNKNOWN_FAST_TIER,
             usage: TokenUsage {
                 input_tokens: non_cached_input,
                 output_tokens,

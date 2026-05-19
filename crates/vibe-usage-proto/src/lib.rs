@@ -4,6 +4,10 @@ use std::fmt;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+fn default_fast_tier() -> i8 {
+    -1
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireRecord {
     pub schema_version: u32,
@@ -15,6 +19,8 @@ pub struct WireRecord {
     pub session_end_time: String,
     pub model: String,
     pub effort: Option<String>,
+    #[serde(default = "default_fast_tier")]
+    pub fast_tier: i8,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
@@ -226,6 +232,7 @@ mod tests {
             session_end_time: "2026-05-18T12:34:56Z".to_string(),
             model: "claude-sonnet-4".to_string(),
             effort: Some("high".to_string()),
+            fast_tier: 1,
             input_tokens: 10,
             output_tokens: 20,
             cache_read_input_tokens: 30,
@@ -302,6 +309,32 @@ mod tests {
         record.output_tokens = -1;
 
         assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn missing_fast_tier_defaults_to_unknown() {
+        let record: WireRecord = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "host_id": "workstation-home",
+                "vendor": "claude",
+                "dedup_key": "source-record-1",
+                "timestamp": "2026-05-18T12:34:56Z",
+                "session_start_time": "2026-05-18T12:30:00Z",
+                "session_end_time": "2026-05-18T12:34:56Z",
+                "model": "claude-sonnet-4",
+                "effort": "high",
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 40,
+                "reasoning_output_tokens": 50,
+                "project_path_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }"#,
+        )
+        .expect("deserialize");
+
+        assert_eq!(record.fast_tier, -1);
     }
 
     #[test]

@@ -21,11 +21,11 @@ use clap::{Parser, Subcommand};
 use crossterm::terminal;
 
 use constants::{
-    AllPricing, CodexServiceTier, ModelPricing, SubscriptionFees, load_subscription_fees,
-    prompt_subscription_fees,
+    AllPricing, ModelPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees,
 };
 use data::UsageEntry;
-use data::codex::{detect_service_tier_from_config, get_codex_dir};
+use data::claude::detect_fast_tier_snapshot as detect_claude_fast_tier_snapshot;
+use data::codex::{detect_fast_tier_snapshot as detect_codex_fast_tier_snapshot, get_codex_dir};
 use data::gemini::get_gemini_dir;
 use formatting::print_model_breakdown;
 use stats::{ModelBreakdownRow, VendorTimeSeries};
@@ -337,18 +337,6 @@ struct Args {
     #[arg(long)]
     host: Option<String>,
 
-    /// Override the Codex API service tier used for cost calculation.
-    /// `auto` (default) reads `service_tier` from `~/.codex/config.toml`.
-    /// `fast` (a.k.a. `priority`) applies the fast multipliers (gpt-5.5 = 2.5x,
-    /// gpt-5.4 family = 2x); `flex` applies the ~0.5x discount; `default`
-    /// forces standard API pricing. Has no effect on Claude/Gemini cost.
-    #[arg(
-        long = "codex-service-tier",
-        default_value = "auto",
-        value_parser = ["auto", "default", "standard", "fast", "priority", "flex"],
-    )]
-    codex_service_tier: String,
-
     #[command(subcommand)]
     command: Option<CliCommand>,
 }
@@ -371,17 +359,6 @@ enum SyncCommand {
         #[arg(long)]
         force: bool,
     },
-}
-
-/// Resolve the effective Codex service tier from CLI args, falling back to
-/// `~/.codex/config.toml` when the caller asked for `auto`.
-fn resolve_codex_service_tier(arg: &str) -> CodexServiceTier {
-    if !arg.eq_ignore_ascii_case("auto") {
-        return CodexServiceTier::from_str(arg).unwrap_or_default();
-    }
-    detect_service_tier_from_config()
-        .and_then(|raw| CodexServiceTier::from_str(&raw))
-        .unwrap_or_default()
 }
 
 fn get_terminal_size() -> (u16, u16) {
@@ -689,18 +666,22 @@ fn read_all_vendor_cached_snapshot_for_hosts(
 
 fn refresh_all_vendor_raw_full() -> RawDataCache {
     let cache_root = data::cache::default_cache_dir();
+    let claude_fast_tier = detect_claude_fast_tier_snapshot();
     let claude = data::cache::refresh_full_vendor_cache(
         &cache_root,
         "claude",
         data::claude::collect_usage_files(None),
+        claude_fast_tier,
         data::claude::read_jsonl_file_records,
     );
 
     let codex_dir = get_codex_dir().join("sessions");
+    let codex_fast_tier = detect_codex_fast_tier_snapshot();
     let codex = data::cache::refresh_full_vendor_cache(
         &cache_root,
         "codex",
         data::codex::collect_usage_files(&codex_dir, None),
+        codex_fast_tier,
         data::codex::read_codex_file_records,
     );
 
@@ -709,6 +690,7 @@ fn refresh_all_vendor_raw_full() -> RawDataCache {
         &cache_root,
         "gemini",
         data::gemini::collect_usage_files(&gemini_dir, None),
+        0,
         data::gemini::read_gemini_file_records,
     );
 
@@ -1362,7 +1344,7 @@ fn calculate_weighted_cost_per_mtok(
                 + entry.usage.cache_read_input_tokens
                 + extra;
 
-            let p = pricing.pricing_for_entry(vendor, &entry.model);
+            let p = pricing.pricing_for_entry(vendor, &entry.model, entry.fast_tier);
             api_cost +=
                 ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
             api_cost +=
@@ -1474,16 +1456,7 @@ fn get_version(state: &mut AppState, vendor: &str) -> String {
             }
         });
 
-    let mut version_str = format_local_version_label(display_name, current_version);
-
-    // Suffix the Codex label with the active API service tier when it deviates
-    // from the standard rate, so the user can tell at a glance whether the
-    // shown cost includes the fast/flex multiplier.
-    if vendor == "codex" && state.pricing.codex_service_tier != CodexServiceTier::Default {
-        version_str.push_str(" [");
-        version_str.push_str(state.pricing.codex_service_tier.label());
-        version_str.push_str(" tier]");
-    }
+    let version_str = format_local_version_label(display_name, current_version);
 
     state.version_cache.insert(
         vendor.to_string(),
@@ -1637,14 +1610,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         _ => "Claude Code",
     };
 
-    let tier_suffix = if vendor.as_str() == "codex"
-        && state.pricing.codex_service_tier != CodexServiceTier::Default
-    {
-        format!(" [{} tier]", state.pricing.codex_service_tier.label())
-    } else {
-        String::new()
-    };
-    println!("Calculating {}{} usage...", vendor_name, tier_suffix);
+    println!("Calculating {} usage...", vendor_name);
     println!("{}", showing_data_line(&state.time_window, now));
     if !once {
         println!(
@@ -2004,8 +1970,7 @@ fn main() {
         std::process::exit(code);
     }
 
-    let mut pricing = pricing::load_layered();
-    pricing.codex_service_tier = resolve_codex_service_tier(&args.codex_service_tier);
+    let pricing = pricing::load_layered();
     let subscription_fees = load_subscription_fees().unwrap_or_else(prompt_subscription_fees);
     let local_host_id = match &sync_config {
         sync::config::SyncConfig::Enabled(config) => Some(config.machine_id.clone()),
@@ -3601,6 +3566,7 @@ mod tests {
                         session_end_time: timestamp.to_string(),
                         model: "model-a".to_string(),
                         effort: None,
+                        fast_tier: -1,
                         usage: data::TokenUsage::default(),
                     },
                 },
@@ -3615,6 +3581,7 @@ mod tests {
                         session_end_time: timestamp.to_string(),
                         model: "model-b".to_string(),
                         effort: None,
+                        fast_tier: -1,
                         usage: data::TokenUsage::default(),
                     },
                 },

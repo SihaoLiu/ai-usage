@@ -236,6 +236,7 @@ fn cached_record_to_wire(
         session_end_time: record.entry.session_end_time.clone(),
         model: record.entry.model.clone(),
         effort: record.entry.effort.clone(),
+        fast_tier: record.entry.fast_tier,
         input_tokens: record.entry.usage.input_tokens,
         output_tokens: record.entry.usage.output_tokens,
         cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
@@ -279,6 +280,7 @@ fn wire_to_remote_record(record: WireRecord) -> RemoteUsageRecord {
             session_end_time: record.session_end_time,
             model: record.model,
             effort: record.effort,
+            fast_tier: record.fast_tier,
             usage: TokenUsage {
                 input_tokens: record.input_tokens,
                 output_tokens: record.output_tokens,
@@ -361,6 +363,7 @@ mod tests {
                 session_end_time: timestamp.to_string(),
                 model: "test-model".to_string(),
                 effort: None,
+                fast_tier: -1,
                 usage: TokenUsage {
                     input_tokens,
                     output_tokens: 2,
@@ -375,19 +378,29 @@ mod tests {
     fn populate_vendor_cache(cache_root: &Path, vendor: &str, key: &str) {
         let source = cache_root.join(format!("{vendor}.jsonl"));
         std::fs::write(&source, "source").expect("write source");
-        crate::data::cache::load_or_update_vendor_cache(cache_root, vendor, vec![source], |_| {
-            vec![usage_record(key, "2026-05-18T12:00:00Z", 10)]
-        });
+        crate::data::cache::load_or_update_vendor_cache(
+            cache_root,
+            vendor,
+            vec![source],
+            1,
+            |_| vec![usage_record(key, "2026-05-18T12:00:00Z", 10)],
+        );
     }
 
     fn populate_vendor_cache_with_count(cache_root: &Path, vendor: &str, count: usize) {
         let source = cache_root.join(format!("{vendor}.jsonl"));
         std::fs::write(&source, "source").expect("write source");
-        crate::data::cache::load_or_update_vendor_cache(cache_root, vendor, vec![source], |_| {
-            (0..count)
-                .map(|idx| usage_record(&format!("dedup-{idx}"), "2026-05-18T12:00:00Z", 10))
-                .collect()
-        });
+        crate::data::cache::load_or_update_vendor_cache(
+            cache_root,
+            vendor,
+            vec![source],
+            0,
+            |_| {
+                (0..count)
+                    .map(|idx| usage_record(&format!("dedup-{idx}"), "2026-05-18T12:00:00Z", 10))
+                    .collect()
+            },
+        );
     }
 
     fn enabled_config(machine_id: &str) -> crate::sync::config::EnabledSyncConfig {
@@ -419,6 +432,7 @@ mod tests {
         assert_eq!(uploads[0][0].host_id, "workstation");
         assert_eq!(uploads[0][0].vendor, "claude");
         assert_eq!(uploads[0][0].dedup_key, "dedup-a");
+        assert_eq!(uploads[0][0].fast_tier, 1);
         assert!(uploads[0][0].project_path_sha256.is_some());
         assert!(
             crate::sync::state::load_upload_log(&cache_root)
@@ -491,6 +505,7 @@ mod tests {
                 session_end_time: "2026-05-18T12:05:00Z".to_string(),
                 model: "remote-model".to_string(),
                 effort: Some("high".to_string()),
+                fast_tier: 1,
                 input_tokens: 11,
                 output_tokens: 12,
                 cache_read_input_tokens: 13,
@@ -586,6 +601,7 @@ mod tests {
                 session_end_time: "2026-05-18T12:05:00Z".to_string(),
                 model: "remote-model".to_string(),
                 effort: Some("high".to_string()),
+                fast_tier: 1,
                 input_tokens: 11,
                 output_tokens: 12,
                 cache_read_input_tokens: 13,
@@ -608,6 +624,7 @@ mod tests {
         assert_eq!(remote[0].vendor, "codex");
         assert_eq!(remote[0].dedup_key, "remote-a");
         assert_eq!(remote[0].entry.host_id, Some("laptop".to_string()));
+        assert_eq!(remote[0].entry.fast_tier, 1);
         assert_eq!(
             crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
             7

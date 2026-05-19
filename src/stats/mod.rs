@@ -114,9 +114,9 @@ pub(crate) fn calculate_model_breakdown_generic(
         }
 
         // Apply tiered pricing per-entry. Use entry.model (without the effort
-        // suffix) so the lookup matches pricing.json keys. For Codex this
-        // also folds in the active service tier (fast/flex multiplier).
-        let p = pricing.pricing_for_entry(vendor, &entry.model);
+        // suffix) so the lookup matches pricing.json keys and the stored
+        // fast tier snapshot can be applied per record.
+        let p = pricing.pricing_for_entry(vendor, &entry.model, entry.fast_tier);
         row.input_cost +=
             ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
         row.output_cost +=

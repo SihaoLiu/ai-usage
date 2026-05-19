@@ -233,6 +233,7 @@ mod tests {
             session_end_time: "2026-05-18T12:05:00Z".to_string(),
             model: "test-model".to_string(),
             effort: None,
+            fast_tier: 1,
             input_tokens: 1,
             output_tokens: 2,
             cache_read_input_tokens: 3,
@@ -275,6 +276,7 @@ mod tests {
         assert_eq!(pull.records.len(), 1);
         assert_eq!(pull.records[0].record.host_id, "laptop");
         assert_eq!(pull.records[0].record.dedup_key, "remote-a");
+        assert_eq!(pull.records[0].record.fast_tier, 1);
 
         let machines_client = client.clone();
         let machines = tokio::task::spawn_blocking(move || machines_client.machines())

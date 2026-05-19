@@ -6,6 +6,8 @@ pub mod gemini;
 use crate::time_utils::{TimeWindow, parse_timestamp};
 use chrono::{DateTime, Local};
 
+pub const UNKNOWN_FAST_TIER: i8 = -1;
+
 /// Normalized usage entry shared across all vendors.
 /// All vendor-specific data is normalized into this common format.
 #[derive(Debug, Clone)]
@@ -17,6 +19,7 @@ pub struct UsageEntry {
     pub session_end_time: String,
     pub model: String,
     pub effort: Option<String>,
+    pub fast_tier: i8,
     pub usage: TokenUsage,
 }
 
@@ -74,6 +77,7 @@ mod tests {
             session_end_time: timestamp,
             model: "test-model".to_string(),
             effort: None,
+            fast_tier: UNKNOWN_FAST_TIER,
             usage: TokenUsage {
                 input_tokens,
                 output_tokens: 0,

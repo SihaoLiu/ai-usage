@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS records (
     session_end    TEXT NOT NULL,
     model          TEXT NOT NULL,
     effort         TEXT,
+    fast_tier      INTEGER NOT NULL DEFAULT -1,
     input_tokens   INTEGER NOT NULL,
     output_tokens  INTEGER NOT NULL,
     cache_read     INTEGER NOT NULL,

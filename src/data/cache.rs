@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
+use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
 use crate::time_utils::parse_timestamp;
 
 const CACHE_VERSION: u32 = 1;
@@ -116,6 +116,8 @@ struct PersistedSourceRecord {
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
     reasoning_output_tokens: i64,
+    #[serde(default = "default_fast_tier")]
+    fast_tier: i8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,12 +140,58 @@ struct PersistedRemoteRecord {
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
     reasoning_output_tokens: i64,
+    #[serde(default = "default_fast_tier")]
+    fast_tier: i8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedRemoteRecords {
     format_version: u32,
     records: Vec<PersistedRemoteRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedVendorRecordsV1 {
+    format_version: u32,
+    records: Vec<PersistedSourceRecordV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSourceRecordV1 {
+    source_path: String,
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
+    effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRemoteRecordsV1 {
+    format_version: u32,
+    records: Vec<PersistedRemoteRecordV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRemoteRecordV1 {
+    vendor: String,
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
+    effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -161,8 +209,67 @@ pub struct CachedUsageRecord {
     pub entry: UsageEntry,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SourceRecordFingerprint {
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
+    effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+fn default_fast_tier() -> i8 {
+    UNKNOWN_FAST_TIER
+}
+
+impl From<PersistedSourceRecordV1> for PersistedSourceRecord {
+    fn from(record: PersistedSourceRecordV1) -> Self {
+        Self {
+            source_path: record.source_path,
+            dedup_key: record.dedup_key,
+            timestamp: record.timestamp,
+            session_start_time: record.session_start_time,
+            session_end_time: record.session_end_time,
+            model: record.model,
+            effort: record.effort,
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            cache_read_input_tokens: record.cache_read_input_tokens,
+            cache_creation_input_tokens: record.cache_creation_input_tokens,
+            reasoning_output_tokens: record.reasoning_output_tokens,
+            fast_tier: UNKNOWN_FAST_TIER,
+        }
+    }
+}
+
+impl From<PersistedRemoteRecordV1> for PersistedRemoteRecord {
+    fn from(record: PersistedRemoteRecordV1) -> Self {
+        Self {
+            vendor: record.vendor,
+            dedup_key: record.dedup_key,
+            timestamp: record.timestamp,
+            session_start_time: record.session_start_time,
+            session_end_time: record.session_end_time,
+            model: record.model,
+            effort: record.effort,
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            cache_read_input_tokens: record.cache_read_input_tokens,
+            cache_creation_input_tokens: record.cache_creation_input_tokens,
+            reasoning_output_tokens: record.reasoning_output_tokens,
+            fast_tier: UNKNOWN_FAST_TIER,
+        }
+    }
+}
+
 impl PersistedSourceRecord {
-    fn from_source_record(source_path: String, record: SourceUsageRecord) -> Self {
+    fn from_source_record(source_path: String, record: SourceUsageRecord, fast_tier: i8) -> Self {
         Self {
             source_path,
             dedup_key: record.dedup_key,
@@ -176,6 +283,7 @@ impl PersistedSourceRecord {
             cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
             cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
             reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+            fast_tier,
         }
     }
 
@@ -188,6 +296,7 @@ impl PersistedSourceRecord {
             session_end_time: self.session_end_time.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            fast_tier: self.fast_tier,
             usage: TokenUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
@@ -224,6 +333,7 @@ impl PersistedRemoteRecord {
             cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
             cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
             reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+            fast_tier: record.entry.fast_tier,
         }
     }
 
@@ -239,6 +349,7 @@ impl PersistedRemoteRecord {
                 session_end_time: self.session_end_time.clone(),
                 model: self.model.clone(),
                 effort: self.effort.clone(),
+                fast_tier: self.fast_tier,
                 usage: TokenUsage {
                     input_tokens: self.input_tokens,
                     output_tokens: self.output_tokens,
@@ -374,30 +485,47 @@ pub fn load_or_update_vendor_cache<F>(
     cache_root: &Path,
     vendor: &str,
     source_files: Vec<PathBuf>,
+    current_fast_tier: i8,
     parse_file: F,
 ) -> Vec<UsageEntry>
 where
     F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
 {
-    load_or_update_vendor_cache_inner(cache_root, vendor, source_files, parse_file, true)
+    load_or_update_vendor_cache_inner(
+        cache_root,
+        vendor,
+        source_files,
+        current_fast_tier,
+        parse_file,
+        true,
+    )
 }
 
 pub fn refresh_full_vendor_cache<F>(
     cache_root: &Path,
     vendor: &str,
     source_files: Vec<PathBuf>,
+    current_fast_tier: i8,
     parse_file: F,
 ) -> Vec<UsageEntry>
 where
     F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
 {
-    load_or_update_vendor_cache_inner(cache_root, vendor, source_files, parse_file, false)
+    load_or_update_vendor_cache_inner(
+        cache_root,
+        vendor,
+        source_files,
+        current_fast_tier,
+        parse_file,
+        false,
+    )
 }
 
 fn load_or_update_vendor_cache_inner<F>(
     cache_root: &Path,
     vendor: &str,
     source_files: Vec<PathBuf>,
+    current_fast_tier: i8,
     parse_file: F,
     retain_inactive_sources: bool,
 ) -> Vec<UsageEntry>
@@ -408,7 +536,7 @@ where
     if fs::create_dir_all(cache_root).is_err()
         || fs::create_dir_all(cache_root.join(ENTRIES_DIR)).is_err()
     {
-        let records = parse_active_sources(&active_sources, &parse_file);
+        let records = parse_active_sources(&active_sources, current_fast_tier, &parse_file);
         return aggregate_persisted_records(records.iter());
     }
 
@@ -425,6 +553,7 @@ where
                 &manifest_path,
                 manifest,
                 active_sources,
+                current_fast_tier,
                 &parse_file,
             );
         }
@@ -454,9 +583,18 @@ where
             records_by_path.remove(&source.key).unwrap_or_default()
         } else {
             cache_changed = true;
+            let previous_records = records_by_path.remove(&source.key).unwrap_or_default();
+            let mut fast_tiers = fast_tiers_by_fingerprint(&previous_records);
             parse_file(&source.path)
                 .into_iter()
-                .map(|record| PersistedSourceRecord::from_source_record(source.key.clone(), record))
+                .map(|record| {
+                    let fingerprint = source_record_fingerprint(&record);
+                    let fast_tier = fast_tiers
+                        .get_mut(&fingerprint)
+                        .and_then(|tiers| tiers.pop_front())
+                        .unwrap_or(current_fast_tier);
+                    PersistedSourceRecord::from_source_record(source.key.clone(), record, fast_tier)
+                })
                 .collect()
         };
 
@@ -508,12 +646,13 @@ fn rebuild_vendor_cache<F>(
     manifest_path: &Path,
     mut manifest: CacheManifest,
     active_sources: Vec<CurrentSource>,
+    current_fast_tier: i8,
     parse_file: &F,
 ) -> Vec<UsageEntry>
 where
     F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
 {
-    let active_records = parse_active_sources(&active_sources, parse_file);
+    let active_records = parse_active_sources(&active_sources, current_fast_tier, parse_file);
     let mut vendor_manifest = VendorManifest::default();
     let stats = record_stats_by_path(&active_records);
 
@@ -537,6 +676,7 @@ where
 
 fn parse_active_sources<F>(
     active_sources: &[CurrentSource],
+    current_fast_tier: i8,
     parse_file: &F,
 ) -> Vec<PersistedSourceRecord>
 where
@@ -547,7 +687,13 @@ where
         .map(|source| {
             parse_file(&source.path)
                 .into_iter()
-                .map(|record| PersistedSourceRecord::from_source_record(source.key.clone(), record))
+                .map(|record| {
+                    PersistedSourceRecord::from_source_record(
+                        source.key.clone(),
+                        record,
+                        current_fast_tier,
+                    )
+                })
                 .collect()
         })
         .collect();
@@ -679,7 +825,27 @@ fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
             "cache entry checksum mismatch",
         ));
     }
-    let decoded: PersistedVendorRecords = bincode::deserialize(payload)
+    if let Ok(decoded) = bincode::deserialize::<PersistedVendorRecords>(payload) {
+        if decoded.format_version != CACHE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported cache entry version",
+            ));
+        }
+        if decoded
+            .records
+            .iter()
+            .any(|record| !record.has_non_negative_token_usage())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache entry has negative token count",
+            ));
+        }
+        return Ok(decoded.records);
+    }
+
+    let decoded: PersistedVendorRecordsV1 = bincode::deserialize(payload)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     if decoded.format_version != CACHE_VERSION {
         return Err(io::Error::new(
@@ -687,8 +853,8 @@ fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
             "unsupported cache entry version",
         ));
     }
-    if decoded
-        .records
+    let records: Vec<PersistedSourceRecord> = decoded.records.into_iter().map(Into::into).collect();
+    if records
         .iter()
         .any(|record| !record.has_non_negative_token_usage())
     {
@@ -697,7 +863,7 @@ fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
             "cache entry has negative token count",
         ));
     }
-    Ok(decoded.records)
+    Ok(records)
 }
 
 fn write_cached_records(path: &Path, records: &[PersistedSourceRecord]) -> io::Result<()> {
@@ -739,7 +905,27 @@ fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
             "remote cache entry checksum mismatch",
         ));
     }
-    let decoded: PersistedRemoteRecords = bincode::deserialize(payload)
+    if let Ok(decoded) = bincode::deserialize::<PersistedRemoteRecords>(payload) {
+        if decoded.format_version != CACHE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported remote cache entry version",
+            ));
+        }
+        if decoded
+            .records
+            .iter()
+            .any(|record| !record.has_non_negative_token_usage())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote cache entry has negative token count",
+            ));
+        }
+        return Ok(decoded.records);
+    }
+
+    let decoded: PersistedRemoteRecordsV1 = bincode::deserialize(payload)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     if decoded.format_version != CACHE_VERSION {
         return Err(io::Error::new(
@@ -747,8 +933,8 @@ fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
             "unsupported remote cache entry version",
         ));
     }
-    if decoded
-        .records
+    let records: Vec<PersistedRemoteRecord> = decoded.records.into_iter().map(Into::into).collect();
+    if records
         .iter()
         .any(|record| !record.has_non_negative_token_usage())
     {
@@ -757,7 +943,7 @@ fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
             "remote cache entry has negative token count",
         ));
     }
-    Ok(decoded.records)
+    Ok(records)
 }
 
 fn write_remote_records(path: &Path, records: &[PersistedRemoteRecord]) -> io::Result<()> {
@@ -803,6 +989,51 @@ fn records_by_path(
             .push(record);
     }
     result
+}
+
+fn fast_tiers_by_fingerprint(
+    records: &[PersistedSourceRecord],
+) -> HashMap<SourceRecordFingerprint, VecDeque<i8>> {
+    let mut tiers = HashMap::new();
+    for record in records {
+        tiers
+            .entry(persisted_record_fingerprint(record))
+            .or_insert_with(VecDeque::new)
+            .push_back(record.fast_tier);
+    }
+    tiers
+}
+
+fn source_record_fingerprint(record: &SourceUsageRecord) -> SourceRecordFingerprint {
+    SourceRecordFingerprint {
+        dedup_key: record.dedup_key.clone(),
+        timestamp: record.entry.timestamp.clone(),
+        session_start_time: record.entry.session_start_time.clone(),
+        session_end_time: record.entry.session_end_time.clone(),
+        model: record.entry.model.clone(),
+        effort: record.entry.effort.clone(),
+        input_tokens: record.entry.usage.input_tokens,
+        output_tokens: record.entry.usage.output_tokens,
+        cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
+        cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
+        reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+    }
+}
+
+fn persisted_record_fingerprint(record: &PersistedSourceRecord) -> SourceRecordFingerprint {
+    SourceRecordFingerprint {
+        dedup_key: record.dedup_key.clone(),
+        timestamp: record.timestamp.clone(),
+        session_start_time: record.session_start_time.clone(),
+        session_end_time: record.session_end_time.clone(),
+        model: record.model.clone(),
+        effort: record.effort.clone(),
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        cache_read_input_tokens: record.cache_read_input_tokens,
+        cache_creation_input_tokens: record.cache_creation_input_tokens,
+        reasoning_output_tokens: record.reasoning_output_tokens,
+    }
 }
 
 fn record_stats_by_path(records: &[PersistedSourceRecord]) -> HashMap<String, RecordStats> {
@@ -883,7 +1114,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
+    use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
@@ -910,6 +1141,7 @@ mod tests {
                 session_end_time: timestamp.to_string(),
                 model: "test-model".to_string(),
                 effort: None,
+                fast_tier: UNKNOWN_FAST_TIER,
                 usage: TokenUsage {
                     input_tokens,
                     output_tokens: 2,
@@ -945,6 +1177,7 @@ mod tests {
                 session_end_time: timestamp.to_string(),
                 model: "remote-model".to_string(),
                 effort: None,
+                fast_tier: UNKNOWN_FAST_TIER,
                 usage: TokenUsage {
                     input_tokens,
                     output_tokens: 2,
@@ -984,6 +1217,7 @@ mod tests {
         i64,
         i64,
         i64,
+        i8,
     );
 
     fn entry_fingerprints(entries: &[UsageEntry]) -> Vec<EntryFingerprint> {
@@ -1004,6 +1238,7 @@ mod tests {
                     entry.usage.cache_read_input_tokens,
                     entry.usage.cache_creation_input_tokens,
                     entry.usage.reasoning_output_tokens,
+                    entry.fast_tier,
                 )
             })
             .collect()
@@ -1032,9 +1267,10 @@ mod tests {
         let source = cache_root.join("source.jsonl");
         write_source(&source, "first");
 
-        let entries = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], |_| {
-            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-        });
+        let entries =
+            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
+                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
+            });
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].host_id, None);
@@ -1153,20 +1389,27 @@ mod tests {
         write_source(&source, "first");
         let calls = AtomicUsize::new(0);
 
-        let first =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source.clone()], |_| {
+        let first = super::load_or_update_vendor_cache(
+            &cache_root,
+            "test",
+            vec![source.clone()],
+            1,
+            |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
+            },
+        );
+        let second =
+            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], 0, |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 99)]
             });
-        let second = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], |_| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 99)]
-        });
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].usage.input_tokens, 42);
+        assert_eq!(second[0].fast_tier, 1);
     }
 
     #[test]
@@ -1176,16 +1419,21 @@ mod tests {
         write_source(&source, "first");
         let calls = AtomicUsize::new(0);
 
-        let _ =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source.clone()], |_| {
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "test",
+            vec![source.clone()],
+            1,
+            |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            });
+            },
+        );
         std::thread::sleep(Duration::from_millis(2));
         write_source(&source, "second-content");
 
         let refreshed =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], |_| {
+            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], 0, |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 99)]
             });
@@ -1193,6 +1441,38 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(refreshed.len(), 1);
         assert_eq!(refreshed[0].usage.input_tokens, 99);
+        assert_eq!(refreshed[0].fast_tier, 0);
+    }
+
+    #[test]
+    fn changed_source_file_preserves_matching_record_fast_tier() {
+        let cache_root = unique_temp_dir("changed-preserve-fast-tier");
+        let source = cache_root.join("source.jsonl");
+        write_source(&source, "first");
+        let calls = AtomicUsize::new(0);
+
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "test",
+            vec![source.clone()],
+            1,
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
+            },
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        write_source(&source, "second-content");
+
+        let refreshed =
+            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], 0, |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
+            });
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].fast_tier, 1);
     }
 
     #[test]
@@ -1202,18 +1482,24 @@ mod tests {
         write_source(&source, "first");
         let calls = AtomicUsize::new(0);
 
-        let _ =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source.clone()], |_| {
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "test",
+            vec![source.clone()],
+            -1,
+            |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            });
+            },
+        );
         fs::write(cache_root.join("entries").join("test.bin"), b"not binary")
             .expect("damage cache");
 
-        let rebuilt = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], |_| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
-        });
+        let rebuilt =
+            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
+            });
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(rebuilt.len(), 1);
@@ -1227,11 +1513,16 @@ mod tests {
         write_source(&source, "first");
         let calls = AtomicUsize::new(0);
 
-        let _ =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source.clone()], |_| {
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "test",
+            vec![source.clone()],
+            -1,
+            |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            });
+            },
+        );
 
         let entries_path = cache_root.join("entries").join("test.bin");
         let mut original = fs::read(&entries_path).expect("read cache");
@@ -1239,10 +1530,11 @@ mod tests {
         *last = last.wrapping_add(1);
         fs::write(&entries_path, original).expect("tamper cache");
 
-        let rebuilt = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], |_| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
-        });
+        let rebuilt =
+            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
+            });
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(entry_tokens(&rebuilt), vec![77]);
@@ -1255,18 +1547,24 @@ mod tests {
         write_source(&source, "first");
         let calls = AtomicUsize::new(0);
 
-        let _ =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source.clone()], |_| {
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "test",
+            vec![source.clone()],
+            -1,
+            |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 let mut record = usage_record("stable-key", "2026-05-01T00:00:00Z", 42);
                 record.entry.usage.output_tokens = -1;
                 vec![record]
-            });
+            },
+        );
 
-        let rebuilt = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], |_| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
-        });
+        let rebuilt =
+            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
+            });
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(entry_tokens(&rebuilt), vec![77]);
@@ -1285,6 +1583,7 @@ mod tests {
             &cache_root,
             "test",
             vec![first_source.clone(), second_source.clone()],
+            -1,
             |path| {
                 let input = if path == first_source { 10 } else { 20 };
                 vec![usage_record("same-key", "2026-05-01T00:00:00Z", input)]
@@ -1320,11 +1619,17 @@ mod tests {
         };
 
         let direct = direct_parse(source_files.clone(), parse);
-        let _ =
-            super::load_or_update_vendor_cache(&cache_root, "test", source_files.clone(), parse);
-        let cached = super::load_or_update_vendor_cache(&cache_root, "test", source_files, |_| {
-            panic!("unchanged files should not be reparsed")
-        });
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "test",
+            source_files.clone(),
+            -1,
+            parse,
+        );
+        let cached =
+            super::load_or_update_vendor_cache(&cache_root, "test", source_files, -1, |_| {
+                panic!("unchanged files should not be reparsed")
+            });
 
         assert_eq!(entry_tokens(&cached), entry_tokens(&direct));
         assert_eq!(entry_tokens(&cached), vec![1, 10, 30, 40]);
@@ -1360,7 +1665,8 @@ mod tests {
         };
 
         let direct = direct_parse(source_files.clone(), parse);
-        let refreshed = super::refresh_full_vendor_cache(&cache_root, "test", source_files, parse);
+        let refreshed =
+            super::refresh_full_vendor_cache(&cache_root, "test", source_files, -1, parse);
         let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
 
         assert_eq!(entry_fingerprints(&refreshed), entry_fingerprints(&direct));
@@ -1376,11 +1682,17 @@ mod tests {
 
         let parse = |_path: &Path| vec![usage_record("", "2026-05-01T00:00:00Z", 11)];
         let direct = direct_parse(source_files.clone(), parse);
-        let _ =
-            super::load_or_update_vendor_cache(&cache_root, "test", source_files.clone(), parse);
-        let cached = super::load_or_update_vendor_cache(&cache_root, "test", source_files, |_| {
-            panic!("unchanged files should not be reparsed")
-        });
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "test",
+            source_files.clone(),
+            -1,
+            parse,
+        );
+        let cached =
+            super::load_or_update_vendor_cache(&cache_root, "test", source_files, -1, |_| {
+                panic!("unchanged files should not be reparsed")
+            });
 
         assert_eq!(entry_tokens(&cached), entry_tokens(&direct));
         assert_eq!(entry_tokens(&cached), vec![11, 11]);
@@ -1392,15 +1704,54 @@ mod tests {
         let source = cache_root.join("source.jsonl");
         write_source(&source, "first");
 
-        let _ =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source.clone()], |_| {
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            });
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "test",
+            vec![source.clone()],
+            -1,
+            |_| vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)],
+        );
         fs::remove_file(source).expect("remove source");
 
         let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
 
         assert_eq!(entry_tokens(&snapshot), vec![42]);
+    }
+
+    #[test]
+    fn old_cached_records_default_to_unknown_fast_tier() {
+        let cache_root = unique_temp_dir("snapshot-old-fast-tier");
+        fs::create_dir_all(cache_root.join("entries")).expect("create entries dir");
+        let payload = bincode::serialize(&super::PersistedVendorRecordsV1 {
+            format_version: super::CACHE_VERSION,
+            records: vec![super::PersistedSourceRecordV1 {
+                source_path: "source.jsonl".to_string(),
+                dedup_key: "stable-key".to_string(),
+                timestamp: "2026-05-01T00:00:00Z".to_string(),
+                session_start_time: "2026-05-01T00:00:00Z".to_string(),
+                session_end_time: "2026-05-01T00:00:00Z".to_string(),
+                model: "test-model".to_string(),
+                effort: None,
+                input_tokens: 42,
+                output_tokens: 2,
+                cache_read_input_tokens: 3,
+                cache_creation_input_tokens: 4,
+                reasoning_output_tokens: 5,
+            }],
+        })
+        .expect("serialize old cache");
+        let checksum = super::fnv1a_bytes(0, &payload);
+        let mut content = Vec::new();
+        content.extend_from_slice(super::ENTRY_FILE_MAGIC);
+        content.extend_from_slice(&checksum.to_le_bytes());
+        content.extend_from_slice(&payload);
+        fs::write(cache_root.join("entries").join("test.bin"), content).expect("write old cache");
+
+        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].usage.input_tokens, 42);
+        assert_eq!(snapshot[0].fast_tier, UNKNOWN_FAST_TIER);
     }
 
     #[test]
@@ -1427,6 +1778,7 @@ mod tests {
             &cache_root,
             "test",
             vec![first_source.clone(), second_source.clone()],
+            -1,
             |path| {
                 if path == first_source {
                     vec![usage_record("first", "2026-05-01T00:00:00Z", 1)]
@@ -1438,7 +1790,7 @@ mod tests {
         fs::remove_file(&second_source).expect("remove source");
 
         let refreshed =
-            super::refresh_full_vendor_cache(&cache_root, "test", vec![first_source], |_| {
+            super::refresh_full_vendor_cache(&cache_root, "test", vec![first_source], -1, |_| {
                 vec![usage_record("first", "2026-05-01T00:00:00Z", 1)]
             });
         let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");

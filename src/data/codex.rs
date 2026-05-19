@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use walkdir::WalkDir;
 
-use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
+use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
 use crate::time_utils::parse_timestamp;
 
 /// When a Codex session is resumed via `--fork`, the new rollout file replays every
@@ -32,18 +32,20 @@ pub fn get_codex_dir() -> PathBuf {
         })
 }
 
-/// Read the top-level `service_tier` setting from `~/.codex/config.toml`.
-/// Returns the literal value (e.g. `"fast"`, `"flex"`) if present in the
-/// global section, or `None` when the key is absent or the file is missing.
-///
-/// Codex rollout JSONL files never store this per turn, so the global
-/// config setting is the only deterministic signal we have for whether
-/// `/fast` was active. We deliberately stop at the first `[section]` header
-/// so a per-profile `service_tier` doesn't get mistaken for the active one.
-pub fn detect_service_tier_from_config() -> Option<String> {
+fn read_top_level_service_tier_from_config() -> Option<String> {
     let path = get_codex_dir().join("config.toml");
     let content = fs::read_to_string(&path).ok()?;
     parse_top_level_service_tier(&content)
+}
+
+pub fn detect_fast_tier_snapshot() -> i8 {
+    let Some(raw) = read_top_level_service_tier_from_config() else {
+        return 0;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "fast" | "priority" => 1,
+        _ => 0,
+    }
 }
 
 fn parse_top_level_service_tier(content: &str) -> Option<String> {
@@ -225,6 +227,7 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                                 session_end_time: ts_owned,
                                 model: current_model.clone(),
                                 effort: Some(current_effort.clone()),
+                                fast_tier: UNKNOWN_FAST_TIER,
                                 usage: TokenUsage {
                                     input_tokens: non_cached_input,
                                     output_tokens,

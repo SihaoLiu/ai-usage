@@ -44,6 +44,7 @@ fn record(host_id: &str, vendor: &str, dedup_key: &str, input_tokens: i64) -> Wi
         session_end_time: "2026-05-18T12:05:00Z".to_string(),
         model: "test-model".to_string(),
         effort: None,
+        fast_tier: 1,
         input_tokens,
         output_tokens: 2,
         cache_read_input_tokens: 3,
@@ -175,6 +176,7 @@ async fn pull_filters_after_sequence_and_excluded_hosts() {
     assert_eq!(body.records.len(), 1);
     assert_eq!(body.records[0].seq, 2);
     assert_eq!(body.records[0].record.host_id, "workstation");
+    assert_eq!(body.records[0].record.fast_tier, 1);
     assert_eq!(body.max_seq, 3);
     assert!(!body.truncated);
 }

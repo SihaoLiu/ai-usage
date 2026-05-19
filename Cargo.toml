@@ -3,6 +3,13 @@ name = "vibe-usage"
 version = "1.5.12"
 edition = "2024"
 
+[workspace]
+members = [
+    ".",
+    "crates/vibe-usage-proto",
+]
+resolver = "3"
+
 [[bin]]
 name = "vibe-usage"
 path = "src/main.rs"

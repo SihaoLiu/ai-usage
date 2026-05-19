@@ -1045,6 +1045,85 @@ fn prompt_notice_expired(notice: &Option<PromptNotice>, now: std::time::Instant)
         .unwrap_or(false)
 }
 
+#[derive(Clone, Copy)]
+enum PromptBlockMode {
+    Append,
+    Replace,
+}
+
+fn truncate_chars(text: &str, width: usize) -> String {
+    text.chars().take(width).collect()
+}
+
+fn format_monitor_status_line(left: &str, right: Option<&str>, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let Some(right) = right.filter(|text| !text.is_empty()) else {
+        return truncate_chars(left, width);
+    };
+    let right_width = right.chars().count();
+    if right_width >= width {
+        return truncate_chars(right, width);
+    }
+
+    let left_width = left.chars().count();
+    if left_width + right_width < width {
+        return format!(
+            "{}{}{}",
+            left,
+            " ".repeat(width - left_width - right_width),
+            right
+        );
+    }
+
+    let left_limit = width.saturating_sub(right_width + 1);
+    format!("{} {}", truncate_chars(left, left_limit), right)
+}
+
+fn monitor_status_title(state: &mut AppState) -> String {
+    if state.vendor == "all" {
+        state
+            .all_vendor_prompt
+            .clone()
+            .unwrap_or_else(|| "All Vendors Comparison".to_string())
+    } else {
+        let vendor = state.vendor.clone();
+        get_version(state, &vendor)
+    }
+}
+
+fn render_monitor_prompt_block(
+    state: &mut AppState,
+    input: &InputLine,
+    too_small: bool,
+    notice: Option<&PromptNotice>,
+    sync_status: Option<&str>,
+    mode: PromptBlockMode,
+) -> bool {
+    if too_small {
+        return false;
+    }
+
+    let (width, _) = get_terminal_size();
+    let width = width as usize;
+    let title = monitor_status_title(state);
+    let status_line = format_monitor_status_line(&title, sync_status, width);
+
+    match mode {
+        PromptBlockMode::Append => {
+            println!("\n\r{}\r", status_line);
+        }
+        PromptBlockMode::Replace => {
+            print!("\x1b[2A\r\x1b[K{}\r\n", status_line);
+        }
+    }
+    println!("\r{}\r", "-".repeat(width));
+    render_prompt_line(input, too_small, notice, state.integrity_status);
+    true
+}
+
 fn render_prompt_line(
     input: &InputLine,
     too_small: bool,
@@ -1083,6 +1162,38 @@ fn render_prompt_line(
     let cursor_col = (3 + input.cursor_chars()).min(width.max(1));
     print!("\x1b[{}G", cursor_col);
     io::stdout().flush().unwrap();
+}
+
+fn host_label(host: Option<&str>) -> &str {
+    host.unwrap_or("all")
+}
+
+fn parse_host_selection(selection: &str) -> Result<Option<String>, &'static str> {
+    let selection = selection.trim();
+    if selection == "all" {
+        return Ok(None);
+    }
+    if vibe_usage_proto::is_valid_host_id(selection) {
+        Ok(Some(selection.to_string()))
+    } else {
+        Err("Usage: host [all|HOST], where HOST matches [a-z0-9_-]{1,64}")
+    }
+}
+
+fn known_host_ids(local_host_id: Option<&str>) -> Vec<String> {
+    let cache_root = data::cache::default_cache_dir();
+    let mut hosts = HashSet::new();
+    if let Some(local_host_id) = local_host_id {
+        hosts.insert(local_host_id.to_string());
+    }
+    for record in data::cache::load_remote_entries(&cache_root, None) {
+        if let Some(host_id) = record.entry.host_id {
+            hosts.insert(host_id);
+        }
+    }
+    let mut hosts = hosts.into_iter().collect::<Vec<_>>();
+    hosts.sort();
+    hosts
 }
 
 /// Loaded and filtered data for all vendors.
@@ -1993,43 +2104,37 @@ fn main() {
         let mut terminal_too_small = result.is_none();
         let mut last_size = get_terminal_size();
 
+        let mut input = InputLine::new();
+        let mut history = CommandHistory::new();
         let show_prompt = |state: &mut AppState,
+                           input: &InputLine,
                            too_small: bool,
                            notice: Option<&PromptNotice>,
-                           sync_status: Option<String>| {
-            if too_small {
-                return;
-            }
-            let (width, _) = get_terminal_size();
-            let version = if state.vendor == "all" {
-                state
-                    .all_vendor_prompt
-                    .clone()
-                    .unwrap_or_else(|| "All Vendors Comparison".to_string())
-            } else {
-                get_version(state, &state.vendor.clone())
-            };
-            println!("\n\r{}\r", version);
-            if let Some(sync_status) = sync_status {
-                println!("\r{}\r", sync_status);
-            }
-            println!("\r{}\r", "-".repeat(width as usize));
-            render_prompt_line(&InputLine::new(), too_small, notice, state.integrity_status);
+                           sync_status: Option<String>,
+                           mode: PromptBlockMode| {
+            render_monitor_prompt_block(
+                state,
+                input,
+                too_small,
+                notice,
+                sync_status.as_deref(),
+                mode,
+            )
         };
 
-        show_prompt(
+        let mut prompt_block_visible = show_prompt(
             &mut state,
+            &input,
             terminal_too_small,
             prompt_notice.as_ref(),
             current_sync_status(sync_worker.as_ref()),
+            PromptBlockMode::Append,
         );
 
         let mut next_refresh =
             std::time::Instant::now() + std::time::Duration::from_secs(state.monitor_interval);
         let mut next_sync = std::time::Instant::now()
             + monitor_sync_interval(std::time::Duration::from_secs(state.monitor_interval));
-        let mut input = InputLine::new();
-        let mut history = CommandHistory::new();
 
         // Redraw the prompt line in place: clears it, reprints "> {buf}",
         // restores the dimmed watermark when empty, and finally moves the
@@ -2060,11 +2165,13 @@ fn main() {
                 }
                 let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
-                show_prompt(
+                prompt_block_visible = show_prompt(
                     &mut state,
+                    &input,
                     terminal_too_small,
                     prompt_notice.as_ref(),
                     current_sync_status(sync_worker.as_ref()),
+                    PromptBlockMode::Append,
                 );
                 render_input(
                     &input,
@@ -2077,6 +2184,7 @@ fn main() {
             if let Some(sync_stats) =
                 poll_sync_worker_status(sync_worker.as_ref(), &mut observed_sync_revision)
             {
+                let mut redrew_display = false;
                 if !sync_stats.running
                     && sync_stats.last_error.is_none()
                     && sync_stats.success_count > 0
@@ -2087,12 +2195,20 @@ fn main() {
                     ));
                     let result = refresh_display(&mut state);
                     terminal_too_small = result.is_none();
+                    redrew_display = true;
                 }
-                show_prompt(
+                let mode = if redrew_display || !prompt_block_visible {
+                    PromptBlockMode::Append
+                } else {
+                    PromptBlockMode::Replace
+                };
+                prompt_block_visible = show_prompt(
                     &mut state,
+                    &input,
                     terminal_too_small,
                     prompt_notice.as_ref(),
                     format_monitor_sync_status(&sync_stats),
+                    mode,
                 );
                 render_input(
                     &input,
@@ -2133,11 +2249,13 @@ fn main() {
                     + std::time::Duration::from_secs(state.monitor_interval);
                 next_sync = std::time::Instant::now()
                     + monitor_sync_interval(std::time::Duration::from_secs(state.monitor_interval));
-                show_prompt(
+                prompt_block_visible = show_prompt(
                     &mut state,
+                    &input,
                     terminal_too_small,
                     prompt_notice.as_ref(),
                     current_sync_status(sync_worker.as_ref()),
+                    PromptBlockMode::Append,
                 );
             }
 
@@ -2156,11 +2274,13 @@ fn main() {
                 terminal_too_small = result.is_none();
                 next_refresh = std::time::Instant::now()
                     + std::time::Duration::from_secs(state.monitor_interval);
-                show_prompt(
+                prompt_block_visible = show_prompt(
                     &mut state,
+                    &input,
                     terminal_too_small,
                     prompt_notice.as_ref(),
                     current_sync_status(sync_worker.as_ref()),
+                    PromptBlockMode::Append,
                 );
             }
 
@@ -2170,11 +2290,17 @@ fn main() {
                 worker.request_sync();
                 next_sync = std::time::Instant::now()
                     + monitor_sync_interval(std::time::Duration::from_secs(state.monitor_interval));
-                show_prompt(
+                prompt_block_visible = show_prompt(
                     &mut state,
+                    &input,
                     terminal_too_small,
                     prompt_notice.as_ref(),
                     current_sync_status(sync_worker.as_ref()),
+                    if prompt_block_visible {
+                        PromptBlockMode::Replace
+                    } else {
+                        PromptBlockMode::Append
+                    },
                 );
             }
 
@@ -2327,6 +2453,9 @@ fn main() {
                                     println!(
                                         "  v, vendor [X]    - Switch vendor (claude|codex|gemini|all)\r"
                                     );
+                                    println!(
+                                        "  host [X]         - Switch host (all or machine id)\r"
+                                    );
                                     println!("  n                - Rotate to next vendor\r");
                                     println!("  a                - Jump to vendor=all\r");
                                     println!(
@@ -2362,11 +2491,24 @@ fn main() {
                                     println!("  e, exit          - Exit monitor mode\r");
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!(
-                                        "Current: vendor={}, window={}, interval={}s\r",
+                                        "Current: vendor={}, host={}, window={}, interval={}s\r",
                                         state.vendor,
+                                        host_label(state.host.as_deref()),
                                         state.time_window.display_label(Local::now()),
                                         state.monitor_interval
                                     );
+                                }
+                                "host" => {
+                                    let known_hosts =
+                                        known_host_ids(state.local_host_id.as_deref());
+                                    println!(
+                                        "Current host: {}\r",
+                                        host_label(state.host.as_deref())
+                                    );
+                                    println!("Usage: host [all|HOST]\r");
+                                    if !known_hosts.is_empty() {
+                                        println!("Known hosts: {}\r", known_hosts.join(", "));
+                                    }
                                 }
                                 "e" | "exit" => {
                                     cleanup_and_break("Exiting monitor mode...");
@@ -2431,13 +2573,15 @@ fn main() {
                                                             "Error: Data directory not found at {}\r",
                                                             dir.display()
                                                         );
-                                                        show_prompt(
+                                                        prompt_block_visible = show_prompt(
                                                             &mut state,
+                                                            &input,
                                                             terminal_too_small,
                                                             prompt_notice.as_ref(),
                                                             current_sync_status(
                                                                 sync_worker.as_ref(),
                                                             ),
+                                                            PromptBlockMode::Append,
                                                         );
                                                         continue 'monitor;
                                                     }
@@ -2456,6 +2600,46 @@ fn main() {
                                                     println!(
                                                         "Usage: v, vendor [claude|codex|gemini|all]\r"
                                                     );
+                                                }
+                                            }
+                                            "host" if parts.len() == 2 => {
+                                                match parse_host_selection(parts[1]) {
+                                                    Ok(new_host) => {
+                                                        if state.host == new_host {
+                                                            println!(
+                                                                "Already showing host {}.\r",
+                                                                host_label(state.host.as_deref())
+                                                            );
+                                                        } else {
+                                                            state.host = new_host;
+                                                            state.raw_cache = None;
+                                                            state.raw_refresh = None;
+                                                            println!(
+                                                                "{}\r",
+                                                                "-".repeat(width as usize)
+                                                            );
+                                                            println!(
+                                                                "\n\r{}\r",
+                                                                "=".repeat(width as usize)
+                                                            );
+                                                            println!(
+                                                                "SWITCHED TO HOST {}\r",
+                                                                host_label(state.host.as_deref())
+                                                            );
+                                                            println!(
+                                                                "{}\n\r",
+                                                                "=".repeat(width as usize)
+                                                            );
+                                                            start_background_raw_refresh(
+                                                                &mut state,
+                                                            );
+                                                            let result =
+                                                                refresh_display(&mut state);
+                                                            terminal_too_small = result.is_none();
+                                                            did_refresh = true;
+                                                        }
+                                                    }
+                                                    Err(err) => println!("{err}\r"),
                                                 }
                                             }
                                             "d" | "day" | "days" if parts.len() == 2 => {
@@ -2515,6 +2699,21 @@ fn main() {
                                                     "Usage: v, vendor [claude|codex|gemini|all]\r"
                                                 );
                                             }
+                                            "host" => {
+                                                let known_hosts =
+                                                    known_host_ids(state.local_host_id.as_deref());
+                                                println!(
+                                                    "Current host: {}\r",
+                                                    host_label(state.host.as_deref())
+                                                );
+                                                println!("Usage: host [all|HOST]\r");
+                                                if !known_hosts.is_empty() {
+                                                    println!(
+                                                        "Known hosts: {}\r",
+                                                        known_hosts.join(", ")
+                                                    );
+                                                }
+                                            }
                                             "i" | "interval" => {
                                                 println!(
                                                     "Current interval: {} seconds\r",
@@ -2536,11 +2735,13 @@ fn main() {
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
                             }
-                            show_prompt(
+                            prompt_block_visible = show_prompt(
                                 &mut state,
+                                &input,
                                 terminal_too_small,
                                 prompt_notice.as_ref(),
                                 current_sync_status(sync_worker.as_ref()),
+                                PromptBlockMode::Append,
                             );
                         }
                         Event::Key(KeyEvent {
@@ -2583,11 +2784,13 @@ fn main() {
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
-                                show_prompt(
+                                prompt_block_visible = show_prompt(
                                     &mut state,
+                                    &input,
                                     terminal_too_small,
                                     prompt_notice.as_ref(),
                                     current_sync_status(sync_worker.as_ref()),
+                                    PromptBlockMode::Append,
                                 );
                                 render_input(
                                     &input,
@@ -2608,11 +2811,13 @@ fn main() {
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
-                                show_prompt(
+                                prompt_block_visible = show_prompt(
                                     &mut state,
+                                    &input,
                                     terminal_too_small,
                                     prompt_notice.as_ref(),
                                     current_sync_status(sync_worker.as_ref()),
+                                    PromptBlockMode::Append,
                                 );
                                 render_input(
                                     &input,
@@ -2639,11 +2844,13 @@ fn main() {
                                     terminal_too_small = result.is_none();
                                     next_refresh = std::time::Instant::now()
                                         + std::time::Duration::from_secs(state.monitor_interval);
-                                    show_prompt(
+                                    prompt_block_visible = show_prompt(
                                         &mut state,
+                                        &input,
                                         terminal_too_small,
                                         prompt_notice.as_ref(),
                                         current_sync_status(sync_worker.as_ref()),
+                                        PromptBlockMode::Append,
                                     );
                                     render_input(
                                         &input,
@@ -2674,11 +2881,13 @@ fn main() {
                                     terminal_too_small = result.is_none();
                                     next_refresh = std::time::Instant::now()
                                         + std::time::Duration::from_secs(state.monitor_interval);
-                                    show_prompt(
+                                    prompt_block_visible = show_prompt(
                                         &mut state,
+                                        &input,
                                         terminal_too_small,
                                         prompt_notice.as_ref(),
                                         current_sync_status(sync_worker.as_ref()),
+                                        PromptBlockMode::Append,
                                     );
                                     render_input(
                                         &input,
@@ -2718,11 +2927,13 @@ fn main() {
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
-                                show_prompt(
+                                prompt_block_visible = show_prompt(
                                     &mut state,
+                                    &input,
                                     terminal_too_small,
                                     prompt_notice.as_ref(),
                                     current_sync_status(sync_worker.as_ref()),
+                                    PromptBlockMode::Append,
                                 );
                                 render_input(
                                     &input,
@@ -2744,11 +2955,13 @@ fn main() {
                                 terminal_too_small = result.is_none();
                                 next_refresh = std::time::Instant::now()
                                     + std::time::Duration::from_secs(state.monitor_interval);
-                                show_prompt(
+                                prompt_block_visible = show_prompt(
                                     &mut state,
+                                    &input,
                                     terminal_too_small,
                                     prompt_notice.as_ref(),
                                     current_sync_status(sync_worker.as_ref()),
+                                    PromptBlockMode::Append,
                                 );
                                 render_input(
                                     &input,
@@ -2785,11 +2998,13 @@ fn main() {
                             terminal_too_small = result.is_none();
                             next_refresh = std::time::Instant::now()
                                 + std::time::Duration::from_secs(state.monitor_interval);
-                            show_prompt(
+                            prompt_block_visible = show_prompt(
                                 &mut state,
+                                &input,
                                 terminal_too_small,
                                 prompt_notice.as_ref(),
                                 current_sync_status(sync_worker.as_ref()),
+                                PromptBlockMode::Append,
                             );
                         }
                         _ => {}
@@ -3306,6 +3521,47 @@ mod tests {
     fn host_arg_parses() {
         let args = Args::try_parse_from(["vibe-usage", "--host", "laptop"]).expect("host parses");
         assert_eq!(args.host.as_deref(), Some("laptop"));
+    }
+
+    #[test]
+    fn monitor_status_line_places_sync_on_same_line() {
+        let line = format_monitor_status_line(
+            "All Vendors Comparison",
+            Some("Sync: checked just now"),
+            60,
+        );
+
+        assert_eq!(
+            line,
+            format!(
+                "{}{}{}",
+                "All Vendors Comparison",
+                " ".repeat(16),
+                "Sync: checked just now"
+            )
+        );
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn monitor_status_line_truncates_left_before_sync() {
+        let line = format_monitor_status_line(
+            "All Vendors Comparison",
+            Some("Sync: checked just now"),
+            28,
+        );
+
+        assert_eq!(line, "All V Sync: checked just now");
+    }
+
+    #[test]
+    fn host_command_selection_parses_all_and_machine_ids() {
+        assert_eq!(parse_host_selection("all"), Ok(None));
+        assert_eq!(
+            parse_host_selection("workstation-home"),
+            Ok(Some("workstation-home".to_string()))
+        );
+        assert!(parse_host_selection("Workstation").is_err());
     }
 
     #[test]

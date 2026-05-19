@@ -9,6 +9,7 @@ Options:
   --once              Show stats once and exit (no monitor loop)
   --days <N>          Number of days to analyze (default: 3)
   --vendor <VENDOR>   Filter to a single vendor: claude, codex, or gemini
+  --host <HOST>       Filter to a single machine id
 ```
 
 Default behavior (no flags) enters monitor mode showing all vendors for the last 3 days.
@@ -21,6 +22,7 @@ Default behavior (no flags) enters monitor mode showing all vendors for the last
 | `n` | Cycle to next vendor |
 | `r` | Refresh now |
 | `v claude` / `v codex` / `v gemini` / `v all` | Switch vendor |
+| `host all` / `host <HOST>` | Switch between all machines and one machine |
 | `d <N>` | Change days range |
 | `a` | Switch to all vendors |
 | `d` / `w` / `m` | Switch to 1 day / 7 days / 30 days |

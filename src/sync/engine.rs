@@ -56,7 +56,15 @@ pub fn run_sync_cycle(
     config: &EnabledSyncConfig,
     transport: &impl SyncTransport,
 ) -> Result<(), SyncError> {
-    let mut sync_state = state::load_sync_state(cache_root);
+    run_upload_once(cache_root, config, transport)?;
+    run_pull_once(cache_root, config, transport)
+}
+
+pub fn run_upload_once(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    transport: &impl SyncTransport,
+) -> Result<(), SyncError> {
     let mut upload_log = state::load_upload_log(cache_root);
     let mut upload_records = Vec::new();
 
@@ -83,6 +91,16 @@ pub fn run_sync_cycle(
         }
         state::save_upload_log(cache_root, &upload_log)?;
     }
+
+    Ok(())
+}
+
+pub fn run_pull_once(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    transport: &impl SyncTransport,
+) -> Result<(), SyncError> {
+    let mut sync_state = state::load_sync_state(cache_root);
 
     loop {
         let response = transport.pull(sync_state.last_seen_seq, &config.machine_id, PULL_LIMIT)?;

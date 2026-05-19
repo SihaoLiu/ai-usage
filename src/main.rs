@@ -12,12 +12,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
 use std::thread;
 
 use chrono::{DateTime, Duration, Local};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::terminal;
 
 use constants::{
@@ -342,6 +342,24 @@ struct Args {
         value_parser = ["auto", "default", "standard", "fast", "priority", "flex"],
     )]
     codex_service_tier: String,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCommand {
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncCommand {
+    Push,
+    Pull,
+    Status,
 }
 
 /// Resolve the effective Codex service tier from CLI args, falling back to
@@ -1019,7 +1037,7 @@ fn get_version(state: &mut AppState, vendor: &str) -> String {
         _ => return String::new(),
     };
 
-    let current_version = Command::new(cmd)
+    let current_version = ProcessCommand::new(cmd)
         .arg("--version")
         .output()
         .ok()
@@ -1444,10 +1462,91 @@ fn print_stats(state: &mut AppState, once: bool) -> Option<bool> {
     }
 }
 
+fn run_cli_command(command: CliCommand, sync_config: sync::config::SyncConfig) -> i32 {
+    match command {
+        CliCommand::Sync { command } => run_sync_command(command, sync_config),
+    }
+}
+
+fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig) -> i32 {
+    match command {
+        SyncCommand::Status => {
+            print_sync_status(&sync_config);
+            0
+        }
+        SyncCommand::Push | SyncCommand::Pull => {
+            let sync::config::SyncConfig::Enabled(config) = sync_config else {
+                eprintln!("vibe-usage: sync is disabled");
+                return 1;
+            };
+            let cache_root = data::cache::default_cache_dir();
+            let client = sync::client::SyncHttpClient::new(config.clone());
+            let result = match command {
+                SyncCommand::Push => {
+                    let _ = refresh_all_vendor_raw_full();
+                    sync::engine::run_upload_once(&cache_root, &config, &client)
+                }
+                SyncCommand::Pull => sync::engine::run_pull_once(&cache_root, &config, &client),
+                SyncCommand::Status => unreachable!("status handled above"),
+            };
+            match result {
+                Ok(()) => {
+                    println!("sync {} complete", sync_command_name(command));
+                    0
+                }
+                Err(err) => {
+                    eprintln!(
+                        "vibe-usage: sync {} failed: {}",
+                        sync_command_name(command),
+                        err
+                    );
+                    1
+                }
+            }
+        }
+    }
+}
+
+fn print_sync_status(sync_config: &sync::config::SyncConfig) {
+    match sync_config {
+        sync::config::SyncConfig::Disabled => {
+            println!("sync: disabled");
+        }
+        sync::config::SyncConfig::Enabled(config) => {
+            let state = sync::state::load_sync_state(&data::cache::default_cache_dir());
+            println!("sync: enabled");
+            println!("server_url: {}", config.server_url);
+            println!("machine_id: {}", config.machine_id);
+            println!("last_seen_seq: {}", state.last_seen_seq);
+            println!(
+                "last_successful_sync: {}",
+                state.last_successful_sync.as_deref().unwrap_or("never")
+            );
+            println!(
+                "last_error: {}",
+                state.last_error.as_deref().unwrap_or("none")
+            );
+        }
+    }
+}
+
+fn sync_command_name(command: SyncCommand) -> &'static str {
+    match command {
+        SyncCommand::Push => "push",
+        SyncCommand::Pull => "pull",
+        SyncCommand::Status => "status",
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
-    let _sync_config = sync::config::load_sync_config(false);
+    let sync_config = sync::config::load_sync_config(false);
+    if let Some(command) = args.command {
+        let code = run_cli_command(command, sync_config);
+        std::process::exit(code);
+    }
+
     let mut pricing = pricing::load_layered();
     pricing.codex_service_tier = resolve_codex_service_tier(&args.codex_service_tier);
     let subscription_fees = load_subscription_fees().unwrap_or_else(prompt_subscription_fees);
@@ -2555,5 +2654,32 @@ mod tests {
         };
 
         assert_eq!(days, 5);
+    }
+
+    #[test]
+    fn sync_subcommands_parse() {
+        let push = Args::try_parse_from(["vibe-usage", "sync", "push"]).expect("push parses");
+        assert!(matches!(
+            push.command,
+            Some(CliCommand::Sync {
+                command: SyncCommand::Push
+            })
+        ));
+
+        let pull = Args::try_parse_from(["vibe-usage", "sync", "pull"]).expect("pull parses");
+        assert!(matches!(
+            pull.command,
+            Some(CliCommand::Sync {
+                command: SyncCommand::Pull
+            })
+        ));
+
+        let status = Args::try_parse_from(["vibe-usage", "sync", "status"]).expect("status parses");
+        assert!(matches!(
+            status.command,
+            Some(CliCommand::Sync {
+                command: SyncCommand::Status
+            })
+        ));
     }
 }

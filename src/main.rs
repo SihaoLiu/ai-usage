@@ -130,6 +130,8 @@ enum IntegrityStatus {
 
 struct AppState {
     vendor: String,
+    host: Option<String>,
+    local_host_id: Option<String>,
     days: i64,
     time_window: TimeWindow,
     monitor_interval: u64,
@@ -331,6 +333,10 @@ struct Args {
     #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "all"])]
     vendor: String,
 
+    /// Filter usage to a single machine id
+    #[arg(long)]
+    host: Option<String>,
+
     /// Override the Codex API service tier used for cost calculation.
     /// `auto` (default) reads `service_tier` from `~/.codex/config.toml`.
     /// `fast` (a.k.a. `priority`) applies the fast multipliers (gpt-5.5 = 2.5x,
@@ -347,7 +353,7 @@ struct Args {
     command: Option<CliCommand>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 enum CliCommand {
     Sync {
         #[command(subcommand)]
@@ -622,14 +628,55 @@ fn compute_required_horizon(window: &TimeWindow, now: DateTime<Local>) -> i64 {
     days.max(1)
 }
 
-fn read_all_vendor_cached_snapshot() -> RawDataCache {
-    let cache_root = data::cache::default_cache_dir();
-    RawDataCache {
-        claude: data::cache::load_vendor_cached_snapshot(&cache_root, "claude"),
-        codex: data::cache::load_vendor_cached_snapshot(&cache_root, "codex"),
-        gemini: data::cache::load_vendor_cached_snapshot(&cache_root, "gemini"),
-        horizon_days: FULL_CACHE_HORIZON,
+fn include_local_for_host_filter(host_filter: Option<&str>, local_host_id: Option<&str>) -> bool {
+    match host_filter {
+        None => true,
+        Some(host) => local_host_id == Some(host),
     }
+}
+
+fn merge_remote_records_into_raw_cache(
+    cache: &mut RawDataCache,
+    records: Vec<data::cache::RemoteUsageRecord>,
+) {
+    for record in records {
+        match record.vendor.as_str() {
+            "claude" => cache.claude.push(record.entry),
+            "codex" => cache.codex.push(record.entry),
+            "gemini" => cache.gemini.push(record.entry),
+            _ => {}
+        }
+    }
+}
+
+fn read_all_vendor_cached_snapshot_for_hosts(
+    host_filter: Option<&str>,
+    local_host_id: Option<&str>,
+) -> RawDataCache {
+    let cache_root = data::cache::default_cache_dir();
+    let include_local = include_local_for_host_filter(host_filter, local_host_id);
+    let mut cache = RawDataCache {
+        claude: if include_local {
+            data::cache::load_vendor_cached_snapshot(&cache_root, "claude")
+        } else {
+            Vec::new()
+        },
+        codex: if include_local {
+            data::cache::load_vendor_cached_snapshot(&cache_root, "codex")
+        } else {
+            Vec::new()
+        },
+        gemini: if include_local {
+            data::cache::load_vendor_cached_snapshot(&cache_root, "gemini")
+        } else {
+            Vec::new()
+        },
+        horizon_days: FULL_CACHE_HORIZON,
+    };
+    let host_set = host_filter.map(|host| HashSet::from([host.to_string()]));
+    let remote_records = data::cache::load_remote_entries(&cache_root, host_set.as_ref());
+    merge_remote_records_into_raw_cache(&mut cache, remote_records);
+    cache
 }
 
 fn refresh_all_vendor_raw_full() -> RawDataCache {
@@ -674,7 +721,10 @@ fn ensure_raw_cache(state: &mut AppState, required_horizon: i64) -> &RawDataCach
         Some(cache) => cache.horizon_days < required_horizon,
     };
     if needs_load {
-        state.raw_cache = Some(read_all_vendor_cached_snapshot());
+        state.raw_cache = Some(read_all_vendor_cached_snapshot_for_hosts(
+            state.host.as_deref(),
+            state.local_host_id.as_deref(),
+        ));
     }
     state.raw_cache.as_ref().unwrap()
 }
@@ -684,11 +734,24 @@ fn start_background_raw_refresh(state: &mut AppState) {
         return;
     }
     let (tx, rx) = mpsc::channel();
+    let host_filter = state.host.clone();
+    let local_host_id = state.local_host_id.clone();
     state.raw_refresh = Some(rx);
     state.integrity_status = IntegrityStatus::Checking;
     state.integrity_started_at = Some(std::time::Instant::now());
     thread::spawn(move || {
-        let refreshed = refresh_all_vendor_raw_full();
+        let mut refreshed = refresh_all_vendor_raw_full();
+        if !include_local_for_host_filter(host_filter.as_deref(), local_host_id.as_deref()) {
+            refreshed.claude.clear();
+            refreshed.codex.clear();
+            refreshed.gemini.clear();
+        }
+        let cache_root = data::cache::default_cache_dir();
+        let host_set = host_filter
+            .as_ref()
+            .map(|host| HashSet::from([host.clone()]));
+        let remote_records = data::cache::load_remote_entries(&cache_root, host_set.as_ref());
+        merge_remote_records_into_raw_cache(&mut refreshed, remote_records);
         let _ = tx.send(refreshed);
     });
 }
@@ -1550,6 +1613,10 @@ fn main() {
     let mut pricing = pricing::load_layered();
     pricing.codex_service_tier = resolve_codex_service_tier(&args.codex_service_tier);
     let subscription_fees = load_subscription_fees().unwrap_or_else(prompt_subscription_fees);
+    let local_host_id = match &sync_config {
+        sync::config::SyncConfig::Enabled(config) => Some(config.machine_id.clone()),
+        sync::config::SyncConfig::Disabled => None,
+    };
 
     // Validate vendor data directory on startup (matches Python behavior)
     if let Some(data_dir) = get_vendor_data_dir(&args.vendor)
@@ -1561,6 +1628,8 @@ fn main() {
 
     let mut state = AppState {
         vendor: args.vendor.clone(),
+        host: args.host.clone(),
+        local_host_id,
         days: args.days,
         time_window: TimeWindow::rolling_days(args.days),
         monitor_interval: 3600,
@@ -1575,7 +1644,20 @@ fn main() {
     };
 
     if args.once {
-        state.raw_cache = Some(refresh_all_vendor_raw_full());
+        let mut refreshed = refresh_all_vendor_raw_full();
+        if !include_local_for_host_filter(state.host.as_deref(), state.local_host_id.as_deref()) {
+            refreshed.claude.clear();
+            refreshed.codex.clear();
+            refreshed.gemini.clear();
+        }
+        let cache_root = data::cache::default_cache_dir();
+        let host_set = state
+            .host
+            .as_ref()
+            .map(|host| HashSet::from([host.clone()]));
+        let remote_records = data::cache::load_remote_entries(&cache_root, host_set.as_ref());
+        merge_remote_records_into_raw_cache(&mut refreshed, remote_records);
+        state.raw_cache = Some(refreshed);
         let result = print_stats(&mut state, true);
         match result {
             None => std::process::exit(1),
@@ -1587,7 +1669,10 @@ fn main() {
         let (width, height) = get_terminal_size();
         let load_started = std::time::Instant::now();
         print_loading_data_screen(width, height);
-        state.raw_cache = Some(read_all_vendor_cached_snapshot());
+        state.raw_cache = Some(read_all_vendor_cached_snapshot_for_hosts(
+            state.host.as_deref(),
+            state.local_host_id.as_deref(),
+        ));
         let mut prompt_notice = Some(data_loaded_notice(load_started.elapsed()));
         start_background_raw_refresh(&mut state);
 
@@ -2681,5 +2766,73 @@ mod tests {
                 command: SyncCommand::Status
             })
         ));
+    }
+
+    #[test]
+    fn host_arg_parses() {
+        let args = Args::try_parse_from(["vibe-usage", "--host", "laptop"]).expect("host parses");
+        assert_eq!(args.host.as_deref(), Some("laptop"));
+    }
+
+    #[test]
+    fn host_filter_includes_local_only_when_machine_matches() {
+        assert!(include_local_for_host_filter(None, None));
+        assert!(include_local_for_host_filter(
+            Some("workstation"),
+            Some("workstation")
+        ));
+        assert!(!include_local_for_host_filter(
+            Some("laptop"),
+            Some("workstation")
+        ));
+        assert!(!include_local_for_host_filter(Some("laptop"), None));
+    }
+
+    #[test]
+    fn remote_records_merge_into_vendor_buckets() {
+        let timestamp = "2026-05-18T12:00:00Z";
+        let mut cache = RawDataCache {
+            claude: Vec::new(),
+            codex: Vec::new(),
+            gemini: Vec::new(),
+            horizon_days: FULL_CACHE_HORIZON,
+        };
+        merge_remote_records_into_raw_cache(
+            &mut cache,
+            vec![
+                data::cache::RemoteUsageRecord {
+                    vendor: "claude".to_string(),
+                    dedup_key: "a".to_string(),
+                    entry: UsageEntry {
+                        host_id: Some("laptop".to_string()),
+                        timestamp: timestamp.to_string(),
+                        parsed_timestamp: time_utils::parse_timestamp(timestamp),
+                        session_start_time: timestamp.to_string(),
+                        session_end_time: timestamp.to_string(),
+                        model: "model-a".to_string(),
+                        effort: None,
+                        usage: data::TokenUsage::default(),
+                    },
+                },
+                data::cache::RemoteUsageRecord {
+                    vendor: "codex".to_string(),
+                    dedup_key: "b".to_string(),
+                    entry: UsageEntry {
+                        host_id: Some("laptop".to_string()),
+                        timestamp: timestamp.to_string(),
+                        parsed_timestamp: time_utils::parse_timestamp(timestamp),
+                        session_start_time: timestamp.to_string(),
+                        session_end_time: timestamp.to_string(),
+                        model: "model-b".to_string(),
+                        effort: None,
+                        usage: data::TokenUsage::default(),
+                    },
+                },
+            ],
+        );
+
+        assert_eq!(cache.claude.len(), 1);
+        assert_eq!(cache.codex.len(), 1);
+        assert!(cache.gemini.is_empty());
     }
 }

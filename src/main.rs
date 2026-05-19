@@ -779,6 +779,23 @@ fn poll_background_raw_refresh(state: &mut AppState) -> bool {
     }
 }
 
+fn poll_sync_worker_completion(
+    worker: Option<&sync::worker::SyncWorker>,
+    observed_events: &mut u64,
+) -> Option<Result<(), String>> {
+    let worker = worker?;
+    let stats = worker.stats();
+    let events = stats.success_count + stats.error_count;
+    if events == *observed_events {
+        return None;
+    }
+    *observed_events = events;
+    match stats.last_error {
+        Some(error) => Some(Err(error)),
+        None => Some(Ok(())),
+    }
+}
+
 fn data_loaded_notice(load_duration: std::time::Duration) -> PromptNotice {
     PromptNotice {
         message: format!("Data loaded in {} ms", load_duration.as_millis()),
@@ -1673,6 +1690,14 @@ fn main() {
             state.host.as_deref(),
             state.local_host_id.as_deref(),
         ));
+        let mut sync_worker = match &sync_config {
+            sync::config::SyncConfig::Enabled(config) => Some(sync::worker::SyncWorker::spawn(
+                data::cache::default_cache_dir(),
+                config.clone(),
+            )),
+            sync::config::SyncConfig::Disabled => None,
+        };
+        let mut observed_sync_events = 0_u64;
         let mut prompt_notice = Some(data_loaded_notice(load_started.elapsed()));
         start_background_raw_refresh(&mut state);
 
@@ -1747,9 +1772,32 @@ fn main() {
 
         'monitor: loop {
             if poll_background_raw_refresh(&mut state) {
+                if let Some(worker) = sync_worker.as_ref() {
+                    worker.request_sync();
+                }
                 let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
                 show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                render_input(
+                    &input,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    state.integrity_status,
+                );
+            }
+
+            if let Some(sync_result) =
+                poll_sync_worker_completion(sync_worker.as_ref(), &mut observed_sync_events)
+            {
+                if sync_result.is_ok() {
+                    state.raw_cache = Some(read_all_vendor_cached_snapshot_for_hosts(
+                        state.host.as_deref(),
+                        state.local_host_id.as_deref(),
+                    ));
+                    let result = refresh_display(&mut state);
+                    terminal_too_small = result.is_none();
+                    show_prompt(&mut state, terminal_too_small, prompt_notice.as_ref());
+                }
                 render_input(
                     &input,
                     terminal_too_small,
@@ -2386,6 +2434,9 @@ fn main() {
             }
         }
         crossterm::terminal::disable_raw_mode().ok();
+        if let Some(worker) = sync_worker.as_mut() {
+            worker.shutdown();
+        }
     }
 }
 

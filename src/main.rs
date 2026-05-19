@@ -366,6 +366,11 @@ enum SyncCommand {
     Push,
     Pull,
     Status,
+    Init {
+        /// Replace an existing sync config template
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Resolve the effective Codex service tier from CLI args, falling back to
@@ -640,6 +645,9 @@ fn merge_remote_records_into_raw_cache(
     records: Vec<data::cache::RemoteUsageRecord>,
 ) {
     for record in records {
+        if record.entry.host_id.is_none() {
+            continue;
+        }
         match record.vendor.as_str() {
             "claude" => cache.claude.push(record.entry),
             "codex" => cache.codex.push(record.entry),
@@ -1554,6 +1562,21 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
             print_sync_status(&sync_config);
             0
         }
+        SyncCommand::Init { force } => match sync::config::init_sync_config(force) {
+            Ok(path) => {
+                println!("wrote sync config template: {}", path.display());
+                println!("edit the template, then set sync.enabled to true");
+                0
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                eprintln!("vibe-usage: sync config already exists; pass --force to replace it");
+                1
+            }
+            Err(err) => {
+                eprintln!("vibe-usage: sync init failed: {err}");
+                1
+            }
+        },
         SyncCommand::Push | SyncCommand::Pull => {
             let sync::config::SyncConfig::Enabled(config) = sync_config else {
                 eprintln!("vibe-usage: sync is disabled");
@@ -1568,6 +1591,7 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                 }
                 SyncCommand::Pull => sync::engine::run_pull_once(&cache_root, &config, &client),
                 SyncCommand::Status => unreachable!("status handled above"),
+                SyncCommand::Init { .. } => unreachable!("init handled above"),
             };
             match result {
                 Ok(()) => {
@@ -1606,6 +1630,25 @@ fn print_sync_status(sync_config: &sync::config::SyncConfig) {
                 "last_error: {}",
                 state.last_error.as_deref().unwrap_or("none")
             );
+            let client = sync::client::SyncHttpClient::new(config.clone());
+            match client.machines() {
+                Ok(list) => {
+                    println!("machines:");
+                    if list.machines.is_empty() {
+                        println!("  none");
+                    } else {
+                        for machine in list.machines {
+                            println!(
+                                "  {} last_seen={} record_count={}",
+                                machine.host_id, machine.last_seen, machine.record_count
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    println!("machines: unavailable ({err})");
+                }
+            }
         }
     }
 }
@@ -1615,6 +1658,7 @@ fn sync_command_name(command: SyncCommand) -> &'static str {
         SyncCommand::Push => "push",
         SyncCommand::Pull => "pull",
         SyncCommand::Status => "status",
+        SyncCommand::Init { .. } => "init",
     }
 }
 
@@ -2815,6 +2859,15 @@ mod tests {
             status.command,
             Some(CliCommand::Sync {
                 command: SyncCommand::Status
+            })
+        ));
+
+        let init =
+            Args::try_parse_from(["vibe-usage", "sync", "init", "--force"]).expect("init parses");
+        assert!(matches!(
+            init.command,
+            Some(CliCommand::Sync {
+                command: SyncCommand::Init { force: true }
             })
         ));
     }

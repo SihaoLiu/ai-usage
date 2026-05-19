@@ -2,7 +2,7 @@ use crate::sync::config::EnabledSyncConfig;
 use crate::sync::engine::{SyncError, SyncTransport};
 use serde::de::DeserializeOwned;
 use std::time::Duration;
-use vibe_usage_proto::{PullResponse, UploadResponse, WireRecord};
+use vibe_usage_proto::{MachineList, PullResponse, UploadResponse, WireRecord};
 
 #[derive(Clone)]
 pub struct SyncHttpClient {
@@ -31,6 +31,16 @@ impl SyncHttpClient {
 
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.token)
+    }
+
+    pub fn machines(&self) -> Result<MachineList, SyncError> {
+        let response = self
+            .agent
+            .get(&self.endpoint("/v1/machines"))
+            .header("Authorization", self.auth_header())
+            .call()
+            .map_err(transport_error)?;
+        read_json_response(response)
     }
 }
 
@@ -183,6 +193,15 @@ mod tests {
         assert_eq!(pull.records.len(), 1);
         assert_eq!(pull.records[0].record.host_id, "laptop");
         assert_eq!(pull.records[0].record.dedup_key, "remote-a");
+
+        let machines_client = client.clone();
+        let machines = tokio::task::spawn_blocking(move || machines_client.machines())
+            .await
+            .expect("machines join")
+            .expect("machines response");
+        assert_eq!(machines.machines.len(), 1);
+        assert_eq!(machines.machines[0].host_id, "laptop");
+        assert_eq!(machines.machines[0].record_count, 1);
         server.abort();
     }
 }

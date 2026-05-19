@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 15;
@@ -53,6 +54,17 @@ pub fn load_sync_config(debug_sync: bool) -> SyncConfig {
         );
     }
     result.config
+}
+
+pub fn sync_config_path() -> PathBuf {
+    default_secrets_path()
+}
+
+pub fn init_sync_config(force: bool) -> io::Result<PathBuf> {
+    let path = sync_config_path();
+    let machine_id = sanitize_hostname(&default_hostname());
+    write_sync_config_template(&path, &machine_id, force)?;
+    Ok(path)
 }
 
 fn load_sync_config_from_path(path: &Path, fallback_hostname: &str) -> ConfigLoadResult {
@@ -130,6 +142,47 @@ fn load_sync_config_from_path(path: &Path, fallback_hostname: &str) -> ConfigLoa
         }),
         warning: None,
     }
+}
+
+fn write_sync_config_template(path: &Path, machine_id: &str, force: bool) -> io::Result<()> {
+    if path.exists() && !force {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "sync config already exists",
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true);
+    if force {
+        options.truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(sync_config_template(machine_id).as_bytes())?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn sync_config_template(machine_id: &str) -> String {
+    format!(
+        r#"sync:
+  enabled: false
+  server_url: "https://replace-with-your-sync-host.example"
+  token: "replace-me"
+  machine_id: "{machine_id}"
+  upload_project_hash: true
+  request_timeout_seconds: 15
+"#
+    )
 }
 
 fn invalid(path: &Path, reason: impl AsRef<str>) -> ConfigLoadResult {
@@ -413,5 +466,50 @@ mod tests {
             resolve_secrets_path(home, None),
             home.join(".secrets").join("ai-usage.yaml")
         );
+    }
+
+    #[test]
+    fn init_template_creates_disabled_config() {
+        let dir = unique_temp_dir("init-template");
+        let path = dir.join(".secrets").join("ai-usage.yaml");
+
+        write_sync_config_template(&path, "workstation-home", false).expect("write template");
+
+        let content = fs::read_to_string(&path).expect("read template");
+        assert!(content.contains("enabled: false"));
+        assert!(content.contains("machine_id: \"workstation-home\""));
+        let result = load_sync_config_from_path(&path, "fallback-host");
+        assert_eq!(result.config, SyncConfig::Disabled);
+        assert_eq!(result.warning, None);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn init_template_refuses_to_overwrite_without_force() {
+        let dir = unique_temp_dir("init-existing");
+        let path = dir.join("ai-usage.yaml");
+        write_sync_config_template(&path, "first-host", false).expect("write initial template");
+
+        let err = write_sync_config_template(&path, "second-host", false).expect_err("exists");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let content = fs::read_to_string(&path).expect("read template");
+        assert!(content.contains("machine_id: \"first-host\""));
+    }
+
+    #[test]
+    fn init_template_force_replaces_existing_file() {
+        let dir = unique_temp_dir("init-force");
+        let path = dir.join("ai-usage.yaml");
+        write_sync_config_template(&path, "first-host", false).expect("write initial template");
+
+        write_sync_config_template(&path, "second-host", true).expect("replace template");
+
+        let content = fs::read_to_string(&path).expect("read template");
+        assert!(content.contains("machine_id: \"second-host\""));
     }
 }

@@ -1,0 +1,22 @@
+[Unit]
+Description=Vibe Usage sync server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vibe-usage
+Group=vibe-usage
+WorkingDirectory=/var/lib/vibe-usage
+ExecStart=/usr/local/bin/vibe-usage-server /etc/vibe-usage-server/config.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/vibe-usage
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

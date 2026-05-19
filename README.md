@@ -53,7 +53,7 @@ vibe-usage --once
 vibe-usage --days 30 --vendor claude
 ```
 
-See [docs/usage.md](docs/usage.md) for full usage details, data sources, monitor mode controls, and configuration.
+See [docs/usage.md](docs/usage.md) for full usage details, data sources, monitor mode controls, and configuration. For optional cross-machine sync, see [docs/sync.md](docs/sync.md).
 
 ## License
 

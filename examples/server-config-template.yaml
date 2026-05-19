@@ -1,0 +1,9 @@
+listen: "127.0.0.1:8787"
+db_path: "/var/lib/vibe-usage/data.db"
+shared_token: "replace-me"
+allowed_hosts:
+  - "workstation-home"
+  - "laptop"
+max_body_bytes: 1048576
+max_batch_records: 1000
+log_level: "info"

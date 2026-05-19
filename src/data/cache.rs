@@ -928,9 +928,7 @@ mod tests {
             .collect()
     }
 
-    fn entry_fingerprints(
-        entries: &[UsageEntry],
-    ) -> Vec<(
+    type EntryFingerprint = (
         String,
         Option<String>,
         String,
@@ -942,7 +940,9 @@ mod tests {
         i64,
         i64,
         i64,
-    )> {
+    );
+
+    fn entry_fingerprints(entries: &[UsageEntry]) -> Vec<EntryFingerprint> {
         entries
             .iter()
             .map(|entry| {

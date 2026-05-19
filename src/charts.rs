@@ -454,7 +454,7 @@ mod tests {
             segment_header_lines(&layout, ChartGranularity::Week, &|idx| match idx {
                 0 => 1_030_000_000.0,
                 1 => 1_540_000_000.0,
-                _ => 9_650_000_00.0,
+                _ => 965_000_000.0,
             })
         else {
             panic!("header should render");
@@ -525,7 +525,7 @@ mod tests {
             segment_header_lines(&layout, ChartGranularity::Week, &|idx| match idx {
                 0 => 1_030_000_000.0,
                 1 => 1_540_000_000.0,
-                _ => 9_650_000_00.0,
+                _ => 965_000_000.0,
             })
         else {
             panic!("header should render");

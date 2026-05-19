@@ -95,18 +95,14 @@ impl SyncWorker {
         }
     }
 
-    fn spawn_with_settings<F>(
-        cache_root: PathBuf,
-        settings: WorkerSettings,
-        mut run_cycle: F,
-    ) -> Self
+    fn spawn_with_settings<F>(cache_root: PathBuf, settings: WorkerSettings, run_cycle: F) -> Self
     where
         F: FnMut() -> Result<(), SyncError> + Send + 'static,
     {
         let shared = Arc::new(WorkerShared::new());
         let worker_shared = Arc::clone(&shared);
         let handle = thread::spawn(move || {
-            run_worker_loop(worker_shared, cache_root, settings, move || run_cycle());
+            run_worker_loop(worker_shared, cache_root, settings, run_cycle);
         });
         Self {
             shared,

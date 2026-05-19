@@ -230,10 +230,10 @@ fn default_secrets_path() -> PathBuf {
 }
 
 fn default_hostname() -> String {
-    if let Ok(hostname) = std::env::var("HOSTNAME") {
-        if !hostname.trim().is_empty() {
-            return hostname;
-        }
+    if let Ok(hostname) = std::env::var("HOSTNAME")
+        && !hostname.trim().is_empty()
+    {
+        return hostname;
     }
     fs::read_to_string("/etc/hostname")
         .ok()

@@ -153,6 +153,14 @@ pub struct RemoteUsageRecord {
     pub entry: UsageEntry,
 }
 
+#[derive(Debug, Clone)]
+pub struct CachedUsageRecord {
+    pub vendor: String,
+    pub source_path: String,
+    pub dedup_key: String,
+    pub entry: UsageEntry,
+}
+
 impl PersistedSourceRecord {
     fn from_source_record(source_path: String, record: SourceUsageRecord) -> Self {
         Self {
@@ -250,6 +258,28 @@ pub fn default_cache_dir() -> PathBuf {
 pub fn load_vendor_cached_snapshot(cache_root: &Path, vendor: &str) -> Vec<UsageEntry> {
     read_cached_records(&vendor_entries_path(cache_root, vendor))
         .map(|records| aggregate_persisted_records(records.iter()))
+        .unwrap_or_default()
+}
+
+pub fn load_vendor_cached_records(cache_root: &Path, vendor: &str) -> Vec<CachedUsageRecord> {
+    read_cached_records(&vendor_entries_path(cache_root, vendor))
+        .map(|records| {
+            let mut seen = HashSet::new();
+            records
+                .iter()
+                .filter_map(|record| {
+                    if !record.dedup_key.is_empty() && !seen.insert(record.dedup_key.clone()) {
+                        return None;
+                    }
+                    Some(CachedUsageRecord {
+                        vendor: vendor.to_string(),
+                        source_path: record.source_path.clone(),
+                        dedup_key: record.dedup_key.clone(),
+                        entry: record.to_usage_entry(),
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 

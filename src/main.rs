@@ -11,7 +11,7 @@ mod updater;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::os::unix::io::FromRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
 use std::thread;
@@ -359,6 +359,9 @@ enum SyncCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Drop the local pulled-records cache and the pull cursor, then refetch
+    /// every record this host can see from the server.
+    Clean,
 }
 
 fn get_terminal_size() -> (u16, u16) {
@@ -1855,7 +1858,7 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                 1
             }
         },
-        SyncCommand::Push | SyncCommand::Pull => {
+        SyncCommand::Push | SyncCommand::Pull | SyncCommand::Clean => {
             let sync::config::SyncConfig::Enabled(config) = sync_config else {
                 eprintln!("vibe-usage: sync is disabled");
                 return 1;
@@ -1889,6 +1892,7 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                         }
                     },
                 ),
+                SyncCommand::Clean => run_sync_clean(&cache_root, &config, &client),
                 SyncCommand::Status => unreachable!("status handled above"),
                 SyncCommand::Init { .. } => unreachable!("init handled above"),
             };
@@ -1908,6 +1912,25 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
             }
         }
     }
+}
+
+fn run_sync_clean(
+    cache_root: &Path,
+    config: &sync::config::EnabledSyncConfig,
+    client: &sync::client::SyncHttpClient,
+) -> Result<(), sync::engine::SyncError> {
+    let removed_files = data::cache::clear_remote_cache(cache_root)?;
+    let removed_state = sync::state::clear_sync_state(cache_root)?;
+    eprintln!(
+        "sync clean: cleared {removed_files} cached remote file(s); sync cursor {}",
+        if removed_state { "reset" } else { "already absent" }
+    );
+    eprintln!("sync clean: refetching records from server");
+    sync::engine::run_pull_once_with_progress(cache_root, config, client, |event| {
+        if let Some(message) = format_manual_sync_progress(event) {
+            eprintln!("{message}");
+        }
+    })
 }
 
 fn print_sync_status(sync_config: &sync::config::SyncConfig) {
@@ -1958,6 +1981,7 @@ fn sync_command_name(command: SyncCommand) -> &'static str {
         SyncCommand::Pull => "pull",
         SyncCommand::Status => "status",
         SyncCommand::Init { .. } => "init",
+        SyncCommand::Clean => "clean",
     }
 }
 
@@ -3478,6 +3502,14 @@ mod tests {
             init.command,
             Some(CliCommand::Sync {
                 command: SyncCommand::Init { force: true }
+            })
+        ));
+
+        let clean = Args::try_parse_from(["vibe-usage", "sync", "clean"]).expect("clean parses");
+        assert!(matches!(
+            clean.command,
+            Some(CliCommand::Sync {
+                command: SyncCommand::Clean
             })
         ));
     }

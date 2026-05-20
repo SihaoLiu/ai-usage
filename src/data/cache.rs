@@ -457,6 +457,28 @@ pub fn load_remote_entries(
     records
 }
 
+/// Remove every per-host file in the remote cache directory and report
+/// how many files were deleted. Returns Ok(0) if the directory does
+/// not exist.
+pub fn clear_remote_cache(cache_root: &Path) -> io::Result<usize> {
+    let remote_root = cache_root.join(REMOTE_DIR);
+    let entries = match fs::read_dir(&remote_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            fs::remove_file(&path)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 pub fn merge_remote_records(
     cache_root: &Path,
     host_id: &str,
@@ -1350,6 +1372,50 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn clear_remote_cache_drops_pulled_records_and_leaves_local_cache() {
+        let cache_root = unique_temp_dir("clear-remote");
+        super::merge_remote_records(
+            &cache_root,
+            "laptop",
+            vec![remote_record("claude", "a", "2026-05-01T00:00:00Z", 10)],
+        )
+        .expect("merge laptop");
+        super::merge_remote_records(
+            &cache_root,
+            "workstation",
+            vec![remote_record("claude", "b", "2026-05-01T00:01:00Z", 20)],
+        )
+        .expect("merge workstation");
+        let source = cache_root.join("source.jsonl");
+        write_source(&source, "first");
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "test",
+            vec![source],
+            -1,
+            |_| vec![usage_record("local-key", "2026-05-01T00:00:00Z", 7)],
+        );
+
+        let removed = super::clear_remote_cache(&cache_root).expect("clear");
+
+        assert_eq!(removed, 2);
+        assert!(super::load_remote_entries(&cache_root, None).is_empty());
+        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].usage.input_tokens, 7);
+
+        let removed_again = super::clear_remote_cache(&cache_root).expect("clear again");
+        assert_eq!(removed_again, 0);
+    }
+
+    #[test]
+    fn clear_remote_cache_on_missing_directory_returns_zero() {
+        let cache_root = unique_temp_dir("clear-remote-missing");
+
+        assert_eq!(super::clear_remote_cache(&cache_root).expect("clear"), 0);
     }
 
     #[test]

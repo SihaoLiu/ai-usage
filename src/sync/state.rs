@@ -50,6 +50,16 @@ pub fn save_sync_state(cache_root: &Path, state: &SyncState) -> io::Result<()> {
     atomic_write(&path, &content)
 }
 
+/// Delete the persisted sync cursor. Returns whether a file was removed.
+pub fn clear_sync_state(cache_root: &Path) -> io::Result<bool> {
+    let path = cache_root.join(SYNC_STATE_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 pub fn load_upload_log(cache_root: &Path) -> BTreeSet<(String, String)> {
     let path = cache_root.join(SYNC_UPLOAD_LOG_FILE);
     let Ok(content) = fs::read(path) else {
@@ -170,6 +180,27 @@ mod tests {
             .expect("write corrupt log");
 
         assert!(load_upload_log(&corrupt_root).is_empty());
+    }
+
+    #[test]
+    fn clear_sync_state_removes_existing_file_and_is_idempotent() {
+        let cache_root = unique_temp_dir("clear-state");
+        save_sync_state(
+            &cache_root,
+            &SyncState {
+                schema_version: SYNC_STATE_SCHEMA_VERSION,
+                last_seen_seq: 99,
+                last_successful_sync: Some("2026-05-20T00:00:00Z".to_string()),
+                last_error: None,
+            },
+        )
+        .expect("save state");
+
+        assert!(clear_sync_state(&cache_root).expect("first clear"));
+        assert!(!cache_root.join("sync_state.json").exists());
+        assert_eq!(load_sync_state(&cache_root), SyncState::default());
+
+        assert!(!clear_sync_state(&cache_root).expect("second clear"));
     }
 
     #[test]

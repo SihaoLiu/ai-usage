@@ -141,3 +141,66 @@ async fn two_homes_exchange_usage_through_local_server() {
 
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_clean_refetches_records_from_server_after_local_wipe() {
+    let root = unique_temp_dir("clean");
+    let home_a = root.join("home-a");
+    let home_b = root.join("home-b");
+    fs::create_dir_all(&home_a).expect("create home a");
+    fs::create_dir_all(&home_b).expect("create home b");
+
+    let state = AppState::new(server_config(root.join("server.db"))).expect("server state");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("server addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, build_app(state))
+            .await
+            .expect("server");
+    });
+    let server_url = format!("http://{addr}");
+
+    write_client_config(&home_a, &server_url, "host-a");
+    write_client_config(&home_b, &server_url, "host-b");
+    ensure_claude_dir(&home_b);
+    write_claude_usage(&home_a, "clean-model", &Utc::now().to_rfc3339());
+
+    assert_success(run_cli(&home_a, &["sync", "push"]), "host-a push");
+    assert_success(run_cli(&home_b, &["sync", "pull"]), "host-b pull");
+    let remote_path = home_b
+        .join(".cache")
+        .join("ai-usage")
+        .join("remote")
+        .join("host-a.bin");
+    let state_path = home_b
+        .join(".cache")
+        .join("ai-usage")
+        .join("sync_state.json");
+    assert!(remote_path.exists(), "first pull must populate remote cache");
+    assert!(state_path.exists(), "first pull must persist cursor");
+
+    fs::write(&remote_path, b"corrupted contents").expect("corrupt remote cache");
+
+    let clean_output = assert_success(run_cli(&home_b, &["sync", "clean"]), "host-b clean");
+    assert!(
+        clean_output.contains("sync clean complete"),
+        "clean stdout: {clean_output}"
+    );
+    assert!(
+        remote_path.exists(),
+        "clean must repopulate remote cache from server"
+    );
+
+    let after_clean = assert_success(
+        run_cli(
+            &home_b,
+            &["--once", "--vendor", "claude", "--host", "host-a"],
+        ),
+        "host-b display after clean",
+    );
+    assert!(after_clean.contains("clean-model"), "{after_clean}");
+
+    server.abort();
+}

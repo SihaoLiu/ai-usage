@@ -1823,8 +1823,17 @@ pub fn print_vendor_comparison_chart(
             .collect();
         let grand_total: f64 = vendor_totals.values().sum();
 
+        let mut legend_vendors: Vec<&String> =
+            vendors_sorted.iter().filter(|v| *v != "All").collect();
+        legend_vendors.sort_by(|a, b| {
+            vendor_totals[*b]
+                .partial_cmp(&vendor_totals[*a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
+        });
+
         let mut legend_items: Vec<String> = Vec::new();
-        for v in vendors_sorted.iter().filter(|v| *v != "All") {
+        for v in legend_vendors {
             let color = vendor_color(v);
             let pct = if grand_total > 0.0 {
                 vendor_totals[v] / grand_total * 100.0

@@ -319,7 +319,10 @@ fn byte_index_for_char(s: &str, char_idx: usize) -> usize {
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Analyze AI coding assistant usage statistics")]
+#[command(
+    about = "Analyze AI coding assistant usage statistics",
+    version = env!("CARGO_PKG_VERSION"),
+)]
 struct Args {
     /// Number of days to look back
     #[arg(long, default_value = "3")]
@@ -3518,6 +3521,18 @@ mod tests {
     fn host_arg_parses() {
         let args = Args::try_parse_from(["vibe-usage", "--host", "laptop"]).expect("host parses");
         assert_eq!(args.host.as_deref(), Some("laptop"));
+    }
+
+    #[test]
+    fn version_flag_prints_cargo_pkg_version() {
+        let err = Args::try_parse_from(["vibe-usage", "--version"])
+            .expect_err("--version should short-circuit parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(env!("CARGO_PKG_VERSION")),
+            "version output should contain crate version: {rendered}"
+        );
     }
 
     #[test]

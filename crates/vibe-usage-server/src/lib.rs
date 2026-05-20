@@ -297,7 +297,14 @@ async fn pull(
     let query = parse_pull_query(raw_query.as_deref())?;
     let limit = query.limit.unwrap_or(5000).clamp(1, 20_000);
     let fetch_limit = limit + 1;
-    let conn = state.pool.get()?;
+    let mut conn = state.pool.get()?;
+    // The page query and the global max_seq query must observe the same
+    // database snapshot. Without an enclosing transaction, SQLite WAL would
+    // begin a fresh read snapshot for each SELECT, letting writes from other
+    // connections appear between them; the response would then advertise a
+    // max_seq that includes records the page query never saw, causing the
+    // client to skip them on the next pull.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let mut sql = String::from(
         "SELECT seq, host_id, vendor, dedup_key, schema_version, timestamp_utc,
             session_start, session_end, model, effort, fast_tier, input_tokens, output_tokens,
@@ -317,22 +324,24 @@ async fn pull(
     }
     values.push(Value::Integer(fetch_limit as i64));
 
-    let mut stmt = conn.prepare(&sql)?;
-    let mut records: Vec<SequencedWireRecord> = stmt
-        .query_map(params_from_iter(values.iter()), row_to_sequenced_record)?
-        .collect::<Result<_, _>>()?;
+    let mut records: Vec<SequencedWireRecord> = {
+        let mut stmt = tx.prepare(&sql)?;
+        stmt.query_map(params_from_iter(values.iter()), row_to_sequenced_record)?
+            .collect::<Result<_, _>>()?
+    };
     let truncated = records.len() > limit;
     if truncated {
         records.truncate(limit);
     }
-    let global_max_seq = max_seq(&conn)?;
+    let snapshot_max_seq = max_seq_in_tx(&tx)?;
+    tx.commit()?;
     let response_max_seq = if truncated {
         records
             .last()
             .map(|record| record.seq)
             .unwrap_or(query.after_seq)
     } else {
-        global_max_seq
+        snapshot_max_seq
     };
 
     Ok(Json(PullResponse {
@@ -486,14 +495,6 @@ fn ensure_fast_tier_column(conn: &rusqlite::Connection) -> rusqlite::Result<()> 
         )?;
     }
     Ok(())
-}
-
-fn max_seq(conn: &rusqlite::Connection) -> rusqlite::Result<u64> {
-    conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM records", [], |row| {
-        Ok(row.get::<_, i64>(0)? as u64)
-    })
-    .optional()
-    .map(|value| value.unwrap_or(0))
 }
 
 fn max_seq_in_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<u64> {

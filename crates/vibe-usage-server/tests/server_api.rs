@@ -286,6 +286,92 @@ async fn concurrent_uploads_from_two_clients_succeed() {
     assert_eq!(body.records.len(), 2);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn pull_does_not_skip_records_committed_concurrently() {
+    use tokio::sync::Barrier;
+
+    const ITERATIONS: usize = 200;
+    const PARALLEL_UPLOADS: usize = 8;
+
+    for iteration in 0..ITERATIONS {
+        let cfg = ServerConfig {
+            max_batch_records: 1000,
+            ..config(&format!("pull-race-{iteration}"))
+        };
+        let app = build_app(AppState::new(cfg).expect("app state"));
+        let barrier = std::sync::Arc::new(Barrier::new(PARALLEL_UPLOADS + 1));
+
+        let pull_app = app.clone();
+        let pull_barrier = std::sync::Arc::clone(&barrier);
+        let pull_handle = tokio::spawn(async move {
+            pull_barrier.wait().await;
+            pull_app
+                .oneshot(authed_request(
+                    "GET",
+                    "/v1/pull?after_seq=0&exclude_host=host-b",
+                    Body::empty(),
+                ))
+                .await
+                .expect("pull response")
+        });
+
+        let upload_handles: Vec<_> = (0..PARALLEL_UPLOADS)
+            .map(|slot| {
+                let upload_app = app.clone();
+                let upload_barrier = std::sync::Arc::clone(&barrier);
+                let dedup_key = format!("race-{iteration}-{slot}");
+                tokio::spawn(async move {
+                    upload_barrier.wait().await;
+                    upload_app
+                        .oneshot(authed_request(
+                            "POST",
+                            "/v1/upload",
+                            ndjson(&[record("host-a", "claude", &dedup_key, slot as i64 + 1)]),
+                        ))
+                        .await
+                        .expect("upload response")
+                })
+            })
+            .collect();
+
+        let pull = pull_handle.await.expect("pull join");
+        assert_eq!(pull.status(), StatusCode::OK, "iteration {iteration}");
+        for handle in upload_handles {
+            let response = handle.await.expect("upload join");
+            assert_eq!(response.status(), StatusCode::OK, "iteration {iteration}");
+        }
+        let first_pull: PullResponse = read_json(pull).await;
+        let last_returned_seq = first_pull.records.last().map(|r| r.seq).unwrap_or(0);
+
+        let mut total_records = first_pull.records.len();
+        let mut cursor = first_pull.max_seq;
+        loop {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    "GET",
+                    &format!("/v1/pull?after_seq={cursor}&exclude_host=host-b"),
+                    Body::empty(),
+                ))
+                .await
+                .expect("follow-up pull");
+            assert_eq!(response.status(), StatusCode::OK, "iteration {iteration}");
+            let body: PullResponse = read_json(response).await;
+            total_records += body.records.len();
+            if body.max_seq == cursor && !body.truncated {
+                break;
+            }
+            cursor = body.max_seq;
+        }
+
+        assert_eq!(
+            total_records, PARALLEL_UPLOADS,
+            "iteration {iteration}: host-b lost records. first pull returned {} records (last seq={}), advertised max_seq={}, follow-up drained to seq={}",
+            first_pull.records.len(), last_returned_seq, first_pull.max_seq, cursor,
+        );
+    }
+}
+
 #[tokio::test]
 async fn token_bucket_rejects_after_burst_is_spent() {
     let app = app("rate-limit").await;

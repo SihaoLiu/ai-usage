@@ -155,7 +155,7 @@ pub fn is_valid_host_id(host_id: &str) -> bool {
 }
 
 pub fn is_valid_vendor(vendor: &str) -> bool {
-    matches!(vendor, "claude" | "codex" | "gemini")
+    matches!(vendor, "claude" | "codex" | "gemini" | "omp")
 }
 
 fn validate_host_id(host_id: &str) -> Result<(), ValidationError> {

@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod omp;
 
 use std::collections::HashMap;
 
@@ -12,8 +13,28 @@ use crate::time_utils::{
     TokenFractions, distribute_tokens_to_intervals, parse_timestamp, to_interval,
 };
 
+pub(crate) fn pricing_vendor_for_entry<'a>(vendor: &'a str, entry: &'a UsageEntry) -> &'a str {
+    if vendor != "omp" {
+        return vendor;
+    }
+
+    let Some(provider) = entry.effort.as_deref() else {
+        return "codex";
+    };
+    let provider = provider.to_ascii_lowercase();
+    if provider.contains("anthropic") || provider.contains("claude") {
+        "claude"
+    } else if provider.contains("gemini")
+        || provider.contains("google")
+        || provider.contains("vertex")
+    {
+        "gemini"
+    } else {
+        "codex"
+    }
+}
+
 /// Model breakdown row (shared across all vendors).
-///
 /// Cost component fields are populated during aggregation by applying tiered
 /// pricing on each individual entry, then summing. This is the only correct
 /// way to handle Claude's 1M-context >200k-tier pricing — applying the tier
@@ -112,11 +133,19 @@ pub(crate) fn calculate_model_breakdown_generic(
                 row.cache_creation += entry.usage.cache_creation_input_tokens;
             }
         }
+        if let Some(costs) = entry.costs {
+            row.input_cost += costs.input;
+            row.output_cost += costs.output;
+            row.cache_read_cost += costs.cache_read;
+            row.cache_creation_cost += costs.cache_creation;
+            continue;
+        }
 
-        // Apply tiered pricing per-entry. Use entry.model (without the effort
-        // suffix) so the lookup matches pricing.json keys and the stored
-        // fast tier snapshot can be applied per record.
-        let p = pricing.pricing_for_entry(vendor, &entry.model, entry.fast_tier);
+        // Apply tiered pricing per-entry. OMP records carry the underlying
+        // provider in `effort`; use that provider's rate table while preserving
+        // OMP as the display vendor.
+        let pricing_vendor = pricing_vendor_for_entry(vendor, entry);
+        let p = pricing.pricing_for_entry(pricing_vendor, &entry.model, entry.fast_tier);
         row.input_cost +=
             ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
         row.output_cost +=
@@ -126,16 +155,21 @@ pub(crate) fn calculate_model_breakdown_generic(
             p.cache_input,
             p.cache_input_above_200k,
         );
-        row.cache_creation_cost += match vendor {
+        row.cache_creation_cost += match (vendor, pricing_vendor) {
+            ("omp", _) => ModelPricing::tier_cost(
+                entry.usage.cache_creation_input_tokens,
+                p.cache_output,
+                p.cache_output_above_200k,
+            ),
             // Codex bills reasoning at the output rate; tier rules track output.
-            "codex" => ModelPricing::tier_cost(
+            (_, "codex") => ModelPricing::tier_cost(
                 entry.usage.reasoning_output_tokens,
                 p.output,
                 p.output_above_200k,
             ),
             // Gemini's "thoughts" land in cache_creation_input_tokens and bill
             // at the output rate.
-            "gemini" => ModelPricing::tier_cost(
+            (_, "gemini") => ModelPricing::tier_cost(
                 entry.usage.cache_creation_input_tokens,
                 p.output,
                 p.output_above_200k,
@@ -248,6 +282,7 @@ pub use codex::{
 pub use gemini::{
     calculate_gemini_model_breakdown, calculate_gemini_model_token_breakdown_time_series,
 };
+pub use omp::{calculate_omp_model_breakdown, calculate_omp_model_token_breakdown_time_series};
 
 // Re-export the generic functions for use by vendor modules
 pub(crate) use self::calculate_model_breakdown_generic as _calc_breakdown;

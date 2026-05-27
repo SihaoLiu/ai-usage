@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
+use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageCost, UsageEntry};
 use crate::time_utils::parse_timestamp;
 
 const CACHE_VERSION: u32 = 1;
@@ -118,6 +118,14 @@ struct PersistedSourceRecord {
     reasoning_output_tokens: i64,
     #[serde(default = "default_fast_tier")]
     fast_tier: i8,
+    #[serde(default)]
+    cost_input: Option<f64>,
+    #[serde(default)]
+    cost_output: Option<f64>,
+    #[serde(default)]
+    cost_cache_read: Option<f64>,
+    #[serde(default)]
+    cost_cache_creation: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +150,14 @@ struct PersistedRemoteRecord {
     reasoning_output_tokens: i64,
     #[serde(default = "default_fast_tier")]
     fast_tier: i8,
+    #[serde(default)]
+    cost_input: Option<f64>,
+    #[serde(default)]
+    cost_output: Option<f64>,
+    #[serde(default)]
+    cost_cache_read: Option<f64>,
+    #[serde(default)]
+    cost_cache_creation: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +244,23 @@ fn default_fast_tier() -> i8 {
     UNKNOWN_FAST_TIER
 }
 
+fn persisted_costs(
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_creation: Option<f64>,
+) -> Option<UsageCost> {
+    match (input, output, cache_read, cache_creation) {
+        (None, None, None, None) => None,
+        _ => Some(UsageCost {
+            input: input.unwrap_or(0.0),
+            output: output.unwrap_or(0.0),
+            cache_read: cache_read.unwrap_or(0.0),
+            cache_creation: cache_creation.unwrap_or(0.0),
+        }),
+    }
+}
+
 impl From<PersistedSourceRecordV1> for PersistedSourceRecord {
     fn from(record: PersistedSourceRecordV1) -> Self {
         Self {
@@ -244,6 +277,10 @@ impl From<PersistedSourceRecordV1> for PersistedSourceRecord {
             cache_creation_input_tokens: record.cache_creation_input_tokens,
             reasoning_output_tokens: record.reasoning_output_tokens,
             fast_tier: UNKNOWN_FAST_TIER,
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_creation: None,
         }
     }
 }
@@ -264,6 +301,10 @@ impl From<PersistedRemoteRecordV1> for PersistedRemoteRecord {
             cache_creation_input_tokens: record.cache_creation_input_tokens,
             reasoning_output_tokens: record.reasoning_output_tokens,
             fast_tier: UNKNOWN_FAST_TIER,
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_creation: None,
         }
     }
 }
@@ -284,6 +325,10 @@ impl PersistedSourceRecord {
             cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
             reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
             fast_tier,
+            cost_input: record.entry.costs.map(|costs| costs.input),
+            cost_output: record.entry.costs.map(|costs| costs.output),
+            cost_cache_read: record.entry.costs.map(|costs| costs.cache_read),
+            cost_cache_creation: record.entry.costs.map(|costs| costs.cache_creation),
         }
     }
 
@@ -304,6 +349,12 @@ impl PersistedSourceRecord {
                 cache_creation_input_tokens: self.cache_creation_input_tokens,
                 reasoning_output_tokens: self.reasoning_output_tokens,
             },
+            costs: persisted_costs(
+                self.cost_input,
+                self.cost_output,
+                self.cost_cache_read,
+                self.cost_cache_creation,
+            ),
         }
     }
 
@@ -334,6 +385,10 @@ impl PersistedRemoteRecord {
             cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
             reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
             fast_tier: record.entry.fast_tier,
+            cost_input: record.entry.costs.map(|costs| costs.input),
+            cost_output: record.entry.costs.map(|costs| costs.output),
+            cost_cache_read: record.entry.costs.map(|costs| costs.cache_read),
+            cost_cache_creation: record.entry.costs.map(|costs| costs.cache_creation),
         }
     }
 
@@ -357,6 +412,12 @@ impl PersistedRemoteRecord {
                     cache_creation_input_tokens: self.cache_creation_input_tokens,
                     reasoning_output_tokens: self.reasoning_output_tokens,
                 },
+                costs: persisted_costs(
+                    self.cost_input,
+                    self.cost_output,
+                    self.cost_cache_read,
+                    self.cost_cache_creation,
+                ),
             },
         }
     }
@@ -1100,6 +1161,14 @@ fn update_record_hash(hash: u64, record: &PersistedSourceRecord) -> u64 {
     ] {
         h = fnv1a_bytes(h, &value.to_le_bytes());
     }
+    for value in [
+        record.cost_input,
+        record.cost_output,
+        record.cost_cache_read,
+        record.cost_cache_creation,
+    ] {
+        h = fnv1a_bytes(h, &value.unwrap_or(0.0).to_le_bytes());
+    }
     h
 }
 
@@ -1171,6 +1240,7 @@ mod tests {
                     cache_creation_input_tokens: 4,
                     reasoning_output_tokens: 5,
                 },
+                costs: None,
             },
         }
     }
@@ -1207,6 +1277,7 @@ mod tests {
                     cache_creation_input_tokens: 4,
                     reasoning_output_tokens: 5,
                 },
+                costs: None,
             },
         }
     }
@@ -1391,13 +1462,9 @@ mod tests {
         .expect("merge workstation");
         let source = cache_root.join("source.jsonl");
         write_source(&source, "first");
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            vec![source],
-            -1,
-            |_| vec![usage_record("local-key", "2026-05-01T00:00:00Z", 7)],
-        );
+        let _ = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
+            vec![usage_record("local-key", "2026-05-01T00:00:00Z", 7)]
+        });
 
         let removed = super::clear_remote_cache(&cache_root).expect("clear");
 

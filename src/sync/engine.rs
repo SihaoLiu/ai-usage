@@ -10,7 +10,7 @@ use std::fmt;
 use std::path::Path;
 use vibe_usage_proto::{PullResponse, UploadResponse, WireRecord};
 
-const VENDORS: [&str; 3] = ["claude", "codex", "gemini"];
+const VENDORS: [&str; 4] = ["claude", "codex", "gemini", "omp"];
 const BATCH_SIZE: usize = 1000;
 const PULL_LIMIT: usize = 5000;
 
@@ -288,6 +288,7 @@ fn wire_to_remote_record(record: WireRecord) -> RemoteUsageRecord {
                 cache_creation_input_tokens: record.cache_creation_input_tokens,
                 reasoning_output_tokens: record.reasoning_output_tokens,
             },
+            costs: None,
         },
     }
 }
@@ -371,6 +372,7 @@ mod tests {
                     cache_creation_input_tokens: 4,
                     reasoning_output_tokens: 5,
                 },
+                costs: None,
             },
         }
     }

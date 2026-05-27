@@ -178,7 +178,10 @@ async fn sync_clean_refetches_records_from_server_after_local_wipe() {
         .join(".cache")
         .join("ai-usage")
         .join("sync_state.json");
-    assert!(remote_path.exists(), "first pull must populate remote cache");
+    assert!(
+        remote_path.exists(),
+        "first pull must populate remote cache"
+    );
     assert!(state_path.exists(), "first pull must persist cursor");
 
     fs::write(&remote_path, b"corrupted contents").expect("corrupt remote cache");

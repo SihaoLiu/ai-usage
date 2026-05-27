@@ -169,6 +169,7 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
                         .unwrap_or(0),
                     reasoning_output_tokens: 0,
                 },
+                costs: None,
             },
         });
     }

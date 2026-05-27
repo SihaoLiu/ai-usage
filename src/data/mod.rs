@@ -2,6 +2,7 @@ pub mod cache;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod omp;
 
 use crate::time_utils::{TimeWindow, parse_timestamp};
 use chrono::{DateTime, Local};
@@ -21,6 +22,7 @@ pub struct UsageEntry {
     pub effort: Option<String>,
     pub fast_tier: i8,
     pub usage: TokenUsage,
+    pub costs: Option<UsageCost>,
 }
 
 /// Token usage counts for a single entry.
@@ -31,6 +33,14 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
     pub reasoning_output_tokens: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UsageCost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_creation: f64,
 }
 
 /// Normalized usage entry paired with a stable source-level deduplication key.
@@ -85,6 +95,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 reasoning_output_tokens: 0,
             },
+            costs: None,
         }
     }
 

@@ -97,6 +97,7 @@ fn read_single_gemini_file(path: &Path) -> Vec<SourceUsageRecord> {
                     cache_creation_input_tokens: thoughts_tokens,
                     reasoning_output_tokens: 0,
                 },
+                costs: None,
             },
         });
     }

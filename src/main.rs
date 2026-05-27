@@ -30,6 +30,7 @@ use data::UsageEntry;
 use data::claude::detect_fast_tier_snapshot as detect_claude_fast_tier_snapshot;
 use data::codex::{detect_fast_tier_snapshot as detect_codex_fast_tier_snapshot, get_codex_dir};
 use data::gemini::get_gemini_dir;
+use data::omp::get_omp_dir;
 use formatting::print_model_breakdown;
 use stats::{ModelBreakdownRow, VendorTimeSeries};
 use time_utils::TimeWindow;
@@ -155,6 +156,7 @@ struct RawDataCache {
     claude: Vec<UsageEntry>,
     codex: Vec<UsageEntry>,
     gemini: Vec<UsageEntry>,
+    omp: Vec<UsageEntry>,
     horizon_days: i64,
 }
 
@@ -336,7 +338,7 @@ struct Args {
     once: bool,
 
     /// Vendor to collect statistics from
-    #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "all"])]
+    #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "omp", "all"])]
     vendor: String,
 
     /// Filter usage to a single machine id
@@ -652,6 +654,7 @@ fn get_vendor_data_dir(vendor: &str) -> Option<PathBuf> {
     match vendor {
         "codex" => Some(get_codex_dir().join("sessions")),
         "gemini" => Some(get_gemini_dir().join("tmp")),
+        "omp" => Some(get_omp_dir().join("agent").join("sessions")),
         "claude" => {
             let dirs = data::claude::get_claude_dirs();
             Some(
@@ -694,6 +697,7 @@ fn merge_remote_records_into_raw_cache(
             "claude" => cache.claude.push(record.entry),
             "codex" => cache.codex.push(record.entry),
             "gemini" => cache.gemini.push(record.entry),
+            "omp" => cache.omp.push(record.entry),
             _ => {}
         }
     }
@@ -718,6 +722,11 @@ fn read_all_vendor_cached_snapshot_for_hosts(
         },
         gemini: if include_local {
             data::cache::load_vendor_cached_snapshot(&cache_root, "gemini")
+        } else {
+            Vec::new()
+        },
+        omp: if include_local {
+            data::cache::load_vendor_cached_snapshot(&cache_root, "omp")
         } else {
             Vec::new()
         },
@@ -759,10 +768,20 @@ fn refresh_all_vendor_raw_full() -> RawDataCache {
         data::gemini::read_gemini_file_records,
     );
 
+    let omp_dir = get_omp_dir().join("agent").join("sessions");
+    let omp = data::cache::refresh_full_vendor_cache(
+        &cache_root,
+        "omp",
+        data::omp::collect_usage_files(&omp_dir, None),
+        0,
+        data::omp::read_omp_file_records,
+    );
+
     RawDataCache {
         claude,
         codex,
         gemini,
+        omp,
         horizon_days: FULL_CACHE_HORIZON,
     }
 }
@@ -800,6 +819,7 @@ fn start_background_raw_refresh(state: &mut AppState) {
             refreshed.claude.clear();
             refreshed.codex.clear();
             refreshed.gemini.clear();
+            refreshed.omp.clear();
         }
         let cache_root = data::cache::default_cache_dir();
         let host_set = host_filter
@@ -1248,6 +1268,7 @@ struct AllVendorData {
     claude: Vec<UsageEntry>,
     codex: Vec<UsageEntry>,
     gemini: Vec<UsageEntry>,
+    omp: Vec<UsageEntry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1266,11 +1287,17 @@ fn classify_window_data(has_source_data: bool, has_window_data: bool) -> WindowD
 }
 
 fn raw_cache_has_any_vendor_data(cache: &RawDataCache) -> bool {
-    !cache.claude.is_empty() || !cache.codex.is_empty() || !cache.gemini.is_empty()
+    !cache.claude.is_empty()
+        || !cache.codex.is_empty()
+        || !cache.gemini.is_empty()
+        || !cache.omp.is_empty()
 }
 
 fn all_vendor_data_has_window_data(all_data: &AllVendorData) -> bool {
-    !all_data.claude.is_empty() || !all_data.codex.is_empty() || !all_data.gemini.is_empty()
+    !all_data.claude.is_empty()
+        || !all_data.codex.is_empty()
+        || !all_data.gemini.is_empty()
+        || !all_data.omp.is_empty()
 }
 
 fn load_all_vendor_data(state: &mut AppState, now: DateTime<Local>) -> AllVendorData {
@@ -1281,6 +1308,7 @@ fn load_all_vendor_data(state: &mut AppState, now: DateTime<Local>) -> AllVendor
         claude: data::filter_usage_data_by_window(&cache.claude, &window, now),
         codex: data::filter_usage_data_by_window(&cache.codex, &window, now),
         gemini: data::filter_usage_data_by_window(&cache.gemini, &window, now),
+        omp: data::filter_usage_data_by_window(&cache.omp, &window, now),
     }
 }
 
@@ -1334,6 +1362,9 @@ fn calculate_vendor_aggregate_time_series(
     if !all_data.gemini.is_empty() {
         process_data(&all_data.gemini, "Gemini", &mut time_series);
     }
+    if !all_data.omp.is_empty() {
+        process_data(&all_data.omp, "Oh My Pi", &mut time_series);
+    }
 
     time_series
 }
@@ -1362,6 +1393,9 @@ fn calculate_all_model_breakdown(
             pricing,
         ));
     }
+    if !all_data.omp.is_empty() {
+        all_stats.extend(stats::calculate_omp_model_breakdown(&all_data.omp, pricing));
+    }
 
     all_stats.sort_by(|a, b| b.count.cmp(&a.count));
     all_stats
@@ -1379,6 +1413,7 @@ fn calculate_weighted_cost_per_mtok(
         ("claude", &all_data.claude, subscription_fees.claude),
         ("codex", &all_data.codex, subscription_fees.codex),
         ("gemini", &all_data.gemini, subscription_fees.gemini),
+        ("omp", &all_data.omp, 0.0),
     ];
 
     let mut vendor_data: Vec<(i64, f64, f64)> = Vec::new(); // (tokens, api_cost, sub_price)
@@ -1409,7 +1444,13 @@ fn calculate_weighted_cost_per_mtok(
                 + entry.usage.cache_read_input_tokens
                 + extra;
 
-            let p = pricing.pricing_for_entry(vendor, &entry.model, entry.fast_tier);
+            if let Some(costs) = entry.costs {
+                api_cost += costs.input + costs.output + costs.cache_read + costs.cache_creation;
+                continue;
+            }
+
+            let pricing_vendor = stats::pricing_vendor_for_entry(vendor, entry);
+            let p = pricing.pricing_for_entry(pricing_vendor, &entry.model, entry.fast_tier);
             api_cost +=
                 ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
             api_cost +=
@@ -1419,13 +1460,18 @@ fn calculate_weighted_cost_per_mtok(
                 p.cache_input,
                 p.cache_input_above_200k,
             );
-            api_cost += match vendor {
-                "codex" => ModelPricing::tier_cost(
+            api_cost += match (vendor, pricing_vendor) {
+                ("omp", _) => ModelPricing::tier_cost(
+                    entry.usage.cache_creation_input_tokens,
+                    p.cache_output,
+                    p.cache_output_above_200k,
+                ),
+                (_, "codex") => ModelPricing::tier_cost(
                     entry.usage.reasoning_output_tokens,
                     p.output,
                     p.output_above_200k,
                 ),
-                "gemini" => ModelPricing::tier_cost(
+                (_, "gemini") => ModelPricing::tier_cost(
                     entry.usage.cache_creation_input_tokens,
                     p.output,
                     p.output_above_200k,
@@ -1631,6 +1677,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         "claude" => &cache.claude,
         "codex" => &cache.codex,
         "gemini" => &cache.gemini,
+        "omp" => &cache.omp,
         _ => &cache.claude,
     };
     let filtered = data::filter_usage_data_by_window(raw_for_vendor, &state.time_window, now);
@@ -1647,6 +1694,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let model_stats = match vendor.as_str() {
         "codex" => stats::calculate_codex_model_breakdown(&filtered, &state.pricing),
         "gemini" => stats::calculate_gemini_model_breakdown(&filtered, &state.pricing),
+        "omp" => stats::calculate_omp_model_breakdown(&filtered, &state.pricing),
         _ => stats::calculate_claude_model_breakdown(&filtered, &state.pricing),
     };
 
@@ -1672,6 +1720,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let vendor_name = match vendor.as_str() {
         "codex" => "Codex",
         "gemini" => "Gemini CLI",
+        "omp" => "Oh My Pi",
         _ => "Claude Code",
     };
 
@@ -1706,6 +1755,9 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         }
         "gemini" => {
             stats::calculate_gemini_model_token_breakdown_time_series(&filtered, interval_minutes)
+        }
+        "omp" => {
+            stats::calculate_omp_model_token_breakdown_time_series(&filtered, interval_minutes)
         }
         _ => stats::calculate_claude_model_token_breakdown_time_series(&filtered, interval_minutes),
     };
@@ -2098,6 +2150,7 @@ fn main() {
             refreshed.claude.clear();
             refreshed.codex.clear();
             refreshed.gemini.clear();
+            refreshed.omp.clear();
         }
         let cache_root = data::cache::default_cache_dir();
         let host_set = state
@@ -2416,7 +2469,7 @@ fn main() {
                                 did_refresh = true;
                             }
                             "n" => {
-                                let rotation = ["all", "claude", "codex", "gemini"];
+                                let rotation = ["all", "claude", "codex", "gemini", "omp"];
                                 let idx = rotation
                                     .iter()
                                     .position(|&v| v == state.vendor)
@@ -2510,7 +2563,7 @@ fn main() {
                                 println!("Available Commands:\r");
                                 println!("  r, refresh       - Refresh statistics immediately\r");
                                 println!(
-                                    "  v, vendor [X]    - Switch vendor (claude|codex|gemini|all)\r"
+                                    "  v, vendor [X]    - Switch vendor (claude|codex|gemini|omp|all)\r"
                                 );
                                 println!("  host [X]         - Switch host (all or machine id)\r");
                                 println!("  n                - Rotate to next vendor\r");
@@ -2611,7 +2664,9 @@ fn main() {
                                     match parts[0] {
                                         "v" | "vendor" if parts.len() == 2 => {
                                             let nv = parts[1];
-                                            if ["claude", "codex", "gemini", "all"].contains(&nv) {
+                                            if ["claude", "codex", "gemini", "omp", "all"]
+                                                .contains(&nv)
+                                            {
                                                 // Validate directory before switching
                                                 if let Some(dir) = get_vendor_data_dir(nv)
                                                     && !dir.exists()
@@ -2640,7 +2695,7 @@ fn main() {
                                                 did_refresh = true;
                                             } else {
                                                 println!(
-                                                    "Usage: v, vendor [claude|codex|gemini|all]\r"
+                                                    "Usage: v, vendor [claude|codex|gemini|omp|all]\r"
                                                 );
                                             }
                                         }
@@ -2728,7 +2783,7 @@ fn main() {
                                         "v" | "vendor" => {
                                             println!("Current vendor: {}\r", state.vendor);
                                             println!(
-                                                "Usage: v, vendor [claude|codex|gemini|all]\r"
+                                                "Usage: v, vendor [claude|codex|gemini|omp|all]\r"
                                             );
                                         }
                                         "host" => {
@@ -3695,6 +3750,7 @@ mod tests {
             claude: Vec::new(),
             codex: Vec::new(),
             gemini: Vec::new(),
+            omp: Vec::new(),
             horizon_days: FULL_CACHE_HORIZON,
         };
         merge_remote_records_into_raw_cache(
@@ -3713,6 +3769,7 @@ mod tests {
                         effort: None,
                         fast_tier: -1,
                         usage: data::TokenUsage::default(),
+                        costs: None,
                     },
                 },
                 data::cache::RemoteUsageRecord {
@@ -3728,6 +3785,7 @@ mod tests {
                         effort: None,
                         fast_tier: -1,
                         usage: data::TokenUsage::default(),
+                        costs: None,
                     },
                 },
             ],

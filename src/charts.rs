@@ -712,6 +712,7 @@ fn vendor_color(vendor: &str) -> &'static str {
         "Claude" => "\x1b[38;5;173m",
         "Codex" => "\x1b[38;5;255m",
         "Gemini" => "\x1b[38;5;33m",
+        "Oh My Pi" => "\x1b[38;5;141m",
         "All" => "\x1b[38;5;226m",
         _ => "\x1b[38;5;135m",
     }
@@ -1700,7 +1701,7 @@ pub fn print_vendor_comparison_chart(
         }
     }
 
-    let vendor_order = ["Claude", "Codex", "Gemini"];
+    let vendor_order = ["Claude", "Codex", "Gemini", "Oh My Pi"];
     let mut vendors_sorted: Vec<String> = vendor_order
         .iter()
         .filter(|v| all_vendors.contains(**v))

@@ -365,9 +365,13 @@ async fn pull_does_not_skip_records_committed_concurrently() {
         }
 
         assert_eq!(
-            total_records, PARALLEL_UPLOADS,
+            total_records,
+            PARALLEL_UPLOADS,
             "iteration {iteration}: host-b lost records. first pull returned {} records (last seq={}), advertised max_seq={}, follow-up drained to seq={}",
-            first_pull.records.len(), last_returned_seq, first_pull.max_seq, cursor,
+            first_pull.records.len(),
+            last_returned_seq,
+            first_pull.max_seq,
+            cursor,
         );
     }
 }

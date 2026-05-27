@@ -141,6 +141,7 @@ fn format_model_name_with_vendor_prefix(
         "claude" => "Claude",
         "codex" => "OpenAI",
         "gemini" => "Google",
+        "omp" => "Oh My Pi",
         _ => vendor,
     };
     format!("{:<width$}: {}", display_vendor, name, width = prefix_width)
@@ -453,7 +454,7 @@ pub fn get_table_width(mode: &str) -> usize {
 fn get_strategy_totals(stats: &ModelBreakdownRow) -> (i64, i64, i64) {
     let cache_hit = stats.cache_read;
     match stats.vendor.as_str() {
-        "claude" => {
+        "claude" | "omp" => {
             let prefill = stats.input + stats.cache_creation;
             let decoding = stats.output;
             (cache_hit, prefill, decoding)
@@ -482,7 +483,7 @@ fn get_strategy_costs(
 ) -> (f64, f64, f64) {
     let cache_hit_cost = cache_input_cost;
     match vendor {
-        "claude" => {
+        "claude" | "omp" => {
             let prefill_cost = input_cost + cache_output_cost;
             let decoding_cost = output_cost;
             (cache_hit_cost, prefill_cost, decoding_cost)

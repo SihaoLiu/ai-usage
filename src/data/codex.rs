@@ -235,6 +235,7 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                                     cache_creation_input_tokens: 0,
                                     reasoning_output_tokens: reasoning_output,
                                 },
+                                costs: None,
                             },
                             dedup_key,
                         });

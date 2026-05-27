@@ -8,7 +8,7 @@ mod sync;
 mod time_utils;
 mod updater;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,10 @@ use std::thread;
 
 use chrono::{DateTime, Duration, Local};
 use clap::{Parser, Subcommand};
-use crossterm::terminal;
+use crossterm::{
+    event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    terminal,
+};
 
 use constants::{
     AllPricing, ModelPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees,
@@ -586,6 +589,62 @@ fn slide_window_by_display_interval(
         IntervalSlideDirection::Older => window.slide_back_by(now, step),
         IntervalSlideDirection::Newer => window.slide_forward_by(now, step),
     }
+}
+
+fn apply_interval_slide_directions<I>(
+    window: &TimeWindow,
+    now: DateTime<Local>,
+    target_width: usize,
+    directions: I,
+) -> Option<TimeWindow>
+where
+    I: IntoIterator<Item = IntervalSlideDirection>,
+{
+    let mut current = window.clone();
+    let mut changed = false;
+    for direction in directions {
+        if let Some(next) = slide_window_by_display_interval(&current, now, target_width, direction)
+        {
+            current = next;
+            changed = true;
+        }
+    }
+    changed.then_some(current)
+}
+
+fn interval_slide_direction_for_event(event: &Event) -> Option<IntervalSlideDirection> {
+    match event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Left,
+            ..
+        }) => Some(IntervalSlideDirection::Newer),
+        Event::Key(KeyEvent {
+            code: KeyCode::Right,
+            ..
+        }) => Some(IntervalSlideDirection::Older),
+        _ => None,
+    }
+}
+
+fn collect_interval_slide_directions(
+    pending_events: &mut VecDeque<Event>,
+    first_direction: IntervalSlideDirection,
+) -> Vec<IntervalSlideDirection> {
+    let mut directions = vec![first_direction];
+    while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+        match crossterm::event::read() {
+            Ok(event) => {
+                if let Some(direction) = interval_slide_direction_for_event(&event) {
+                    directions.push(direction);
+                } else {
+                    pending_events.push_back(event);
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    directions
 }
 
 /// Get the data directory for a vendor, or None for "all".
@@ -1926,7 +1985,11 @@ fn run_sync_clean(
     let removed_state = sync::state::clear_sync_state(cache_root)?;
     eprintln!(
         "sync clean: cleared {removed_files} cached remote file(s); sync cursor {}",
-        if removed_state { "reset" } else { "already absent" }
+        if removed_state {
+            "reset"
+        } else {
+            "already absent"
+        }
     );
     eprintln!("sync clean: refetching records from server");
     sync::engine::run_pull_once_with_progress(cache_root, config, client, |event| {
@@ -2098,6 +2161,7 @@ fn main() {
 
         let mut input = InputLine::new();
         let mut history = CommandHistory::new();
+        let mut pending_events = VecDeque::new();
         let show_prompt = |state: &mut AppState,
                            input: &InputLine,
                            too_small: bool,
@@ -2303,343 +2367,295 @@ fn main() {
                 timeout =
                     timeout.min(next_sync.saturating_duration_since(std::time::Instant::now()));
             }
-            if crossterm::event::poll(timeout).unwrap_or(false) {
-                use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-                if let Ok(event) = crossterm::event::read() {
-                    match event {
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Char('c'),
-                            modifiers,
-                            ..
-                        }) if modifiers.contains(KeyModifiers::CONTROL) => {
-                            cleanup_and_break("Monitoring stopped.");
-                            break 'monitor;
-                        }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Char('d'),
-                            modifiers,
-                            ..
-                        }) if modifiers.contains(KeyModifiers::CONTROL) => {
-                            cleanup_and_break("Exiting monitor mode...");
-                            break 'monitor;
-                        }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Enter,
-                            ..
-                        }) => {
-                            prompt_notice = None;
-                            println!("\r");
-                            let command = input.snapshot().trim().to_string();
-                            history.record(&command);
-                            input.clear();
-                            let (width, _) = get_terminal_size();
+            let next_event = if let Some(event) = pending_events.pop_front() {
+                Some(event)
+            } else if crossterm::event::poll(timeout).unwrap_or(false) {
+                crossterm::event::read().ok()
+            } else {
+                None
+            };
+            if let Some(event) = next_event {
+                match event {
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers,
+                        ..
+                    }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                        cleanup_and_break("Monitoring stopped.");
+                        break 'monitor;
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Char('d'),
+                        modifiers,
+                        ..
+                    }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                        cleanup_and_break("Exiting monitor mode...");
+                        break 'monitor;
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    }) => {
+                        prompt_notice = None;
+                        println!("\r");
+                        let command = input.snapshot().trim().to_string();
+                        history.record(&command);
+                        input.clear();
+                        let (width, _) = get_terminal_size();
 
-                            let mut did_refresh = false;
-                            match command.as_str() {
-                                "" | "r" | "refresh" => {
-                                    println!("{}\r", "-".repeat(width as usize));
-                                    println!("\n\r{}\r", "=".repeat(width as usize));
-                                    println!("MANUAL REFRESH\r");
-                                    println!("{}\n\r", "=".repeat(width as usize));
-                                    start_background_raw_refresh(&mut state);
-                                    let result = refresh_display(&mut state);
-                                    terminal_too_small = result.is_none();
-                                    did_refresh = true;
-                                }
-                                "n" => {
-                                    let rotation = ["all", "claude", "codex", "gemini"];
-                                    let idx = rotation
-                                        .iter()
-                                        .position(|&v| v == state.vendor)
-                                        .unwrap_or(0);
-                                    let mut new_vendor = rotation[(idx + 1) % rotation.len()];
-                                    // Validate directory; skip missing vendors
-                                    for _ in 0..rotation.len() {
-                                        if let Some(dir) = get_vendor_data_dir(new_vendor)
-                                            && !dir.exists()
-                                        {
-                                            println!("Skipping {} (no data dir)...\r", new_vendor);
-                                            let skip_idx = rotation
-                                                .iter()
-                                                .position(|&v| v == new_vendor)
-                                                .unwrap_or(0);
-                                            new_vendor = rotation[(skip_idx + 1) % rotation.len()];
-                                            continue;
-                                        }
-                                        break;
-                                    }
-                                    state.vendor = new_vendor.to_string();
-                                    println!("{}\r", "-".repeat(width as usize));
-                                    println!("\n\r{}\r", "=".repeat(width as usize));
-                                    println!("SWITCHED TO {}\r", state.vendor.to_uppercase());
-                                    println!("{}\n\r", "=".repeat(width as usize));
-                                    let result = refresh_display(&mut state);
-                                    terminal_too_small = result.is_none();
-                                    did_refresh = true;
-                                }
-                                "a" => {
-                                    if state.vendor != "all" {
-                                        state.vendor = "all".to_string();
-                                        println!("{}\r", "-".repeat(width as usize));
-                                        println!("\n\r{}\r", "=".repeat(width as usize));
-                                        println!("SWITCHED TO ALL VENDORS\r");
-                                        println!("{}\n\r", "=".repeat(width as usize));
-                                        let result = refresh_display(&mut state);
-                                        terminal_too_small = result.is_none();
-                                        did_refresh = true;
-                                    } else {
-                                        println!("Already monitoring all vendors.\r");
-                                    }
-                                }
-                                "d" | "day" | "days" => {
-                                    if state.days != 1 {
-                                        state.days = 1;
-                                        state.time_window = TimeWindow::rolling_days(1);
-                                        println!("{}\r", "-".repeat(width as usize));
-                                        println!("\n\r{}\r", "=".repeat(width as usize));
-                                        println!("CHANGED TO 1 DAY\r");
-                                        println!("{}\n\r", "=".repeat(width as usize));
-                                        let result = refresh_display(&mut state);
-                                        terminal_too_small = result.is_none();
-                                        did_refresh = true;
-                                    } else {
-                                        println!("Already showing 1 day.\r");
-                                    }
-                                }
-                                "w" | "week" => {
-                                    if state.days != 7 {
-                                        state.days = 7;
-                                        state.time_window = TimeWindow::rolling_days(7);
-                                        println!("{}\r", "-".repeat(width as usize));
-                                        println!("\n\r{}\r", "=".repeat(width as usize));
-                                        println!("CHANGED TO 7 DAYS (WEEK MODE)\r");
-                                        println!("{}\n\r", "=".repeat(width as usize));
-                                        let result = refresh_display(&mut state);
-                                        terminal_too_small = result.is_none();
-                                        did_refresh = true;
-                                    } else {
-                                        println!("Already showing 7 days (week mode).\r");
-                                    }
-                                }
-                                "m" | "month" => {
-                                    if state.days != 30 {
-                                        state.days = 30;
-                                        state.time_window = TimeWindow::rolling_days(30);
-                                        println!("{}\r", "-".repeat(width as usize));
-                                        println!("\n\r{}\r", "=".repeat(width as usize));
-                                        println!("CHANGED TO 30 DAYS (MONTH MODE)\r");
-                                        println!("{}\n\r", "=".repeat(width as usize));
-                                        let result = refresh_display(&mut state);
-                                        terminal_too_small = result.is_none();
-                                        did_refresh = true;
-                                    } else {
-                                        println!("Already showing 30 days (month mode).\r");
-                                    }
-                                }
-                                "h" | "help" => {
-                                    println!("{}\r", "-".repeat(width as usize));
-                                    println!("Available Commands:\r");
-                                    println!(
-                                        "  r, refresh       - Refresh statistics immediately\r"
-                                    );
-                                    println!(
-                                        "  v, vendor [X]    - Switch vendor (claude|codex|gemini|all)\r"
-                                    );
-                                    println!(
-                                        "  host [X]         - Switch host (all or machine id)\r"
-                                    );
-                                    println!("  n                - Rotate to next vendor\r");
-                                    println!("  a                - Jump to vendor=all\r");
-                                    println!(
-                                        "  d, day, days [N] - Change days (default: 1 if no N)\r"
-                                    );
-                                    println!("  w, week          - Week mode (7 days)\r");
-                                    println!("  m, month         - Month mode (30 days)\r");
-                                    println!("  date YYYY-MM-DD  - Show one complete local day\r");
-                                    println!(
-                                        "  range A B        - Show inclusive local date span (any order)\r"
-                                    );
-                                    println!(
-                                        "  latest           - Return to rolling days window\r"
-                                    );
-                                    println!(
-                                        "  i, interval <N>  - Change refresh interval (seconds)\r"
-                                    );
-                                    println!(
-                                        "  PgUp / PgDn      - Slide the time window back / forward by its width\r"
-                                    );
-                                    println!(
-                                        "                     (PgDn snaps to the present once you reach it)\r"
-                                    );
-                                    println!(
-                                        "  Left / Right     - Empty prompt: newer / older by interval; text: move cursor\r"
-                                    );
-                                    println!(
-                                        "  + / -            - Empty prompt: zoom the time window in / out\r"
-                                    );
-                                    println!(
-                                        "  update           - Download the latest GitHub release and restart\r"
-                                    );
-                                    println!("  e, exit          - Exit monitor mode\r");
-                                    println!("{}\r", "-".repeat(width as usize));
-                                    println!(
-                                        "Current: vendor={}, host={}, window={}, interval={}s\r",
-                                        state.vendor,
-                                        host_label(state.host.as_deref()),
-                                        state.time_window.display_label(Local::now()),
-                                        state.monitor_interval
-                                    );
-                                }
-                                "host" => {
-                                    let known_hosts =
-                                        known_host_ids(state.local_host_id.as_deref());
-                                    println!(
-                                        "Current host: {}\r",
-                                        host_label(state.host.as_deref())
-                                    );
-                                    println!("Usage: host [all|HOST]\r");
-                                    if !known_hosts.is_empty() {
-                                        println!("Known hosts: {}\r", known_hosts.join(", "));
-                                    }
-                                }
-                                "e" | "exit" => {
-                                    cleanup_and_break("Exiting monitor mode...");
-                                    break 'monitor;
-                                }
-                                "update" | "upgrade" => {
-                                    crossterm::terminal::disable_raw_mode().ok();
-                                    println!("\r");
-                                    let result = updater::run_update(|msg| {
-                                        println!("{msg}\r");
-                                    });
-                                    match result {
-                                        Ok(updater::UpdateOutcome::AlreadyLatest {
-                                            current,
-                                            latest,
-                                        }) => {
-                                            println!(
-                                                "Already on latest version: v{current} (remote: v{latest}).\r"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            println!("Update failed: {e}\r");
-                                        }
-                                    }
-                                    crossterm::terminal::enable_raw_mode().ok();
-                                }
-                                _ => {
-                                    if let Some(parsed) =
-                                        parse_time_window_command(&command, state.days)
+                        let mut did_refresh = false;
+                        match command.as_str() {
+                            "" | "r" | "refresh" => {
+                                println!("{}\r", "-".repeat(width as usize));
+                                println!("\n\r{}\r", "=".repeat(width as usize));
+                                println!("MANUAL REFRESH\r");
+                                println!("{}\n\r", "=".repeat(width as usize));
+                                start_background_raw_refresh(&mut state);
+                                let result = refresh_display(&mut state);
+                                terminal_too_small = result.is_none();
+                                did_refresh = true;
+                            }
+                            "n" => {
+                                let rotation = ["all", "claude", "codex", "gemini"];
+                                let idx = rotation
+                                    .iter()
+                                    .position(|&v| v == state.vendor)
+                                    .unwrap_or(0);
+                                let mut new_vendor = rotation[(idx + 1) % rotation.len()];
+                                // Validate directory; skip missing vendors
+                                for _ in 0..rotation.len() {
+                                    if let Some(dir) = get_vendor_data_dir(new_vendor)
+                                        && !dir.exists()
                                     {
-                                        match parsed {
-                                            Ok(window) => {
-                                                state.time_window = window;
+                                        println!("Skipping {} (no data dir)...\r", new_vendor);
+                                        let skip_idx = rotation
+                                            .iter()
+                                            .position(|&v| v == new_vendor)
+                                            .unwrap_or(0);
+                                        new_vendor = rotation[(skip_idx + 1) % rotation.len()];
+                                        continue;
+                                    }
+                                    break;
+                                }
+                                state.vendor = new_vendor.to_string();
+                                println!("{}\r", "-".repeat(width as usize));
+                                println!("\n\r{}\r", "=".repeat(width as usize));
+                                println!("SWITCHED TO {}\r", state.vendor.to_uppercase());
+                                println!("{}\n\r", "=".repeat(width as usize));
+                                let result = refresh_display(&mut state);
+                                terminal_too_small = result.is_none();
+                                did_refresh = true;
+                            }
+                            "a" => {
+                                if state.vendor != "all" {
+                                    state.vendor = "all".to_string();
+                                    println!("{}\r", "-".repeat(width as usize));
+                                    println!("\n\r{}\r", "=".repeat(width as usize));
+                                    println!("SWITCHED TO ALL VENDORS\r");
+                                    println!("{}\n\r", "=".repeat(width as usize));
+                                    let result = refresh_display(&mut state);
+                                    terminal_too_small = result.is_none();
+                                    did_refresh = true;
+                                } else {
+                                    println!("Already monitoring all vendors.\r");
+                                }
+                            }
+                            "d" | "day" | "days" => {
+                                if state.days != 1 {
+                                    state.days = 1;
+                                    state.time_window = TimeWindow::rolling_days(1);
+                                    println!("{}\r", "-".repeat(width as usize));
+                                    println!("\n\r{}\r", "=".repeat(width as usize));
+                                    println!("CHANGED TO 1 DAY\r");
+                                    println!("{}\n\r", "=".repeat(width as usize));
+                                    let result = refresh_display(&mut state);
+                                    terminal_too_small = result.is_none();
+                                    did_refresh = true;
+                                } else {
+                                    println!("Already showing 1 day.\r");
+                                }
+                            }
+                            "w" | "week" => {
+                                if state.days != 7 {
+                                    state.days = 7;
+                                    state.time_window = TimeWindow::rolling_days(7);
+                                    println!("{}\r", "-".repeat(width as usize));
+                                    println!("\n\r{}\r", "=".repeat(width as usize));
+                                    println!("CHANGED TO 7 DAYS (WEEK MODE)\r");
+                                    println!("{}\n\r", "=".repeat(width as usize));
+                                    let result = refresh_display(&mut state);
+                                    terminal_too_small = result.is_none();
+                                    did_refresh = true;
+                                } else {
+                                    println!("Already showing 7 days (week mode).\r");
+                                }
+                            }
+                            "m" | "month" => {
+                                if state.days != 30 {
+                                    state.days = 30;
+                                    state.time_window = TimeWindow::rolling_days(30);
+                                    println!("{}\r", "-".repeat(width as usize));
+                                    println!("\n\r{}\r", "=".repeat(width as usize));
+                                    println!("CHANGED TO 30 DAYS (MONTH MODE)\r");
+                                    println!("{}\n\r", "=".repeat(width as usize));
+                                    let result = refresh_display(&mut state);
+                                    terminal_too_small = result.is_none();
+                                    did_refresh = true;
+                                } else {
+                                    println!("Already showing 30 days (month mode).\r");
+                                }
+                            }
+                            "h" | "help" => {
+                                println!("{}\r", "-".repeat(width as usize));
+                                println!("Available Commands:\r");
+                                println!("  r, refresh       - Refresh statistics immediately\r");
+                                println!(
+                                    "  v, vendor [X]    - Switch vendor (claude|codex|gemini|all)\r"
+                                );
+                                println!("  host [X]         - Switch host (all or machine id)\r");
+                                println!("  n                - Rotate to next vendor\r");
+                                println!("  a                - Jump to vendor=all\r");
+                                println!("  d, day, days [N] - Change days (default: 1 if no N)\r");
+                                println!("  w, week          - Week mode (7 days)\r");
+                                println!("  m, month         - Month mode (30 days)\r");
+                                println!("  date YYYY-MM-DD  - Show one complete local day\r");
+                                println!(
+                                    "  range A B        - Show inclusive local date span (any order)\r"
+                                );
+                                println!("  latest           - Return to rolling days window\r");
+                                println!(
+                                    "  i, interval <N>  - Change refresh interval (seconds)\r"
+                                );
+                                println!(
+                                    "  PgUp / PgDn      - Slide the time window back / forward by its width\r"
+                                );
+                                println!(
+                                    "                     (PgDn snaps to the present once you reach it)\r"
+                                );
+                                println!(
+                                    "  Left / Right     - Empty prompt: newer / older by interval; text: move cursor\r"
+                                );
+                                println!(
+                                    "  + / -            - Empty prompt: zoom the time window in / out\r"
+                                );
+                                println!(
+                                    "  update           - Download the latest GitHub release and restart\r"
+                                );
+                                println!("  e, exit          - Exit monitor mode\r");
+                                println!("{}\r", "-".repeat(width as usize));
+                                println!(
+                                    "Current: vendor={}, host={}, window={}, interval={}s\r",
+                                    state.vendor,
+                                    host_label(state.host.as_deref()),
+                                    state.time_window.display_label(Local::now()),
+                                    state.monitor_interval
+                                );
+                            }
+                            "host" => {
+                                let known_hosts = known_host_ids(state.local_host_id.as_deref());
+                                println!("Current host: {}\r", host_label(state.host.as_deref()));
+                                println!("Usage: host [all|HOST]\r");
+                                if !known_hosts.is_empty() {
+                                    println!("Known hosts: {}\r", known_hosts.join(", "));
+                                }
+                            }
+                            "e" | "exit" => {
+                                cleanup_and_break("Exiting monitor mode...");
+                                break 'monitor;
+                            }
+                            "update" | "upgrade" => {
+                                crossterm::terminal::disable_raw_mode().ok();
+                                println!("\r");
+                                let result = updater::run_update(|msg| {
+                                    println!("{msg}\r");
+                                });
+                                match result {
+                                    Ok(updater::UpdateOutcome::AlreadyLatest {
+                                        current,
+                                        latest,
+                                    }) => {
+                                        println!(
+                                            "Already on latest version: v{current} (remote: v{latest}).\r"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        println!("Update failed: {e}\r");
+                                    }
+                                }
+                                crossterm::terminal::enable_raw_mode().ok();
+                            }
+                            _ => {
+                                if let Some(parsed) =
+                                    parse_time_window_command(&command, state.days)
+                                {
+                                    match parsed {
+                                        Ok(window) => {
+                                            state.time_window = window;
+                                            println!("{}\r", "-".repeat(width as usize));
+                                            println!("\n\r{}\r", "=".repeat(width as usize));
+                                            println!(
+                                                "SET TIME WINDOW: {}\r",
+                                                state.time_window.display_label(Local::now())
+                                            );
+                                            println!("{}\n\r", "=".repeat(width as usize));
+                                            let result = refresh_display(&mut state);
+                                            terminal_too_small = result.is_none();
+                                            did_refresh = true;
+                                        }
+                                        Err(err) => {
+                                            println!("{}\r", err);
+                                        }
+                                    }
+                                } else {
+                                    let parts: Vec<&str> = command.splitn(2, ' ').collect();
+                                    match parts[0] {
+                                        "v" | "vendor" if parts.len() == 2 => {
+                                            let nv = parts[1];
+                                            if ["claude", "codex", "gemini", "all"].contains(&nv) {
+                                                // Validate directory before switching
+                                                if let Some(dir) = get_vendor_data_dir(nv)
+                                                    && !dir.exists()
+                                                {
+                                                    println!(
+                                                        "Error: Data directory not found at {}\r",
+                                                        dir.display()
+                                                    );
+                                                    prompt_block_visible = show_prompt(
+                                                        &mut state,
+                                                        &input,
+                                                        terminal_too_small,
+                                                        prompt_notice.as_ref(),
+                                                        current_sync_status(sync_worker.as_ref()),
+                                                        PromptBlockMode::Append,
+                                                    );
+                                                    continue 'monitor;
+                                                }
+                                                state.vendor = nv.to_string();
                                                 println!("{}\r", "-".repeat(width as usize));
                                                 println!("\n\r{}\r", "=".repeat(width as usize));
-                                                println!(
-                                                    "SET TIME WINDOW: {}\r",
-                                                    state.time_window.display_label(Local::now())
-                                                );
+                                                println!("SWITCHED TO {}\r", nv.to_uppercase());
                                                 println!("{}\n\r", "=".repeat(width as usize));
                                                 let result = refresh_display(&mut state);
                                                 terminal_too_small = result.is_none();
                                                 did_refresh = true;
-                                            }
-                                            Err(err) => {
-                                                println!("{}\r", err);
+                                            } else {
+                                                println!(
+                                                    "Usage: v, vendor [claude|codex|gemini|all]\r"
+                                                );
                                             }
                                         }
-                                    } else {
-                                        let parts: Vec<&str> = command.splitn(2, ' ').collect();
-                                        match parts[0] {
-                                            "v" | "vendor" if parts.len() == 2 => {
-                                                let nv = parts[1];
-                                                if ["claude", "codex", "gemini", "all"]
-                                                    .contains(&nv)
-                                                {
-                                                    // Validate directory before switching
-                                                    if let Some(dir) = get_vendor_data_dir(nv)
-                                                        && !dir.exists()
-                                                    {
+                                        "host" if parts.len() == 2 => {
+                                            match parse_host_selection(parts[1]) {
+                                                Ok(new_host) => {
+                                                    if state.host == new_host {
                                                         println!(
-                                                            "Error: Data directory not found at {}\r",
-                                                            dir.display()
+                                                            "Already showing host {}.\r",
+                                                            host_label(state.host.as_deref())
                                                         );
-                                                        prompt_block_visible = show_prompt(
-                                                            &mut state,
-                                                            &input,
-                                                            terminal_too_small,
-                                                            prompt_notice.as_ref(),
-                                                            current_sync_status(
-                                                                sync_worker.as_ref(),
-                                                            ),
-                                                            PromptBlockMode::Append,
-                                                        );
-                                                        continue 'monitor;
-                                                    }
-                                                    state.vendor = nv.to_string();
-                                                    println!("{}\r", "-".repeat(width as usize));
-                                                    println!(
-                                                        "\n\r{}\r",
-                                                        "=".repeat(width as usize)
-                                                    );
-                                                    println!("SWITCHED TO {}\r", nv.to_uppercase());
-                                                    println!("{}\n\r", "=".repeat(width as usize));
-                                                    let result = refresh_display(&mut state);
-                                                    terminal_too_small = result.is_none();
-                                                    did_refresh = true;
-                                                } else {
-                                                    println!(
-                                                        "Usage: v, vendor [claude|codex|gemini|all]\r"
-                                                    );
-                                                }
-                                            }
-                                            "host" if parts.len() == 2 => {
-                                                match parse_host_selection(parts[1]) {
-                                                    Ok(new_host) => {
-                                                        if state.host == new_host {
-                                                            println!(
-                                                                "Already showing host {}.\r",
-                                                                host_label(state.host.as_deref())
-                                                            );
-                                                        } else {
-                                                            state.host = new_host;
-                                                            state.raw_cache = None;
-                                                            state.raw_refresh = None;
-                                                            println!(
-                                                                "{}\r",
-                                                                "-".repeat(width as usize)
-                                                            );
-                                                            println!(
-                                                                "\n\r{}\r",
-                                                                "=".repeat(width as usize)
-                                                            );
-                                                            println!(
-                                                                "SWITCHED TO HOST {}\r",
-                                                                host_label(state.host.as_deref())
-                                                            );
-                                                            println!(
-                                                                "{}\n\r",
-                                                                "=".repeat(width as usize)
-                                                            );
-                                                            start_background_raw_refresh(
-                                                                &mut state,
-                                                            );
-                                                            let result =
-                                                                refresh_display(&mut state);
-                                                            terminal_too_small = result.is_none();
-                                                            did_refresh = true;
-                                                        }
-                                                    }
-                                                    Err(err) => println!("{err}\r"),
-                                                }
-                                            }
-                                            "d" | "day" | "days" if parts.len() == 2 => {
-                                                if let Ok(n) = parts[1].parse::<i64>() {
-                                                    if n >= 1 {
-                                                        state.days = n;
-                                                        state.time_window =
-                                                            TimeWindow::rolling_days(n);
+                                                    } else {
+                                                        state.host = new_host;
+                                                        state.raw_cache = None;
+                                                        state.raw_refresh = None;
                                                         println!(
                                                             "{}\r",
                                                             "-".repeat(width as usize)
@@ -2648,328 +2664,124 @@ fn main() {
                                                             "\n\r{}\r",
                                                             "=".repeat(width as usize)
                                                         );
-                                                        println!("CHANGED TO {} DAYS\r", n);
+                                                        println!(
+                                                            "SWITCHED TO HOST {}\r",
+                                                            host_label(state.host.as_deref())
+                                                        );
                                                         println!(
                                                             "{}\n\r",
                                                             "=".repeat(width as usize)
                                                         );
+                                                        start_background_raw_refresh(&mut state);
                                                         let result = refresh_display(&mut state);
                                                         terminal_too_small = result.is_none();
                                                         did_refresh = true;
-                                                    } else {
-                                                        println!("Days must be at least 1.\r");
                                                     }
-                                                } else {
-                                                    println!("Invalid days value.\r");
                                                 }
+                                                Err(err) => println!("{err}\r"),
                                             }
-                                            "i" | "interval" if parts.len() == 2 => {
-                                                if let Ok(n) = parts[1].parse::<u64>() {
-                                                    if n >= 1 {
-                                                        state.monitor_interval = n;
-                                                        (next_refresh, next_sync) =
-                                                            monitor_deadlines_after_interval_change(
-                                                                std::time::Instant::now(),
-                                                                n,
-                                                            );
-                                                        println!(
-                                                            "Refresh interval changed to {} seconds.\r",
-                                                            n
-                                                        );
-                                                    } else {
-                                                        println!(
-                                                            "Interval must be at least 1 second.\r"
-                                                        );
-                                                    }
-                                                } else {
-                                                    println!("Invalid interval value.\r");
-                                                }
-                                            }
-                                            "v" | "vendor" => {
-                                                println!("Current vendor: {}\r", state.vendor);
-                                                println!(
-                                                    "Usage: v, vendor [claude|codex|gemini|all]\r"
-                                                );
-                                            }
-                                            "host" => {
-                                                let known_hosts =
-                                                    known_host_ids(state.local_host_id.as_deref());
-                                                println!(
-                                                    "Current host: {}\r",
-                                                    host_label(state.host.as_deref())
-                                                );
-                                                println!("Usage: host [all|HOST]\r");
-                                                if !known_hosts.is_empty() {
+                                        }
+                                        "d" | "day" | "days" if parts.len() == 2 => {
+                                            if let Ok(n) = parts[1].parse::<i64>() {
+                                                if n >= 1 {
+                                                    state.days = n;
+                                                    state.time_window = TimeWindow::rolling_days(n);
+                                                    println!("{}\r", "-".repeat(width as usize));
                                                     println!(
-                                                        "Known hosts: {}\r",
-                                                        known_hosts.join(", ")
+                                                        "\n\r{}\r",
+                                                        "=".repeat(width as usize)
+                                                    );
+                                                    println!("CHANGED TO {} DAYS\r", n);
+                                                    println!("{}\n\r", "=".repeat(width as usize));
+                                                    let result = refresh_display(&mut state);
+                                                    terminal_too_small = result.is_none();
+                                                    did_refresh = true;
+                                                } else {
+                                                    println!("Days must be at least 1.\r");
+                                                }
+                                            } else {
+                                                println!("Invalid days value.\r");
+                                            }
+                                        }
+                                        "i" | "interval" if parts.len() == 2 => {
+                                            if let Ok(n) = parts[1].parse::<u64>() {
+                                                if n >= 1 {
+                                                    state.monitor_interval = n;
+                                                    (next_refresh, next_sync) =
+                                                        monitor_deadlines_after_interval_change(
+                                                            std::time::Instant::now(),
+                                                            n,
+                                                        );
+                                                    println!(
+                                                        "Refresh interval changed to {} seconds.\r",
+                                                        n
+                                                    );
+                                                } else {
+                                                    println!(
+                                                        "Interval must be at least 1 second.\r"
                                                     );
                                                 }
+                                            } else {
+                                                println!("Invalid interval value.\r");
                                             }
-                                            "i" | "interval" => {
+                                        }
+                                        "v" | "vendor" => {
+                                            println!("Current vendor: {}\r", state.vendor);
+                                            println!(
+                                                "Usage: v, vendor [claude|codex|gemini|all]\r"
+                                            );
+                                        }
+                                        "host" => {
+                                            let known_hosts =
+                                                known_host_ids(state.local_host_id.as_deref());
+                                            println!(
+                                                "Current host: {}\r",
+                                                host_label(state.host.as_deref())
+                                            );
+                                            println!("Usage: host [all|HOST]\r");
+                                            if !known_hosts.is_empty() {
                                                 println!(
-                                                    "Current interval: {} seconds\r",
-                                                    state.monitor_interval
-                                                );
-                                                println!("Usage: i <N> or interval <N>\r");
-                                            }
-                                            _ => {
-                                                println!(
-                                                    "Unknown command: '{}'. Type h for help.\r",
-                                                    command
+                                                    "Known hosts: {}\r",
+                                                    known_hosts.join(", ")
                                                 );
                                             }
+                                        }
+                                        "i" | "interval" => {
+                                            println!(
+                                                "Current interval: {} seconds\r",
+                                                state.monitor_interval
+                                            );
+                                            println!("Usage: i <N> or interval <N>\r");
+                                        }
+                                        _ => {
+                                            println!(
+                                                "Unknown command: '{}'. Type h for help.\r",
+                                                command
+                                            );
                                         }
                                     }
                                 }
                             }
-                            if did_refresh {
-                                next_refresh = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(state.monitor_interval);
-                            }
-                            prompt_block_visible = show_prompt(
-                                &mut state,
-                                &input,
-                                terminal_too_small,
-                                prompt_notice.as_ref(),
-                                current_sync_status(sync_worker.as_ref()),
-                                PromptBlockMode::Append,
-                            );
                         }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Up, ..
-                        }) => {
-                            if let Some(recalled) = history.navigate_up(input.snapshot()) {
-                                prompt_notice = None;
-                                input.replace(recalled);
-                                render_input(
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    state.integrity_status,
-                                );
-                            }
+                        if did_refresh {
+                            next_refresh = std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval);
                         }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Down,
-                            ..
-                        }) => {
-                            if let Some(recalled) = history.navigate_down() {
-                                prompt_notice = None;
-                                input.replace(recalled);
-                                render_input(
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    state.integrity_status,
-                                );
-                            }
-                        }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::PageUp,
-                            ..
-                        }) => {
-                            let now = Local::now();
-                            if let Some(new_window) = state.time_window.slide_back(now) {
-                                state.time_window = new_window;
-                                let result = refresh_display(&mut state);
-                                terminal_too_small = result.is_none();
-                                next_refresh = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(state.monitor_interval);
-                                prompt_block_visible = show_prompt(
-                                    &mut state,
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    current_sync_status(sync_worker.as_ref()),
-                                    PromptBlockMode::Append,
-                                );
-                                render_input(
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    state.integrity_status,
-                                );
-                            }
-                        }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::PageDown,
-                            ..
-                        }) => {
-                            let now = Local::now();
-                            if let Some(new_window) = state.time_window.slide_forward(now) {
-                                state.time_window = new_window;
-                                let result = refresh_display(&mut state);
-                                terminal_too_small = result.is_none();
-                                next_refresh = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(state.monitor_interval);
-                                prompt_block_visible = show_prompt(
-                                    &mut state,
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    current_sync_status(sync_worker.as_ref()),
-                                    PromptBlockMode::Append,
-                                );
-                                render_input(
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    state.integrity_status,
-                                );
-                            }
-                        }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Left,
-                            ..
-                        }) => {
-                            if input.is_empty() {
-                                let now = Local::now();
-                                if let Some(new_window) = slide_window_by_display_interval(
-                                    &state.time_window,
-                                    now,
-                                    get_chart_target_width(),
-                                    IntervalSlideDirection::Newer,
-                                ) {
-                                    state.time_window = new_window;
-                                    let result = refresh_display(&mut state);
-                                    terminal_too_small = result.is_none();
-                                    next_refresh = std::time::Instant::now()
-                                        + std::time::Duration::from_secs(state.monitor_interval);
-                                    prompt_block_visible = show_prompt(
-                                        &mut state,
-                                        &input,
-                                        terminal_too_small,
-                                        prompt_notice.as_ref(),
-                                        current_sync_status(sync_worker.as_ref()),
-                                        PromptBlockMode::Append,
-                                    );
-                                    render_input(
-                                        &input,
-                                        terminal_too_small,
-                                        prompt_notice.as_ref(),
-                                        state.integrity_status,
-                                    );
-                                }
-                            } else if input.move_left() {
-                                print!("\x1b[D");
-                                io::stdout().flush().unwrap();
-                            }
-                        }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Right,
-                            ..
-                        }) => {
-                            if input.is_empty() {
-                                let now = Local::now();
-                                if let Some(new_window) = slide_window_by_display_interval(
-                                    &state.time_window,
-                                    now,
-                                    get_chart_target_width(),
-                                    IntervalSlideDirection::Older,
-                                ) {
-                                    state.time_window = new_window;
-                                    let result = refresh_display(&mut state);
-                                    terminal_too_small = result.is_none();
-                                    next_refresh = std::time::Instant::now()
-                                        + std::time::Duration::from_secs(state.monitor_interval);
-                                    prompt_block_visible = show_prompt(
-                                        &mut state,
-                                        &input,
-                                        terminal_too_small,
-                                        prompt_notice.as_ref(),
-                                        current_sync_status(sync_worker.as_ref()),
-                                        PromptBlockMode::Append,
-                                    );
-                                    render_input(
-                                        &input,
-                                        terminal_too_small,
-                                        prompt_notice.as_ref(),
-                                        state.integrity_status,
-                                    );
-                                }
-                            } else if input.move_right() {
-                                print!("\x1b[C");
-                                io::stdout().flush().unwrap();
-                            }
-                        }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Backspace,
-                            ..
-                        }) => {
-                            if input.backspace() {
-                                prompt_notice = None;
-                                render_input(
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    state.integrity_status,
-                                );
-                            }
-                        }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Char('+'),
-                            modifiers,
-                            ..
-                        }) if input.is_empty() && !modifiers.contains(KeyModifiers::CONTROL) => {
-                            let now = Local::now();
-                            if let Some(new_window) = state.time_window.zoom_in(now) {
-                                state.time_window = new_window;
-                                let result = refresh_display(&mut state);
-                                terminal_too_small = result.is_none();
-                                next_refresh = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(state.monitor_interval);
-                                prompt_block_visible = show_prompt(
-                                    &mut state,
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    current_sync_status(sync_worker.as_ref()),
-                                    PromptBlockMode::Append,
-                                );
-                                render_input(
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    state.integrity_status,
-                                );
-                            }
-                        }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Char('-'),
-                            modifiers,
-                            ..
-                        }) if input.is_empty() && !modifiers.contains(KeyModifiers::CONTROL) => {
-                            let now = Local::now();
-                            if let Some(new_window) = state.time_window.zoom_out(now) {
-                                state.time_window = new_window;
-                                let result = refresh_display(&mut state);
-                                terminal_too_small = result.is_none();
-                                next_refresh = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(state.monitor_interval);
-                                prompt_block_visible = show_prompt(
-                                    &mut state,
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    current_sync_status(sync_worker.as_ref()),
-                                    PromptBlockMode::Append,
-                                );
-                                render_input(
-                                    &input,
-                                    terminal_too_small,
-                                    prompt_notice.as_ref(),
-                                    state.integrity_status,
-                                );
-                            }
-                        }
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Char(c),
-                            modifiers,
-                            ..
-                        }) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                        prompt_block_visible = show_prompt(
+                            &mut state,
+                            &input,
+                            terminal_too_small,
+                            prompt_notice.as_ref(),
+                            current_sync_status(sync_worker.as_ref()),
+                            PromptBlockMode::Append,
+                        );
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Up, ..
+                    }) => {
+                        if let Some(recalled) = history.navigate_up(input.snapshot()) {
                             prompt_notice = None;
-                            input.insert_char(c);
+                            input.replace(recalled);
                             render_input(
                                 &input,
                                 terminal_too_small,
@@ -2977,15 +2789,29 @@ fn main() {
                                 state.integrity_status,
                             );
                         }
-                        Event::Resize(w, h) => {
-                            last_size = (w, h);
-                            if !terminal_too_small {
-                                println!("\r{}\r", " ".repeat(w as usize + 2));
-                                println!("{}\r", "-".repeat(w as usize));
-                                println!("\n\r{}\r", "=".repeat(w as usize));
-                                println!("TERMINAL RESIZED (width: {}, height: {})\r", w, h);
-                                println!("{}\n\r", "=".repeat(w as usize));
-                            }
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    }) => {
+                        if let Some(recalled) = history.navigate_down() {
+                            prompt_notice = None;
+                            input.replace(recalled);
+                            render_input(
+                                &input,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                state.integrity_status,
+                            );
+                        }
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    }) => {
+                        let now = Local::now();
+                        if let Some(new_window) = state.time_window.slide_back(now) {
+                            state.time_window = new_window;
                             let result = refresh_display(&mut state);
                             terminal_too_small = result.is_none();
                             next_refresh = std::time::Instant::now()
@@ -2998,9 +2824,230 @@ fn main() {
                                 current_sync_status(sync_worker.as_ref()),
                                 PromptBlockMode::Append,
                             );
+                            render_input(
+                                &input,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                state.integrity_status,
+                            );
                         }
-                        _ => {}
                     }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    }) => {
+                        let now = Local::now();
+                        if let Some(new_window) = state.time_window.slide_forward(now) {
+                            state.time_window = new_window;
+                            let result = refresh_display(&mut state);
+                            terminal_too_small = result.is_none();
+                            next_refresh = std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval);
+                            prompt_block_visible = show_prompt(
+                                &mut state,
+                                &input,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                current_sync_status(sync_worker.as_ref()),
+                                PromptBlockMode::Append,
+                            );
+                            render_input(
+                                &input,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                state.integrity_status,
+                            );
+                        }
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Left,
+                        ..
+                    }) => {
+                        if input.is_empty() {
+                            let now = Local::now();
+                            let directions = collect_interval_slide_directions(
+                                &mut pending_events,
+                                IntervalSlideDirection::Newer,
+                            );
+                            if let Some(new_window) = apply_interval_slide_directions(
+                                &state.time_window,
+                                now,
+                                get_chart_target_width(),
+                                directions,
+                            ) {
+                                state.time_window = new_window;
+                                let result = refresh_display(&mut state);
+                                terminal_too_small = result.is_none();
+                                next_refresh = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval);
+                                prompt_block_visible = show_prompt(
+                                    &mut state,
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    current_sync_status(sync_worker.as_ref()),
+                                    PromptBlockMode::Append,
+                                );
+                                render_input(
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    state.integrity_status,
+                                );
+                            }
+                        } else if input.move_left() {
+                            print!("\x1b[D");
+                            io::stdout().flush().unwrap();
+                        }
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Right,
+                        ..
+                    }) => {
+                        if input.is_empty() {
+                            let now = Local::now();
+                            let directions = collect_interval_slide_directions(
+                                &mut pending_events,
+                                IntervalSlideDirection::Older,
+                            );
+                            if let Some(new_window) = apply_interval_slide_directions(
+                                &state.time_window,
+                                now,
+                                get_chart_target_width(),
+                                directions,
+                            ) {
+                                state.time_window = new_window;
+                                let result = refresh_display(&mut state);
+                                terminal_too_small = result.is_none();
+                                next_refresh = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval);
+                                prompt_block_visible = show_prompt(
+                                    &mut state,
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    current_sync_status(sync_worker.as_ref()),
+                                    PromptBlockMode::Append,
+                                );
+                                render_input(
+                                    &input,
+                                    terminal_too_small,
+                                    prompt_notice.as_ref(),
+                                    state.integrity_status,
+                                );
+                            }
+                        } else if input.move_right() {
+                            print!("\x1b[C");
+                            io::stdout().flush().unwrap();
+                        }
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Backspace,
+                        ..
+                    }) => {
+                        if input.backspace() {
+                            prompt_notice = None;
+                            render_input(
+                                &input,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                state.integrity_status,
+                            );
+                        }
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Char('+'),
+                        modifiers,
+                        ..
+                    }) if input.is_empty() && !modifiers.contains(KeyModifiers::CONTROL) => {
+                        let now = Local::now();
+                        if let Some(new_window) = state.time_window.zoom_in(now) {
+                            state.time_window = new_window;
+                            let result = refresh_display(&mut state);
+                            terminal_too_small = result.is_none();
+                            next_refresh = std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval);
+                            prompt_block_visible = show_prompt(
+                                &mut state,
+                                &input,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                current_sync_status(sync_worker.as_ref()),
+                                PromptBlockMode::Append,
+                            );
+                            render_input(
+                                &input,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                state.integrity_status,
+                            );
+                        }
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Char('-'),
+                        modifiers,
+                        ..
+                    }) if input.is_empty() && !modifiers.contains(KeyModifiers::CONTROL) => {
+                        let now = Local::now();
+                        if let Some(new_window) = state.time_window.zoom_out(now) {
+                            state.time_window = new_window;
+                            let result = refresh_display(&mut state);
+                            terminal_too_small = result.is_none();
+                            next_refresh = std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval);
+                            prompt_block_visible = show_prompt(
+                                &mut state,
+                                &input,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                current_sync_status(sync_worker.as_ref()),
+                                PromptBlockMode::Append,
+                            );
+                            render_input(
+                                &input,
+                                terminal_too_small,
+                                prompt_notice.as_ref(),
+                                state.integrity_status,
+                            );
+                        }
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Char(c),
+                        modifiers,
+                        ..
+                    }) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                        prompt_notice = None;
+                        input.insert_char(c);
+                        render_input(
+                            &input,
+                            terminal_too_small,
+                            prompt_notice.as_ref(),
+                            state.integrity_status,
+                        );
+                    }
+                    Event::Resize(w, h) => {
+                        last_size = (w, h);
+                        if !terminal_too_small {
+                            println!("\r{}\r", " ".repeat(w as usize + 2));
+                            println!("{}\r", "-".repeat(w as usize));
+                            println!("\n\r{}\r", "=".repeat(w as usize));
+                            println!("TERMINAL RESIZED (width: {}, height: {})\r", w, h);
+                            println!("{}\n\r", "=".repeat(w as usize));
+                        }
+                        let result = refresh_display(&mut state);
+                        terminal_too_small = result.is_none();
+                        next_refresh = std::time::Instant::now()
+                            + std::time::Duration::from_secs(state.monitor_interval);
+                        prompt_block_visible = show_prompt(
+                            &mut state,
+                            &input,
+                            terminal_too_small,
+                            prompt_notice.as_ref(),
+                            current_sync_status(sync_worker.as_ref()),
+                            PromptBlockMode::Append,
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -3283,6 +3330,57 @@ mod tests {
             slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Newer)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn batched_interval_slide_matches_repeated_right_arrow_slides() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+        let target_width = 160;
+        let directions = [IntervalSlideDirection::Older; 5];
+
+        let batched = apply_interval_slide_directions(&window, now, target_width, directions)
+            .expect("batched slide");
+        let mut sequential = window.clone();
+        for _ in 0..directions.len() {
+            sequential = slide_window_by_display_interval(
+                &sequential,
+                now,
+                target_width,
+                IntervalSlideDirection::Older,
+            )
+            .expect("sequential slide");
+        }
+
+        assert_eq!(batched.bounds(now), sequential.bounds(now));
+        assert_eq!(batched.page_step(), sequential.page_step());
+    }
+
+    #[test]
+    fn batched_interval_slide_preserves_noop_then_right_arrow_slide() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+        let target_width = 160;
+        let directions = [IntervalSlideDirection::Newer, IntervalSlideDirection::Older];
+
+        let batched = apply_interval_slide_directions(&window, now, target_width, directions)
+            .expect("batched slide");
+        let expected = slide_window_by_display_interval(
+            &window,
+            now,
+            target_width,
+            IntervalSlideDirection::Older,
+        )
+        .expect("right arrow slide");
+
+        assert_eq!(batched.bounds(now), expected.bounds(now));
+        assert_eq!(batched.page_step(), expected.page_step());
     }
 
     #[test]

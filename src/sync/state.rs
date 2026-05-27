@@ -14,6 +14,8 @@ const SYNC_UPLOAD_LOG_FILE: &str = "sync_upload_log.bin";
 pub struct SyncState {
     pub schema_version: u32,
     pub last_seen_seq: u64,
+    #[serde(default)]
+    pub pull_vendors: Vec<String>,
     pub last_successful_sync: Option<String>,
     pub last_error: Option<String>,
 }
@@ -23,6 +25,7 @@ impl Default for SyncState {
         Self {
             schema_version: SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 0,
+            pull_vendors: Vec::new(),
             last_successful_sync: None,
             last_error: None,
         }
@@ -125,6 +128,7 @@ mod tests {
             SyncState {
                 schema_version: SYNC_STATE_SCHEMA_VERSION,
                 last_seen_seq: 0,
+                pull_vendors: Vec::new(),
                 last_successful_sync: None,
                 last_error: None,
             }
@@ -137,6 +141,7 @@ mod tests {
         let state = SyncState {
             schema_version: SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 42,
+            pull_vendors: vec!["claude".to_string(), "codex".to_string()],
             last_successful_sync: Some("2026-05-18T12:34:56Z".to_string()),
             last_error: Some("temporary network error".to_string()),
         };
@@ -190,6 +195,7 @@ mod tests {
             &SyncState {
                 schema_version: SYNC_STATE_SCHEMA_VERSION,
                 last_seen_seq: 99,
+                pull_vendors: Vec::new(),
                 last_successful_sync: Some("2026-05-20T00:00:00Z".to_string()),
                 last_error: None,
             },
@@ -209,6 +215,7 @@ mod tests {
         let state = SyncState {
             schema_version: SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 7,
+            pull_vendors: Vec::new(),
             last_successful_sync: None,
             last_error: None,
         };

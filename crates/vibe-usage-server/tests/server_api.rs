@@ -197,6 +197,41 @@ async fn upload_treats_omp_v220_message_key_as_duplicate() {
 }
 
 #[tokio::test]
+async fn upload_treats_omp_stable_message_key_as_duplicate_for_v220_key() {
+    let app = app("omp-stable-message-key").await;
+    let mut stable_record = record("laptop", "omp", "omp:message:msg-a:response:resp-a", 10);
+    stable_record.model = "gpt-5.5".to_string();
+    stable_record.effort = Some("openai-codex".to_string());
+    let first = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/upload",
+            ndjson(&[stable_record.clone()]),
+        ))
+        .await
+        .expect("first response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body: UploadResponse = read_json(first).await;
+    assert_eq!(first_body.accepted, 1);
+    assert_eq!(first_body.max_seq, 1);
+
+    let mut old_record = stable_record;
+    old_record.dedup_key = omp_v220_key("msg-a", "resp-a", "openai-codex/gpt-5.5", &old_record);
+    let second = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[old_record])))
+        .await
+        .expect("second response");
+
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body: UploadResponse = read_json(second).await;
+    assert_eq!(second_body.accepted, 0);
+    assert_eq!(second_body.ignored, 1);
+    assert_eq!(second_body.max_seq, 1);
+}
+
+#[tokio::test]
 async fn upload_consumes_one_omp_v220_file_key_duplicate() {
     let app = app("omp-v220-file-key").await;
     let mut old_record = record("laptop", "omp", "placeholder", 10);
@@ -221,6 +256,42 @@ async fn upload_consumes_one_omp_v220_file_key_duplicate() {
     assert_eq!(second.status(), StatusCode::OK);
     let second_body: UploadResponse = read_json(second).await;
     assert_eq!(second_body.accepted, 1);
+    assert_eq!(second_body.ignored, 1);
+    assert_eq!(second_body.max_seq, 2);
+}
+
+#[tokio::test]
+async fn upload_consumes_one_omp_stable_file_key_duplicate_for_v220_key() {
+    let app = app("omp-stable-file-key").await;
+    let stable_records = vec![
+        record("laptop", "omp", "omp:file:/tmp/omp.jsonl:0", 10),
+        record("laptop", "omp", "omp:file:/tmp/omp.jsonl:1", 10),
+    ];
+    let first = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/upload",
+            ndjson(&stable_records),
+        ))
+        .await
+        .expect("first response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body: UploadResponse = read_json(first).await;
+    assert_eq!(first_body.accepted, 2);
+    assert_eq!(first_body.max_seq, 2);
+
+    let mut old_record = record("laptop", "omp", "placeholder", 10);
+    old_record.dedup_key = omp_v220_key("", "", "test-model", &old_record);
+    let second = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[old_record])))
+        .await
+        .expect("second response");
+
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body: UploadResponse = read_json(second).await;
+    assert_eq!(second_body.accepted, 0);
     assert_eq!(second_body.ignored, 1);
     assert_eq!(second_body.max_seq, 2);
 }

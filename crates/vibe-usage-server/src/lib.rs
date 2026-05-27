@@ -227,7 +227,7 @@ async fn upload(
     let mut consumed_omp_v220_keys = BTreeSet::new();
 
     for record in &records {
-        if uploaded_with_omp_v220_key(&tx, record, &mut consumed_omp_v220_keys)? {
+        if uploaded_with_omp_alias(&tx, record, &mut consumed_omp_v220_keys)? {
             ignored += 1;
             touched_hosts.insert(record.host_id.clone());
             continue;
@@ -607,13 +607,22 @@ fn append_placeholders(sql: &mut String, count: usize) {
     }
 }
 
-fn uploaded_with_omp_v220_key(
+fn uploaded_with_omp_alias(
     tx: &rusqlite::Transaction<'_>,
     record: &WireRecord,
     consumed_keys: &mut BTreeSet<String>,
 ) -> rusqlite::Result<bool> {
     if record.vendor != "omp" {
         return Ok(false);
+    }
+    if let Some(key) = parse_omp_v220_key(&record.dedup_key) {
+        if !omp_v220_key_matches_record(&key, record) {
+            return Ok(false);
+        }
+        if let Some(stable_key) = omp_stable_key_from_v220_key(&key) {
+            return omp_stable_key_exists(tx, &record.host_id, &stable_key);
+        }
+        return omp_stable_file_key_exists(tx, record, &key);
     }
     let consume_once = record.dedup_key.starts_with("omp:file:");
     for legacy_key in omp_v220_key_candidates(record) {
@@ -633,15 +642,96 @@ fn uploaded_with_omp_v220_key(
     Ok(false)
 }
 
+#[derive(Debug, Deserialize)]
+struct OmpV220Key {
+    #[serde(rename = "message")]
+    message_id: String,
+    #[serde(rename = "response")]
+    response_id: String,
+    model: String,
+    #[serde(rename = "input")]
+    input_tokens: i64,
+    #[serde(rename = "output")]
+    output_tokens: i64,
+    #[serde(rename = "cache_read")]
+    cache_read_input_tokens: i64,
+    #[serde(rename = "cache_write")]
+    cache_creation_input_tokens: i64,
+}
+
+fn parse_omp_v220_key(dedup_key: &str) -> Option<OmpV220Key> {
+    serde_json::from_str(dedup_key).ok()
+}
+
+fn omp_v220_key_matches_record(key: &OmpV220Key, record: &WireRecord) -> bool {
+    key.input_tokens == record.input_tokens
+        && key.output_tokens == record.output_tokens
+        && key.cache_read_input_tokens == record.cache_read_input_tokens
+        && key.cache_creation_input_tokens == record.cache_creation_input_tokens
+        && omp_model_candidates(record)
+            .into_iter()
+            .any(|model| model == key.model)
+}
+
+fn omp_stable_key_from_v220_key(key: &OmpV220Key) -> Option<String> {
+    match (key.message_id.is_empty(), key.response_id.is_empty()) {
+        (false, false) => Some(format!(
+            "omp:message:{}:response:{}",
+            key.message_id, key.response_id
+        )),
+        (false, true) => Some(format!("omp:message:{}", key.message_id)),
+        (true, false) => Some(format!("omp:response:{}", key.response_id)),
+        (true, true) => None,
+    }
+}
+
+fn omp_stable_key_exists(
+    tx: &rusqlite::Transaction<'_>,
+    host_id: &str,
+    stable_key: &str,
+) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT 1 FROM records WHERE host_id = ?1 AND vendor = 'omp' AND dedup_key = ?2 LIMIT 1",
+        params![host_id, stable_key],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+}
+
+fn omp_stable_file_key_exists(
+    tx: &rusqlite::Transaction<'_>,
+    record: &WireRecord,
+    key: &OmpV220Key,
+) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT 1 FROM records
+         WHERE host_id = ?1
+           AND vendor = 'omp'
+           AND dedup_key LIKE 'omp:file:%'
+           AND model = ?2
+           AND input_tokens = ?3
+           AND output_tokens = ?4
+           AND cache_read = ?5
+           AND cache_creation = ?6
+         LIMIT 1",
+        params![
+            record.host_id,
+            omp_normalized_model(&key.model),
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_read_input_tokens,
+            record.cache_creation_input_tokens,
+        ],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+}
+
 fn omp_v220_key_candidates(record: &WireRecord) -> Vec<String> {
     let (message_id, response_id) = omp_ids_from_dedup_key(&record.dedup_key);
-    let mut models = vec![record.model.clone()];
-    if let Some(provider) = record.effort.as_deref().filter(|value| !value.is_empty()) {
-        models.push(format!("{provider}/{}", record.model));
-    }
-    models.sort();
-    models.dedup();
-    models
+    omp_model_candidates(record)
         .into_iter()
         .map(|model| {
             serde_json::json!({
@@ -656,6 +746,23 @@ fn omp_v220_key_candidates(record: &WireRecord) -> Vec<String> {
             .to_string()
         })
         .collect()
+}
+
+fn omp_model_candidates(record: &WireRecord) -> Vec<String> {
+    let mut models = vec![record.model.clone()];
+    if let Some(provider) = record.effort.as_deref().filter(|value| !value.is_empty()) {
+        models.push(format!("{provider}/{}", record.model));
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn omp_normalized_model(raw_model: &str) -> &str {
+    raw_model
+        .split_once('/')
+        .and_then(|(_, model)| (!model.is_empty()).then_some(model))
+        .unwrap_or(raw_model)
 }
 
 fn omp_ids_from_dedup_key(dedup_key: &str) -> (String, String) {

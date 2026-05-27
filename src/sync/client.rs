@@ -1,5 +1,5 @@
 use crate::sync::config::EnabledSyncConfig;
-use crate::sync::engine::{SyncError, SyncTransport};
+use crate::sync::engine::{SUPPORTED_PULL_VENDORS, SyncError, SyncTransport};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +8,6 @@ use vibe_usage_proto::{MachineList, PullResponse, UploadResponse, WireRecord};
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
 const DEFAULT_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_millis(1100);
 const MAX_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(30);
-const SUPPORTED_PULL_VENDORS: &str = "claude,codex,gemini,omp";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpProgress {
@@ -128,8 +127,9 @@ impl SyncTransport for SyncHttpClient {
         exclude_host: &str,
         limit: usize,
     ) -> Result<PullResponse, SyncError> {
+        let supported_vendors = SUPPORTED_PULL_VENDORS.join(",");
         let path = format!(
-            "/v1/pull?after_seq={after_seq}&exclude_host={exclude_host}&limit={limit}&supported_vendors={SUPPORTED_PULL_VENDORS}"
+            "/v1/pull?after_seq={after_seq}&exclude_host={exclude_host}&limit={limit}&supported_vendors={supported_vendors}"
         );
         let response = self.call_with_rate_limit_retry(|| {
             self.agent

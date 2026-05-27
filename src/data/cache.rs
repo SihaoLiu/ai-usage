@@ -18,6 +18,7 @@ const REMOTE_FILE_MAGIC: &[u8; 8] = b"AIUREMT1";
 const MANIFEST_FILE: &str = "manifest.json";
 const ENTRIES_DIR: &str = "entries";
 const REMOTE_DIR: &str = "remote";
+const OMP_PARSER_REVISION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheManifest {
@@ -50,10 +51,12 @@ struct SourceFileMeta {
     inode: u64,
     record_count: usize,
     records_hash: u64,
+    #[serde(default)]
+    parser_revision: u32,
 }
 
 impl SourceFileMeta {
-    fn from_stat(stat: &SourceFileStat, record_stats: RecordStats) -> Self {
+    fn from_stat(stat: &SourceFileStat, record_stats: RecordStats, parser_revision: u32) -> Self {
         Self {
             size_bytes: stat.size_bytes,
             modified_secs: stat.modified_secs,
@@ -64,6 +67,7 @@ impl SourceFileMeta {
             inode: stat.inode,
             record_count: record_stats.count,
             records_hash: record_stats.hash,
+            parser_revision,
         }
     }
 
@@ -75,6 +79,13 @@ impl SourceFileMeta {
             && self.changed_nanos == stat.changed_nanos
             && self.device_id == stat.device_id
             && self.inode == stat.inode
+    }
+}
+
+fn parser_revision(vendor: &str) -> u32 {
+    match vendor {
+        "omp" => OMP_PARSER_REVISION,
+        _ => 0,
     }
 }
 
@@ -279,6 +290,20 @@ struct SourceRecordFingerprint {
     session_end_time: String,
     model: String,
     effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SourceRecordFingerprintWithoutEffort {
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
     input_tokens: i64,
     output_tokens: i64,
     cache_read_input_tokens: i64,
@@ -742,6 +767,7 @@ where
     let mut active_records: Vec<PersistedSourceRecord> = Vec::new();
     let mut active_keys = HashSet::new();
     let mut cache_changed = false;
+    let parser_revision = parser_revision(vendor);
 
     for source in &active_sources {
         active_keys.insert(source.key.clone());
@@ -753,6 +779,7 @@ where
                 meta.matches_stat(&source.stat)
                     && meta.record_count == source_record_stats.count
                     && meta.records_hash == source_record_stats.hash
+                    && meta.parser_revision == parser_revision
             })
             .unwrap_or(false);
 
@@ -762,13 +789,22 @@ where
             cache_changed = true;
             let previous_records = records_by_path.remove(&source.key).unwrap_or_default();
             let mut fast_tiers = fast_tiers_by_fingerprint(&previous_records);
+            let mut fast_tiers_without_effort =
+                fast_tiers_by_fingerprint_without_effort(&previous_records);
             parse_file(&source.path)
                 .into_iter()
                 .map(|record| {
                     let fingerprint = source_record_fingerprint(&record);
+                    let fingerprint_without_effort =
+                        source_record_fingerprint_without_effort(&record);
                     let fast_tier = fast_tiers
                         .get_mut(&fingerprint)
                         .and_then(|tiers| tiers.pop_front())
+                        .or_else(|| {
+                            fast_tiers_without_effort
+                                .get_mut(&fingerprint_without_effort)
+                                .and_then(|tiers| tiers.pop_front())
+                        })
                         .unwrap_or(current_fast_tier);
                     PersistedSourceRecord::from_source_record(source.key.clone(), record, fast_tier)
                 })
@@ -777,7 +813,11 @@ where
 
         next_vendor_manifest.files.insert(
             source.key.clone(),
-            SourceFileMeta::from_stat(&source.stat, record_stats(source_records.iter())),
+            SourceFileMeta::from_stat(
+                &source.stat,
+                record_stats(source_records.iter()),
+                parser_revision,
+            ),
         );
         active_records.extend(source_records);
     }
@@ -839,6 +879,7 @@ where
             SourceFileMeta::from_stat(
                 &source.stat,
                 stats.get(&source.key).copied().unwrap_or_default(),
+                parser_revision(vendor),
             ),
         );
     }
@@ -1223,6 +1264,19 @@ fn fast_tiers_by_fingerprint(
     tiers
 }
 
+fn fast_tiers_by_fingerprint_without_effort(
+    records: &[PersistedSourceRecord],
+) -> HashMap<SourceRecordFingerprintWithoutEffort, VecDeque<i8>> {
+    let mut tiers = HashMap::new();
+    for record in records {
+        tiers
+            .entry(persisted_record_fingerprint_without_effort(record))
+            .or_insert_with(VecDeque::new)
+            .push_back(record.fast_tier);
+    }
+    tiers
+}
+
 fn source_record_fingerprint(record: &SourceUsageRecord) -> SourceRecordFingerprint {
     SourceRecordFingerprint {
         dedup_key: record.dedup_key.clone(),
@@ -1239,6 +1293,23 @@ fn source_record_fingerprint(record: &SourceUsageRecord) -> SourceRecordFingerpr
     }
 }
 
+fn source_record_fingerprint_without_effort(
+    record: &SourceUsageRecord,
+) -> SourceRecordFingerprintWithoutEffort {
+    SourceRecordFingerprintWithoutEffort {
+        dedup_key: record.dedup_key.clone(),
+        timestamp: record.entry.timestamp.clone(),
+        session_start_time: record.entry.session_start_time.clone(),
+        session_end_time: record.entry.session_end_time.clone(),
+        model: record.entry.model.clone(),
+        input_tokens: record.entry.usage.input_tokens,
+        output_tokens: record.entry.usage.output_tokens,
+        cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
+        cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
+        reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+    }
+}
+
 fn persisted_record_fingerprint(record: &PersistedSourceRecord) -> SourceRecordFingerprint {
     SourceRecordFingerprint {
         dedup_key: record.dedup_key.clone(),
@@ -1247,6 +1318,23 @@ fn persisted_record_fingerprint(record: &PersistedSourceRecord) -> SourceRecordF
         session_end_time: record.session_end_time.clone(),
         model: record.model.clone(),
         effort: record.effort.clone(),
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        cache_read_input_tokens: record.cache_read_input_tokens,
+        cache_creation_input_tokens: record.cache_creation_input_tokens,
+        reasoning_output_tokens: record.reasoning_output_tokens,
+    }
+}
+
+fn persisted_record_fingerprint_without_effort(
+    record: &PersistedSourceRecord,
+) -> SourceRecordFingerprintWithoutEffort {
+    SourceRecordFingerprintWithoutEffort {
+        dedup_key: record.dedup_key.clone(),
+        timestamp: record.timestamp.clone(),
+        session_start_time: record.session_start_time.clone(),
+        session_end_time: record.session_end_time.clone(),
+        model: record.model.clone(),
         input_tokens: record.input_tokens,
         output_tokens: record.output_tokens,
         cache_read_input_tokens: record.cache_read_input_tokens,
@@ -1734,6 +1822,55 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].usage.input_tokens, 42);
         assert_eq!(second[0].fast_tier, 1);
+    }
+
+    #[test]
+    fn old_omp_manifest_reparses_unchanged_sources_for_provider_fields() {
+        let cache_root = unique_temp_dir("omp-provider-refresh");
+        let source = cache_root.join("source.jsonl");
+        write_source(&source, "first");
+        let calls = AtomicUsize::new(0);
+
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "omp",
+            vec![source.clone()],
+            -1,
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let mut record = usage_record("omp:message:msg-a", "2026-05-01T00:00:00Z", 42);
+                record.entry.model = "claude-sonnet-4-5-20250929".to_string();
+                record.entry.effort = None;
+                vec![record]
+            },
+        );
+        let manifest_path = cache_root.join(super::MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
+                .expect("manifest json");
+        manifest["vendors"]["omp"]["files"]
+            .as_object_mut()
+            .expect("files object")
+            .values_mut()
+            .for_each(|meta| meta["parser_revision"] = serde_json::json!(0));
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("manifest json"),
+        )
+        .expect("write old manifest");
+
+        let refreshed =
+            super::load_or_update_vendor_cache(&cache_root, "omp", vec![source], -1, |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let mut record = usage_record("omp:message:msg-a", "2026-05-01T00:00:00Z", 42);
+                record.entry.model = "claude-sonnet-4-5-20250929".to_string();
+                record.entry.effort = Some("anthropic".to_string());
+                vec![record]
+            });
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].effort.as_deref(), Some("anthropic"));
     }
 
     #[test]

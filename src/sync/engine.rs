@@ -10,7 +10,8 @@ use std::fmt;
 use std::path::Path;
 use vibe_usage_proto::{PullResponse, UploadResponse, WireRecord};
 
-const VENDORS: [&str; 4] = ["claude", "codex", "gemini", "omp"];
+pub const SUPPORTED_PULL_VENDORS: [&str; 4] = ["claude", "codex", "gemini", "omp"];
+const VENDORS: [&str; 4] = SUPPORTED_PULL_VENDORS;
 const BATCH_SIZE: usize = 1000;
 const PULL_LIMIT: usize = 5000;
 
@@ -207,6 +208,13 @@ fn is_unsupported_vendor_error(err: &SyncError) -> bool {
     message.contains("invalid vendor") || message.contains("unsupported vendor")
 }
 
+fn current_pull_vendors() -> Vec<String> {
+    SUPPORTED_PULL_VENDORS
+        .iter()
+        .map(|vendor| (*vendor).to_string())
+        .collect()
+}
+
 fn uploaded_with_omp_v220_key(
     record: &CachedUsageRecord,
     upload_log: &BTreeSet<(String, String)>,
@@ -281,6 +289,11 @@ where
     F: FnMut(&SyncProgress),
 {
     let mut sync_state = state::load_sync_state(cache_root);
+    let pull_vendors = current_pull_vendors();
+    if sync_state.pull_vendors != pull_vendors {
+        sync_state.last_seen_seq = 0;
+        sync_state.pull_vendors = pull_vendors;
+    }
     let mut page_index = 0;
     let mut pulled_records = 0;
 
@@ -431,6 +444,7 @@ mod tests {
     struct FakeTransport {
         uploads: RefCell<Vec<Vec<WireRecord>>>,
         pulls: RefCell<Vec<PullResponse>>,
+        pull_requests: RefCell<Vec<(u64, String, usize)>>,
     }
 
     struct RejectOmpTransport {
@@ -442,6 +456,7 @@ mod tests {
             Self {
                 uploads: RefCell::new(Vec::new()),
                 pulls: RefCell::new(pulls),
+                pull_requests: RefCell::new(Vec::new()),
             }
         }
     }
@@ -458,10 +473,13 @@ mod tests {
 
         fn pull(
             &self,
-            _after_seq: u64,
-            _exclude_host: &str,
-            _limit: usize,
+            after_seq: u64,
+            exclude_host: &str,
+            limit: usize,
         ) -> Result<PullResponse, SyncError> {
+            self.pull_requests
+                .borrow_mut()
+                .push((after_seq, exclude_host.to_string(), limit));
             Ok(self.pulls.borrow_mut().remove(0))
         }
     }
@@ -970,6 +988,78 @@ mod tests {
         assert_eq!(
             crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
             7
+        );
+    }
+
+    #[test]
+    fn sync_pull_resets_cursor_when_pull_vendor_set_changes() {
+        let cache_root = unique_temp_dir("pull-vendor-set");
+        std::fs::write(
+            cache_root.join("sync_state.json"),
+            r#"{
+  "schema_version": 1,
+  "last_seen_seq": 2,
+  "last_successful_sync": null,
+  "last_error": null
+}"#,
+        )
+        .expect("write old sync state");
+        let omp_record = WireRecord {
+            schema_version: SCHEMA_VERSION,
+            host_id: "laptop".to_string(),
+            vendor: "omp".to_string(),
+            dedup_key: "remote-omp-a".to_string(),
+            timestamp: "2026-05-18T12:00:00Z".to_string(),
+            session_start_time: "2026-05-18T12:00:00Z".to_string(),
+            session_end_time: "2026-05-18T12:05:00Z".to_string(),
+            model: "remote-model".to_string(),
+            effort: Some("openai-codex".to_string()),
+            fast_tier: -1,
+            input_tokens: 11,
+            output_tokens: 12,
+            cache_read_input_tokens: 13,
+            cache_creation_input_tokens: 14,
+            reasoning_output_tokens: 15,
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_creation: None,
+            project_path_sha256: None,
+        };
+        let mut claude_record = omp_record.clone();
+        claude_record.vendor = "claude".to_string();
+        claude_record.dedup_key = "remote-claude-a".to_string();
+        let transport = FakeTransport::new(vec![PullResponse {
+            records: vec![
+                SequencedWireRecord {
+                    seq: 1,
+                    record: omp_record,
+                    uploaded_at: "2026-05-18T12:10:00Z".to_string(),
+                },
+                SequencedWireRecord {
+                    seq: 2,
+                    record: claude_record,
+                    uploaded_at: "2026-05-18T12:11:00Z".to_string(),
+                },
+            ],
+            max_seq: 2,
+            truncated: false,
+        }]);
+
+        run_pull_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("pull");
+
+        assert_eq!(transport.pull_requests.borrow()[0].0, 0);
+        let remote = crate::data::cache::load_remote_entries(&cache_root, None);
+        assert_eq!(remote.len(), 2);
+        assert_eq!(
+            crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
+            2
         );
     }
 

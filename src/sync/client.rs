@@ -178,8 +178,10 @@ fn transport_error(err: ureq::Error) -> SyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
     use crate::sync::config::EnabledSyncConfig;
     use crate::sync::engine::SyncTransport;
+    use crate::sync::{engine, state};
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::response::{IntoResponse, Response};
@@ -254,6 +256,48 @@ mod tests {
             cost_cache_creation: None,
             project_path_sha256: None,
         }
+    }
+
+    fn source_record(dedup_key: &str, timestamp: &str) -> SourceUsageRecord {
+        SourceUsageRecord {
+            dedup_key: dedup_key.to_string(),
+            entry: UsageEntry {
+                host_id: None,
+                timestamp: timestamp.to_string(),
+                parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
+                session_start_time: timestamp.to_string(),
+                session_end_time: timestamp.to_string(),
+                model: "test-model".to_string(),
+                effort: None,
+                fast_tier: -1,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    cache_read_input_tokens: 3,
+                    cache_creation_input_tokens: 4,
+                    reasoning_output_tokens: 5,
+                },
+                costs: None,
+            },
+        }
+    }
+
+    fn omp_v220_key(
+        message_id: &str,
+        response_id: &str,
+        model: &str,
+        record: &WireRecord,
+    ) -> String {
+        serde_json::json!({
+            "message": message_id,
+            "response": response_id,
+            "model": model,
+            "input": record.input_tokens,
+            "output": record.output_tokens,
+            "cache_read": record.cache_read_input_tokens,
+            "cache_write": record.cache_creation_input_tokens,
+        })
+        .to_string()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -333,6 +377,77 @@ mod tests {
         assert_eq!(pull.records.len(), 1);
         assert_eq!(pull.records[0].record.vendor, "omp");
         assert_eq!(pull.records[0].record.dedup_key, "remote-omp-a");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_upload_keeps_remaining_omp_file_records_after_legacy_log_and_remote_row() {
+        let state =
+            AppState::new(server_config("transport-omp-file-compat")).expect("server state");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, build_app(state))
+                .await
+                .expect("server");
+        });
+        let config = client_config(format!("http://{addr}"));
+        let client = SyncHttpClient::new(config.clone());
+
+        let mut legacy = record_with_vendor("workstation", "omp", "placeholder");
+        legacy.input_tokens = 10;
+        legacy.dedup_key = omp_v220_key("", "", "test-model", &legacy);
+        let legacy_key = legacy.dedup_key.clone();
+        let seed_client = client.clone();
+        tokio::task::spawn_blocking(move || seed_client.upload(&[legacy]))
+            .await
+            .expect("seed join")
+            .expect("seed upload");
+
+        let cache_root = unique_db_path("omp-file-compat-cache");
+        std::fs::create_dir_all(&cache_root).expect("create cache root");
+        let source = cache_root.join("omp.jsonl");
+        std::fs::write(&source, "source").expect("write source");
+        crate::data::cache::load_or_update_vendor_cache(
+            &cache_root,
+            "omp",
+            vec![source],
+            -1,
+            |_| {
+                vec![
+                    source_record("omp:file:/tmp/omp.jsonl:0", "2026-05-18T12:00:00Z"),
+                    source_record("omp:file:/tmp/omp.jsonl:1", "2026-05-18T12:01:00Z"),
+                ]
+            },
+        );
+        state::save_upload_log(
+            &cache_root,
+            &std::collections::BTreeSet::from([("omp".to_string(), legacy_key)]),
+        )
+        .expect("save upload log");
+
+        let upload_client = client.clone();
+        tokio::task::spawn_blocking(move || {
+            engine::run_upload_once_with_progress(&cache_root, &config, &upload_client, |_| {})
+        })
+        .await
+        .expect("upload join")
+        .expect("compat upload");
+
+        let pull_client = client.clone();
+        let pull = tokio::task::spawn_blocking(move || pull_client.pull(0, "viewer", 100))
+            .await
+            .expect("pull join")
+            .expect("pull response");
+        let keys = pull
+            .records
+            .iter()
+            .map(|record| record.record.dedup_key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(pull.records.len(), 2, "{keys:?}");
+        assert!(keys.contains(&"omp:file:/tmp/omp.jsonl:1"), "{keys:?}");
         server.abort();
     }
 

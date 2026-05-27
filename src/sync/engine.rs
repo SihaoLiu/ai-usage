@@ -121,7 +121,6 @@ where
     let mut upload_log = state::load_upload_log(cache_root);
     let mut upload_groups = Vec::new();
     let mut skipped_records = 0;
-    let mut consumed_omp_v220_keys = BTreeSet::new();
 
     for vendor in VENDORS {
         let mut vendor_records = Vec::new();
@@ -131,9 +130,7 @@ where
                 continue;
             }
             let key = (record.vendor.clone(), record.dedup_key.clone());
-            if upload_log.contains(&key)
-                || uploaded_with_omp_v220_key(&record, &upload_log, &mut consumed_omp_v220_keys)
-            {
+            if upload_log.contains(&key) || uploaded_with_omp_v220_key(&record, &upload_log) {
                 skipped_records += 1;
                 continue;
             }
@@ -218,16 +215,15 @@ fn current_pull_vendors() -> Vec<String> {
 fn uploaded_with_omp_v220_key(
     record: &CachedUsageRecord,
     upload_log: &BTreeSet<(String, String)>,
-    consumed_keys: &mut BTreeSet<String>,
 ) -> bool {
     if record.vendor != "omp" {
         return false;
     }
-    let consume_once = record.dedup_key.starts_with("omp:file:");
+    if record.dedup_key.starts_with("omp:file:") {
+        return false;
+    }
     for legacy_key in omp_v220_key_candidates(record) {
-        if upload_log.contains(&("omp".to_string(), legacy_key.clone()))
-            && (!consume_once || consumed_keys.insert(legacy_key))
-        {
+        if upload_log.contains(&("omp".to_string(), legacy_key)) {
             return true;
         }
     }
@@ -728,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_upload_consumes_one_logged_omp_v220_file_key() {
+    fn sync_upload_keeps_omp_file_records_for_server_side_aliasing() {
         let cache_root = unique_temp_dir("upload-omp-legacy-file");
         let first = usage_record("omp:file:/tmp/omp.jsonl:0", "2026-05-18T12:00:00Z", 10);
         let second = usage_record("omp:file:/tmp/omp.jsonl:1", "2026-05-18T12:01:00Z", 10);
@@ -753,13 +749,12 @@ mod tests {
 
         let uploads = transport.uploads.borrow();
         assert_eq!(uploads.len(), 1);
-        assert_eq!(uploads[0].len(), 1);
-        assert_eq!(uploads[0][0].dedup_key, "omp:file:/tmp/omp.jsonl:1");
+        assert_eq!(uploads[0].len(), 2);
+        assert_eq!(uploads[0][0].dedup_key, "omp:file:/tmp/omp.jsonl:0");
+        assert_eq!(uploads[0][1].dedup_key, "omp:file:/tmp/omp.jsonl:1");
         let upload_log = crate::sync::state::load_upload_log(&cache_root);
+        assert!(upload_log.contains(&("omp".to_string(), "omp:file:/tmp/omp.jsonl:0".to_string())));
         assert!(upload_log.contains(&("omp".to_string(), "omp:file:/tmp/omp.jsonl:1".to_string())));
-        assert!(
-            !upload_log.contains(&("omp".to_string(), "omp:file:/tmp/omp.jsonl:0".to_string()))
-        );
     }
 
     #[test]

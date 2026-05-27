@@ -1,5 +1,5 @@
 use crate::data::cache::{self, CachedUsageRecord, RemoteUsageRecord};
-use crate::data::{TokenUsage, UsageEntry};
+use crate::data::{TokenUsage, UsageCost, UsageEntry};
 use crate::sync::config::EnabledSyncConfig;
 use crate::sync::state;
 use crate::time_utils::parse_timestamp;
@@ -118,10 +118,11 @@ where
     F: FnMut(&SyncProgress),
 {
     let mut upload_log = state::load_upload_log(cache_root);
-    let mut upload_records = Vec::new();
+    let mut upload_groups = Vec::new();
     let mut skipped_records = 0;
 
     for vendor in VENDORS {
+        let mut vendor_records = Vec::new();
         for record in cache::load_vendor_cached_records(cache_root, vendor) {
             if record.dedup_key.is_empty() {
                 skipped_records += 1;
@@ -133,12 +134,18 @@ where
                 continue;
             }
             let wire = cached_record_to_wire(config, &record)?;
-            upload_records.push((key, wire));
+            vendor_records.push((key, wire));
+        }
+        if !vendor_records.is_empty() {
+            upload_groups.push(vendor_records);
         }
     }
 
-    let total_records = upload_records.len();
-    let total_batches = total_records.div_ceil(BATCH_SIZE);
+    let total_records = upload_groups.iter().map(Vec::len).sum::<usize>();
+    let total_batches = upload_groups
+        .iter()
+        .map(|records| records.len().div_ceil(BATCH_SIZE))
+        .sum::<usize>();
     on_progress(&SyncProgress::UploadPlanned {
         total_records,
         total_batches,
@@ -148,25 +155,38 @@ where
     let mut uploaded_records = 0;
     let mut accepted = 0;
     let mut ignored = 0;
-    for (batch_offset, batch) in upload_records.chunks(BATCH_SIZE).enumerate() {
-        let wire_records: Vec<WireRecord> =
-            batch.iter().map(|(_, record)| record.clone()).collect();
-        let response = transport.upload(&wire_records)?;
-        uploaded_records += batch.len();
-        accepted += response.accepted;
-        ignored += response.ignored;
-        for (key, _) in batch {
-            upload_log.insert(key.clone());
+    let mut batch_index = 0;
+    for group in upload_groups {
+        for batch in group.chunks(BATCH_SIZE) {
+            let wire_records: Vec<WireRecord> =
+                batch.iter().map(|(_, record)| record.clone()).collect();
+            let response = match transport.upload(&wire_records) {
+                Ok(response) => response,
+                Err(err)
+                    if wire_records.iter().all(|record| record.vendor == "omp")
+                        && is_unsupported_vendor_error(&err) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            uploaded_records += batch.len();
+            accepted += response.accepted;
+            ignored += response.ignored;
+            for (key, _) in batch {
+                upload_log.insert(key.clone());
+            }
+            state::save_upload_log(cache_root, &upload_log)?;
+            batch_index += 1;
+            on_progress(&SyncProgress::UploadBatchFinished {
+                batch_index,
+                total_batches,
+                uploaded_records,
+                total_records,
+                accepted,
+                ignored,
+            });
         }
-        state::save_upload_log(cache_root, &upload_log)?;
-        on_progress(&SyncProgress::UploadBatchFinished {
-            batch_index: batch_offset + 1,
-            total_batches,
-            uploaded_records,
-            total_records,
-            accepted,
-            ignored,
-        });
     }
 
     on_progress(&SyncProgress::UploadFinished {
@@ -177,6 +197,11 @@ where
     });
 
     Ok(())
+}
+
+fn is_unsupported_vendor_error(err: &SyncError) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("invalid vendor") || message.contains("unsupported vendor")
 }
 
 pub fn run_pull_once_with_progress<F>(
@@ -242,6 +267,10 @@ fn cached_record_to_wire(
         cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
         cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
         reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+        cost_input: record.entry.costs.map(|costs| costs.input),
+        cost_output: record.entry.costs.map(|costs| costs.output),
+        cost_cache_read: record.entry.costs.map(|costs| costs.cache_read),
+        cost_cache_creation: record.entry.costs.map(|costs| costs.cache_creation),
         project_path_sha256: config
             .upload_project_hash
             .then(|| sha256_hex(record.source_path.as_bytes())),
@@ -288,8 +317,30 @@ fn wire_to_remote_record(record: WireRecord) -> RemoteUsageRecord {
                 cache_creation_input_tokens: record.cache_creation_input_tokens,
                 reasoning_output_tokens: record.reasoning_output_tokens,
             },
-            costs: None,
+            costs: persisted_wire_costs(
+                record.cost_input,
+                record.cost_output,
+                record.cost_cache_read,
+                record.cost_cache_creation,
+            ),
         },
+    }
+}
+
+fn persisted_wire_costs(
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_creation: Option<f64>,
+) -> Option<UsageCost> {
+    match (input, output, cache_read, cache_creation) {
+        (None, None, None, None) => None,
+        _ => Some(UsageCost {
+            input: input.unwrap_or(0.0),
+            output: output.unwrap_or(0.0),
+            cache_read: cache_read.unwrap_or(0.0),
+            cache_creation: cache_creation.unwrap_or(0.0),
+        }),
     }
 }
 
@@ -312,6 +363,10 @@ mod tests {
     struct FakeTransport {
         uploads: RefCell<Vec<Vec<WireRecord>>>,
         pulls: RefCell<Vec<PullResponse>>,
+    }
+
+    struct RejectOmpTransport {
+        uploads: RefCell<Vec<Vec<WireRecord>>>,
     }
 
     impl FakeTransport {
@@ -340,6 +395,33 @@ mod tests {
             _limit: usize,
         ) -> Result<PullResponse, SyncError> {
             Ok(self.pulls.borrow_mut().remove(0))
+        }
+    }
+
+    impl SyncTransport for RejectOmpTransport {
+        fn upload(&self, records: &[WireRecord]) -> Result<UploadResponse, SyncError> {
+            self.uploads.borrow_mut().push(records.to_vec());
+            if records.iter().any(|record| record.vendor == "omp") {
+                return Err(SyncError::new("http status: 400: invalid vendor"));
+            }
+            Ok(UploadResponse {
+                accepted: records.len(),
+                ignored: 0,
+                max_seq: 0,
+            })
+        }
+
+        fn pull(
+            &self,
+            _after_seq: u64,
+            _exclude_host: &str,
+            _limit: usize,
+        ) -> Result<PullResponse, SyncError> {
+            Ok(PullResponse {
+                records: Vec::new(),
+                max_seq: 0,
+                truncated: false,
+            })
         }
     }
 
@@ -377,6 +459,17 @@ mod tests {
         }
     }
 
+    fn usage_record_with_costs(key: &str, timestamp: &str) -> SourceUsageRecord {
+        let mut record = usage_record(key, timestamp, 10);
+        record.entry.costs = Some(UsageCost {
+            input: 0.01,
+            output: 0.02,
+            cache_read: 0.03,
+            cache_creation: 0.04,
+        });
+        record
+    }
+
     fn populate_vendor_cache(cache_root: &Path, vendor: &str, key: &str) {
         let source = cache_root.join(format!("{vendor}.jsonl"));
         std::fs::write(&source, "source").expect("write source");
@@ -386,6 +479,22 @@ mod tests {
             vec![source],
             1,
             |_| vec![usage_record(key, "2026-05-18T12:00:00Z", 10)],
+        );
+    }
+
+    fn populate_vendor_cache_with_record(
+        cache_root: &Path,
+        vendor: &str,
+        record: SourceUsageRecord,
+    ) {
+        let source = cache_root.join(format!("{vendor}.jsonl"));
+        std::fs::write(&source, "source").expect("write source");
+        crate::data::cache::load_or_update_vendor_cache(
+            cache_root,
+            vendor,
+            vec![source],
+            -1,
+            |_| vec![record.clone()],
         );
     }
 
@@ -440,6 +549,63 @@ mod tests {
             crate::sync::state::load_upload_log(&cache_root)
                 .contains(&("claude".to_string(), "dedup-a".to_string()))
         );
+    }
+
+    #[test]
+    fn sync_upload_carries_embedded_costs() {
+        let cache_root = unique_temp_dir("upload-costs");
+        populate_vendor_cache_with_record(
+            &cache_root,
+            "omp",
+            usage_record_with_costs("omp-a", "2026-05-18T12:00:00Z"),
+        );
+        let transport = FakeTransport::new(Vec::new());
+
+        run_upload_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("upload");
+
+        let uploads = transport.uploads.borrow();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].len(), 1);
+        assert_eq!(uploads[0][0].cost_input, Some(0.01));
+        assert_eq!(uploads[0][0].cost_output, Some(0.02));
+        assert_eq!(uploads[0][0].cost_cache_read, Some(0.03));
+        assert_eq!(uploads[0][0].cost_cache_creation, Some(0.04));
+    }
+
+    #[test]
+    fn upload_keeps_supported_vendors_when_omp_is_rejected_by_older_server() {
+        let cache_root = unique_temp_dir("upload-older-server");
+        populate_vendor_cache(&cache_root, "claude", "claude-a");
+        populate_vendor_cache_with_record(
+            &cache_root,
+            "omp",
+            usage_record_with_costs("omp-a", "2026-05-18T12:00:00Z"),
+        );
+        let transport = RejectOmpTransport {
+            uploads: RefCell::new(Vec::new()),
+        };
+
+        run_upload_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("upload should keep supported vendors");
+
+        let uploads = transport.uploads.borrow();
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[0][0].vendor, "claude");
+        assert_eq!(uploads[1][0].vendor, "omp");
+        let upload_log = crate::sync::state::load_upload_log(&cache_root);
+        assert!(upload_log.contains(&("claude".to_string(), "claude-a".to_string())));
+        assert!(!upload_log.contains(&("omp".to_string(), "omp-a".to_string())));
     }
 
     #[test]
@@ -513,6 +679,10 @@ mod tests {
                 cache_read_input_tokens: 13,
                 cache_creation_input_tokens: 14,
                 reasoning_output_tokens: 15,
+                cost_input: None,
+                cost_output: None,
+                cost_cache_read: None,
+                cost_cache_creation: None,
                 project_path_sha256: None,
             },
         };
@@ -609,6 +779,10 @@ mod tests {
                 cache_read_input_tokens: 13,
                 cache_creation_input_tokens: 14,
                 reasoning_output_tokens: 15,
+                cost_input: None,
+                cost_output: None,
+                cost_cache_read: None,
+                cost_cache_creation: None,
                 project_path_sha256: None,
             },
         };
@@ -631,5 +805,51 @@ mod tests {
             crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
             7
         );
+    }
+
+    #[test]
+    fn sync_pull_preserves_remote_embedded_costs() {
+        let cache_root = unique_temp_dir("pull-costs");
+        let pulled = SequencedWireRecord {
+            seq: 7,
+            uploaded_at: "2026-05-18T12:10:00Z".to_string(),
+            record: WireRecord {
+                schema_version: SCHEMA_VERSION,
+                host_id: "laptop".to_string(),
+                vendor: "omp".to_string(),
+                dedup_key: "remote-omp-a".to_string(),
+                timestamp: "2026-05-18T12:00:00Z".to_string(),
+                session_start_time: "2026-05-18T12:00:00Z".to_string(),
+                session_end_time: "2026-05-18T12:05:00Z".to_string(),
+                model: "remote-model".to_string(),
+                effort: Some("openai-codex".to_string()),
+                fast_tier: -1,
+                input_tokens: 11,
+                output_tokens: 12,
+                cache_read_input_tokens: 13,
+                cache_creation_input_tokens: 14,
+                reasoning_output_tokens: 15,
+                cost_input: Some(0.11),
+                cost_output: Some(0.12),
+                cost_cache_read: Some(0.13),
+                cost_cache_creation: Some(0.14),
+                project_path_sha256: None,
+            },
+        };
+        let transport = FakeTransport::new(vec![PullResponse {
+            records: vec![pulled],
+            max_seq: 7,
+            truncated: false,
+        }]);
+
+        run_sync_cycle(&cache_root, &enabled_config("workstation"), &transport)
+            .expect("sync cycle");
+
+        let remote = crate::data::cache::load_remote_entries(&cache_root, None);
+        let costs = remote[0].entry.costs.expect("remote costs");
+        assert_eq!(costs.input, 0.11);
+        assert_eq!(costs.output, 0.12);
+        assert_eq!(costs.cache_read, 0.13);
+        assert_eq!(costs.cache_creation, 0.14);
     }
 }

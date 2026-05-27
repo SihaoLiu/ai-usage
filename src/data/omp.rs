@@ -40,6 +40,7 @@ fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
     };
 
     let mut records = Vec::new();
+    let mut message_index = 0usize;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -107,16 +108,8 @@ fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let message_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let dedup_key = serde_json::json!({
-            "message": message_id,
-            "response": response_id,
-            "model": raw_model,
-            "input": input_tokens,
-            "output": output_tokens,
-            "cache_read": cache_read,
-            "cache_write": cache_write,
-        })
-        .to_string();
+        let dedup_key = build_dedup_key(message_id, response_id, path, message_index);
+        message_index += 1;
 
         records.push(SourceUsageRecord {
             dedup_key,
@@ -142,6 +135,23 @@ fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
     }
 
     records
+}
+
+fn build_dedup_key(
+    message_id: &str,
+    response_id: &str,
+    path: &Path,
+    message_index: usize,
+) -> String {
+    if !message_id.is_empty() && !response_id.is_empty() {
+        format!("omp:message:{message_id}:response:{response_id}")
+    } else if !response_id.is_empty() {
+        format!("omp:response:{response_id}")
+    } else if !message_id.is_empty() {
+        format!("omp:message:{message_id}")
+    } else {
+        format!("omp:file:{}:{message_index}", path.to_string_lossy())
+    }
 }
 
 pub fn collect_usage_files(sessions_dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
@@ -183,6 +193,7 @@ pub fn read_omp_file_records(path: &Path) -> Vec<SourceUsageRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_file(name: &str) -> PathBuf {
@@ -220,5 +231,32 @@ mod tests {
         assert!((costs.output - 0.00081).abs() < f64::EPSILON);
         assert!((costs.cache_read - 0.010112).abs() < f64::EPSILON);
         assert!((costs.cache_creation - 0.000001).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn missing_ids_fall_back_to_unique_file_position_keys() {
+        let path = unique_temp_file("missing-ids");
+        fs::write(
+            &path,
+            r#"{"type":"message","timestamp":"2026-05-27T08:34:02Z","message":{"role":"assistant","provider":"openai-codex","model":"openai-codex/gpt-5.5","usage":{"input":10,"output":2,"cacheRead":3,"cacheWrite":4}}}
+{"type":"message","timestamp":"2026-05-27T08:35:02Z","message":{"role":"assistant","provider":"openai-codex","model":"openai-codex/gpt-5.5","usage":{"input":10,"output":2,"cacheRead":3,"cacheWrite":4}}}
+"#,
+        )
+        .expect("write omp fixture");
+
+        let records = read_omp_file_records(&path);
+        fs::remove_file(&path).ok();
+
+        assert_eq!(records.len(), 2);
+        let keys: HashSet<&str> = records
+            .iter()
+            .map(|record| record.dedup_key.as_str())
+            .collect();
+        assert_eq!(keys.len(), records.len());
+        assert!(
+            records
+                .iter()
+                .all(|record| record.dedup_key.starts_with("omp:file:"))
+        );
     }
 }

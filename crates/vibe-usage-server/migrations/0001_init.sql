@@ -15,6 +15,10 @@ CREATE TABLE IF NOT EXISTS records (
     cache_read     INTEGER NOT NULL,
     cache_creation INTEGER NOT NULL,
     reasoning_out  INTEGER NOT NULL,
+    cost_input     REAL,
+    cost_output    REAL,
+    cost_cache_read REAL,
+    cost_cache_creation REAL,
     project_hash   TEXT,
     uploaded_at    TEXT NOT NULL,
     UNIQUE(host_id, vendor, dedup_key)

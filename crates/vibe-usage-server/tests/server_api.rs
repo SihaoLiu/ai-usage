@@ -50,6 +50,10 @@ fn record(host_id: &str, vendor: &str, dedup_key: &str, input_tokens: i64) -> Wi
         cache_read_input_tokens: 3,
         cache_creation_input_tokens: 4,
         reasoning_output_tokens: 5,
+        cost_input: None,
+        cost_output: None,
+        cost_cache_read: None,
+        cost_cache_creation: None,
         project_path_sha256: None,
     }
 }
@@ -179,6 +183,37 @@ async fn pull_filters_after_sequence_and_excluded_hosts() {
     assert_eq!(body.records[0].record.fast_tier, 1);
     assert_eq!(body.max_seq, 3);
     assert!(!body.truncated);
+}
+
+#[tokio::test]
+async fn upload_and_pull_preserve_embedded_costs() {
+    let app = app("costs").await;
+    let mut costed = record("laptop", "omp", "costed", 10);
+    costed.cost_input = Some(0.01);
+    costed.cost_output = Some(0.02);
+    costed.cost_cache_read = Some(0.03);
+    costed.cost_cache_creation = Some(0.04);
+
+    let upload = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[costed])))
+        .await
+        .expect("upload response");
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let pull = app
+        .clone()
+        .oneshot(authed_request("GET", "/v1/pull?after_seq=0", Body::empty()))
+        .await
+        .expect("pull response");
+
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 1);
+    let record = &body.records[0].record;
+    assert_eq!(record.cost_input, Some(0.01));
+    assert_eq!(record.cost_output, Some(0.02));
+    assert_eq!(record.cost_cache_read, Some(0.03));
+    assert_eq!(record.cost_cache_creation, Some(0.04));
 }
 
 #[tokio::test]

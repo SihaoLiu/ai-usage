@@ -143,10 +143,13 @@ fn read_json_response<T: DeserializeOwned>(
     mut response: ureq::http::Response<ureq::Body>,
 ) -> Result<T, SyncError> {
     if !response.status().is_success() {
-        return Err(SyncError::new(format!(
-            "http status: {}",
-            response.status().as_u16()
-        )));
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            return Err(SyncError::new(format!("http status: {status}: {trimmed}")));
+        }
+        return Err(SyncError::new(format!("http status: {}", status)));
     }
     let body = response
         .body_mut()
@@ -239,6 +242,10 @@ mod tests {
             cache_read_input_tokens: 3,
             cache_creation_input_tokens: 4,
             reasoning_output_tokens: 5,
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_creation: None,
             project_path_sha256: None,
         }
     }

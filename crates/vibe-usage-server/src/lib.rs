@@ -103,6 +103,7 @@ impl AppState {
             let conn = pool.get()?;
             conn.execute_batch(include_str!("../migrations/0001_init.sql"))?;
             ensure_fast_tier_column(&conn)?;
+            ensure_cost_columns(&conn)?;
         }
         Ok(Self {
             config: Arc::new(config),
@@ -229,8 +230,9 @@ async fn upload(
                 host_id, vendor, dedup_key, schema_version, timestamp_utc,
                 session_start, session_end, model, effort, fast_tier, input_tokens,
                 output_tokens, cache_read, cache_creation, reasoning_out,
+                cost_input, cost_output, cost_cache_read, cost_cache_creation,
                 project_hash, uploaded_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 record.host_id,
                 record.vendor,
@@ -247,6 +249,10 @@ async fn upload(
                 record.cache_read_input_tokens,
                 record.cache_creation_input_tokens,
                 record.reasoning_output_tokens,
+                record.cost_input,
+                record.cost_output,
+                record.cost_cache_read,
+                record.cost_cache_creation,
                 record.project_path_sha256,
                 uploaded_at,
             ],
@@ -308,7 +314,8 @@ async fn pull(
     let mut sql = String::from(
         "SELECT seq, host_id, vendor, dedup_key, schema_version, timestamp_utc,
             session_start, session_end, model, effort, fast_tier, input_tokens, output_tokens,
-            cache_read, cache_creation, reasoning_out, project_hash, uploaded_at
+            cache_read, cache_creation, reasoning_out, cost_input, cost_output, cost_cache_read,
+            cost_cache_creation, project_hash, uploaded_at
          FROM records
          WHERE seq > ?1",
     );
@@ -477,9 +484,13 @@ fn row_to_sequenced_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sequence
             cache_read_input_tokens: row.get(13)?,
             cache_creation_input_tokens: row.get(14)?,
             reasoning_output_tokens: row.get(15)?,
-            project_path_sha256: row.get(16)?,
+            cost_input: row.get(16)?,
+            cost_output: row.get(17)?,
+            cost_cache_read: row.get(18)?,
+            cost_cache_creation: row.get(19)?,
+            project_path_sha256: row.get(20)?,
         },
-        uploaded_at: row.get(17)?,
+        uploaded_at: row.get(21)?,
     })
 }
 
@@ -493,6 +504,27 @@ fn ensure_fast_tier_column(conn: &rusqlite::Connection) -> rusqlite::Result<()> 
             "ALTER TABLE records ADD COLUMN fast_tier INTEGER NOT NULL DEFAULT -1",
             [],
         )?;
+    }
+    Ok(())
+}
+
+fn ensure_cost_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(records)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, sql_type) in [
+        ("cost_input", "REAL"),
+        ("cost_output", "REAL"),
+        ("cost_cache_read", "REAL"),
+        ("cost_cache_creation", "REAL"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            conn.execute(
+                &format!("ALTER TABLE records ADD COLUMN {name} {sql_type}"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }

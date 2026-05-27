@@ -8,7 +8,7 @@ fn default_fast_tier() -> i8 {
     -1
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireRecord {
     pub schema_version: u32,
     pub host_id: String,
@@ -26,10 +26,18 @@ pub struct WireRecord {
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
     pub reasoning_output_tokens: i64,
+    #[serde(default)]
+    pub cost_input: Option<f64>,
+    #[serde(default)]
+    pub cost_output: Option<f64>,
+    #[serde(default)]
+    pub cost_cache_read: Option<f64>,
+    #[serde(default)]
+    pub cost_cache_creation: Option<f64>,
     pub project_path_sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SequencedWireRecord {
     #[serde(flatten)]
     pub record: WireRecord,
@@ -44,7 +52,7 @@ pub struct UploadResponse {
     pub max_seq: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PullResponse {
     pub records: Vec<SequencedWireRecord>,
     pub max_seq: u64,
@@ -79,6 +87,7 @@ pub enum ValidationError {
     FieldTooLong(&'static str),
     InvalidTimestamp(&'static str),
     NegativeTokenCount(&'static str),
+    InvalidCost(&'static str),
     InvalidProjectHash,
 }
 
@@ -94,6 +103,7 @@ impl fmt::Display for ValidationError {
             Self::FieldTooLong(field) => write!(f, "{field} is too long"),
             Self::InvalidTimestamp(field) => write!(f, "{field} must be RFC3339"),
             Self::NegativeTokenCount(field) => write!(f, "{field} must be non-negative"),
+            Self::InvalidCost(field) => write!(f, "{field} must be finite and non-negative"),
             Self::InvalidProjectHash => f.write_str("project_path_sha256 must be lowercase hex"),
         }
     }
@@ -130,6 +140,18 @@ impl WireRecord {
         ] {
             if value < 0 {
                 return Err(ValidationError::NegativeTokenCount(field));
+            }
+        }
+        for (field, value) in [
+            ("cost_input", self.cost_input),
+            ("cost_output", self.cost_output),
+            ("cost_cache_read", self.cost_cache_read),
+            ("cost_cache_creation", self.cost_cache_creation),
+        ] {
+            if let Some(cost) = value
+                && (!cost.is_finite() || cost < 0.0)
+            {
+                return Err(ValidationError::InvalidCost(field));
             }
         }
         if let Some(hash) = &self.project_path_sha256 {
@@ -238,6 +260,10 @@ mod tests {
             cache_read_input_tokens: 30,
             cache_creation_input_tokens: 40,
             reasoning_output_tokens: 50,
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_creation: None,
             project_path_sha256: Some("a".repeat(64)),
         }
     }
@@ -335,6 +361,43 @@ mod tests {
         .expect("deserialize");
 
         assert_eq!(record.fast_tier, -1);
+    }
+
+    #[test]
+    fn missing_costs_default_to_absent() {
+        let record: WireRecord = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "host_id": "workstation-home",
+                "vendor": "omp",
+                "dedup_key": "source-record-1",
+                "timestamp": "2026-05-18T12:34:56Z",
+                "session_start_time": "2026-05-18T12:30:00Z",
+                "session_end_time": "2026-05-18T12:34:56Z",
+                "model": "gpt-5.5",
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 40,
+                "reasoning_output_tokens": 0,
+                "project_path_sha256": null
+            }"#,
+        )
+        .expect("deserialize record without costs");
+
+        assert_eq!(record.cost_input, None);
+        assert_eq!(record.cost_output, None);
+        assert_eq!(record.cost_cache_read, None);
+        assert_eq!(record.cost_cache_creation, None);
+        assert!(record.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_negative_costs() {
+        let mut record = valid_record();
+        record.cost_input = Some(-0.01);
+
+        assert!(record.validate().is_err());
     }
 
     #[test]

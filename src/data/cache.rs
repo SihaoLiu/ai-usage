@@ -173,6 +173,12 @@ struct PersistedVendorRecordsV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedVendorRecordsWithFastTier {
+    format_version: u32,
+    records: Vec<PersistedSourceRecordWithFastTier>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedSourceRecordV1 {
     source_path: String,
     dedup_key: String,
@@ -189,9 +195,32 @@ struct PersistedSourceRecordV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSourceRecordWithFastTier {
+    source_path: String,
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
+    effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+    fast_tier: i8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedRemoteRecordsV1 {
     format_version: u32,
     records: Vec<PersistedRemoteRecordV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRemoteRecordsWithFastTier {
+    format_version: u32,
+    records: Vec<PersistedRemoteRecordWithFastTier>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +237,23 @@ struct PersistedRemoteRecordV1 {
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
     reasoning_output_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRemoteRecordWithFastTier {
+    vendor: String,
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
+    effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+    fast_tier: i8,
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +331,30 @@ impl From<PersistedSourceRecordV1> for PersistedSourceRecord {
     }
 }
 
+impl From<PersistedSourceRecordWithFastTier> for PersistedSourceRecord {
+    fn from(record: PersistedSourceRecordWithFastTier) -> Self {
+        Self {
+            source_path: record.source_path,
+            dedup_key: record.dedup_key,
+            timestamp: record.timestamp,
+            session_start_time: record.session_start_time,
+            session_end_time: record.session_end_time,
+            model: record.model,
+            effort: record.effort,
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            cache_read_input_tokens: record.cache_read_input_tokens,
+            cache_creation_input_tokens: record.cache_creation_input_tokens,
+            reasoning_output_tokens: record.reasoning_output_tokens,
+            fast_tier: record.fast_tier,
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_creation: None,
+        }
+    }
+}
+
 impl From<PersistedRemoteRecordV1> for PersistedRemoteRecord {
     fn from(record: PersistedRemoteRecordV1) -> Self {
         Self {
@@ -301,6 +371,30 @@ impl From<PersistedRemoteRecordV1> for PersistedRemoteRecord {
             cache_creation_input_tokens: record.cache_creation_input_tokens,
             reasoning_output_tokens: record.reasoning_output_tokens,
             fast_tier: UNKNOWN_FAST_TIER,
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_creation: None,
+        }
+    }
+}
+
+impl From<PersistedRemoteRecordWithFastTier> for PersistedRemoteRecord {
+    fn from(record: PersistedRemoteRecordWithFastTier) -> Self {
+        Self {
+            vendor: record.vendor,
+            dedup_key: record.dedup_key,
+            timestamp: record.timestamp,
+            session_start_time: record.session_start_time,
+            session_end_time: record.session_end_time,
+            model: record.model,
+            effort: record.effort,
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            cache_read_input_tokens: record.cache_read_input_tokens,
+            cache_creation_input_tokens: record.cache_creation_input_tokens,
+            reasoning_output_tokens: record.reasoning_output_tokens,
+            fast_tier: record.fast_tier,
             cost_input: None,
             cost_output: None,
             cost_cache_read: None,
@@ -928,6 +1022,27 @@ fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
         return Ok(decoded.records);
     }
 
+    if let Ok(decoded) = bincode::deserialize::<PersistedVendorRecordsWithFastTier>(payload) {
+        if decoded.format_version != CACHE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported cache entry version",
+            ));
+        }
+        let records: Vec<PersistedSourceRecord> =
+            decoded.records.into_iter().map(Into::into).collect();
+        if records
+            .iter()
+            .any(|record| !record.has_non_negative_token_usage())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache entry has negative token count",
+            ));
+        }
+        return Ok(records);
+    }
+
     let decoded: PersistedVendorRecordsV1 = bincode::deserialize(payload)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     if decoded.format_version != CACHE_VERSION {
@@ -1006,6 +1121,27 @@ fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
             ));
         }
         return Ok(decoded.records);
+    }
+
+    if let Ok(decoded) = bincode::deserialize::<PersistedRemoteRecordsWithFastTier>(payload) {
+        if decoded.format_version != CACHE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported remote cache entry version",
+            ));
+        }
+        let records: Vec<PersistedRemoteRecord> =
+            decoded.records.into_iter().map(Into::into).collect();
+        if records
+            .iter()
+            .any(|record| !record.has_non_negative_token_usage())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote cache entry has negative token count",
+            ));
+        }
+        return Ok(records);
     }
 
     let decoded: PersistedRemoteRecordsV1 = bincode::deserialize(payload)
@@ -1207,6 +1343,52 @@ mod tests {
 
     use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
 
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct PersistedVendorRecordsWithFastTier {
+        format_version: u32,
+        records: Vec<PersistedSourceRecordWithFastTier>,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct PersistedSourceRecordWithFastTier {
+        source_path: String,
+        dedup_key: String,
+        timestamp: String,
+        session_start_time: String,
+        session_end_time: String,
+        model: String,
+        effort: Option<String>,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_input_tokens: i64,
+        cache_creation_input_tokens: i64,
+        reasoning_output_tokens: i64,
+        fast_tier: i8,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct PersistedRemoteRecordsWithFastTier {
+        format_version: u32,
+        records: Vec<PersistedRemoteRecordWithFastTier>,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct PersistedRemoteRecordWithFastTier {
+        vendor: String,
+        dedup_key: String,
+        timestamp: String,
+        session_start_time: String,
+        session_end_time: String,
+        model: String,
+        effort: Option<String>,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_input_tokens: i64,
+        cache_creation_input_tokens: i64,
+        reasoning_output_tokens: i64,
+        fast_tier: i8,
+    }
+
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1219,6 +1401,15 @@ mod tests {
 
     fn write_source(path: &Path, content: &str) {
         fs::write(path, content).expect("write source");
+    }
+
+    fn write_payload_file(path: &Path, magic: &[u8], payload: &[u8]) {
+        let checksum = super::fnv1a_bytes(0, payload);
+        let mut content = Vec::new();
+        content.extend_from_slice(magic);
+        content.extend_from_slice(&checksum.to_le_bytes());
+        content.extend_from_slice(payload);
+        fs::write(path, content).expect("write payload file");
     }
 
     fn usage_record(key: &str, timestamp: &str, input_tokens: i64) -> SourceUsageRecord {
@@ -1885,6 +2076,81 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].usage.input_tokens, 42);
         assert_eq!(snapshot[0].fast_tier, UNKNOWN_FAST_TIER);
+    }
+
+    #[test]
+    fn cache_records_from_fast_tier_format_keep_fast_tier_after_cost_fields() {
+        let cache_root = unique_temp_dir("snapshot-fast-tier-compat");
+        let entries_dir = cache_root.join("entries");
+        fs::create_dir_all(&entries_dir).expect("create entries dir");
+        let payload = bincode::serialize(&PersistedVendorRecordsWithFastTier {
+            format_version: super::CACHE_VERSION,
+            records: vec![PersistedSourceRecordWithFastTier {
+                source_path: "source.jsonl".to_string(),
+                dedup_key: "stable-key".to_string(),
+                timestamp: "2026-05-01T00:00:00Z".to_string(),
+                session_start_time: "2026-05-01T00:00:00Z".to_string(),
+                session_end_time: "2026-05-01T00:00:00Z".to_string(),
+                model: "test-model".to_string(),
+                effort: None,
+                input_tokens: 42,
+                output_tokens: 2,
+                cache_read_input_tokens: 3,
+                cache_creation_input_tokens: 4,
+                reasoning_output_tokens: 5,
+                fast_tier: 1,
+            }],
+        })
+        .expect("serialize fast-tier cache");
+        write_payload_file(
+            &entries_dir.join("test.bin"),
+            super::ENTRY_FILE_MAGIC,
+            &payload,
+        );
+
+        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].fast_tier, 1);
+        assert!(snapshot[0].costs.is_none());
+    }
+
+    #[test]
+    fn remote_records_from_fast_tier_format_keep_fast_tier_after_cost_fields() {
+        let cache_root = unique_temp_dir("remote-fast-tier-compat");
+        let remote_dir = cache_root.join("remote");
+        fs::create_dir_all(&remote_dir).expect("create remote dir");
+        let payload = bincode::serialize(&PersistedRemoteRecordsWithFastTier {
+            format_version: super::CACHE_VERSION,
+            records: vec![PersistedRemoteRecordWithFastTier {
+                vendor: "codex".to_string(),
+                dedup_key: "remote-key".to_string(),
+                timestamp: "2026-05-01T00:00:00Z".to_string(),
+                session_start_time: "2026-05-01T00:00:00Z".to_string(),
+                session_end_time: "2026-05-01T00:00:00Z".to_string(),
+                model: "test-model".to_string(),
+                effort: None,
+                input_tokens: 42,
+                output_tokens: 2,
+                cache_read_input_tokens: 3,
+                cache_creation_input_tokens: 4,
+                reasoning_output_tokens: 5,
+                fast_tier: 1,
+            }],
+        })
+        .expect("serialize fast-tier remote cache");
+        write_payload_file(
+            &remote_dir.join("laptop.bin"),
+            super::REMOTE_FILE_MAGIC,
+            &payload,
+        );
+
+        let records = super::load_remote_entries(&cache_root, None);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry.host_id.as_deref(), Some("laptop"));
+        assert_eq!(records[0].entry.fast_tier, 1);
+        assert!(records[0].entry.costs.is_none());
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
+use rusqlite::params;
 use serde_json::json;
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 use vibe_usage_proto::{PullResponse, SCHEMA_VERSION, UploadResponse, WireRecord};
@@ -96,6 +98,58 @@ fn authed_request(method: &str, uri: &str, body: impl Into<Body>) -> Request<Bod
         .expect("request")
 }
 
+fn seed_existing_records(db_path: &Path, records: &[WireRecord]) {
+    let conn = rusqlite::Connection::open(db_path).expect("open seed database");
+    conn.execute_batch(include_str!("../migrations/0001_init.sql"))
+        .expect("create schema");
+    let uploaded_at = "2026-05-18T12:10:00Z";
+    let mut touched_hosts = HashSet::new();
+    for record in records {
+        conn.execute(
+            "INSERT INTO records (
+                host_id, vendor, dedup_key, schema_version, timestamp_utc,
+                session_start, session_end, model, effort, fast_tier, input_tokens,
+                output_tokens, cache_read, cache_creation, reasoning_out,
+                cost_input, cost_output, cost_cache_read, cost_cache_creation,
+                project_hash, uploaded_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            params![
+                record.host_id,
+                record.vendor,
+                record.dedup_key,
+                i64::from(record.schema_version),
+                record.timestamp,
+                record.session_start_time,
+                record.session_end_time,
+                record.model,
+                record.effort,
+                i64::from(record.fast_tier),
+                record.input_tokens,
+                record.output_tokens,
+                record.cache_read_input_tokens,
+                record.cache_creation_input_tokens,
+                record.reasoning_output_tokens,
+                record.cost_input,
+                record.cost_output,
+                record.cost_cache_read,
+                record.cost_cache_creation,
+                record.project_path_sha256,
+                uploaded_at,
+            ],
+        )
+        .expect("seed record");
+        touched_hosts.insert(record.host_id.clone());
+    }
+    for host_id in touched_hosts {
+        conn.execute(
+            "INSERT INTO machines (host_id, last_seen, record_count)
+             VALUES (?1, ?2, (SELECT COUNT(*) FROM records WHERE host_id = ?1))",
+            params![host_id, uploaded_at],
+        )
+        .expect("seed machine");
+    }
+}
+
 #[tokio::test]
 async fn health_is_public() {
     let response = app("health")
@@ -113,6 +167,70 @@ async fn health_is_public() {
     let body: serde_json::Value = read_json(response).await;
     assert_eq!(body["ok"], json!(true));
     assert_eq!(body["schema_version"], json!(SCHEMA_VERSION));
+}
+
+#[tokio::test]
+async fn startup_removes_existing_omp_alias_duplicates_before_pull() {
+    let cfg = config("startup-omp-alias-duplicates");
+    let mut message_legacy = record("laptop", "omp", "placeholder", 10);
+    message_legacy.model = "gpt-5.5".to_string();
+    message_legacy.effort = Some("openai-codex".to_string());
+    message_legacy.dedup_key =
+        omp_v220_key("msg-a", "resp-a", "openai-codex/gpt-5.5", &message_legacy);
+    let mut message_stable = message_legacy.clone();
+    message_stable.dedup_key = "omp:message:msg-a:response:resp-a".to_string();
+
+    let mut file_legacy = record("laptop", "omp", "placeholder", 20);
+    file_legacy.dedup_key = omp_v220_key("", "", "test-model", &file_legacy);
+    let file_stable_a = record("laptop", "omp", "omp:file:/tmp/omp.jsonl:0", 20);
+    let file_stable_b = record("laptop", "omp", "omp:file:/tmp/omp.jsonl:1", 20);
+    let claude = record("laptop", "claude", "claude-a", 30);
+    seed_existing_records(
+        &cfg.db_path,
+        &[
+            message_legacy,
+            message_stable,
+            file_legacy,
+            file_stable_a,
+            file_stable_b,
+            claude,
+        ],
+    );
+    let app = build_app(AppState::new(cfg).expect("app state"));
+
+    let pull = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=omp",
+            Body::empty(),
+        ))
+        .await
+        .expect("pull response");
+    assert_eq!(pull.status(), StatusCode::OK);
+    let body: PullResponse = read_json(pull).await;
+    let keys = body
+        .records
+        .iter()
+        .map(|record| record.record.dedup_key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        vec![
+            "omp:message:msg-a:response:resp-a",
+            "omp:file:/tmp/omp.jsonl:0",
+            "omp:file:/tmp/omp.jsonl:1",
+        ]
+    );
+
+    let machines = app
+        .oneshot(authed_request("GET", "/v1/machines", Body::empty()))
+        .await
+        .expect("machines response");
+    assert_eq!(machines.status(), StatusCode::OK);
+    let body: vibe_usage_proto::MachineList = read_json(machines).await;
+    assert_eq!(body.machines.len(), 1);
+    assert_eq!(body.machines[0].record_count, 4);
 }
 
 #[tokio::test]

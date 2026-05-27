@@ -311,6 +311,32 @@ struct SourceRecordFingerprintWithoutEffort {
     reasoning_output_tokens: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct OmpV220Key {
+    #[serde(rename = "message")]
+    message_id: String,
+    #[serde(rename = "response")]
+    response_id: String,
+    model: String,
+    #[serde(rename = "input")]
+    input_tokens: i64,
+    #[serde(rename = "output")]
+    output_tokens: i64,
+    #[serde(rename = "cache_read")]
+    cache_read_input_tokens: i64,
+    #[serde(rename = "cache_write")]
+    cache_creation_input_tokens: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OmpRemoteFileAlias {
+    model: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+}
+
 fn default_fast_tier() -> i8 {
     UNKNOWN_FAST_TIER
 }
@@ -628,6 +654,7 @@ pub fn load_remote_entries(
         let Ok(host_records) = read_remote_records(&path) else {
             continue;
         };
+        let host_records = deduplicate_remote_omp_aliases(host_records);
         records.extend(
             host_records
                 .iter()
@@ -678,7 +705,120 @@ pub fn merge_remote_records(
         }
     }
 
+    existing = deduplicate_remote_omp_aliases(existing);
     write_remote_records(&path, &existing)
+}
+
+fn deduplicate_remote_omp_aliases(
+    records: Vec<PersistedRemoteRecord>,
+) -> Vec<PersistedRemoteRecord> {
+    if records.len() < 2 {
+        return records;
+    }
+
+    let stable_keys = records
+        .iter()
+        .filter(|record| record.vendor == "omp" && parse_omp_v220_key(&record.dedup_key).is_none())
+        .map(|record| record.dedup_key.clone())
+        .collect::<HashSet<_>>();
+    let stable_file_aliases = records
+        .iter()
+        .filter(|record| record.vendor == "omp" && record.dedup_key.starts_with("omp:file:"))
+        .map(remote_omp_file_alias)
+        .collect::<HashSet<_>>();
+
+    let stale_indexes = records
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, record)| {
+            if record.vendor != "omp" {
+                return None;
+            }
+            let key = parse_omp_v220_key(&record.dedup_key)?;
+            if !omp_v220_key_matches_remote_record(&key, record) {
+                return None;
+            }
+            let duplicate_exists = omp_stable_key_from_v220_key(&key)
+                .map(|stable_key| stable_keys.contains(&stable_key))
+                .unwrap_or_else(|| {
+                    stable_file_aliases.contains(&remote_omp_file_alias_from_key(&key))
+                });
+            duplicate_exists.then_some(idx)
+        })
+        .collect::<HashSet<_>>();
+
+    if stale_indexes.is_empty() {
+        return records;
+    }
+
+    records
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, record)| (!stale_indexes.contains(&idx)).then_some(record))
+        .collect()
+}
+
+fn parse_omp_v220_key(dedup_key: &str) -> Option<OmpV220Key> {
+    serde_json::from_str(dedup_key).ok()
+}
+
+fn omp_v220_key_matches_remote_record(key: &OmpV220Key, record: &PersistedRemoteRecord) -> bool {
+    key.input_tokens == record.input_tokens
+        && key.output_tokens == record.output_tokens
+        && key.cache_read_input_tokens == record.cache_read_input_tokens
+        && key.cache_creation_input_tokens == record.cache_creation_input_tokens
+        && omp_model_candidates_for(&record.model, record.effort.as_deref())
+            .into_iter()
+            .any(|model| model == key.model)
+}
+
+fn omp_stable_key_from_v220_key(key: &OmpV220Key) -> Option<String> {
+    match (key.message_id.is_empty(), key.response_id.is_empty()) {
+        (false, false) => Some(format!(
+            "omp:message:{}:response:{}",
+            key.message_id, key.response_id
+        )),
+        (false, true) => Some(format!("omp:message:{}", key.message_id)),
+        (true, false) => Some(format!("omp:response:{}", key.response_id)),
+        (true, true) => None,
+    }
+}
+
+fn remote_omp_file_alias(record: &PersistedRemoteRecord) -> OmpRemoteFileAlias {
+    OmpRemoteFileAlias {
+        model: record.model.clone(),
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        cache_read_input_tokens: record.cache_read_input_tokens,
+        cache_creation_input_tokens: record.cache_creation_input_tokens,
+    }
+}
+
+fn remote_omp_file_alias_from_key(key: &OmpV220Key) -> OmpRemoteFileAlias {
+    OmpRemoteFileAlias {
+        model: omp_normalized_model(&key.model).to_string(),
+        input_tokens: key.input_tokens,
+        output_tokens: key.output_tokens,
+        cache_read_input_tokens: key.cache_read_input_tokens,
+        cache_creation_input_tokens: key.cache_creation_input_tokens,
+    }
+}
+
+fn omp_model_candidates_for(model: &str, effort: Option<&str>) -> Vec<String> {
+    let mut models = vec![model.to_string()];
+    if let Some(provider) = effort.filter(|value| !value.is_empty()) {
+        models.push(format!("{provider}/{model}"));
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn omp_normalized_model(raw_model: &str) -> &str {
+    raw_model
+        .split_once('/')
+        .and_then(|(_, model)| (!model.is_empty()).then_some(model))
+        .unwrap_or(raw_model)
 }
 
 /// Load normalized entries for one vendor, parsing only files whose metadata changed.
@@ -1561,6 +1701,19 @@ mod tests {
         }
     }
 
+    fn omp_v220_key(message_id: &str, response_id: &str, model: &str, input_tokens: i64) -> String {
+        serde_json::json!({
+            "message": message_id,
+            "response": response_id,
+            "model": model,
+            "input": input_tokens,
+            "output": 2,
+            "cache_read": 3,
+            "cache_write": 4,
+        })
+        .to_string()
+    }
+
     fn remote_fingerprints(
         records: &[super::RemoteUsageRecord],
     ) -> Vec<(String, String, Option<String>, i64)> {
@@ -1676,6 +1829,80 @@ mod tests {
                 (
                     "codex".to_string(),
                     "b".to_string(),
+                    Some("laptop".to_string()),
+                    20
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_load_suppresses_existing_omp_alias_duplicates() {
+        let cache_root = unique_temp_dir("remote-omp-alias-dedup");
+        let remote_dir = cache_root.join(super::REMOTE_DIR);
+        fs::create_dir_all(&remote_dir).expect("create remote dir");
+        let payload = bincode::serialize(&super::PersistedRemoteRecords {
+            format_version: super::CACHE_VERSION,
+            records: vec![
+                super::PersistedRemoteRecord::from_remote_record(remote_record(
+                    "omp",
+                    &omp_v220_key("msg-a", "resp-a", "remote-model", 10),
+                    "2026-05-01T00:00:00Z",
+                    10,
+                )),
+                super::PersistedRemoteRecord::from_remote_record(remote_record(
+                    "omp",
+                    "omp:message:msg-a:response:resp-a",
+                    "2026-05-01T00:00:00Z",
+                    10,
+                )),
+                super::PersistedRemoteRecord::from_remote_record(remote_record(
+                    "omp",
+                    &omp_v220_key("", "", "remote-model", 20),
+                    "2026-05-01T00:01:00Z",
+                    20,
+                )),
+                super::PersistedRemoteRecord::from_remote_record(remote_record(
+                    "omp",
+                    "omp:file:/tmp/omp.jsonl:0",
+                    "2026-05-01T00:01:00Z",
+                    20,
+                )),
+                super::PersistedRemoteRecord::from_remote_record(remote_record(
+                    "omp",
+                    "omp:file:/tmp/omp.jsonl:1",
+                    "2026-05-01T00:02:00Z",
+                    20,
+                )),
+            ],
+        })
+        .expect("serialize remote records");
+        write_payload_file(
+            &remote_dir.join("laptop.bin"),
+            super::REMOTE_FILE_MAGIC,
+            &payload,
+        );
+
+        let records = super::load_remote_entries(&cache_root, None);
+
+        assert_eq!(
+            remote_fingerprints(&records),
+            vec![
+                (
+                    "omp".to_string(),
+                    "omp:message:msg-a:response:resp-a".to_string(),
+                    Some("laptop".to_string()),
+                    10
+                ),
+                (
+                    "omp".to_string(),
+                    "omp:file:/tmp/omp.jsonl:0".to_string(),
+                    Some("laptop".to_string()),
+                    20
+                ),
+                (
+                    "omp".to_string(),
+                    "omp:file:/tmp/omp.jsonl:1".to_string(),
                     Some("laptop".to_string()),
                     20
                 ),

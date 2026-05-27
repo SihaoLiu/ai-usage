@@ -101,10 +101,11 @@ impl AppState {
             .connection_timeout(Duration::from_secs(5))
             .build(manager)?;
         {
-            let conn = pool.get()?;
+            let mut conn = pool.get()?;
             conn.execute_batch(include_str!("../migrations/0001_init.sql"))?;
             ensure_fast_tier_column(&conn)?;
             ensure_cost_columns(&conn)?;
+            cleanup_omp_alias_duplicates(&mut conn)?;
         }
         Ok(Self {
             config: Arc::new(config),
@@ -572,6 +573,140 @@ fn ensure_cost_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct StoredOmpRecord {
+    seq: u64,
+    host_id: String,
+    dedup_key: String,
+    model: String,
+    effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OmpFileAlias {
+    host_id: String,
+    model: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+}
+
+fn cleanup_omp_alias_duplicates(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let records = load_stored_omp_records(conn)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    let stable_keys = records
+        .iter()
+        .filter(|record| parse_omp_v220_key(&record.dedup_key).is_none())
+        .map(|record| (record.host_id.clone(), record.dedup_key.clone()))
+        .collect::<HashSet<_>>();
+    let stable_file_aliases = records
+        .iter()
+        .filter(|record| record.dedup_key.starts_with("omp:file:"))
+        .map(stored_omp_file_alias)
+        .collect::<HashSet<_>>();
+
+    let mut stale_seqs = BTreeSet::new();
+    let mut touched_hosts = BTreeSet::new();
+    for record in &records {
+        let Some(key) = parse_omp_v220_key(&record.dedup_key) else {
+            continue;
+        };
+        if !omp_v220_key_matches_stored_record(&key, record) {
+            continue;
+        }
+        let duplicate_exists = omp_stable_key_from_v220_key(&key)
+            .map(|stable_key| stable_keys.contains(&(record.host_id.clone(), stable_key)))
+            .unwrap_or_else(|| {
+                stable_file_aliases.contains(&stored_omp_file_alias_from_key(record, &key))
+            });
+        if duplicate_exists {
+            stale_seqs.insert(record.seq);
+            touched_hosts.insert(record.host_id.clone());
+        }
+    }
+
+    if stale_seqs.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for seq in stale_seqs {
+        tx.execute("DELETE FROM records WHERE seq = ?1", params![seq as i64])?;
+    }
+    for host_id in touched_hosts {
+        tx.execute(
+            "UPDATE machines
+             SET record_count = (SELECT COUNT(*) FROM records WHERE host_id = ?1)
+             WHERE host_id = ?1",
+            params![host_id],
+        )?;
+    }
+    tx.commit()
+}
+
+fn load_stored_omp_records(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<StoredOmpRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, host_id, dedup_key, model, effort, input_tokens, output_tokens,
+            cache_read, cache_creation
+         FROM records
+         WHERE vendor = 'omp'",
+    )?;
+    stmt.query_map([], |row| {
+        Ok(StoredOmpRecord {
+            seq: row.get::<_, i64>(0)? as u64,
+            host_id: row.get(1)?,
+            dedup_key: row.get(2)?,
+            model: row.get(3)?,
+            effort: row.get(4)?,
+            input_tokens: row.get(5)?,
+            output_tokens: row.get(6)?,
+            cache_read_input_tokens: row.get(7)?,
+            cache_creation_input_tokens: row.get(8)?,
+        })
+    })?
+    .collect()
+}
+
+fn stored_omp_file_alias(record: &StoredOmpRecord) -> OmpFileAlias {
+    OmpFileAlias {
+        host_id: record.host_id.clone(),
+        model: record.model.clone(),
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        cache_read_input_tokens: record.cache_read_input_tokens,
+        cache_creation_input_tokens: record.cache_creation_input_tokens,
+    }
+}
+
+fn stored_omp_file_alias_from_key(record: &StoredOmpRecord, key: &OmpV220Key) -> OmpFileAlias {
+    OmpFileAlias {
+        host_id: record.host_id.clone(),
+        model: omp_normalized_model(&key.model).to_string(),
+        input_tokens: key.input_tokens,
+        output_tokens: key.output_tokens,
+        cache_read_input_tokens: key.cache_read_input_tokens,
+        cache_creation_input_tokens: key.cache_creation_input_tokens,
+    }
+}
+
+fn omp_v220_key_matches_stored_record(key: &OmpV220Key, record: &StoredOmpRecord) -> bool {
+    key.input_tokens == record.input_tokens
+        && key.output_tokens == record.output_tokens
+        && key.cache_read_input_tokens == record.cache_read_input_tokens
+        && key.cache_creation_input_tokens == record.cache_creation_input_tokens
+        && omp_model_candidates_for(&record.model, record.effort.as_deref())
+            .into_iter()
+            .any(|model| model == key.model)
+}
+
 fn max_seq_in_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<u64> {
     tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM records", [], |row| {
         Ok(row.get::<_, i64>(0)? as u64)
@@ -749,9 +884,13 @@ fn omp_v220_key_candidates(record: &WireRecord) -> Vec<String> {
 }
 
 fn omp_model_candidates(record: &WireRecord) -> Vec<String> {
-    let mut models = vec![record.model.clone()];
-    if let Some(provider) = record.effort.as_deref().filter(|value| !value.is_empty()) {
-        models.push(format!("{provider}/{}", record.model));
+    omp_model_candidates_for(&record.model, record.effort.as_deref())
+}
+
+fn omp_model_candidates_for(model: &str, effort: Option<&str>) -> Vec<String> {
+    let mut models = vec![model.to_string()];
+    if let Some(provider) = effort.filter(|value| !value.is_empty()) {
+        models.push(format!("{provider}/{model}"));
     }
     models.sort();
     models.dedup();

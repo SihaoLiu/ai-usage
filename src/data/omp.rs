@@ -33,6 +33,13 @@ fn normalize_model(raw: &str) -> (&str, Option<&str>) {
         })
 }
 
+fn non_empty_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
 fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
@@ -73,7 +80,10 @@ fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
             .or_else(|| message.get("model"))
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let (model, provider) = normalize_model(raw_model);
+        let (model, provider_from_model) = normalize_model(raw_model);
+        let provider = provider_from_model
+            .or_else(|| non_empty_str(usage, "provider"))
+            .or_else(|| non_empty_str(message, "provider"));
 
         let input_tokens = as_i64(usage, "input");
         let output_tokens = as_i64(usage, "output");
@@ -258,5 +268,26 @@ mod tests {
                 .iter()
                 .all(|record| record.dedup_key.starts_with("omp:file:"))
         );
+    }
+
+    #[test]
+    fn uses_explicit_provider_when_model_has_no_prefix() {
+        let path = unique_temp_file("explicit-provider");
+        fs::write(
+            &path,
+            r#"{"type":"message","id":"msg-a","timestamp":"2026-05-27T08:34:02Z","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-5-20250929","usage":{"input":10,"output":2,"cacheRead":3,"cacheWrite":4},"responseId":"resp-a"}}
+{"type":"message","id":"msg-b","timestamp":"2026-05-27T08:35:02Z","message":{"role":"assistant","model":"gemini-2.5-pro","usage":{"provider":"google","input":20,"output":5,"cacheRead":0,"cacheWrite":0},"responseId":"resp-b"}}
+"#,
+        )
+        .expect("write omp fixture");
+
+        let records = read_omp_file_records(&path);
+        fs::remove_file(&path).ok();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].entry.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(records[0].entry.effort.as_deref(), Some("anthropic"));
+        assert_eq!(records[1].entry.model, "gemini-2.5-pro");
+        assert_eq!(records[1].entry.effort.as_deref(), Some("google"));
     }
 }

@@ -8,6 +8,7 @@ use vibe_usage_proto::{MachineList, PullResponse, UploadResponse, WireRecord};
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
 const DEFAULT_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_millis(1100);
 const MAX_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(30);
+const SUPPORTED_PULL_VENDORS: &str = "claude,codex,gemini,omp";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpProgress {
@@ -127,8 +128,9 @@ impl SyncTransport for SyncHttpClient {
         exclude_host: &str,
         limit: usize,
     ) -> Result<PullResponse, SyncError> {
-        let path =
-            format!("/v1/pull?after_seq={after_seq}&exclude_host={exclude_host}&limit={limit}");
+        let path = format!(
+            "/v1/pull?after_seq={after_seq}&exclude_host={exclude_host}&limit={limit}&supported_vendors={SUPPORTED_PULL_VENDORS}"
+        );
         let response = self.call_with_rate_limit_retry(|| {
             self.agent
                 .get(&self.endpoint(&path))
@@ -226,10 +228,14 @@ mod tests {
     }
 
     fn record(host_id: &str, dedup_key: &str) -> WireRecord {
+        record_with_vendor(host_id, "claude", dedup_key)
+    }
+
+    fn record_with_vendor(host_id: &str, vendor: &str, dedup_key: &str) -> WireRecord {
         WireRecord {
             schema_version: SCHEMA_VERSION,
             host_id: host_id.to_string(),
-            vendor: "claude".to_string(),
+            vendor: vendor.to_string(),
             dedup_key: dedup_key.to_string(),
             timestamp: "2026-05-18T12:00:00Z".to_string(),
             session_start_time: "2026-05-18T12:00:00Z".to_string(),
@@ -293,6 +299,40 @@ mod tests {
         assert_eq!(machines.machines.len(), 1);
         assert_eq!(machines.machines[0].host_id, "laptop");
         assert_eq!(machines.machines[0].record_count, 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_pull_requests_omp_records() {
+        let state = AppState::new(server_config("transport-omp")).expect("server state");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, build_app(state))
+                .await
+                .expect("server");
+        });
+        let client = SyncHttpClient::new(client_config(format!("http://{addr}")));
+
+        let upload_client = client.clone();
+        tokio::task::spawn_blocking(move || {
+            upload_client.upload(&[record_with_vendor("laptop", "omp", "remote-omp-a")])
+        })
+        .await
+        .expect("upload join")
+        .expect("upload response");
+
+        let pull_client = client.clone();
+        let pull = tokio::task::spawn_blocking(move || pull_client.pull(0, "workstation", 100))
+            .await
+            .expect("pull join")
+            .expect("pull response");
+
+        assert_eq!(pull.records.len(), 1);
+        assert_eq!(pull.records[0].record.vendor, "omp");
+        assert_eq!(pull.records[0].record.dedup_key, "remote-omp-a");
         server.abort();
     }
 

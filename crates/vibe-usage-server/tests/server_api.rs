@@ -66,6 +66,19 @@ fn ndjson(records: &[WireRecord]) -> String {
         .join("\n")
 }
 
+fn omp_v220_key(message_id: &str, response_id: &str, model: &str, record: &WireRecord) -> String {
+    json!({
+        "message": message_id,
+        "response": response_id,
+        "model": model,
+        "input": record.input_tokens,
+        "output": record.output_tokens,
+        "cache_read": record.cache_read_input_tokens,
+        "cache_write": record.cache_creation_input_tokens,
+    })
+    .to_string()
+}
+
 async fn read_json<T: serde::de::DeserializeOwned>(response: axum::response::Response) -> T {
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -151,6 +164,68 @@ async fn upload_deduplicates_without_advancing_sequence() {
 }
 
 #[tokio::test]
+async fn upload_treats_omp_v220_message_key_as_duplicate() {
+    let app = app("omp-v220-message-key").await;
+    let mut old_record = record("laptop", "omp", "placeholder", 10);
+    old_record.model = "gpt-5.5".to_string();
+    old_record.effort = Some("openai-codex".to_string());
+    old_record.dedup_key = omp_v220_key("msg-a", "resp-a", "openai-codex/gpt-5.5", &old_record);
+    let first = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[old_record])))
+        .await
+        .expect("first response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body: UploadResponse = read_json(first).await;
+    assert_eq!(first_body.accepted, 1);
+    assert_eq!(first_body.max_seq, 1);
+
+    let mut new_record = record("laptop", "omp", "omp:message:msg-a:response:resp-a", 10);
+    new_record.model = "gpt-5.5".to_string();
+    new_record.effort = Some("openai-codex".to_string());
+    let second = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[new_record])))
+        .await
+        .expect("second response");
+
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body: UploadResponse = read_json(second).await;
+    assert_eq!(second_body.accepted, 0);
+    assert_eq!(second_body.ignored, 1);
+    assert_eq!(second_body.max_seq, 1);
+}
+
+#[tokio::test]
+async fn upload_consumes_one_omp_v220_file_key_duplicate() {
+    let app = app("omp-v220-file-key").await;
+    let mut old_record = record("laptop", "omp", "placeholder", 10);
+    old_record.dedup_key = omp_v220_key("", "", "test-model", &old_record);
+    let first = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[old_record])))
+        .await
+        .expect("first response");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let new_records = vec![
+        record("laptop", "omp", "omp:file:/tmp/omp.jsonl:0", 10),
+        record("laptop", "omp", "omp:file:/tmp/omp.jsonl:1", 10),
+    ];
+    let second = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&new_records)))
+        .await
+        .expect("second response");
+
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body: UploadResponse = read_json(second).await;
+    assert_eq!(second_body.accepted, 1);
+    assert_eq!(second_body.ignored, 1);
+    assert_eq!(second_body.max_seq, 2);
+}
+
+#[tokio::test]
 async fn pull_filters_after_sequence_and_excluded_hosts() {
     let app = app("pull").await;
     let records = vec![
@@ -186,6 +261,61 @@ async fn pull_filters_after_sequence_and_excluded_hosts() {
 }
 
 #[tokio::test]
+async fn pull_defaults_to_legacy_vendors_when_supported_vendors_are_absent() {
+    let app = app("pull-legacy-vendors").await;
+    let records = vec![
+        record("laptop", "claude", "claude-a", 10),
+        record("laptop", "omp", "omp-a", 20),
+    ];
+    let upload = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&records)))
+        .await
+        .expect("upload response");
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let legacy_pull = app
+        .clone()
+        .oneshot(authed_request("GET", "/v1/pull?after_seq=0", Body::empty()))
+        .await
+        .expect("legacy pull response");
+
+    assert_eq!(legacy_pull.status(), StatusCode::OK);
+    let legacy_body: PullResponse = read_json(legacy_pull).await;
+    assert_eq!(legacy_body.records.len(), 1);
+    assert_eq!(legacy_body.records[0].record.vendor, "claude");
+    assert_eq!(legacy_body.max_seq, 1);
+
+    let late_legacy_pull = app
+        .clone()
+        .oneshot(authed_request("GET", "/v1/pull?after_seq=2", Body::empty()))
+        .await
+        .expect("late legacy pull response");
+
+    assert_eq!(late_legacy_pull.status(), StatusCode::OK);
+    let late_legacy_body: PullResponse = read_json(late_legacy_pull).await;
+    assert!(late_legacy_body.records.is_empty());
+    assert_eq!(late_legacy_body.max_seq, 2);
+
+    let current_pull = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=claude,codex,gemini,omp",
+            Body::empty(),
+        ))
+        .await
+        .expect("current pull response");
+
+    assert_eq!(current_pull.status(), StatusCode::OK);
+    let current_body: PullResponse = read_json(current_pull).await;
+    assert_eq!(current_body.records.len(), 2);
+    assert_eq!(current_body.records[0].record.vendor, "claude");
+    assert_eq!(current_body.records[1].record.vendor, "omp");
+    assert_eq!(current_body.max_seq, 2);
+}
+
+#[tokio::test]
 async fn upload_and_pull_preserve_embedded_costs() {
     let app = app("costs").await;
     let mut costed = record("laptop", "omp", "costed", 10);
@@ -203,7 +333,11 @@ async fn upload_and_pull_preserve_embedded_costs() {
 
     let pull = app
         .clone()
-        .oneshot(authed_request("GET", "/v1/pull?after_seq=0", Body::empty()))
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=claude,codex,gemini,omp",
+            Body::empty(),
+        ))
         .await
         .expect("pull response");
 

@@ -16,13 +16,14 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use vibe_usage_proto::{
     HealthResponse, MachineInfo, MachineList, PullResponse, SCHEMA_VERSION, SequencedWireRecord,
-    UploadResponse, WireRecord,
+    UploadResponse, WireRecord, is_valid_vendor,
 };
 
 type DbPool = Pool<SqliteConnectionManager>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const RATE_LIMIT_REFILL_PER_SECOND: f64 = 1.0;
 const RATE_LIMIT_BURST: f64 = 30.0;
+const LEGACY_PULL_VENDORS: [&str; 3] = ["claude", "codex", "gemini"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -223,8 +224,14 @@ async fn upload(
     let mut accepted = 0usize;
     let mut ignored = 0usize;
     let mut touched_hosts = BTreeSet::new();
+    let mut consumed_omp_v220_keys = BTreeSet::new();
 
     for record in &records {
+        if uploaded_with_omp_v220_key(&tx, record, &mut consumed_omp_v220_keys)? {
+            ignored += 1;
+            touched_hosts.insert(record.host_id.clone());
+            continue;
+        }
         let changed = tx.execute(
             "INSERT OR IGNORE INTO records (
                 host_id, vendor, dedup_key, schema_version, timestamp_utc,
@@ -292,6 +299,7 @@ struct PullQuery {
     #[serde(default)]
     exclude_host: Vec<String>,
     limit: Option<usize>,
+    supported_vendors: Vec<String>,
 }
 
 async fn pull(
@@ -317,8 +325,11 @@ async fn pull(
             cache_read, cache_creation, reasoning_out, cost_input, cost_output, cost_cache_read,
             cost_cache_creation, project_hash, uploaded_at
          FROM records
-         WHERE seq > ?1",
+         WHERE seq > ?",
     );
+    sql.push_str(" AND vendor IN (");
+    append_placeholders(&mut sql, query.supported_vendors.len());
+    sql.push(')');
     for _ in &query.exclude_host {
         sql.push_str(" AND host_id != ?");
     }
@@ -326,6 +337,9 @@ async fn pull(
 
     let mut values = Vec::new();
     values.push(Value::Integer(query.after_seq as i64));
+    for vendor in &query.supported_vendors {
+        values.push(Value::Text(vendor.clone()));
+    }
     for host in &query.exclude_host {
         values.push(Value::Text(host.clone()));
     }
@@ -340,7 +354,7 @@ async fn pull(
     if truncated {
         records.truncate(limit);
     }
-    let snapshot_max_seq = max_seq_in_tx(&tx)?;
+    let snapshot_max_seq = max_seq_in_tx_for_vendors(&tx, &query.supported_vendors)?;
     tx.commit()?;
     let response_max_seq = if truncated {
         records
@@ -348,7 +362,7 @@ async fn pull(
             .map(|record| record.seq)
             .unwrap_or(query.after_seq)
     } else {
-        snapshot_max_seq
+        snapshot_max_seq.max(query.after_seq)
     };
 
     Ok(Json(PullResponse {
@@ -362,6 +376,7 @@ fn parse_pull_query(raw_query: Option<&str>) -> Result<PullQuery, AppError> {
     let mut after_seq = None;
     let mut exclude_host = Vec::new();
     let mut limit = None;
+    let mut supported_vendors = None::<Vec<String>>;
 
     for part in raw_query
         .unwrap_or("")
@@ -376,6 +391,20 @@ fn parse_pull_query(raw_query: Option<&str>) -> Result<PullQuery, AppError> {
                 })?);
             }
             "exclude_host" => exclude_host.push(value.to_string()),
+            "supported_vendors" => {
+                let vendors = supported_vendors.get_or_insert_with(Vec::new);
+                for vendor in value.split(',').filter(|vendor| !vendor.is_empty()) {
+                    if !is_valid_vendor(vendor) {
+                        return Err(AppError::new(
+                            StatusCode::BAD_REQUEST,
+                            "supported_vendors contains invalid vendor",
+                        ));
+                    }
+                    if !vendors.iter().any(|seen| seen == vendor) {
+                        vendors.push(vendor.to_string());
+                    }
+                }
+            }
             "limit" => {
                 limit = Some(value.parse::<usize>().map_err(|_| {
                     AppError::new(StatusCode::BAD_REQUEST, "limit must be an integer")
@@ -392,10 +421,24 @@ fn parse_pull_query(raw_query: Option<&str>) -> Result<PullQuery, AppError> {
         ));
     };
 
+    let supported_vendors = supported_vendors.unwrap_or_else(|| {
+        LEGACY_PULL_VENDORS
+            .iter()
+            .map(|vendor| (*vendor).to_string())
+            .collect()
+    });
+    if supported_vendors.is_empty() {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "supported_vendors must not be empty",
+        ));
+    }
+
     Ok(PullQuery {
         after_seq,
         exclude_host,
         limit,
+        supported_vendors,
     })
 }
 
@@ -535,4 +578,95 @@ fn max_seq_in_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<u64> {
     })
     .optional()
     .map(|value| value.unwrap_or(0))
+}
+
+fn max_seq_in_tx_for_vendors(
+    tx: &rusqlite::Transaction<'_>,
+    supported_vendors: &[String],
+) -> rusqlite::Result<u64> {
+    let mut sql = String::from("SELECT COALESCE(MAX(seq), 0) FROM records WHERE vendor IN (");
+    append_placeholders(&mut sql, supported_vendors.len());
+    sql.push(')');
+    let values = supported_vendors
+        .iter()
+        .map(|vendor| Value::Text(vendor.clone()))
+        .collect::<Vec<_>>();
+    tx.query_row(&sql, params_from_iter(values.iter()), |row| {
+        Ok(row.get::<_, i64>(0)? as u64)
+    })
+    .optional()
+    .map(|value| value.unwrap_or(0))
+}
+
+fn append_placeholders(sql: &mut String, count: usize) {
+    for idx in 0..count {
+        if idx > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+    }
+}
+
+fn uploaded_with_omp_v220_key(
+    tx: &rusqlite::Transaction<'_>,
+    record: &WireRecord,
+    consumed_keys: &mut BTreeSet<String>,
+) -> rusqlite::Result<bool> {
+    if record.vendor != "omp" {
+        return Ok(false);
+    }
+    let consume_once = record.dedup_key.starts_with("omp:file:");
+    for legacy_key in omp_v220_key_candidates(record) {
+        let scoped_key = format!("{}:{legacy_key}", record.host_id);
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM records WHERE host_id = ?1 AND vendor = 'omp' AND dedup_key = ?2 LIMIT 1",
+                params![record.host_id, legacy_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if exists && (!consume_once || consumed_keys.insert(scoped_key)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn omp_v220_key_candidates(record: &WireRecord) -> Vec<String> {
+    let (message_id, response_id) = omp_ids_from_dedup_key(&record.dedup_key);
+    let mut models = vec![record.model.clone()];
+    if let Some(provider) = record.effort.as_deref().filter(|value| !value.is_empty()) {
+        models.push(format!("{provider}/{}", record.model));
+    }
+    models.sort();
+    models.dedup();
+    models
+        .into_iter()
+        .map(|model| {
+            serde_json::json!({
+                "message": message_id,
+                "response": response_id,
+                "model": model,
+                "input": record.input_tokens,
+                "output": record.output_tokens,
+                "cache_read": record.cache_read_input_tokens,
+                "cache_write": record.cache_creation_input_tokens,
+            })
+            .to_string()
+        })
+        .collect()
+}
+
+fn omp_ids_from_dedup_key(dedup_key: &str) -> (String, String) {
+    if let Some(rest) = dedup_key.strip_prefix("omp:message:") {
+        if let Some((message_id, response_id)) = rest.split_once(":response:") {
+            return (message_id.to_string(), response_id.to_string());
+        }
+        return (rest.to_string(), String::new());
+    }
+    if let Some(response_id) = dedup_key.strip_prefix("omp:response:") {
+        return (String::new(), response_id.to_string());
+    }
+    (String::new(), String::new())
 }

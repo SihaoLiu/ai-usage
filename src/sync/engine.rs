@@ -5,7 +5,7 @@ use crate::sync::state;
 use crate::time_utils::parse_timestamp;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use vibe_usage_proto::{PullResponse, UploadResponse, WireRecord};
@@ -120,6 +120,7 @@ where
     let mut upload_log = state::load_upload_log(cache_root);
     let mut upload_groups = Vec::new();
     let mut skipped_records = 0;
+    let mut consumed_omp_v220_keys = BTreeSet::new();
 
     for vendor in VENDORS {
         let mut vendor_records = Vec::new();
@@ -129,7 +130,9 @@ where
                 continue;
             }
             let key = (record.vendor.clone(), record.dedup_key.clone());
-            if upload_log.contains(&key) {
+            if upload_log.contains(&key)
+                || uploaded_with_omp_v220_key(&record, &upload_log, &mut consumed_omp_v220_keys)
+            {
                 skipped_records += 1;
                 continue;
             }
@@ -202,6 +205,70 @@ where
 fn is_unsupported_vendor_error(err: &SyncError) -> bool {
     let message = err.to_string().to_ascii_lowercase();
     message.contains("invalid vendor") || message.contains("unsupported vendor")
+}
+
+fn uploaded_with_omp_v220_key(
+    record: &CachedUsageRecord,
+    upload_log: &BTreeSet<(String, String)>,
+    consumed_keys: &mut BTreeSet<String>,
+) -> bool {
+    if record.vendor != "omp" {
+        return false;
+    }
+    let consume_once = record.dedup_key.starts_with("omp:file:");
+    for legacy_key in omp_v220_key_candidates(record) {
+        if upload_log.contains(&("omp".to_string(), legacy_key.clone()))
+            && (!consume_once || consumed_keys.insert(legacy_key))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn omp_v220_key_candidates(record: &CachedUsageRecord) -> Vec<String> {
+    let (message_id, response_id) = omp_ids_from_dedup_key(&record.dedup_key);
+    let mut models = vec![record.entry.model.clone()];
+    if let Some(provider) = record
+        .entry
+        .effort
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        models.push(format!("{provider}/{}", record.entry.model));
+    }
+    models.sort();
+    models.dedup();
+    models
+        .into_iter()
+        .map(|model| omp_v220_key(&message_id, &response_id, &model, &record.entry.usage))
+        .collect()
+}
+
+fn omp_ids_from_dedup_key(dedup_key: &str) -> (String, String) {
+    if let Some(rest) = dedup_key.strip_prefix("omp:message:") {
+        if let Some((message_id, response_id)) = rest.split_once(":response:") {
+            return (message_id.to_string(), response_id.to_string());
+        }
+        return (rest.to_string(), String::new());
+    }
+    if let Some(response_id) = dedup_key.strip_prefix("omp:response:") {
+        return (String::new(), response_id.to_string());
+    }
+    (String::new(), String::new())
+}
+
+fn omp_v220_key(message_id: &str, response_id: &str, model: &str, usage: &TokenUsage) -> String {
+    serde_json::json!({
+        "message": message_id,
+        "response": response_id,
+        "model": model,
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "cache_read": usage.cache_read_input_tokens,
+        "cache_write": usage.cache_creation_input_tokens,
+    })
+    .to_string()
 }
 
 pub fn run_pull_once_with_progress<F>(
@@ -354,6 +421,7 @@ mod tests {
     use super::*;
     use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
     use std::cell::RefCell;
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
     use vibe_usage_proto::{
@@ -487,6 +555,14 @@ mod tests {
         vendor: &str,
         record: SourceUsageRecord,
     ) {
+        populate_vendor_cache_with_records(cache_root, vendor, vec![record]);
+    }
+
+    fn populate_vendor_cache_with_records(
+        cache_root: &Path,
+        vendor: &str,
+        records: Vec<SourceUsageRecord>,
+    ) {
         let source = cache_root.join(format!("{vendor}.jsonl"));
         std::fs::write(&source, "source").expect("write source");
         crate::data::cache::load_or_update_vendor_cache(
@@ -494,7 +570,7 @@ mod tests {
             vendor,
             vec![source],
             -1,
-            |_| vec![record.clone()],
+            |_| records.clone(),
         );
     }
 
@@ -522,6 +598,24 @@ mod tests {
             upload_project_hash: true,
             request_timeout_seconds: 15,
         }
+    }
+
+    fn omp_v220_key(
+        message_id: &str,
+        response_id: &str,
+        model: &str,
+        usage: &TokenUsage,
+    ) -> String {
+        serde_json::json!({
+            "message": message_id,
+            "response": response_id,
+            "model": model,
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "cache_read": usage.cache_read_input_tokens,
+            "cache_write": usage.cache_creation_input_tokens,
+        })
+        .to_string()
     }
 
     #[test]
@@ -576,6 +670,78 @@ mod tests {
         assert_eq!(uploads[0][0].cost_output, Some(0.02));
         assert_eq!(uploads[0][0].cost_cache_read, Some(0.03));
         assert_eq!(uploads[0][0].cost_cache_creation, Some(0.04));
+    }
+
+    #[test]
+    fn sync_upload_treats_logged_omp_v220_message_key_as_seen() {
+        let cache_root = unique_temp_dir("upload-omp-legacy-message");
+        let mut record = usage_record(
+            "omp:message:msg-a:response:resp-a",
+            "2026-05-18T12:00:00Z",
+            10,
+        );
+        record.entry.model = "gpt-5.5".to_string();
+        record.entry.effort = Some("openai-codex".to_string());
+        populate_vendor_cache_with_record(&cache_root, "omp", record.clone());
+        crate::sync::state::save_upload_log(
+            &cache_root,
+            &BTreeSet::from([(
+                "omp".to_string(),
+                omp_v220_key(
+                    "msg-a",
+                    "resp-a",
+                    "openai-codex/gpt-5.5",
+                    &record.entry.usage,
+                ),
+            )]),
+        )
+        .expect("save upload log");
+        let transport = FakeTransport::new(Vec::new());
+
+        run_upload_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("upload");
+
+        assert!(transport.uploads.borrow().is_empty());
+    }
+
+    #[test]
+    fn sync_upload_consumes_one_logged_omp_v220_file_key() {
+        let cache_root = unique_temp_dir("upload-omp-legacy-file");
+        let first = usage_record("omp:file:/tmp/omp.jsonl:0", "2026-05-18T12:00:00Z", 10);
+        let second = usage_record("omp:file:/tmp/omp.jsonl:1", "2026-05-18T12:01:00Z", 10);
+        populate_vendor_cache_with_records(&cache_root, "omp", vec![first.clone(), second]);
+        crate::sync::state::save_upload_log(
+            &cache_root,
+            &BTreeSet::from([(
+                "omp".to_string(),
+                omp_v220_key("", "", "test-model", &first.entry.usage),
+            )]),
+        )
+        .expect("save upload log");
+        let transport = FakeTransport::new(Vec::new());
+
+        run_upload_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("upload");
+
+        let uploads = transport.uploads.borrow();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].len(), 1);
+        assert_eq!(uploads[0][0].dedup_key, "omp:file:/tmp/omp.jsonl:1");
+        let upload_log = crate::sync::state::load_upload_log(&cache_root);
+        assert!(upload_log.contains(&("omp".to_string(), "omp:file:/tmp/omp.jsonl:1".to_string())));
+        assert!(
+            !upload_log.contains(&("omp".to_string(), "omp:file:/tmp/omp.jsonl:0".to_string()))
+        );
     }
 
     #[test]

@@ -231,6 +231,7 @@ async fn health_is_public() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = read_json(response).await;
     assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
     assert_eq!(body["schema_version"], json!(SCHEMA_VERSION));
 }
 

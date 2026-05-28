@@ -251,6 +251,7 @@ impl From<r2d2::Error> for AppError {
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
+        version: env!("CARGO_PKG_VERSION").to_string(),
         schema_version: SCHEMA_VERSION,
         uptime_seconds: state.started_at.elapsed().as_secs(),
     })

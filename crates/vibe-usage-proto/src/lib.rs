@@ -74,6 +74,7 @@ pub struct MachineList {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub ok: bool,
+    pub version: String,
     pub schema_version: u32,
     pub uptime_seconds: u64,
 }

@@ -83,6 +83,8 @@ Check the public health endpoint:
 curl https://usage.your-domain.example/v1/health
 ```
 
+The health response includes the running server `version`, `schema_version`, and `uptime_seconds`.
+
 ## Client Setup
 
 Create a disabled template:

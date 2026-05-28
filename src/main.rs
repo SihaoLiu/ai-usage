@@ -546,6 +546,7 @@ fn estimate_chart_separator_count(
         charts::ChartGranularity::Hour => 60.0,
         charts::ChartGranularity::Day => 24.0 * 60.0,
         charts::ChartGranularity::Week => 7.0 * 24.0 * 60.0,
+        charts::ChartGranularity::Month => 30.0 * 24.0 * 60.0,
         charts::ChartGranularity::Year => 365.0 * 24.0 * 60.0,
     };
     (span_minutes / segment_minutes).ceil().max(1.0) as usize
@@ -3501,7 +3502,7 @@ mod tests {
     }
 
     #[test]
-    fn display_interval_scales_past_daily_for_week_granularity_windows() {
+    fn display_interval_scales_past_daily_for_multi_month_windows() {
         let now = Local
             .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
             .single()
@@ -3512,6 +3513,22 @@ mod tests {
 
         assert!(interval > 1440);
         assert_eq!(interval, 2880);
+    }
+
+    #[test]
+    fn display_interval_uses_month_granularity_for_quarter_windows() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::from_range("2026-02-14", "2026-05-14").expect("range");
+        let (range_start, range_end) = window.bounds(now);
+
+        let granularity = display_chart_granularity(&range_start, &range_end);
+        let interval = display_interval_minutes_for_window(&window, now, 160);
+
+        assert_eq!(granularity, charts::ChartGranularity::Month);
+        assert_eq!(interval, 1440);
     }
 
     #[test]

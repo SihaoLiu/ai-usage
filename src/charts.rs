@@ -18,6 +18,7 @@ pub enum ChartGranularity {
     Hour,
     Day,
     Week,
+    Month,
     Year,
 }
 
@@ -27,9 +28,12 @@ impl ChartGranularity {
     /// room to render labels without overcrowding.
     pub fn from_span_minutes(span_minutes: i64) -> Self {
         let span_hours = span_minutes / 60;
-        let span_days = span_minutes / (24 * 60);
+        let day_minutes = 24 * 60;
+        let span_days = (span_minutes + day_minutes - 1) / day_minutes;
         if span_days >= 365 {
             ChartGranularity::Year
+        } else if span_days >= 90 {
+            ChartGranularity::Month
         } else if span_days >= 18 {
             ChartGranularity::Week
         } else if span_hours <= 12 {
@@ -48,6 +52,9 @@ impl ChartGranularity {
             ChartGranularity::Day => t.hour() == 0 && t.minute() == 0 && exact_minute,
             ChartGranularity::Week => {
                 t.hour() == 0 && t.minute() == 0 && exact_minute && t.weekday() == Weekday::Mon
+            }
+            ChartGranularity::Month => {
+                t.day() == 1 && t.hour() == 0 && t.minute() == 0 && exact_minute
             }
             ChartGranularity::Year => {
                 t.month() == 1 && t.day() == 1 && t.hour() == 0 && t.minute() == 0 && exact_minute
@@ -69,6 +76,10 @@ impl ChartGranularity {
                 let mon_date = t.date_naive() - Duration::days(days_from_mon);
                 mon_date.and_hms_opt(0, 0, 0).expect("week anchor")
             }
+            ChartGranularity::Month => chrono::NaiveDate::from_ymd_opt(t.year(), t.month(), 1)
+                .expect("month date")
+                .and_hms_opt(0, 0, 0)
+                .expect("month anchor"),
             ChartGranularity::Year => chrono::NaiveDate::from_ymd_opt(t.year(), 1, 1)
                 .expect("year date")
                 .and_hms_opt(0, 0, 0)
@@ -179,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn granularity_picks_year_for_annual_spans() {
+    fn granularity_picks_month_between_week_and_year_spans() {
         assert_eq!(
             ChartGranularity::from_span_minutes(60),
             ChartGranularity::Hour
@@ -206,12 +217,16 @@ mod tests {
             ChartGranularity::Week
         );
         assert_eq!(
-            ChartGranularity::from_span_minutes(90 * 24 * 60),
+            ChartGranularity::from_span_minutes(89 * 24 * 60),
             ChartGranularity::Week
         );
         assert_eq!(
+            ChartGranularity::from_span_minutes(90 * 24 * 60),
+            ChartGranularity::Month
+        );
+        assert_eq!(
             ChartGranularity::from_span_minutes(364 * 24 * 60),
-            ChartGranularity::Week
+            ChartGranularity::Month
         );
         assert_eq!(
             ChartGranularity::from_span_minutes(365 * 24 * 60),
@@ -236,6 +251,49 @@ mod tests {
             anchor.format("%Y-%m-%d %H:%M").to_string(),
             "2026-05-04 00:00"
         );
+    }
+
+    #[test]
+    fn month_granularity_anchors_to_month_start_across_month_lengths() {
+        let leap_day = Local
+            .with_ymd_and_hms(2024, 2, 29, 15, 30, 0)
+            .single()
+            .expect("leap day");
+        let leap_anchor = ChartGranularity::Month.segment_start(leap_day);
+        assert_eq!(
+            leap_anchor.format("%Y-%m-%d %H:%M").to_string(),
+            "2024-02-01 00:00"
+        );
+
+        let month_end = Local
+            .with_ymd_and_hms(2026, 4, 30, 23, 59, 0)
+            .single()
+            .expect("month end");
+        let month_end_anchor = ChartGranularity::Month.segment_start(month_end);
+        assert_eq!(
+            month_end_anchor.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-04-01 00:00"
+        );
+    }
+
+    #[test]
+    fn month_granularity_treats_only_month_start_midnight_as_boundary() {
+        let boundary = Local
+            .with_ymd_and_hms(2026, 5, 1, 0, 0, 0)
+            .single()
+            .expect("month start");
+        let later = Local
+            .with_ymd_and_hms(2026, 5, 1, 12, 0, 0)
+            .single()
+            .expect("same day");
+        let prior_day = Local
+            .with_ymd_and_hms(2026, 4, 30, 0, 0, 0)
+            .single()
+            .expect("prior day");
+
+        assert!(ChartGranularity::Month.is_boundary(&boundary));
+        assert!(!ChartGranularity::Month.is_boundary(&later));
+        assert!(!ChartGranularity::Month.is_boundary(&prior_day));
     }
 
     #[test]
@@ -302,6 +360,35 @@ mod tests {
     }
 
     #[test]
+    fn month_header_labels_month_and_anchor_date() {
+        let day = Local
+            .with_ymd_and_hms(2026, 5, 11, 12, 0, 0)
+            .single()
+            .expect("fixed local time");
+        let mut columns = Vec::new();
+        for sub_col in 0..20 {
+            columns.push(ChartColumn::Data {
+                data_idx: 0,
+                sub_col,
+            });
+        }
+        let layout = ChartLayout {
+            columns,
+            data_to_col: HashMap::new(),
+            sorted_times: vec![day],
+        };
+
+        let Some((month_line, date_line)) =
+            segment_header_lines(&layout, ChartGranularity::Month, &|_| 3_260_000.0)
+        else {
+            panic!("header should render");
+        };
+
+        assert!(month_line.contains("2026-05 : 3.26M"));
+        assert!(date_line.contains("05 / 01"));
+    }
+
+    #[test]
     fn hour_granularity_treats_only_minute_zero_as_boundary() {
         let mid = Local
             .with_ymd_and_hms(2026, 5, 7, 13, 0, 0)
@@ -344,6 +431,20 @@ mod tests {
         assert_eq!(
             tick.format("%Y-%m-%d %H:%M").to_string(),
             "2026-05-18 00:00"
+        );
+    }
+
+    #[test]
+    fn month_x_axis_ticks_anchor_to_next_month_start() {
+        let first_time = Local
+            .with_ymd_and_hms(2026, 2, 10, 9, 0, 0)
+            .single()
+            .expect("fixed local time");
+        let tick = first_x_axis_tick(&first_time, ChartGranularity::Month, 28_800);
+
+        assert_eq!(
+            tick.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-03-01 00:00"
         );
     }
 
@@ -402,6 +503,36 @@ mod tests {
             .expect("end");
         let layout = build_chart_layout(&start, &end, 1440, ChartGranularity::Year, Some(160));
         assert_eq!(count_separators(&layout), 2);
+    }
+
+    #[test]
+    fn month_granularity_places_separators_only_on_internal_month_starts() {
+        let start = Local
+            .with_ymd_and_hms(2026, 1, 15, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Local
+            .with_ymd_and_hms(2026, 5, 14, 0, 0, 0)
+            .single()
+            .expect("end");
+        let layout = build_chart_layout(&start, &end, 1440, ChartGranularity::Month, Some(160));
+
+        assert_eq!(count_separators(&layout), 4);
+    }
+
+    #[test]
+    fn month_granularity_marks_month_change_with_coarse_buckets() {
+        let start = Local
+            .with_ymd_and_hms(2026, 1, 20, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Local
+            .with_ymd_and_hms(2026, 4, 20, 0, 0, 0)
+            .single()
+            .expect("end");
+        let layout = build_chart_layout(&start, &end, 14 * 1440, ChartGranularity::Month, Some(80));
+
+        assert_eq!(count_separators(&layout), 3);
     }
 
     #[test]
@@ -796,8 +927,7 @@ fn should_insert_separator(
     granularity: ChartGranularity,
     interval_minutes: i64,
 ) -> bool {
-    let last_idx = sorted_times.len().saturating_sub(1);
-    if index == 0 || index == last_idx {
+    if index == 0 {
         return false;
     }
 
@@ -805,6 +935,11 @@ fn should_insert_separator(
     if interval_minutes > 1440 {
         return granularity.segment_start(sorted_times[index - 1])
             != granularity.segment_start(time);
+    }
+
+    let last_idx = sorted_times.len().saturating_sub(1);
+    if index == last_idx {
+        return false;
     }
 
     granularity.is_boundary(&time)
@@ -945,6 +1080,19 @@ fn segment_label(
             } else {
                 (
                     format!("Wk {:02} : {}", week_num, format_total_value(total)),
+                    anchor.format(" %m / %d").to_string(),
+                )
+            }
+        }
+        ChartGranularity::Month => {
+            if compact {
+                (
+                    format!("{}:{}", anchor.format("%Y-%m"), format_total_compact(total)),
+                    anchor.format("%m/%d").to_string(),
+                )
+            } else {
+                (
+                    format!("{} : {}", anchor.format("%Y-%m"), format_total_value(total)),
                     anchor.format(" %m / %d").to_string(),
                 )
             }
@@ -1186,6 +1334,19 @@ fn add_wall_clock_minutes(anchor: DateTime<Local>, minutes: i64) -> DateTime<Loc
     local_from_naive_with_fallback(naive, anchor + Duration::minutes(minutes))
 }
 
+fn add_calendar_month(anchor: DateTime<Local>) -> DateTime<Local> {
+    let (year, month) = if anchor.month() == 12 {
+        (anchor.year() + 1, 1)
+    } else {
+        (anchor.year(), anchor.month() + 1)
+    };
+    let naive = chrono::NaiveDate::from_ymd_opt(year, month, 1)
+        .expect("next month date")
+        .and_hms_opt(0, 0, 0)
+        .expect("next month anchor");
+    local_from_naive_with_fallback(naive, anchor + Duration::days(31))
+}
+
 fn first_x_axis_tick(
     first_time: &DateTime<Local>,
     granularity: ChartGranularity,
@@ -1194,6 +1355,9 @@ fn first_x_axis_tick(
     let anchor = granularity.segment_start(*first_time);
     if anchor >= *first_time {
         return anchor;
+    }
+    if granularity == ChartGranularity::Month {
+        return add_calendar_month(anchor);
     }
 
     let tick_interval = tick_interval.max(1);
@@ -1260,7 +1424,11 @@ fn print_x_axis_labels(
             used_positions.insert(pos);
         }
 
-        current_tick = add_wall_clock_minutes(current_tick, tick_interval);
+        current_tick = if granularity == ChartGranularity::Month {
+            add_calendar_month(current_tick)
+        } else {
+            add_wall_clock_minutes(current_tick, tick_interval)
+        };
     }
 
     let max_label_len = labels.iter().map(|l| l.len()).max().unwrap_or(0);

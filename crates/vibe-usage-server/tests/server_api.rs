@@ -331,6 +331,63 @@ async fn upload_replaces_omp_v220_message_key_with_stable_key() {
 }
 
 #[tokio::test]
+async fn upload_refreshes_existing_omp_stable_metadata() {
+    let app = app("omp-stable-metadata-refresh").await;
+    let mut old_record = record("laptop", "omp", "omp:message:msg-a:response:resp-a", 10);
+    old_record.model = "claude-sonnet-4-5-20250929".to_string();
+    let first = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/upload",
+            ndjson(&[old_record.clone()]),
+        ))
+        .await
+        .expect("first response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body: UploadResponse = read_json(first).await;
+    assert_eq!(first_body.accepted, 1);
+    assert_eq!(first_body.max_seq, 1);
+
+    let mut refreshed = old_record;
+    refreshed.effort = Some("anthropic".to_string());
+    refreshed.cost_input = Some(0.01);
+    refreshed.cost_output = Some(0.02);
+    refreshed.cost_cache_read = Some(0.03);
+    refreshed.cost_cache_creation = Some(0.04);
+    let second = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[refreshed])))
+        .await
+        .expect("second response");
+
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body: UploadResponse = read_json(second).await;
+    assert_eq!(second_body.accepted, 1);
+    assert_eq!(second_body.ignored, 0);
+    assert!(second_body.max_seq > 1);
+
+    let pull = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=omp",
+            Body::empty(),
+        ))
+        .await
+        .expect("pull response");
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 1);
+    assert_eq!(body.records[0].seq, second_body.max_seq);
+    let record = &body.records[0].record;
+    assert_eq!(record.effort.as_deref(), Some("anthropic"));
+    assert_eq!(record.cost_input, Some(0.01));
+    assert_eq!(record.cost_output, Some(0.02));
+    assert_eq!(record.cost_cache_read, Some(0.03));
+    assert_eq!(record.cost_cache_creation, Some(0.04));
+}
+
+#[tokio::test]
 async fn upload_treats_omp_stable_message_key_as_duplicate_for_v220_key() {
     let app = app("omp-stable-message-key").await;
     let mut stable_record = record("laptop", "omp", "omp:message:msg-a:response:resp-a", 10);

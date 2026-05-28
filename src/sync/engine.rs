@@ -14,6 +14,14 @@ pub const SUPPORTED_PULL_VENDORS: [&str; 4] = ["claude", "codex", "gemini", "omp
 const VENDORS: [&str; 4] = SUPPORTED_PULL_VENDORS;
 const BATCH_SIZE: usize = 1000;
 const PULL_LIMIT: usize = 5000;
+const OMP_METADATA_REFRESH_LOG_VENDOR: &str = "omp-metadata-refresh";
+
+#[derive(Debug, Clone)]
+struct UploadCandidate {
+    key: (String, String),
+    refresh_key: Option<(String, String)>,
+    wire: WireRecord,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncProgress {
@@ -124,21 +132,42 @@ where
 
     for vendor in VENDORS {
         let mut vendor_records = Vec::new();
+        let mut vendor_refresh_records = Vec::new();
         for record in cache::load_vendor_cached_records(cache_root, vendor) {
             if record.dedup_key.is_empty() {
                 skipped_records += 1;
                 continue;
             }
             let key = (record.vendor.clone(), record.dedup_key.clone());
-            if upload_log.contains(&key) || uploaded_with_omp_v220_key(&record, &upload_log) {
+            let logged = upload_log.contains(&key);
+            if logged || uploaded_with_omp_v220_key(&record, &upload_log) {
+                if logged
+                    && let Some(refresh_key) = omp_metadata_refresh_log_key(&record)
+                    && !upload_log.contains(&refresh_key)
+                {
+                    let wire = cached_record_to_wire(config, &record)?;
+                    vendor_refresh_records.push(UploadCandidate {
+                        key,
+                        refresh_key: Some(refresh_key),
+                        wire,
+                    });
+                    continue;
+                }
                 skipped_records += 1;
                 continue;
             }
             let wire = cached_record_to_wire(config, &record)?;
-            vendor_records.push((key, wire));
+            vendor_records.push(UploadCandidate {
+                key,
+                refresh_key: None,
+                wire,
+            });
         }
         if !vendor_records.is_empty() {
             upload_groups.push(vendor_records);
+        }
+        if !vendor_refresh_records.is_empty() {
+            upload_groups.push(vendor_refresh_records);
         }
     }
 
@@ -159,8 +188,10 @@ where
     let mut batch_index = 0;
     for group in upload_groups {
         for batch in group.chunks(BATCH_SIZE) {
-            let wire_records: Vec<WireRecord> =
-                batch.iter().map(|(_, record)| record.clone()).collect();
+            let wire_records: Vec<WireRecord> = batch
+                .iter()
+                .map(|candidate| candidate.wire.clone())
+                .collect();
             let response = match transport.upload(&wire_records) {
                 Ok(response) => response,
                 Err(err)
@@ -174,8 +205,13 @@ where
             uploaded_records += batch.len();
             accepted += response.accepted;
             ignored += response.ignored;
-            for (key, _) in batch {
-                upload_log.insert(key.clone());
+            for candidate in batch {
+                upload_log.insert(candidate.key.clone());
+                if response.accepted > 0
+                    && let Some(refresh_key) = &candidate.refresh_key
+                {
+                    upload_log.insert(refresh_key.clone());
+                }
             }
             state::save_upload_log(cache_root, &upload_log)?;
             batch_index += 1;
@@ -228,6 +264,31 @@ fn uploaded_with_omp_v220_key(
         }
     }
     false
+}
+
+fn omp_metadata_refresh_log_key(record: &CachedUsageRecord) -> Option<(String, String)> {
+    if record.vendor == "omp"
+        && is_stable_omp_key(&record.dedup_key)
+        && (record
+            .entry
+            .effort
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            || record.entry.costs.is_some())
+    {
+        Some((
+            OMP_METADATA_REFRESH_LOG_VENDOR.to_string(),
+            record.dedup_key.clone(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn is_stable_omp_key(dedup_key: &str) -> bool {
+    dedup_key.starts_with("omp:message:")
+        || dedup_key.starts_with("omp:response:")
+        || dedup_key.starts_with("omp:file:")
 }
 
 fn omp_v220_key_candidates(record: &CachedUsageRecord) -> Vec<String> {
@@ -684,6 +745,58 @@ mod tests {
         assert_eq!(uploads[0][0].cost_output, Some(0.02));
         assert_eq!(uploads[0][0].cost_cache_read, Some(0.03));
         assert_eq!(uploads[0][0].cost_cache_creation, Some(0.04));
+    }
+
+    #[test]
+    fn sync_upload_refreshes_logged_omp_stable_metadata_once() {
+        let cache_root = unique_temp_dir("upload-omp-refresh");
+        let mut record = usage_record(
+            "omp:message:msg-a:response:resp-a",
+            "2026-05-18T12:00:00Z",
+            10,
+        );
+        record.entry.model = "claude-sonnet-4-5-20250929".to_string();
+        record.entry.effort = Some("anthropic".to_string());
+        record.entry.costs = Some(UsageCost {
+            input: 0.01,
+            output: 0.02,
+            cache_read: 0.03,
+            cache_creation: 0.04,
+        });
+        populate_vendor_cache_with_record(&cache_root, "omp", record.clone());
+        crate::sync::state::save_upload_log(
+            &cache_root,
+            &BTreeSet::from([("omp".to_string(), record.dedup_key.clone())]),
+        )
+        .expect("save upload log");
+        let transport = FakeTransport::new(Vec::new());
+
+        run_upload_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("upload");
+
+        let uploads = transport.uploads.borrow();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].len(), 1);
+        assert_eq!(uploads[0][0].dedup_key, "omp:message:msg-a:response:resp-a");
+        assert_eq!(uploads[0][0].effort.as_deref(), Some("anthropic"));
+        assert_eq!(uploads[0][0].cost_input, Some(0.01));
+        drop(uploads);
+
+        let second_transport = FakeTransport::new(Vec::new());
+        run_upload_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &second_transport,
+            |_| {},
+        )
+        .expect("second upload");
+
+        assert!(second_transport.uploads.borrow().is_empty());
     }
 
     #[test]

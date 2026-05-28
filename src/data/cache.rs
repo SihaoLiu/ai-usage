@@ -693,20 +693,67 @@ pub fn merge_remote_records(
 ) -> io::Result<()> {
     let path = remote_entries_path(cache_root, host_id);
     let mut existing = read_remote_records(&path).unwrap_or_default();
-    let mut seen: HashSet<(String, String)> = existing
+    let mut positions: HashMap<(String, String), usize> = existing
         .iter()
-        .map(|record| (record.vendor.clone(), record.dedup_key.clone()))
+        .enumerate()
+        .map(|(idx, record)| ((record.vendor.clone(), record.dedup_key.clone()), idx))
         .collect();
 
     for record in records {
         let key = (record.vendor.clone(), record.dedup_key.clone());
-        if seen.insert(key) {
-            existing.push(PersistedRemoteRecord::from_remote_record(record));
+        let incoming = PersistedRemoteRecord::from_remote_record(record);
+        if let Some(idx) = positions.get(&key).copied() {
+            refresh_remote_record(&mut existing[idx], incoming);
+        } else {
+            positions.insert(key, existing.len());
+            existing.push(incoming);
         }
     }
 
     existing = deduplicate_remote_omp_aliases(existing);
     write_remote_records(&path, &existing)
+}
+
+fn refresh_remote_record(existing: &mut PersistedRemoteRecord, incoming: PersistedRemoteRecord) {
+    if incoming.vendor != "omp"
+        || !is_stable_omp_key(&incoming.dedup_key)
+        || !has_remote_refresh_metadata(&incoming)
+    {
+        return;
+    }
+
+    let mut refreshed = incoming;
+    if refreshed
+        .effort
+        .as_deref()
+        .is_none_or(|value| value.is_empty())
+    {
+        refreshed.effort = existing.effort.clone();
+    }
+    if refreshed.cost_input.is_none() {
+        refreshed.cost_input = existing.cost_input;
+    }
+    if refreshed.cost_output.is_none() {
+        refreshed.cost_output = existing.cost_output;
+    }
+    if refreshed.cost_cache_read.is_none() {
+        refreshed.cost_cache_read = existing.cost_cache_read;
+    }
+    if refreshed.cost_cache_creation.is_none() {
+        refreshed.cost_cache_creation = existing.cost_cache_creation;
+    }
+    *existing = refreshed;
+}
+
+fn has_remote_refresh_metadata(record: &PersistedRemoteRecord) -> bool {
+    record
+        .effort
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        || record.cost_input.is_some()
+        || record.cost_output.is_some()
+        || record.cost_cache_read.is_some()
+        || record.cost_cache_creation.is_some()
 }
 
 fn deduplicate_remote_omp_aliases(
@@ -756,6 +803,12 @@ fn deduplicate_remote_omp_aliases(
         .enumerate()
         .filter_map(|(idx, record)| (!stale_indexes.contains(&idx)).then_some(record))
         .collect()
+}
+
+fn is_stable_omp_key(dedup_key: &str) -> bool {
+    dedup_key.starts_with("omp:message:")
+        || dedup_key.starts_with("omp:response:")
+        || dedup_key.starts_with("omp:file:")
 }
 
 fn parse_omp_v220_key(dedup_key: &str) -> Option<OmpV220Key> {
@@ -1949,6 +2002,46 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn remote_omp_stable_records_refresh_existing_metadata() {
+        let cache_root = unique_temp_dir("remote-omp-metadata-refresh");
+        let stale = remote_record(
+            "omp",
+            "omp:message:msg-a:response:resp-a",
+            "2026-05-01T00:00:00Z",
+            10,
+        );
+        super::merge_remote_records(&cache_root, "laptop", vec![stale])
+            .expect("merge stale remote record");
+
+        let mut refreshed = remote_record(
+            "omp",
+            "omp:message:msg-a:response:resp-a",
+            "2026-05-01T00:00:00Z",
+            10,
+        );
+        refreshed.entry.effort = Some("anthropic".to_string());
+        refreshed.entry.costs = Some(crate::data::UsageCost {
+            input: 0.01,
+            output: 0.02,
+            cache_read: 0.03,
+            cache_creation: 0.04,
+        });
+        super::merge_remote_records(&cache_root, "laptop", vec![refreshed])
+            .expect("merge refreshed remote record");
+
+        let records = super::load_remote_entries(&cache_root, None);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].dedup_key, "omp:message:msg-a:response:resp-a");
+        assert_eq!(records[0].entry.effort.as_deref(), Some("anthropic"));
+        let costs = records[0].entry.costs.expect("refreshed costs");
+        assert_eq!(costs.input, 0.01);
+        assert_eq!(costs.output, 0.02);
+        assert_eq!(costs.cache_read, 0.03);
+        assert_eq!(costs.cache_creation, 0.04);
     }
 
     #[test]

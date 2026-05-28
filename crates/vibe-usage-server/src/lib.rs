@@ -232,39 +232,9 @@ async fn upload(
             touched_hosts.insert(record.host_id.clone());
             continue;
         }
-        let changed = tx.execute(
-            "INSERT OR IGNORE INTO records (
-                host_id, vendor, dedup_key, schema_version, timestamp_utc,
-                session_start, session_end, model, effort, fast_tier, input_tokens,
-                output_tokens, cache_read, cache_creation, reasoning_out,
-                cost_input, cost_output, cost_cache_read, cost_cache_creation,
-                project_hash, uploaded_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-            params![
-                record.host_id,
-                record.vendor,
-                record.dedup_key,
-                i64::from(record.schema_version),
-                record.timestamp,
-                record.session_start_time,
-                record.session_end_time,
-                record.model,
-                record.effort,
-                i64::from(record.fast_tier),
-                record.input_tokens,
-                record.output_tokens,
-                record.cache_read_input_tokens,
-                record.cache_creation_input_tokens,
-                record.reasoning_output_tokens,
-                record.cost_input,
-                record.cost_output,
-                record.cost_cache_read,
-                record.cost_cache_creation,
-                record.project_path_sha256,
-                uploaded_at,
-            ],
-        )?;
-        if changed == 1 {
+        let changed = insert_record(&tx, record, &uploaded_at)?;
+        let accepted_record = changed == 1 || refresh_omp_stable_record(&tx, record, &uploaded_at)?;
+        if accepted_record {
             accepted += 1;
         } else {
             ignored += 1;
@@ -294,6 +264,45 @@ async fn upload(
         ignored,
         max_seq,
     }))
+}
+
+fn insert_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &WireRecord,
+    uploaded_at: &str,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        "INSERT OR IGNORE INTO records (
+            host_id, vendor, dedup_key, schema_version, timestamp_utc,
+            session_start, session_end, model, effort, fast_tier, input_tokens,
+            output_tokens, cache_read, cache_creation, reasoning_out,
+            cost_input, cost_output, cost_cache_read, cost_cache_creation,
+            project_hash, uploaded_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        params![
+            record.host_id,
+            record.vendor,
+            record.dedup_key,
+            i64::from(record.schema_version),
+            record.timestamp,
+            record.session_start_time,
+            record.session_end_time,
+            record.model,
+            record.effort,
+            i64::from(record.fast_tier),
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_read_input_tokens,
+            record.cache_creation_input_tokens,
+            record.reasoning_output_tokens,
+            record.cost_input,
+            record.cost_output,
+            record.cost_cache_read,
+            record.cost_cache_creation,
+            record.project_path_sha256,
+            uploaded_at,
+        ],
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -598,6 +607,16 @@ struct OmpFileAlias {
     cache_creation_input_tokens: i64,
 }
 
+#[derive(Debug, Clone)]
+struct StoredOmpMetadata {
+    effort: Option<String>,
+    cost_input: Option<f64>,
+    cost_output: Option<f64>,
+    cost_cache_read: Option<f64>,
+    cost_cache_creation: Option<f64>,
+    project_path_sha256: Option<String>,
+}
+
 fn cleanup_omp_alias_duplicates(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
     let records = load_stored_omp_records(conn)?;
     if records.is_empty() {
@@ -761,6 +780,91 @@ fn uploaded_with_omp_alias(
         return omp_stable_file_key_exists(tx, record, &key);
     }
     Ok(false)
+}
+
+fn refresh_omp_stable_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &WireRecord,
+    uploaded_at: &str,
+) -> rusqlite::Result<bool> {
+    if record.vendor != "omp"
+        || parse_omp_v220_key(&record.dedup_key).is_some()
+        || !is_stable_omp_key(&record.dedup_key)
+        || !has_omp_refresh_metadata(record)
+    {
+        return Ok(false);
+    }
+
+    let Some(existing) = load_existing_omp_metadata(tx, record)? else {
+        return Ok(false);
+    };
+
+    let mut refreshed = record.clone();
+    if refreshed
+        .effort
+        .as_deref()
+        .is_none_or(|value| value.is_empty())
+    {
+        refreshed.effort = existing.effort;
+    }
+    if refreshed.cost_input.is_none() {
+        refreshed.cost_input = existing.cost_input;
+    }
+    if refreshed.cost_output.is_none() {
+        refreshed.cost_output = existing.cost_output;
+    }
+    if refreshed.cost_cache_read.is_none() {
+        refreshed.cost_cache_read = existing.cost_cache_read;
+    }
+    if refreshed.cost_cache_creation.is_none() {
+        refreshed.cost_cache_creation = existing.cost_cache_creation;
+    }
+    if refreshed.project_path_sha256.is_none() {
+        refreshed.project_path_sha256 = existing.project_path_sha256;
+    }
+
+    tx.execute(
+        "DELETE FROM records WHERE host_id = ?1 AND vendor = 'omp' AND dedup_key = ?2",
+        params![record.host_id, record.dedup_key],
+    )?;
+    insert_record(tx, &refreshed, uploaded_at)?;
+    Ok(true)
+}
+
+fn load_existing_omp_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    record: &WireRecord,
+) -> rusqlite::Result<Option<StoredOmpMetadata>> {
+    tx.query_row(
+        "SELECT effort, cost_input, cost_output, cost_cache_read, cost_cache_creation,
+            project_hash
+         FROM records
+         WHERE host_id = ?1 AND vendor = 'omp' AND dedup_key = ?2
+         LIMIT 1",
+        params![record.host_id, record.dedup_key],
+        |row| {
+            Ok(StoredOmpMetadata {
+                effort: row.get(0)?,
+                cost_input: row.get(1)?,
+                cost_output: row.get(2)?,
+                cost_cache_read: row.get(3)?,
+                cost_cache_creation: row.get(4)?,
+                project_path_sha256: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn has_omp_refresh_metadata(record: &WireRecord) -> bool {
+    record
+        .effort
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        || record.cost_input.is_some()
+        || record.cost_output.is_some()
+        || record.cost_cache_read.is_some()
+        || record.cost_cache_creation.is_some()
 }
 
 fn delete_omp_v220_aliases_for_stable_record(

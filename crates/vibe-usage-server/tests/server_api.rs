@@ -282,7 +282,7 @@ async fn upload_deduplicates_without_advancing_sequence() {
 }
 
 #[tokio::test]
-async fn upload_treats_omp_v220_message_key_as_duplicate() {
+async fn upload_replaces_omp_v220_message_key_with_stable_key() {
     let app = app("omp-v220-message-key").await;
     let mut old_record = record("laptop", "omp", "placeholder", 10);
     old_record.model = "gpt-5.5".to_string();
@@ -309,9 +309,25 @@ async fn upload_treats_omp_v220_message_key_as_duplicate() {
 
     assert_eq!(second.status(), StatusCode::OK);
     let second_body: UploadResponse = read_json(second).await;
-    assert_eq!(second_body.accepted, 0);
-    assert_eq!(second_body.ignored, 1);
-    assert_eq!(second_body.max_seq, 1);
+    assert_eq!(second_body.accepted, 1);
+    assert_eq!(second_body.ignored, 0);
+    assert_eq!(second_body.max_seq, 2);
+
+    let pull = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=omp",
+            Body::empty(),
+        ))
+        .await
+        .expect("pull response");
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 1);
+    assert_eq!(
+        body.records[0].record.dedup_key,
+        "omp:message:msg-a:response:resp-a"
+    );
 }
 
 #[tokio::test]
@@ -350,7 +366,7 @@ async fn upload_treats_omp_stable_message_key_as_duplicate_for_v220_key() {
 }
 
 #[tokio::test]
-async fn upload_consumes_one_omp_v220_file_key_duplicate() {
+async fn upload_replaces_omp_v220_file_key_with_stable_file_keys() {
     let app = app("omp-v220-file-key").await;
     let mut old_record = record("laptop", "omp", "placeholder", 10);
     old_record.dedup_key = omp_v220_key("", "", "test-model", &old_record);
@@ -373,9 +389,29 @@ async fn upload_consumes_one_omp_v220_file_key_duplicate() {
 
     assert_eq!(second.status(), StatusCode::OK);
     let second_body: UploadResponse = read_json(second).await;
-    assert_eq!(second_body.accepted, 1);
-    assert_eq!(second_body.ignored, 1);
-    assert_eq!(second_body.max_seq, 2);
+    assert_eq!(second_body.accepted, 2);
+    assert_eq!(second_body.ignored, 0);
+    assert_eq!(second_body.max_seq, 3);
+
+    let pull = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=omp",
+            Body::empty(),
+        ))
+        .await
+        .expect("pull response");
+    let body: PullResponse = read_json(pull).await;
+    let keys = body
+        .records
+        .iter()
+        .map(|record| record.record.dedup_key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        vec!["omp:file:/tmp/omp.jsonl:0", "omp:file:/tmp/omp.jsonl:1"]
+    );
 }
 
 #[tokio::test]

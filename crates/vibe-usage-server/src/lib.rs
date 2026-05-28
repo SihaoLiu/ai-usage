@@ -225,10 +225,9 @@ async fn upload(
     let mut accepted = 0usize;
     let mut ignored = 0usize;
     let mut touched_hosts = BTreeSet::new();
-    let mut consumed_omp_v220_keys = BTreeSet::new();
 
     for record in &records {
-        if uploaded_with_omp_alias(&tx, record, &mut consumed_omp_v220_keys)? {
+        if uploaded_with_omp_alias(&tx, record)? {
             ignored += 1;
             touched_hosts.insert(record.host_id.clone());
             continue;
@@ -269,6 +268,9 @@ async fn upload(
             accepted += 1;
         } else {
             ignored += 1;
+        }
+        if delete_omp_v220_aliases_for_stable_record(&tx, record)? {
+            touched_hosts.insert(record.host_id.clone());
         }
         touched_hosts.insert(record.host_id.clone());
     }
@@ -745,7 +747,6 @@ fn append_placeholders(sql: &mut String, count: usize) {
 fn uploaded_with_omp_alias(
     tx: &rusqlite::Transaction<'_>,
     record: &WireRecord,
-    consumed_keys: &mut BTreeSet<String>,
 ) -> rusqlite::Result<bool> {
     if record.vendor != "omp" {
         return Ok(false);
@@ -759,22 +760,35 @@ fn uploaded_with_omp_alias(
         }
         return omp_stable_file_key_exists(tx, record, &key);
     }
-    let consume_once = record.dedup_key.starts_with("omp:file:");
-    for legacy_key in omp_v220_key_candidates(record) {
-        let scoped_key = format!("{}:{legacy_key}", record.host_id);
-        let exists = tx
-            .query_row(
-                "SELECT 1 FROM records WHERE host_id = ?1 AND vendor = 'omp' AND dedup_key = ?2 LIMIT 1",
-                params![record.host_id, legacy_key],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if exists && (!consume_once || consumed_keys.insert(scoped_key)) {
-            return Ok(true);
-        }
-    }
     Ok(false)
+}
+
+fn delete_omp_v220_aliases_for_stable_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &WireRecord,
+) -> rusqlite::Result<bool> {
+    if record.vendor != "omp"
+        || parse_omp_v220_key(&record.dedup_key).is_some()
+        || !is_stable_omp_key(&record.dedup_key)
+    {
+        return Ok(false);
+    }
+
+    let mut deleted = false;
+    for legacy_key in omp_v220_key_candidates(record) {
+        let changed = tx.execute(
+            "DELETE FROM records WHERE host_id = ?1 AND vendor = 'omp' AND dedup_key = ?2",
+            params![record.host_id, legacy_key],
+        )?;
+        deleted |= changed > 0;
+    }
+    Ok(deleted)
+}
+
+fn is_stable_omp_key(dedup_key: &str) -> bool {
+    dedup_key.starts_with("omp:message:")
+        || dedup_key.starts_with("omp:response:")
+        || dedup_key.starts_with("omp:file:")
 }
 
 #[derive(Debug, Deserialize)]

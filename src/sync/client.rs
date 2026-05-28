@@ -429,25 +429,49 @@ mod tests {
         .expect("save upload log");
 
         let upload_client = client.clone();
+        let upload_config = config.clone();
         tokio::task::spawn_blocking(move || {
-            engine::run_upload_once_with_progress(&cache_root, &config, &upload_client, |_| {})
+            engine::run_upload_once_with_progress(
+                &cache_root,
+                &upload_config,
+                &upload_client,
+                |_| {},
+            )
         })
         .await
         .expect("upload join")
         .expect("compat upload");
 
+        let viewer_cache = unique_db_path("omp-file-compat-viewer-cache");
+        std::fs::create_dir_all(&viewer_cache).expect("create viewer cache");
+        let mut viewer_config = config.clone();
+        viewer_config.machine_id = "viewer".to_string();
         let pull_client = client.clone();
-        let pull = tokio::task::spawn_blocking(move || pull_client.pull(0, "viewer", 100))
-            .await
-            .expect("pull join")
-            .expect("pull response");
-        let keys = pull
-            .records
-            .iter()
-            .map(|record| record.record.dedup_key.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(pull.records.len(), 2, "{keys:?}");
-        assert!(keys.contains(&"omp:file:/tmp/omp.jsonl:1"), "{keys:?}");
+        let keys = tokio::task::spawn_blocking(move || {
+            engine::run_pull_once_with_progress(
+                &viewer_cache,
+                &viewer_config,
+                &pull_client,
+                |_| {},
+            )?;
+            let remote = crate::data::cache::load_remote_entries(&viewer_cache, None);
+            Ok::<_, engine::SyncError>(
+                remote
+                    .into_iter()
+                    .map(|record| record.dedup_key)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .expect("pull join")
+        .expect("pull response");
+        assert_eq!(
+            keys,
+            vec![
+                "omp:file:/tmp/omp.jsonl:0".to_string(),
+                "omp:file:/tmp/omp.jsonl:1".to_string(),
+            ]
+        );
         server.abort();
     }
 

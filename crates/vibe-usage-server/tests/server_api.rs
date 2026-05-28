@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 use vibe_usage_proto::{PullResponse, SCHEMA_VERSION, UploadResponse, WireRecord};
-use vibe_usage_server::{AppState, ServerConfig, build_app};
+use vibe_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -28,7 +28,16 @@ fn config(name: &str) -> ServerConfig {
         max_body_bytes: 1024 * 1024,
         max_batch_records: 1000,
         log_level: "info".to_string(),
+        auto_update: AutoUpdateConfig::default(),
     }
+}
+
+fn unique_config_path(name: &str) -> std::path::PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("vibe-usage-server-config-{name}-{stamp}.yaml"))
 }
 
 async fn app(name: &str) -> axum::Router {
@@ -148,6 +157,62 @@ fn seed_existing_records(db_path: &Path, records: &[WireRecord]) {
         )
         .expect("seed machine");
     }
+}
+
+#[test]
+fn server_config_defaults_auto_update_disabled() {
+    let path = unique_config_path("default-auto-update");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+listen: "127.0.0.1:0"
+db_path: "{}"
+shared_token: "{TOKEN}"
+"#,
+            unique_db_path("default-auto-update").display()
+        ),
+    )
+    .expect("write config");
+
+    let cfg = ServerConfig::load_from_path(&path).expect("load config");
+
+    assert!(!cfg.auto_update.enabled);
+    assert_eq!(cfg.auto_update.interval_seconds, 3600);
+}
+
+#[test]
+fn server_config_parses_auto_update_settings() {
+    let path = unique_config_path("enabled-auto-update");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+listen: "127.0.0.1:0"
+db_path: "{}"
+shared_token: "{TOKEN}"
+auto_update:
+  enabled: true
+  interval_seconds: 7200
+"#,
+            unique_db_path("enabled-auto-update").display()
+        ),
+    )
+    .expect("write config");
+
+    let cfg = ServerConfig::load_from_path(&path).expect("load config");
+
+    assert!(cfg.auto_update.enabled);
+    assert_eq!(cfg.auto_update.interval_seconds, 7200);
+}
+
+#[test]
+fn systemd_unit_uses_auto_update_compatible_restart_and_path() {
+    let unit = include_str!("../deploy/vibe-usage-server.service.example");
+
+    assert!(unit.contains("ExecStart=/var/lib/vibe-usage/bin/vibe-usage-server "));
+    assert!(unit.contains("Restart=always"));
+    assert!(unit.contains("ReadWritePaths=/var/lib/vibe-usage"));
 }
 
 #[tokio::test]

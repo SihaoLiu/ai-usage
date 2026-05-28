@@ -34,6 +34,13 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     pub max_batch_records: usize,
     pub log_level: String,
+    pub auto_update: AutoUpdateConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoUpdateConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +52,37 @@ struct RawServerConfig {
     max_body_bytes: Option<usize>,
     max_batch_records: Option<usize>,
     log_level: Option<String>,
+    auto_update: Option<RawAutoUpdateConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAutoUpdateConfig {
+    enabled: Option<bool>,
+    interval_seconds: Option<u64>,
+}
+
+impl Default for AutoUpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: vibe_usage_updater::DEFAULT_AUTO_UPDATE_INTERVAL_SECONDS,
+        }
+    }
+}
+
+impl AutoUpdateConfig {
+    fn from_raw(raw: Option<RawAutoUpdateConfig>) -> Self {
+        let Some(raw) = raw else {
+            return Self::default();
+        };
+        Self {
+            enabled: raw.enabled.unwrap_or(false),
+            interval_seconds: raw
+                .interval_seconds
+                .unwrap_or(vibe_usage_updater::DEFAULT_AUTO_UPDATE_INTERVAL_SECONDS)
+                .max(vibe_usage_updater::MIN_AUTO_UPDATE_INTERVAL_SECONDS),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -76,6 +114,7 @@ impl ServerConfig {
             max_body_bytes: raw.max_body_bytes.unwrap_or(1_048_576),
             max_batch_records: raw.max_batch_records.unwrap_or(1000),
             log_level: raw.log_level.unwrap_or_else(|| "info".to_string()),
+            auto_update: AutoUpdateConfig::from_raw(raw.auto_update),
         })
     }
 }
@@ -125,6 +164,45 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/machines", get(machines))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
+}
+
+pub fn spawn_auto_update_worker(config: AutoUpdateConfig) {
+    if !config.enabled {
+        return;
+    }
+    if let Err(err) = std::thread::Builder::new()
+        .name("vibe-usage-server-auto-update".to_string())
+        .spawn(move || {
+            let interval =
+                vibe_usage_updater::normalize_auto_update_interval(config.interval_seconds);
+            loop {
+                match run_server_auto_update_once() {
+                    Ok(vibe_usage_updater::InstallOutcome::AlreadyLatest { current, latest }) => {
+                        tracing::debug!("auto-update checked: current=v{current} latest=v{latest}");
+                    }
+                    Ok(vibe_usage_updater::InstallOutcome::Updated(update)) => {
+                        tracing::info!(
+                            "auto-update installed {}; exiting for service restart",
+                            update.tag
+                        );
+                        std::process::exit(0);
+                    }
+                    Err(err) => {
+                        tracing::warn!("auto-update failed: {err}");
+                    }
+                }
+                std::thread::sleep(interval);
+            }
+        })
+    {
+        tracing::warn!("failed to start auto-update worker: {err}");
+    }
+}
+
+fn run_server_auto_update_once() -> Result<vibe_usage_updater::InstallOutcome, String> {
+    let config =
+        vibe_usage_updater::UpdateConfig::current("vibe-usage-server", env!("CARGO_PKG_VERSION"));
+    vibe_usage_updater::check_and_install(&config, |_| {})
 }
 
 #[derive(Debug)]

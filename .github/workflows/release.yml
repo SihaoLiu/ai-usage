@@ -24,22 +24,27 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             asset: vibe-usage-x86_64-linux-musl
+            server_asset: vibe-usage-server-x86_64-linux-musl
             use_cross: true
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             asset: vibe-usage-aarch64-linux-musl
+            server_asset: vibe-usage-server-aarch64-linux-musl
             use_cross: true
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             asset: vibe-usage-x86_64-linux-gnu
+            server_asset: vibe-usage-server-x86_64-linux-gnu
             use_cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             asset: vibe-usage-aarch64-linux-gnu
+            server_asset: vibe-usage-server-aarch64-linux-gnu
             use_cross: true
           - target: aarch64-apple-darwin
             os: macos-14
             asset: vibe-usage-aarch64-apple-darwin
+            server_asset: vibe-usage-server-aarch64-apple-darwin
             use_cross: false
     steps:
       - name: Checkout
@@ -69,11 +74,15 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: |
+          cross build --release --bin vibe-usage --target ${{ matrix.target }}
+          cross build --release -p vibe-usage-server --target ${{ matrix.target }}
 
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          cargo build --release --bin vibe-usage --target ${{ matrix.target }}
+          cargo build --release -p vibe-usage-server --target ${{ matrix.target }}
 
       - name: Stage asset
         shell: bash
@@ -83,13 +92,20 @@ jobs:
           dest="dist/${{ matrix.asset }}"
           cp "$src" "$dest"
           chmod +x "$dest"
+          server_src="target/${{ matrix.target }}/release/vibe-usage-server"
+          server_dest="dist/${{ matrix.server_asset }}"
+          cp "$server_src" "$server_dest"
+          chmod +x "$server_dest"
           ls -lh "$dest"
+          ls -lh "$server_dest"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: dist/${{ matrix.asset }}
+          files: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.server_asset }}
           fail_on_unmatched_files: true
           draft: false
           prerelease: false

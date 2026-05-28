@@ -14,19 +14,28 @@ The server is intended for one user operating their own endpoint. It stores reco
 
 ## Server Setup
 
-Build the server binary:
-
-```bash
-cargo build --release -p vibe-usage-server
-sudo install -m 0755 target/release/vibe-usage-server /usr/local/bin/vibe-usage-server
-```
-
 Create a service user and directories:
 
 ```bash
 sudo useradd --system --home /var/lib/vibe-usage --shell /usr/sbin/nologin vibe-usage
 sudo install -d -o vibe-usage -g vibe-usage -m 0750 /var/lib/vibe-usage
+sudo install -d -o vibe-usage -g vibe-usage -m 0755 /var/lib/vibe-usage/bin
 sudo install -d -m 0755 /etc/vibe-usage-server
+```
+
+Download and install the matching server release asset:
+
+```bash
+curl -L -o /tmp/vibe-usage-server \
+  https://github.com/SihaoLiu/ai-usage/releases/latest/download/vibe-usage-server-x86_64-linux-gnu
+sudo install -o vibe-usage -g vibe-usage -m 0755 /tmp/vibe-usage-server /var/lib/vibe-usage/bin/vibe-usage-server
+```
+
+Or build the server binary from source:
+
+```bash
+cargo build --release -p vibe-usage-server
+sudo install -o vibe-usage -g vibe-usage -m 0755 target/release/vibe-usage-server /var/lib/vibe-usage/bin/vibe-usage-server
 ```
 
 Generate one shared token and keep it private:
@@ -47,6 +56,9 @@ allowed_hosts:
 max_body_bytes: 1048576
 max_batch_records: 1000
 log_level: "info"
+auto_update:
+  enabled: false
+  interval_seconds: 3600
 ```
 
 Install the systemd example:
@@ -144,6 +156,18 @@ vibe-usage sync status
 ```
 
 Client-side sync errors are recorded in the local cache root as `sync_state.json` and `sync.log`.
+
+## Auto Update
+
+Automatic server updates are disabled by default. To enable them, run the server from the writable service binary path shown above and set:
+
+```yaml
+auto_update:
+  enabled: true
+  interval_seconds: 3600
+```
+
+The server checks GitHub Releases for a newer `vibe-usage-server-<target>` asset. When a newer binary is installed successfully, the process exits and systemd restarts it. The service unit must use `Restart=always` and start `/var/lib/vibe-usage/bin/vibe-usage-server` so the `vibe-usage` service user can replace the executable.
 
 ## Troubleshooting
 

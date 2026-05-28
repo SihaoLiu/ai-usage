@@ -26,7 +26,7 @@ Download the pre-built binary for your platform from [Releases](https://github.c
 | Linux aarch64 (glibc) | `vibe-usage-aarch64-linux-gnu` |
 | macOS Apple Silicon | `vibe-usage-aarch64-apple-darwin` |
 
-Place it anywhere in your `$PATH` and `chmod +x` it. Once installed, you can keep it up to date by typing `update` in monitor mode (it downloads the matching asset from the latest release and re-execs in place).
+Place it anywhere in your `$PATH` and `chmod +x` it. Once installed, you can keep it up to date by typing `update` in monitor mode, or by starting monitor mode with `--auto-update` for periodic checks.
 
 ### Option 2: Build from source
 

@@ -192,7 +192,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use vibe_usage_proto::{SCHEMA_VERSION, WireRecord};
-    use vibe_usage_server::{AppState, ServerConfig, build_app};
+    use vibe_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -216,6 +216,7 @@ mod tests {
             max_body_bytes: 1024 * 1024,
             max_batch_records: 1000,
             log_level: "info".to_string(),
+            auto_update: AutoUpdateConfig::default(),
         }
     }
 

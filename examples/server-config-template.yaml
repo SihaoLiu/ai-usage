@@ -7,3 +7,6 @@ allowed_hosts:
 max_body_bytes: 1048576
 max_batch_records: 1000
 log_level: "info"
+auto_update:
+  enabled: false
+  interval_seconds: 3600

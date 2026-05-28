@@ -1,6 +1,6 @@
 [package]
 name = "vibe-usage-server"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 [dependencies]
@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 vibe-usage-proto = { path = "../vibe-usage-proto" }
+vibe-usage-updater = { path = "../vibe-usage-updater" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

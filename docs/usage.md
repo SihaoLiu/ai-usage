@@ -10,6 +10,9 @@ Options:
   --days <N>          Number of days to analyze (default: 3)
   --vendor <VENDOR>   Filter to a single vendor: claude, codex, gemini, or omp
   --host <HOST>       Filter to a single machine id
+  --auto-update       Periodically check GitHub Releases in monitor mode
+  --auto-update-interval-seconds <N>
+                      Seconds between automatic release checks (default: 3600)
 ```
 
 Default behavior (no flags) enters monitor mode showing all vendors for the last 3 days.
@@ -38,6 +41,8 @@ Default behavior (no flags) enters monitor mode showing all vendors for the last
 | `e` / `exit` | Exit monitor mode |
 
 Monitor mode date and date-time inputs are interpreted in the running machine's local timezone. For date-only ranges, the ending date is included for the full local day. For example, `range 2026-05-01 2026-05-07` covers local time from `2026-05-01 00:00:00` through the end of `2026-05-07`. The two arguments to `range` may be supplied in any order; the earlier instant is treated as the start and the later one as the end.
+
+Automatic updates are disabled unless `--auto-update` is provided. When enabled, monitor mode checks the latest GitHub release on the configured interval, downloads the matching `vibe-usage-<target>` asset when a newer version exists, replaces the current executable, and restarts in place.
 
 ## Data Sources
 

@@ -1530,6 +1530,7 @@ dependencies = [
  "ureq",
  "vibe-usage-proto",
  "vibe-usage-server",
+ "vibe-usage-updater",
  "walkdir",
 ]
 
@@ -1544,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-usage-server"
-version = "0.1.0"
+version = "2.2.2"
 dependencies = [
  "axum",
  "chrono",
@@ -1560,6 +1561,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vibe-usage-proto",
+ "vibe-usage-updater",
+]
+
+[[package]]
+name = "vibe-usage-updater"
+version = "2.2.2"
+dependencies = [
+ "libc",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

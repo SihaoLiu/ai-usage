@@ -345,6 +345,17 @@ struct Args {
     #[arg(long)]
     host: Option<String>,
 
+    /// Check GitHub releases periodically in monitor mode and restart into a newer binary
+    #[arg(long)]
+    auto_update: bool,
+
+    /// Seconds between automatic release checks when --auto-update is enabled
+    #[arg(
+        long,
+        default_value_t = vibe_usage_updater::DEFAULT_AUTO_UPDATE_INTERVAL_SECONDS
+    )]
+    auto_update_interval_seconds: u64,
+
     #[command(subcommand)]
     command: Option<CliCommand>,
 }
@@ -917,6 +928,13 @@ fn monitor_deadlines_after_interval_change(
         now + monitor_interval,
         now + monitor_sync_interval(monitor_interval),
     )
+}
+
+fn auto_update_deadline_after(
+    now: std::time::Instant,
+    auto_update_interval_seconds: u64,
+) -> std::time::Instant {
+    now + vibe_usage_updater::normalize_auto_update_interval(auto_update_interval_seconds)
 }
 
 fn format_manual_sync_progress(event: &sync::engine::SyncProgress) -> Option<String> {
@@ -2244,6 +2262,7 @@ fn main() {
             std::time::Instant::now() + std::time::Duration::from_secs(state.monitor_interval);
         let mut next_sync = std::time::Instant::now()
             + monitor_sync_interval(std::time::Duration::from_secs(state.monitor_interval));
+        let mut next_auto_update = args.auto_update.then(std::time::Instant::now);
 
         // Redraw the prompt line in place: clears it, reprints "> {buf}",
         // restores the dimmed watermark when empty, and finally moves the
@@ -2337,6 +2356,45 @@ fn main() {
                 );
             }
 
+            if let Some(deadline) = next_auto_update
+                && std::time::Instant::now() >= deadline
+            {
+                crossterm::terminal::disable_raw_mode().ok();
+                println!("\r");
+                let result = updater::run_update(|message| {
+                    println!("auto-update: {message}\r");
+                });
+                match result {
+                    Ok(updater::UpdateOutcome::AlreadyLatest { current, latest }) => {
+                        println!(
+                            "auto-update: already on latest version: v{current} (remote: v{latest}).\r"
+                        );
+                    }
+                    Err(err) => {
+                        println!("auto-update: update failed: {err}\r");
+                    }
+                }
+                crossterm::terminal::enable_raw_mode().ok();
+                next_auto_update = Some(auto_update_deadline_after(
+                    std::time::Instant::now(),
+                    args.auto_update_interval_seconds,
+                ));
+                prompt_block_visible = show_prompt(
+                    &mut state,
+                    &input,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    current_sync_status(sync_worker.as_ref()),
+                    PromptBlockMode::Append,
+                );
+                render_input(
+                    &input,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    state.integrity_status,
+                );
+            }
+
             // Check terminal resize
             let current_size = get_terminal_size();
             if current_size != last_size {
@@ -2419,6 +2477,10 @@ fn main() {
             if sync_worker.is_some() {
                 timeout =
                     timeout.min(next_sync.saturating_duration_since(std::time::Instant::now()));
+            }
+            if let Some(deadline) = next_auto_update {
+                timeout =
+                    timeout.min(deadline.saturating_duration_since(std::time::Instant::now()));
             }
             let next_event = if let Some(event) = pending_events.pop_front() {
                 Some(event)
@@ -3674,6 +3736,28 @@ mod tests {
     fn host_arg_parses() {
         let args = Args::try_parse_from(["vibe-usage", "--host", "laptop"]).expect("host parses");
         assert_eq!(args.host.as_deref(), Some("laptop"));
+    }
+
+    #[test]
+    fn auto_update_flag_defaults_off() {
+        let args = Args::try_parse_from(["vibe-usage"]).expect("args parse");
+
+        assert!(!args.auto_update);
+        assert_eq!(args.auto_update_interval_seconds, 3600);
+    }
+
+    #[test]
+    fn auto_update_flag_parses_interval() {
+        let args = Args::try_parse_from([
+            "vibe-usage",
+            "--auto-update",
+            "--auto-update-interval-seconds",
+            "7200",
+        ])
+        .expect("args parse");
+
+        assert!(args.auto_update);
+        assert_eq!(args.auto_update_interval_seconds, 7200);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
-use vibe_usage_server::{AppState, ServerConfig, build_app};
+use vibe_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -27,6 +27,7 @@ fn server_config(db_path: PathBuf) -> ServerConfig {
         max_body_bytes: 1024 * 1024,
         max_batch_records: 1000,
         log_level: "info".to_string(),
+        auto_update: AutoUpdateConfig::default(),
     }
 }
 

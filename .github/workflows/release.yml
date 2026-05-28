@@ -52,6 +52,27 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      - name: Validate release tag
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag must match vMAJOR.MINOR.PATCH: $tag"
+            exit 1
+          fi
+          version="$(python3 - <<'PY'
+          import tomllib
+
+          with open("Cargo.toml", "rb") as handle:
+              data = tomllib.load(handle)
+          print(data["workspace"]["package"]["version"])
+          PY
+          )"
+          if [[ "$tag" != "v$version" ]]; then
+            echo "::error::Release tag $tag does not match workspace version v$version"
+            exit 1
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

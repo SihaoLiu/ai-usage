@@ -146,29 +146,37 @@ pub fn parse_latest_release(config: &UpdateConfig, body: &str) -> Result<LatestR
     })
 }
 
-pub fn is_newer(latest: &str, current: &str) -> bool {
-    fn parts(s: &str) -> Vec<u64> {
-        s.split('.')
-            .map(|part| {
-                part.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-            })
-            .map(|part| part.parse::<u64>().unwrap_or(0))
-            .collect()
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StableVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
 
-    let latest_parts = parts(latest);
-    let current_parts = parts(current);
-    let len = latest_parts.len().max(current_parts.len());
-    for idx in 0..len {
-        let latest_part = latest_parts.get(idx).copied().unwrap_or(0);
-        let current_part = current_parts.get(idx).copied().unwrap_or(0);
-        if latest_part != current_part {
-            return latest_part > current_part;
-        }
+fn parse_stable_version(value: &str) -> Option<StableVersion> {
+    let value = value.strip_prefix('v').unwrap_or(value);
+    let mut parts = value.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
     }
-    false
+    Some(StableVersion {
+        major,
+        minor,
+        patch,
+    })
+}
+
+pub fn is_newer(latest: &str, current: &str) -> bool {
+    let Some(latest) = parse_stable_version(latest) else {
+        return false;
+    };
+    let Some(current) = parse_stable_version(current) else {
+        return false;
+    };
+    latest > current
 }
 
 fn download_to(config: &UpdateConfig, dir: &Path, url: &str) -> Result<PathBuf, String> {
@@ -366,6 +374,13 @@ mod tests {
         assert!(is_newer("2.0.0", "1.99.99"));
         assert!(!is_newer("1.5.8", "1.5.8"));
         assert!(!is_newer("1.5.7", "1.5.8"));
+    }
+
+    #[test]
+    fn semver_compare_rejects_prerelease_and_malformed_versions() {
+        assert!(!is_newer("2.3.0-rc.1", "2.2.2"));
+        assert!(!is_newer("2.3", "2.2.2"));
+        assert!(!is_newer("release-2.3.0", "2.2.2"));
     }
 
     #[test]

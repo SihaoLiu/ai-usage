@@ -448,6 +448,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn month_axis_ticks_place_multiple_days_per_month() {
+        let first = Local
+            .with_ymd_and_hms(2026, 2, 1, 0, 0, 0)
+            .single()
+            .expect("first");
+        let last = Local
+            .with_ymd_and_hms(2026, 5, 14, 0, 0, 0)
+            .single()
+            .expect("last");
+        let ticks = month_axis_ticks(&first, &last);
+
+        // A short (<=6 month) window steps every 7 days within each month.
+        // February 2026 is not a leap year, so day 29 is skipped.
+        let feb_days: Vec<u32> = ticks
+            .iter()
+            .filter(|t| t.month() == 2)
+            .map(|t| t.day())
+            .collect();
+        assert_eq!(feb_days, vec![1, 8, 15, 22]);
+
+        let mar_days: Vec<u32> = ticks
+            .iter()
+            .filter(|t| t.month() == 3)
+            .map(|t| t.day())
+            .collect();
+        assert_eq!(mar_days, vec![1, 8, 15, 22, 29]);
+
+        // Ticks cover every month in the window and stay within range.
+        let months: std::collections::BTreeSet<u32> = ticks.iter().map(|t| t.month()).collect();
+        assert_eq!(months, [2u32, 3, 4, 5].into_iter().collect());
+        assert!(ticks.iter().all(|t| *t >= first && *t <= last));
+    }
+
+    #[test]
+    fn month_axis_ticks_widen_step_for_long_windows() {
+        // ~11 months exceeds the 6-month threshold, so the step widens to 14
+        // days (days 1, 15, 29 within a 30/31-day month).
+        let first = Local
+            .with_ymd_and_hms(2025, 6, 1, 0, 0, 0)
+            .single()
+            .expect("first");
+        let last = Local
+            .with_ymd_and_hms(2026, 5, 14, 0, 0, 0)
+            .single()
+            .expect("last");
+        let ticks = month_axis_ticks(&first, &last);
+
+        let jun_days: Vec<u32> = ticks
+            .iter()
+            .filter(|t| t.year() == 2025 && t.month() == 6)
+            .map(|t| t.day())
+            .collect();
+        assert_eq!(jun_days, vec![1, 15, 29]);
+    }
+
     fn count_separators(layout: &ChartLayout) -> usize {
         layout
             .columns
@@ -1026,7 +1082,11 @@ fn print_segment_header(
 ) {
     if let Some((line1, line2)) = segment_header_lines(layout, granularity, line_values_fn) {
         println!("{}{}", pad, line1);
-        println!("{}{}", pad, line2);
+        // The Month header line already names the year-month (e.g. "2026-05"),
+        // so the per-segment "MM / DD" date line is redundant and is skipped.
+        if granularity != ChartGranularity::Month {
+            println!("{}{}", pad, line2);
+        }
     }
 }
 
@@ -1367,6 +1427,39 @@ fn first_x_axis_tick(
     add_wall_clock_minutes(anchor, ticks_since * tick_interval)
 }
 
+/// Build x-axis tick times for Month granularity. Each month is already marked
+/// by a chart separator and named in the header, so ticks fall on a fixed set
+/// of days within every month and are later labelled with the day-of-month
+/// alone. The intra-month step widens for longer windows to keep the axis from
+/// overcrowding.
+fn month_axis_ticks(
+    first_time: &DateTime<Local>,
+    last_time: &DateTime<Local>,
+) -> Vec<DateTime<Local>> {
+    let span_days = (*last_time - *first_time).num_days().max(0);
+    let approx_months = (span_days / 30).max(1);
+    let step_days = if approx_months <= 6 { 7 } else { 14 };
+
+    let mut ticks = Vec::new();
+    let mut month_anchor = ChartGranularity::Month.segment_start(*first_time);
+    while month_anchor <= *last_time {
+        let (year, month) = (month_anchor.year(), month_anchor.month());
+        let mut day = 1u32;
+        while day <= 31 {
+            if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month, day) {
+                let naive = date.and_hms_opt(0, 0, 0).expect("tick midnight");
+                let tick = local_from_naive_with_fallback(naive, month_anchor);
+                if tick >= *first_time && tick <= *last_time {
+                    ticks.push(tick);
+                }
+            }
+            day += step_days;
+        }
+        month_anchor = add_calendar_month(month_anchor);
+    }
+    ticks
+}
+
 fn print_x_axis_labels(
     layout: &ChartLayout,
     _interval_minutes: i64,
@@ -1390,13 +1483,25 @@ fn print_x_axis_labels(
         .min_by_key(|&&x| ((x as f64 - target_tick).abs() * 1000.0) as i64)
         .unwrap_or(&60);
 
-    let mut current_tick = first_x_axis_tick(first_time, granularity, tick_interval);
+    // Month ticks fall on fixed days within each labelled month; all other
+    // granularities step by the chosen wall-clock interval.
+    let tick_times: Vec<DateTime<Local>> = if granularity == ChartGranularity::Month {
+        month_axis_ticks(first_time, &last_time)
+    } else {
+        let mut times = Vec::new();
+        let mut current_tick = first_x_axis_tick(first_time, granularity, tick_interval);
+        while current_tick <= last_time {
+            times.push(current_tick);
+            current_tick = add_wall_clock_minutes(current_tick, tick_interval);
+        }
+        times
+    };
 
     let mut labels: Vec<String> = Vec::new();
     let mut positions: Vec<usize> = Vec::new();
     let mut used_positions: HashSet<usize> = HashSet::new();
 
-    while current_tick <= last_time {
+    for current_tick in tick_times {
         let mut closest_idx = None;
         let mut min_diff = i64::MAX;
 
@@ -1412,7 +1517,10 @@ fn print_x_axis_labels(
             && let Some(&pos) = layout.data_to_col.get(&idx)
             && !used_positions.contains(&pos)
         {
-            let label = if tick_interval < 60 {
+            let label = if granularity == ChartGranularity::Month {
+                // The header already carries the month, so only the day is shown.
+                current_tick.format("%d").to_string()
+            } else if tick_interval < 60 {
                 current_tick.format("%H:%M").to_string()
             } else if tick_interval < 1440 {
                 current_tick.format("%H").to_string()
@@ -1423,12 +1531,6 @@ fn print_x_axis_labels(
             positions.push(pos);
             used_positions.insert(pos);
         }
-
-        current_tick = if granularity == ChartGranularity::Month {
-            add_calendar_month(current_tick)
-        } else {
-            add_wall_clock_minutes(current_tick, tick_interval)
-        };
     }
 
     let max_label_len = labels.iter().map(|l| l.len()).max().unwrap_or(0);

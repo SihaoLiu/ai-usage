@@ -15,6 +15,7 @@ const VENDORS: [&str; 4] = SUPPORTED_PULL_VENDORS;
 const BATCH_SIZE: usize = 1000;
 const PULL_LIMIT: usize = 5000;
 const OMP_METADATA_REFRESH_LOG_VENDOR: &str = "omp-metadata-refresh";
+const PULL_SCOPE_ALL_HOSTS_MARKER: &str = "scope:all-hosts";
 
 #[derive(Debug, Clone)]
 struct UploadCandidate {
@@ -248,6 +249,12 @@ fn current_pull_vendors() -> Vec<String> {
         .collect()
 }
 
+fn current_pull_state_fingerprint() -> Vec<String> {
+    let mut fingerprint = current_pull_vendors();
+    fingerprint.push(PULL_SCOPE_ALL_HOSTS_MARKER.to_string());
+    fingerprint
+}
+
 fn uploaded_with_omp_v220_key(
     record: &CachedUsageRecord,
     upload_log: &BTreeSet<(String, String)>,
@@ -338,7 +345,7 @@ fn omp_v220_key(message_id: &str, response_id: &str, model: &str, usage: &TokenU
 
 pub fn run_pull_once_with_progress<F>(
     cache_root: &Path,
-    config: &EnabledSyncConfig,
+    _config: &EnabledSyncConfig,
     transport: &impl SyncTransport,
     mut on_progress: F,
 ) -> Result<(), SyncError>
@@ -346,16 +353,16 @@ where
     F: FnMut(&SyncProgress),
 {
     let mut sync_state = state::load_sync_state(cache_root);
-    let pull_vendors = current_pull_vendors();
-    if sync_state.pull_vendors != pull_vendors {
+    let pull_state_fingerprint = current_pull_state_fingerprint();
+    if sync_state.pull_vendors != pull_state_fingerprint {
         sync_state.last_seen_seq = 0;
-        sync_state.pull_vendors = pull_vendors;
+        sync_state.pull_vendors = pull_state_fingerprint;
     }
     let mut page_index = 0;
     let mut pulled_records = 0;
 
     loop {
-        let response = transport.pull(sync_state.last_seen_seq, &config.machine_id, PULL_LIMIT)?;
+        let response = transport.pull(sync_state.last_seen_seq, "", PULL_LIMIT)?;
         page_index += 1;
         pulled_records += response.records.len();
         merge_pulled_records(cache_root, &response)?;
@@ -1168,6 +1175,44 @@ mod tests {
         assert_eq!(
             crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
             2
+        );
+    }
+
+    #[test]
+    fn sync_pull_resets_legacy_exclude_self_cursor_and_requests_all_hosts() {
+        let cache_root = unique_temp_dir("pull-include-self");
+        std::fs::write(
+            cache_root.join("sync_state.json"),
+            r#"{
+  "schema_version": 1,
+  "last_seen_seq": 99,
+  "pull_vendors": ["claude", "codex", "gemini", "omp"],
+  "last_successful_sync": null,
+  "last_error": null
+}"#,
+        )
+        .expect("write old sync state");
+        let transport = FakeTransport::new(vec![PullResponse {
+            records: Vec::new(),
+            max_seq: 123,
+            truncated: false,
+        }]);
+
+        run_pull_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("pull");
+
+        assert_eq!(
+            transport.pull_requests.borrow()[0],
+            (0, String::new(), PULL_LIMIT)
+        );
+        assert_eq!(
+            crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
+            123
         );
     }
 

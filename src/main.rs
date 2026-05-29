@@ -158,6 +158,8 @@ struct RawDataCache {
     gemini: Vec<UsageEntry>,
     omp: Vec<UsageEntry>,
     horizon_days: i64,
+    local_host_id: Option<String>,
+    local_record_keys: HashSet<(String, String)>,
 }
 
 struct PromptNotice {
@@ -702,7 +704,14 @@ fn merge_remote_records_into_raw_cache(
     records: Vec<data::cache::RemoteUsageRecord>,
 ) {
     for record in records {
-        if record.entry.host_id.is_none() {
+        let Some(host_id) = record.entry.host_id.as_deref() else {
+            continue;
+        };
+        if cache.local_host_id.as_deref() == Some(host_id)
+            && cache
+                .local_record_keys
+                .contains(&(record.vendor.clone(), record.dedup_key.clone()))
+        {
             continue;
         }
         match record.vendor.as_str() {
@@ -715,45 +724,90 @@ fn merge_remote_records_into_raw_cache(
     }
 }
 
+fn load_local_vendor_cached_records(
+    cache_root: &Path,
+    vendor: &str,
+) -> (Vec<UsageEntry>, HashSet<(String, String)>) {
+    let records = data::cache::load_vendor_cached_records(cache_root, vendor);
+    let entries = records
+        .iter()
+        .map(|record| record.entry.clone())
+        .collect::<Vec<_>>();
+    let keys = records
+        .into_iter()
+        .filter(|record| !record.dedup_key.is_empty())
+        .map(|record| (vendor.to_string(), record.dedup_key))
+        .collect::<HashSet<_>>();
+    (entries, keys)
+}
+
+fn local_cached_raw_cache(
+    cache_root: &Path,
+    include_local: bool,
+    local_host_id: Option<&str>,
+) -> RawDataCache {
+    let mut local_record_keys = HashSet::new();
+    let (claude, claude_keys) = if include_local {
+        load_local_vendor_cached_records(cache_root, "claude")
+    } else {
+        (Vec::new(), HashSet::new())
+    };
+    local_record_keys.extend(claude_keys);
+    let (codex, codex_keys) = if include_local {
+        load_local_vendor_cached_records(cache_root, "codex")
+    } else {
+        (Vec::new(), HashSet::new())
+    };
+    local_record_keys.extend(codex_keys);
+    let (gemini, gemini_keys) = if include_local {
+        load_local_vendor_cached_records(cache_root, "gemini")
+    } else {
+        (Vec::new(), HashSet::new())
+    };
+    local_record_keys.extend(gemini_keys);
+    let (omp, omp_keys) = if include_local {
+        load_local_vendor_cached_records(cache_root, "omp")
+    } else {
+        (Vec::new(), HashSet::new())
+    };
+    local_record_keys.extend(omp_keys);
+
+    RawDataCache {
+        claude,
+        codex,
+        gemini,
+        omp,
+        horizon_days: FULL_CACHE_HORIZON,
+        local_host_id: local_host_id.map(str::to_string),
+        local_record_keys,
+    }
+}
+
+fn clear_local_raw_cache(cache: &mut RawDataCache) {
+    cache.claude.clear();
+    cache.codex.clear();
+    cache.gemini.clear();
+    cache.omp.clear();
+    cache.local_record_keys.clear();
+}
+
 fn read_all_vendor_cached_snapshot_for_hosts(
     host_filter: Option<&str>,
     local_host_id: Option<&str>,
 ) -> RawDataCache {
     let cache_root = data::cache::default_cache_dir();
     let include_local = include_local_for_host_filter(host_filter, local_host_id);
-    let mut cache = RawDataCache {
-        claude: if include_local {
-            data::cache::load_vendor_cached_snapshot(&cache_root, "claude")
-        } else {
-            Vec::new()
-        },
-        codex: if include_local {
-            data::cache::load_vendor_cached_snapshot(&cache_root, "codex")
-        } else {
-            Vec::new()
-        },
-        gemini: if include_local {
-            data::cache::load_vendor_cached_snapshot(&cache_root, "gemini")
-        } else {
-            Vec::new()
-        },
-        omp: if include_local {
-            data::cache::load_vendor_cached_snapshot(&cache_root, "omp")
-        } else {
-            Vec::new()
-        },
-        horizon_days: FULL_CACHE_HORIZON,
-    };
+    let mut cache = local_cached_raw_cache(&cache_root, include_local, local_host_id);
     let host_set = host_filter.map(|host| HashSet::from([host.to_string()]));
     let remote_records = data::cache::load_remote_entries(&cache_root, host_set.as_ref());
     merge_remote_records_into_raw_cache(&mut cache, remote_records);
     cache
 }
 
-fn refresh_all_vendor_raw_full() -> RawDataCache {
+fn refresh_all_vendor_raw_full(local_host_id: Option<&str>) -> RawDataCache {
     let cache_root = data::cache::default_cache_dir();
     let claude_fast_tier = detect_claude_fast_tier_snapshot();
-    let claude = data::cache::refresh_full_vendor_cache(
+    let _ = data::cache::refresh_retaining_vendor_cache(
         &cache_root,
         "claude",
         data::claude::collect_usage_files(None),
@@ -763,7 +817,7 @@ fn refresh_all_vendor_raw_full() -> RawDataCache {
 
     let codex_dir = get_codex_dir().join("sessions");
     let codex_fast_tier = detect_codex_fast_tier_snapshot();
-    let codex = data::cache::refresh_full_vendor_cache(
+    let _ = data::cache::refresh_retaining_vendor_cache(
         &cache_root,
         "codex",
         data::codex::collect_usage_files(&codex_dir, None),
@@ -772,7 +826,7 @@ fn refresh_all_vendor_raw_full() -> RawDataCache {
     );
 
     let gemini_dir = get_gemini_dir().join("tmp");
-    let gemini = data::cache::refresh_full_vendor_cache(
+    let _ = data::cache::refresh_retaining_vendor_cache(
         &cache_root,
         "gemini",
         data::gemini::collect_usage_files(&gemini_dir, None),
@@ -781,7 +835,7 @@ fn refresh_all_vendor_raw_full() -> RawDataCache {
     );
 
     let omp_dir = get_omp_dir().join("agent").join("sessions");
-    let omp = data::cache::refresh_full_vendor_cache(
+    let _ = data::cache::refresh_retaining_vendor_cache(
         &cache_root,
         "omp",
         data::omp::collect_usage_files(&omp_dir, None),
@@ -789,13 +843,7 @@ fn refresh_all_vendor_raw_full() -> RawDataCache {
         data::omp::read_omp_file_records,
     );
 
-    RawDataCache {
-        claude,
-        codex,
-        gemini,
-        omp,
-        horizon_days: FULL_CACHE_HORIZON,
-    }
+    local_cached_raw_cache(&cache_root, true, local_host_id)
 }
 
 /// Ensure `state.raw_cache` covers at least `required_horizon` days back.
@@ -826,12 +874,9 @@ fn start_background_raw_refresh(state: &mut AppState) {
     state.integrity_status = IntegrityStatus::Checking;
     state.integrity_started_at = Some(std::time::Instant::now());
     thread::spawn(move || {
-        let mut refreshed = refresh_all_vendor_raw_full();
+        let mut refreshed = refresh_all_vendor_raw_full(local_host_id.as_deref());
         if !include_local_for_host_filter(host_filter.as_deref(), local_host_id.as_deref()) {
-            refreshed.claude.clear();
-            refreshed.codex.clear();
-            refreshed.gemini.clear();
-            refreshed.omp.clear();
+            clear_local_raw_cache(&mut refreshed);
         }
         let cache_root = data::cache::default_cache_dir();
         let host_set = host_filter
@@ -2008,7 +2053,7 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
             let result = match command {
                 SyncCommand::Push => {
                     eprintln!("sync push: refreshing local cache");
-                    let _ = refresh_all_vendor_raw_full();
+                    let _ = refresh_all_vendor_raw_full(Some(&config.machine_id));
                     sync::engine::run_upload_once_with_progress(
                         &cache_root,
                         &config,
@@ -2169,12 +2214,9 @@ fn main() {
     };
 
     if args.once {
-        let mut refreshed = refresh_all_vendor_raw_full();
+        let mut refreshed = refresh_all_vendor_raw_full(state.local_host_id.as_deref());
         if !include_local_for_host_filter(state.host.as_deref(), state.local_host_id.as_deref()) {
-            refreshed.claude.clear();
-            refreshed.codex.clear();
-            refreshed.gemini.clear();
-            refreshed.omp.clear();
+            clear_local_raw_cache(&mut refreshed);
         }
         let cache_root = data::cache::default_cache_dir();
         let host_set = state
@@ -2293,7 +2335,13 @@ fn main() {
                             too_small: bool,
                             notice: Option<&PromptNotice>,
                             integrity_status: IntegrityStatus| {
-            render_prompt_line(input, too_small, notice, integrity_status, refresh_remaining());
+            render_prompt_line(
+                input,
+                too_small,
+                notice,
+                integrity_status,
+                refresh_remaining(),
+            );
         };
 
         let cleanup_and_break = |msg: &str| {
@@ -2433,8 +2481,10 @@ fn main() {
                 }
                 let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
-                next_refresh.set(std::time::Instant::now()
-                    + std::time::Duration::from_secs(state.monitor_interval));
+                next_refresh.set(
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(state.monitor_interval),
+                );
                 next_sync = std::time::Instant::now()
                     + monitor_sync_interval(std::time::Duration::from_secs(state.monitor_interval));
                 prompt_block_visible = show_prompt(
@@ -2460,8 +2510,10 @@ fn main() {
                 start_background_raw_refresh(&mut state);
                 let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
-                next_refresh.set(std::time::Instant::now()
-                    + std::time::Duration::from_secs(state.monitor_interval));
+                next_refresh.set(
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(state.monitor_interval),
+                );
                 prompt_block_visible = show_prompt(
                     &mut state,
                     &input,
@@ -2493,8 +2545,11 @@ fn main() {
             }
 
             // Poll for input with 1s timeout
-            let mut timeout = std::time::Duration::from_secs(1)
-                .min(next_refresh.get().saturating_duration_since(std::time::Instant::now()));
+            let mut timeout = std::time::Duration::from_secs(1).min(
+                next_refresh
+                    .get()
+                    .saturating_duration_since(std::time::Instant::now()),
+            );
             if sync_worker.is_some() {
                 timeout =
                     timeout.min(next_sync.saturating_duration_since(std::time::Instant::now()));
@@ -2904,8 +2959,10 @@ fn main() {
                             }
                         }
                         if did_refresh {
-                            next_refresh.set(std::time::Instant::now()
-                                + std::time::Duration::from_secs(state.monitor_interval));
+                            next_refresh.set(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval),
+                            );
                         }
                         prompt_block_visible = show_prompt(
                             &mut state,
@@ -2954,8 +3011,10 @@ fn main() {
                             state.time_window = new_window;
                             let result = refresh_display(&mut state);
                             terminal_too_small = result.is_none();
-                            next_refresh.set(std::time::Instant::now()
-                                + std::time::Duration::from_secs(state.monitor_interval));
+                            next_refresh.set(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval),
+                            );
                             prompt_block_visible = show_prompt(
                                 &mut state,
                                 &input,
@@ -2981,8 +3040,10 @@ fn main() {
                             state.time_window = new_window;
                             let result = refresh_display(&mut state);
                             terminal_too_small = result.is_none();
-                            next_refresh.set(std::time::Instant::now()
-                                + std::time::Duration::from_secs(state.monitor_interval));
+                            next_refresh.set(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval),
+                            );
                             prompt_block_visible = show_prompt(
                                 &mut state,
                                 &input,
@@ -3018,8 +3079,10 @@ fn main() {
                                 state.time_window = new_window;
                                 let result = refresh_display(&mut state);
                                 terminal_too_small = result.is_none();
-                                next_refresh.set(std::time::Instant::now()
-                                    + std::time::Duration::from_secs(state.monitor_interval));
+                                next_refresh.set(
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_secs(state.monitor_interval),
+                                );
                                 prompt_block_visible = show_prompt(
                                     &mut state,
                                     &input,
@@ -3059,8 +3122,10 @@ fn main() {
                                 state.time_window = new_window;
                                 let result = refresh_display(&mut state);
                                 terminal_too_small = result.is_none();
-                                next_refresh.set(std::time::Instant::now()
-                                    + std::time::Duration::from_secs(state.monitor_interval));
+                                next_refresh.set(
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_secs(state.monitor_interval),
+                                );
                                 prompt_block_visible = show_prompt(
                                     &mut state,
                                     &input,
@@ -3105,8 +3170,10 @@ fn main() {
                             state.time_window = new_window;
                             let result = refresh_display(&mut state);
                             terminal_too_small = result.is_none();
-                            next_refresh.set(std::time::Instant::now()
-                                + std::time::Duration::from_secs(state.monitor_interval));
+                            next_refresh.set(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval),
+                            );
                             prompt_block_visible = show_prompt(
                                 &mut state,
                                 &input,
@@ -3133,8 +3200,10 @@ fn main() {
                             state.time_window = new_window;
                             let result = refresh_display(&mut state);
                             terminal_too_small = result.is_none();
-                            next_refresh.set(std::time::Instant::now()
-                                + std::time::Duration::from_secs(state.monitor_interval));
+                            next_refresh.set(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval),
+                            );
                             prompt_block_visible = show_prompt(
                                 &mut state,
                                 &input,
@@ -3176,8 +3245,10 @@ fn main() {
                         }
                         let result = refresh_display(&mut state);
                         terminal_too_small = result.is_none();
-                        next_refresh.set(std::time::Instant::now()
-                            + std::time::Duration::from_secs(state.monitor_interval));
+                        next_refresh.set(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval),
+                        );
                         prompt_block_visible = show_prompt(
                             &mut state,
                             &input,
@@ -3889,6 +3960,8 @@ mod tests {
             gemini: Vec::new(),
             omp: Vec::new(),
             horizon_days: FULL_CACHE_HORIZON,
+            local_host_id: None,
+            local_record_keys: HashSet::new(),
         };
         merge_remote_records_into_raw_cache(
             &mut cache,
@@ -3931,5 +4004,87 @@ mod tests {
         assert_eq!(cache.claude.len(), 1);
         assert_eq!(cache.codex.len(), 1);
         assert!(cache.gemini.is_empty());
+    }
+
+    #[test]
+    fn remote_records_from_local_host_fill_missing_keys_without_duplicates() {
+        let timestamp = "2026-05-18T12:00:00Z";
+        let mut cache = RawDataCache {
+            claude: vec![UsageEntry {
+                host_id: None,
+                timestamp: timestamp.to_string(),
+                parsed_timestamp: time_utils::parse_timestamp(timestamp),
+                session_start_time: timestamp.to_string(),
+                session_end_time: timestamp.to_string(),
+                model: "local-model".to_string(),
+                effort: None,
+                fast_tier: -1,
+                usage: data::TokenUsage::default(),
+                costs: None,
+            }],
+            codex: Vec::new(),
+            gemini: Vec::new(),
+            omp: Vec::new(),
+            horizon_days: FULL_CACHE_HORIZON,
+            local_host_id: Some("laptop".to_string()),
+            local_record_keys: HashSet::from([("claude".to_string(), "a".to_string())]),
+        };
+        merge_remote_records_into_raw_cache(
+            &mut cache,
+            vec![
+                data::cache::RemoteUsageRecord {
+                    vendor: "claude".to_string(),
+                    dedup_key: "a".to_string(),
+                    entry: UsageEntry {
+                        host_id: Some("laptop".to_string()),
+                        timestamp: timestamp.to_string(),
+                        parsed_timestamp: time_utils::parse_timestamp(timestamp),
+                        session_start_time: timestamp.to_string(),
+                        session_end_time: timestamp.to_string(),
+                        model: "duplicate-model".to_string(),
+                        effort: None,
+                        fast_tier: -1,
+                        usage: data::TokenUsage::default(),
+                        costs: None,
+                    },
+                },
+                data::cache::RemoteUsageRecord {
+                    vendor: "claude".to_string(),
+                    dedup_key: "b".to_string(),
+                    entry: UsageEntry {
+                        host_id: Some("laptop".to_string()),
+                        timestamp: timestamp.to_string(),
+                        parsed_timestamp: time_utils::parse_timestamp(timestamp),
+                        session_start_time: timestamp.to_string(),
+                        session_end_time: timestamp.to_string(),
+                        model: "missing-model".to_string(),
+                        effort: None,
+                        fast_tier: -1,
+                        usage: data::TokenUsage::default(),
+                        costs: None,
+                    },
+                },
+            ],
+        );
+
+        assert_eq!(cache.claude.len(), 2);
+        assert!(
+            cache
+                .claude
+                .iter()
+                .any(|entry| entry.model == "local-model")
+        );
+        assert!(
+            cache
+                .claude
+                .iter()
+                .any(|entry| entry.model == "missing-model")
+        );
+        assert!(
+            !cache
+                .claude
+                .iter()
+                .any(|entry| entry.model == "duplicate-model")
+        );
     }
 }

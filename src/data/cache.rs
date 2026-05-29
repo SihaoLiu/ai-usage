@@ -596,6 +596,7 @@ pub fn default_cache_dir() -> PathBuf {
 }
 
 /// Load cached entries for one vendor without touching source files.
+#[cfg(test)]
 pub fn load_vendor_cached_snapshot(cache_root: &Path, vendor: &str) -> Vec<UsageEntry> {
     read_cached_records(&vendor_entries_path(cache_root, vendor))
         .map(|records| aggregate_persisted_records(records.iter()))
@@ -896,6 +897,7 @@ where
     )
 }
 
+#[cfg(test)]
 pub fn refresh_full_vendor_cache<F>(
     cache_root: &Path,
     vendor: &str,
@@ -913,6 +915,26 @@ where
         current_fast_tier,
         parse_file,
         false,
+    )
+}
+
+pub fn refresh_retaining_vendor_cache<F>(
+    cache_root: &Path,
+    vendor: &str,
+    source_files: Vec<PathBuf>,
+    current_fast_tier: i8,
+    parse_file: F,
+) -> Vec<UsageEntry>
+where
+    F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
+{
+    load_or_update_vendor_cache_inner(
+        cache_root,
+        vendor,
+        source_files,
+        current_fast_tier,
+        parse_file,
+        true,
     )
 }
 
@@ -1026,6 +1048,25 @@ where
         cache_changed |= has_inactive_records || has_inactive_manifest_entries;
     }
 
+    let mut retained_inactive_records = Vec::new();
+    if retain_inactive_sources {
+        for (source_path, records) in &records_by_path {
+            if !active_keys.contains(source_path) {
+                retained_inactive_records.extend(records.iter().cloned());
+            }
+        }
+    }
+
+    let returned_records = if retain_inactive_sources {
+        let mut records =
+            Vec::with_capacity(active_records.len() + retained_inactive_records.len());
+        records.extend(active_records.iter().cloned());
+        records.extend(retained_inactive_records.iter().cloned());
+        records
+    } else {
+        active_records.clone()
+    };
+
     if cache_changed {
         if !retain_inactive_sources {
             next_vendor_manifest
@@ -1033,12 +1074,12 @@ where
                 .retain(|source_path, _| active_keys.contains(source_path));
         }
         let mut records_to_write: Vec<PersistedSourceRecord> = Vec::new();
+        records_to_write.extend(active_records.iter().cloned());
         for (source_path, records) in records_by_path {
             if retain_inactive_sources && !active_keys.contains(&source_path) {
                 records_to_write.extend(records);
             }
         }
-        records_to_write.extend(active_records.iter().cloned());
 
         manifest
             .vendors
@@ -1047,7 +1088,7 @@ where
         let _ = write_manifest(&manifest_path, &manifest);
     }
 
-    aggregate_persisted_records(active_records.iter())
+    aggregate_persisted_records(returned_records.iter())
 }
 
 fn rebuild_vendor_cache<F>(
@@ -2653,5 +2694,41 @@ mod tests {
 
         assert_eq!(entry_tokens(&refreshed), vec![1]);
         assert_eq!(entry_tokens(&snapshot), vec![1]);
+    }
+
+    #[test]
+    fn retaining_refresh_keeps_records_for_deleted_sources_in_returned_view() {
+        let cache_root = unique_temp_dir("retain-deleted");
+        let first_source = cache_root.join("a.jsonl");
+        let second_source = cache_root.join("b.jsonl");
+        write_source(&first_source, "first");
+        write_source(&second_source, "second");
+
+        let _ = super::refresh_retaining_vendor_cache(
+            &cache_root,
+            "test",
+            vec![first_source.clone(), second_source.clone()],
+            -1,
+            |path| {
+                if path == first_source {
+                    vec![usage_record("first", "2026-05-01T00:00:00Z", 1)]
+                } else {
+                    vec![usage_record("second", "2026-05-01T00:01:00Z", 2)]
+                }
+            },
+        );
+        fs::remove_file(&second_source).expect("remove source");
+
+        let refreshed = super::refresh_retaining_vendor_cache(
+            &cache_root,
+            "test",
+            vec![first_source],
+            -1,
+            |_| vec![usage_record("first", "2026-05-01T00:00:00Z", 1)],
+        );
+        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
+
+        assert_eq!(entry_tokens(&refreshed), vec![1, 2]);
+        assert_eq!(entry_tokens(&snapshot), vec![1, 2]);
     }
 }

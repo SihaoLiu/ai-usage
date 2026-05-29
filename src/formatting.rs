@@ -270,14 +270,32 @@ const INTEGRITY_CHECKING_COLOR: &str = "\x1b[38;5;143m"; // muted yellow
 const INTEGRITY_CHECKED_COLOR: &str = "\x1b[38;5;108m"; // muted green
 const COLOR_RESET: &str = "\x1b[0m";
 
+/// Format a remaining duration as a zero-padded `HH:MM:SS` countdown string.
+pub fn format_countdown(remaining: std::time::Duration) -> String {
+    let total = remaining.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
+
 /// Watermark text shown as a dimmed placeholder in the monitor-mode prompt.
 /// Returns `(colored_string, visible_width)`. The visible width is needed by
 /// callers so they can move the cursor back over the watermark after rendering it.
-pub fn prompt_watermark() -> (String, usize) {
-    let text = format!(
-        "ai-usage by SihaoLiu, v{}, enter h or help for usage",
-        env!("CARGO_PKG_VERSION")
-    );
+/// When `refresh_in` is `Some`, a `refresh in HH:MM:SS` countdown is woven into
+/// the text so the user can see how long until the next auto-refresh.
+pub fn prompt_watermark(refresh_in: Option<std::time::Duration>) -> (String, usize) {
+    let text = match refresh_in {
+        Some(remaining) => format!(
+            "ai-usage by SihaoLiu, v{}, refresh in {}, enter h or help for usage",
+            env!("CARGO_PKG_VERSION"),
+            format_countdown(remaining)
+        ),
+        None => format!(
+            "ai-usage by SihaoLiu, v{}, enter h or help for usage",
+            env!("CARGO_PKG_VERSION")
+        ),
+    };
     prompt_placeholder(&text)
 }
 
@@ -1147,4 +1165,31 @@ fn print_table_minimal(
         w_cost = w_strategy - 1,
     );
     println!("{}{}", p, "=".repeat(table_width));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn countdown_pads_to_hh_mm_ss() {
+        assert_eq!(format_countdown(Duration::from_secs(0)), "00:00:00");
+        assert_eq!(format_countdown(Duration::from_secs(5)), "00:00:05");
+        assert_eq!(format_countdown(Duration::from_secs(65)), "00:01:05");
+        assert_eq!(format_countdown(Duration::from_secs(3600)), "01:00:00");
+        assert_eq!(format_countdown(Duration::from_secs(3661)), "01:01:01");
+        assert_eq!(format_countdown(Duration::from_secs(360_000)), "100:00:00");
+    }
+
+    #[test]
+    fn watermark_weaves_countdown_when_present() {
+        let (text, _) = prompt_watermark(Some(Duration::from_secs(3661)));
+        assert!(text.contains("refresh in 01:01:01"));
+        assert!(text.contains("enter h or help for usage"));
+
+        let (plain, _) = prompt_watermark(None);
+        assert!(!plain.contains("refresh in"));
+        assert!(plain.contains("enter h or help for usage"));
+    }
 }

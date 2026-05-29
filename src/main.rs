@@ -891,11 +891,14 @@ fn data_loaded_notice(load_duration: std::time::Duration) -> PromptNotice {
     }
 }
 
-fn active_prompt_placeholder(notice: Option<&PromptNotice>) -> (String, usize) {
+fn active_prompt_placeholder(
+    notice: Option<&PromptNotice>,
+    refresh_in: Option<std::time::Duration>,
+) -> (String, usize) {
     if let Some(notice) = notice {
         formatting::prompt_placeholder(&notice.message)
     } else {
-        formatting::prompt_watermark()
+        formatting::prompt_watermark(refresh_in)
     }
 }
 
@@ -1187,6 +1190,7 @@ fn render_monitor_prompt_block(
     notice: Option<&PromptNotice>,
     sync_status: Option<&str>,
     mode: PromptBlockMode,
+    refresh_in: Option<std::time::Duration>,
 ) -> bool {
     if too_small {
         return false;
@@ -1206,7 +1210,7 @@ fn render_monitor_prompt_block(
         }
     }
     println!("\r{}\r", "-".repeat(width));
-    render_prompt_line(input, too_small, notice, state.integrity_status);
+    render_prompt_line(input, too_small, notice, state.integrity_status, refresh_in);
     true
 }
 
@@ -1215,6 +1219,7 @@ fn render_prompt_line(
     too_small: bool,
     notice: Option<&PromptNotice>,
     integrity_status: IntegrityStatus,
+    refresh_in: Option<std::time::Duration>,
 ) {
     if too_small {
         return;
@@ -1229,7 +1234,7 @@ fn render_prompt_line(
     print!("\r\x1b[K> {}", input.snapshot());
 
     if input.is_empty() {
-        let (mark, mark_visible) = active_prompt_placeholder(notice);
+        let (mark, mark_visible) = active_prompt_placeholder(notice, refresh_in);
         let watermark_fits = if status_fits {
             width >= 2 + mark_visible + 2 + status_visible
         } else {
@@ -2234,6 +2239,22 @@ fn main() {
         let mut input = InputLine::new();
         let mut history = CommandHistory::new();
         let mut pending_events = VecDeque::new();
+
+        // Auto-refresh deadline kept behind a `Cell` so the prompt-rendering
+        // closures below can read the live value when drawing the watermark's
+        // "refresh in HH:MM:SS" countdown, while the monitor loop keeps moving
+        // the deadline forward after each refresh.
+        let next_refresh = std::cell::Cell::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(state.monitor_interval),
+        );
+        let refresh_remaining = || {
+            Some(
+                next_refresh
+                    .get()
+                    .saturating_duration_since(std::time::Instant::now()),
+            )
+        };
+
         let show_prompt = |state: &mut AppState,
                            input: &InputLine,
                            too_small: bool,
@@ -2247,6 +2268,7 @@ fn main() {
                 notice,
                 sync_status.as_deref(),
                 mode,
+                refresh_remaining(),
             )
         };
 
@@ -2259,8 +2281,6 @@ fn main() {
             PromptBlockMode::Append,
         );
 
-        let mut next_refresh =
-            std::time::Instant::now() + std::time::Duration::from_secs(state.monitor_interval);
         let mut next_sync = std::time::Instant::now()
             + monitor_sync_interval(std::time::Duration::from_secs(state.monitor_interval));
         let mut next_auto_update = args.auto_update.then(std::time::Instant::now);
@@ -2273,7 +2293,7 @@ fn main() {
                             too_small: bool,
                             notice: Option<&PromptNotice>,
                             integrity_status: IntegrityStatus| {
-            render_prompt_line(input, too_small, notice, integrity_status);
+            render_prompt_line(input, too_small, notice, integrity_status, refresh_remaining());
         };
 
         let cleanup_and_break = |msg: &str| {
@@ -2413,8 +2433,8 @@ fn main() {
                 }
                 let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
-                next_refresh = std::time::Instant::now()
-                    + std::time::Duration::from_secs(state.monitor_interval);
+                next_refresh.set(std::time::Instant::now()
+                    + std::time::Duration::from_secs(state.monitor_interval));
                 next_sync = std::time::Instant::now()
                     + monitor_sync_interval(std::time::Duration::from_secs(state.monitor_interval));
                 prompt_block_visible = show_prompt(
@@ -2428,7 +2448,7 @@ fn main() {
             }
 
             // Check auto-refresh
-            if std::time::Instant::now() >= next_refresh {
+            if std::time::Instant::now() >= next_refresh.get() {
                 if !terminal_too_small {
                     let (width, _) = get_terminal_size();
                     println!("\r{}\r", " ".repeat(width as usize + 2));
@@ -2440,8 +2460,8 @@ fn main() {
                 start_background_raw_refresh(&mut state);
                 let result = refresh_display(&mut state);
                 terminal_too_small = result.is_none();
-                next_refresh = std::time::Instant::now()
-                    + std::time::Duration::from_secs(state.monitor_interval);
+                next_refresh.set(std::time::Instant::now()
+                    + std::time::Duration::from_secs(state.monitor_interval));
                 prompt_block_visible = show_prompt(
                     &mut state,
                     &input,
@@ -2474,7 +2494,7 @@ fn main() {
 
             // Poll for input with 1s timeout
             let mut timeout = std::time::Duration::from_secs(1)
-                .min(next_refresh.saturating_duration_since(std::time::Instant::now()));
+                .min(next_refresh.get().saturating_duration_since(std::time::Instant::now()));
             if sync_worker.is_some() {
                 timeout =
                     timeout.min(next_sync.saturating_duration_since(std::time::Instant::now()));
@@ -2825,11 +2845,13 @@ fn main() {
                                             if let Ok(n) = parts[1].parse::<u64>() {
                                                 if n >= 1 {
                                                     state.monitor_interval = n;
-                                                    (next_refresh, next_sync) =
+                                                    let (refresh_at, sync_at) =
                                                         monitor_deadlines_after_interval_change(
                                                             std::time::Instant::now(),
                                                             n,
                                                         );
+                                                    next_refresh.set(refresh_at);
+                                                    next_sync = sync_at;
                                                     println!(
                                                         "Refresh interval changed to {} seconds.\r",
                                                         n
@@ -2882,8 +2904,8 @@ fn main() {
                             }
                         }
                         if did_refresh {
-                            next_refresh = std::time::Instant::now()
-                                + std::time::Duration::from_secs(state.monitor_interval);
+                            next_refresh.set(std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval));
                         }
                         prompt_block_visible = show_prompt(
                             &mut state,
@@ -2932,8 +2954,8 @@ fn main() {
                             state.time_window = new_window;
                             let result = refresh_display(&mut state);
                             terminal_too_small = result.is_none();
-                            next_refresh = std::time::Instant::now()
-                                + std::time::Duration::from_secs(state.monitor_interval);
+                            next_refresh.set(std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval));
                             prompt_block_visible = show_prompt(
                                 &mut state,
                                 &input,
@@ -2959,8 +2981,8 @@ fn main() {
                             state.time_window = new_window;
                             let result = refresh_display(&mut state);
                             terminal_too_small = result.is_none();
-                            next_refresh = std::time::Instant::now()
-                                + std::time::Duration::from_secs(state.monitor_interval);
+                            next_refresh.set(std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval));
                             prompt_block_visible = show_prompt(
                                 &mut state,
                                 &input,
@@ -2996,8 +3018,8 @@ fn main() {
                                 state.time_window = new_window;
                                 let result = refresh_display(&mut state);
                                 terminal_too_small = result.is_none();
-                                next_refresh = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(state.monitor_interval);
+                                next_refresh.set(std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval));
                                 prompt_block_visible = show_prompt(
                                     &mut state,
                                     &input,
@@ -3037,8 +3059,8 @@ fn main() {
                                 state.time_window = new_window;
                                 let result = refresh_display(&mut state);
                                 terminal_too_small = result.is_none();
-                                next_refresh = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(state.monitor_interval);
+                                next_refresh.set(std::time::Instant::now()
+                                    + std::time::Duration::from_secs(state.monitor_interval));
                                 prompt_block_visible = show_prompt(
                                     &mut state,
                                     &input,
@@ -3083,8 +3105,8 @@ fn main() {
                             state.time_window = new_window;
                             let result = refresh_display(&mut state);
                             terminal_too_small = result.is_none();
-                            next_refresh = std::time::Instant::now()
-                                + std::time::Duration::from_secs(state.monitor_interval);
+                            next_refresh.set(std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval));
                             prompt_block_visible = show_prompt(
                                 &mut state,
                                 &input,
@@ -3111,8 +3133,8 @@ fn main() {
                             state.time_window = new_window;
                             let result = refresh_display(&mut state);
                             terminal_too_small = result.is_none();
-                            next_refresh = std::time::Instant::now()
-                                + std::time::Duration::from_secs(state.monitor_interval);
+                            next_refresh.set(std::time::Instant::now()
+                                + std::time::Duration::from_secs(state.monitor_interval));
                             prompt_block_visible = show_prompt(
                                 &mut state,
                                 &input,
@@ -3154,8 +3176,8 @@ fn main() {
                         }
                         let result = refresh_display(&mut state);
                         terminal_too_small = result.is_none();
-                        next_refresh = std::time::Instant::now()
-                            + std::time::Duration::from_secs(state.monitor_interval);
+                        next_refresh.set(std::time::Instant::now()
+                            + std::time::Duration::from_secs(state.monitor_interval));
                         prompt_block_visible = show_prompt(
                             &mut state,
                             &input,
@@ -3167,6 +3189,20 @@ fn main() {
                     }
                     _ => {}
                 }
+            } else if !terminal_too_small
+                && prompt_block_visible
+                && input.is_empty()
+                && prompt_notice.is_none()
+            {
+                // Idle poll timeout (~1s elapsed with no input): redraw the
+                // prompt line in place so the watermark's "refresh in HH:MM:SS"
+                // countdown ticks down toward the next auto-refresh.
+                render_input(
+                    &input,
+                    terminal_too_small,
+                    prompt_notice.as_ref(),
+                    state.integrity_status,
+                );
             }
         }
         crossterm::terminal::disable_raw_mode().ok();

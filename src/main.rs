@@ -2112,13 +2112,12 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                         &mut on_progress,
                     )
                     .and_then(|()| {
-                        sync::engine::run_integrity_once_with_progress(
+                        sync::engine::run_integrity_once_with_repair(
                             &cache_root,
                             &config,
                             &client,
                             &mut on_progress,
                         )
-                        .map(|_| ())
                     })
                 }
                 SyncCommand::Pull => {
@@ -2127,21 +2126,12 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                             eprintln!("{message}");
                         }
                     };
-                    sync::engine::run_pull_once_with_progress(
+                    sync::engine::run_pull_and_integrity_once_with_progress(
                         &cache_root,
                         &config,
                         &client,
                         &mut on_progress,
                     )
-                    .and_then(|()| {
-                        sync::engine::run_integrity_once_with_progress(
-                            &cache_root,
-                            &config,
-                            &client,
-                            &mut on_progress,
-                        )
-                        .map(|_| ())
-                    })
                 }
                 SyncCommand::Clean => run_sync_clean(&cache_root, &config, &client),
                 SyncCommand::Status => unreachable!("status handled above"),
@@ -2186,16 +2176,12 @@ fn run_sync_clean(
             eprintln!("{message}");
         }
     };
-    sync::engine::run_pull_once_with_progress(cache_root, config, client, &mut on_progress)
-        .and_then(|()| {
-            sync::engine::run_integrity_once_with_progress(
-                cache_root,
-                config,
-                client,
-                &mut on_progress,
-            )
-            .map(|_| ())
-        })
+    sync::engine::run_pull_and_integrity_once_with_progress(
+        cache_root,
+        config,
+        client,
+        &mut on_progress,
+    )
 }
 
 fn print_sync_status(sync_config: &sync::config::SyncConfig) {

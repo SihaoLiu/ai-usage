@@ -153,19 +153,7 @@ where
     F: FnMut(&SyncProgress),
 {
     run_upload_once_with_progress(cache_root, config, transport, &mut on_progress)?;
-    run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
-    let verification =
-        run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress)?;
-    if matches!(
-        verification,
-        Some(crate::sync::integrity::IntegrityVerification::Failed { .. })
-    ) {
-        cache::clear_remote_cache(cache_root)?;
-        state::clear_sync_state(cache_root)?;
-        run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
-        run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress)?;
-    }
-    Ok(())
+    run_pull_and_integrity_once_with_progress(cache_root, config, transport, on_progress)
 }
 
 pub fn run_upload_once_with_progress<F>(
@@ -656,6 +644,7 @@ where
     let mut sync_state = state::load_sync_state(cache_root);
     let pull_state_fingerprint = current_pull_state_fingerprint();
     if sync_state.pull_vendors != pull_state_fingerprint {
+        cache::clear_remote_cache(cache_root)?;
         sync_state.last_seen_seq = 0;
         sync_state.pull_vendors = pull_state_fingerprint;
     }
@@ -689,6 +678,42 @@ where
         pulled_records,
         max_seq: sync_state.last_seen_seq,
     });
+    Ok(())
+}
+
+pub fn run_pull_and_integrity_once_with_progress<F>(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    transport: &impl SyncTransport,
+    mut on_progress: F,
+) -> Result<(), SyncError>
+where
+    F: FnMut(&SyncProgress),
+{
+    run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+    run_integrity_once_with_repair(cache_root, config, transport, on_progress)
+}
+
+pub fn run_integrity_once_with_repair<F>(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    transport: &impl SyncTransport,
+    mut on_progress: F,
+) -> Result<(), SyncError>
+where
+    F: FnMut(&SyncProgress),
+{
+    let verification =
+        run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+    if matches!(
+        verification,
+        Some(crate::sync::integrity::IntegrityVerification::Failed { .. })
+    ) {
+        cache::clear_remote_cache(cache_root)?;
+        state::clear_sync_state(cache_root)?;
+        run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+        run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+    }
     Ok(())
 }
 
@@ -1684,6 +1709,17 @@ mod tests {
             .expect("seed stale cache");
         crate::data::cache::merge_remote_records(&owner_cache, "laptop", vec![correct.clone()])
             .expect("seed owner cache");
+        crate::sync::state::save_sync_state(
+            &cache_root,
+            &crate::sync::state::SyncState {
+                schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
+                last_seen_seq: 0,
+                pull_vendors: current_pull_state_fingerprint(),
+                last_successful_sync: None,
+                last_error: None,
+            },
+        )
+        .expect("save current cursor");
         let range_end = crate::sync::integrity::integrity_range_end_utc(Utc::now());
         let owner_report = crate::sync::integrity::build_remote_report_at(
             &owner_cache,
@@ -1720,6 +1756,89 @@ mod tests {
 
         assert_eq!(transport.pull_requests.borrow().len(), 2);
         assert!(matches!(transport.pull_requests.borrow()[1].0, 0));
+        let integrity_events = events
+            .iter()
+            .filter_map(|event| match event {
+                SyncProgress::IntegrityCheckFinished { verification } => Some(verification),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            integrity_events[0],
+            crate::sync::integrity::IntegrityVerification::Failed { .. }
+        ));
+        assert!(matches!(
+            integrity_events[1],
+            crate::sync::integrity::IntegrityVerification::Checked { checked_hosts: 1 }
+        ));
+        let remote = crate::data::cache::load_remote_entries(&cache_root, None);
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].dedup_key, "remote-a");
+    }
+
+    #[test]
+    fn pull_integrity_repair_clears_stale_cache_after_incremental_pull_failure() {
+        let cache_root = unique_temp_dir("pull-integrity-repair");
+        let owner_cache = unique_temp_dir("pull-integrity-repair-owner");
+        let correct =
+            remote_usage_record("laptop", "claude", "remote-a", "2000-01-01T00:00:00Z", 10);
+        let stale = remote_usage_record("laptop", "claude", "stale-a", "2000-01-01T00:00:00Z", 10);
+        crate::data::cache::merge_remote_records(&cache_root, "laptop", vec![stale])
+            .expect("seed stale cache");
+        crate::data::cache::merge_remote_records(&owner_cache, "laptop", vec![correct.clone()])
+            .expect("seed owner cache");
+        crate::sync::state::save_sync_state(
+            &cache_root,
+            &crate::sync::state::SyncState {
+                schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
+                last_seen_seq: 10,
+                pull_vendors: current_pull_state_fingerprint(),
+                last_successful_sync: None,
+                last_error: None,
+            },
+        )
+        .expect("save current cursor");
+        let range_end = crate::sync::integrity::integrity_range_end_utc(Utc::now());
+        let owner_report = crate::sync::integrity::build_remote_report_at(
+            &owner_cache,
+            "laptop",
+            range_end,
+            Utc::now(),
+        )
+        .expect("owner report");
+        let pulled = sequenced_remote_record(7, correct);
+        let transport = FakeTransport::new_with_integrity(
+            vec![
+                PullResponse {
+                    records: Vec::new(),
+                    max_seq: 10,
+                    truncated: false,
+                },
+                PullResponse {
+                    records: vec![pulled],
+                    max_seq: 7,
+                    truncated: false,
+                },
+            ],
+            vec![owner_report],
+        );
+        let mut events = Vec::new();
+
+        run_pull_and_integrity_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |event| events.push(event.clone()),
+        )
+        .expect("pull integrity");
+
+        assert_eq!(
+            transport.pull_requests.borrow().as_slice(),
+            &[
+                (10, String::new(), PULL_LIMIT),
+                (0, String::new(), PULL_LIMIT)
+            ]
+        );
         let integrity_events = events
             .iter()
             .filter_map(|event| match event {
@@ -1816,6 +1935,18 @@ mod tests {
     #[test]
     fn sync_pull_resets_cursor_when_pull_vendor_set_changes() {
         let cache_root = unique_temp_dir("pull-vendor-set");
+        crate::data::cache::merge_remote_records(
+            &cache_root,
+            "laptop",
+            vec![remote_usage_record(
+                "laptop",
+                "codex",
+                "stale-a",
+                "2026-05-18T12:00:00Z",
+                10,
+            )],
+        )
+        .expect("seed stale remote cache");
         std::fs::write(
             cache_root.join("sync_state.json"),
             r#"{
@@ -1879,6 +2010,7 @@ mod tests {
         assert_eq!(transport.pull_requests.borrow()[0].0, 0);
         let remote = crate::data::cache::load_remote_entries(&cache_root, None);
         assert_eq!(remote.len(), 2);
+        assert!(remote.iter().all(|record| record.dedup_key != "stale-a"));
         assert_eq!(
             crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
             2

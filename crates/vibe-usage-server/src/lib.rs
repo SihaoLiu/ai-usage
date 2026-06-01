@@ -17,7 +17,7 @@ use subtle::ConstantTimeEq;
 use vibe_usage_proto::{
     HealthResponse, IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineInfo,
     MachineList, PullResponse, SCHEMA_VERSION, SequencedWireRecord, UploadResponse, WireRecord,
-    is_valid_vendor,
+    is_valid_host_id, is_valid_vendor,
 };
 
 type DbPool = Pool<SqliteConnectionManager>;
@@ -145,6 +145,7 @@ impl AppState {
             conn.execute_batch(include_str!("../migrations/0001_init.sql"))?;
             ensure_fast_tier_column(&conn)?;
             ensure_cost_columns(&conn)?;
+            ensure_snapshot_id_column(&conn)?;
             cleanup_omp_alias_duplicates(&mut conn)?;
         }
         Ok(Self {
@@ -161,6 +162,8 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/upload", post(upload))
+        .route("/v1/snapshot/keys", post(snapshot_keys))
+        .route("/v1/snapshot/finalize", post(snapshot_finalize))
         .route("/v1/pull", get(pull))
         .route("/v1/machines", get(machines))
         .route("/v1/integrity/report", post(submit_integrity_report))
@@ -212,6 +215,25 @@ fn run_server_auto_update_once() -> Result<vibe_usage_updater::InstallOutcome, S
 struct AppError {
     status: StatusCode,
     message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotKey {
+    vendor: String,
+    dedup_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotKeyBatch {
+    host_id: String,
+    snapshot_id: String,
+    keys: Vec<SnapshotKey>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotFinalizeRequest {
+    host_id: String,
+    snapshot_id: String,
 }
 
 impl AppError {
@@ -314,8 +336,7 @@ async fn upload(
             touched_hosts.insert(record.host_id.clone());
             continue;
         }
-        let changed = insert_record(&tx, record, &uploaded_at)?;
-        let accepted_record = changed == 1 || refresh_omp_stable_record(&tx, record, &uploaded_at)?;
+        let accepted_record = upsert_record(&tx, record, &uploaded_at)?;
         if accepted_record {
             accepted += 1;
         } else {
@@ -346,6 +367,146 @@ async fn upload(
         ignored,
         max_seq,
     }))
+}
+
+async fn snapshot_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Json<UploadResponse>, AppError> {
+    authorize(&state, &headers)?;
+    let batch: SnapshotKeyBatch = serde_json::from_str(&body)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))?;
+    validate_snapshot_host(&state, &batch.host_id)?;
+    validate_snapshot_id(&batch.snapshot_id)?;
+    if batch.keys.len() > state.config.max_batch_records {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "batch exceeds max_batch_records",
+        ));
+    }
+
+    let mut conn = state.pool.get()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut accepted = 0usize;
+    let mut ignored = 0usize;
+    for key in &batch.keys {
+        validate_snapshot_key(key)?;
+        let changed = tx.execute(
+            "UPDATE records
+             SET snapshot_id = ?1
+             WHERE host_id = ?2 AND vendor = ?3 AND dedup_key = ?4",
+            params![batch.snapshot_id, batch.host_id, key.vendor, key.dedup_key],
+        )?;
+        if changed > 0 {
+            accepted += changed;
+        } else {
+            ignored += 1;
+        }
+    }
+    let max_seq = max_seq_in_tx(&tx)?;
+    tx.commit()?;
+
+    Ok(Json(UploadResponse {
+        accepted,
+        ignored,
+        max_seq,
+    }))
+}
+
+async fn snapshot_finalize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Json<serde_json::Value>, AppError> {
+    authorize(&state, &headers)?;
+    let request: SnapshotFinalizeRequest = serde_json::from_str(&body)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))?;
+    validate_snapshot_host(&state, &request.host_id)?;
+    validate_snapshot_id(&request.snapshot_id)?;
+
+    let mut conn = state.pool.get()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let deleted = tx.execute(
+        "DELETE FROM records
+         WHERE host_id = ?1 AND (snapshot_id IS NULL OR snapshot_id != ?2)",
+        params![request.host_id, request.snapshot_id],
+    )?;
+    let finalized_at = Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO machines (host_id, last_seen, record_count)
+         VALUES (?1, ?2, (SELECT COUNT(*) FROM records WHERE host_id = ?1))
+         ON CONFLICT(host_id) DO UPDATE SET
+            last_seen = excluded.last_seen,
+            record_count = (SELECT COUNT(*) FROM records WHERE host_id = ?1)",
+        params![request.host_id, finalized_at],
+    )?;
+    let max_seq = max_seq_in_tx(&tx)?;
+    tx.commit()?;
+
+    Ok(Json(serde_json::json!({
+        "deleted": deleted,
+        "max_seq": max_seq,
+    })))
+}
+
+fn validate_snapshot_host(state: &AppState, host_id: &str) -> Result<(), AppError> {
+    if !is_valid_host_id(host_id) {
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "invalid host_id"));
+    }
+    if state
+        .config
+        .allowed_hosts
+        .as_ref()
+        .is_some_and(|hosts| !hosts.contains(host_id))
+    {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "host_id is not allowed",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_id(snapshot_id: &str) -> Result<(), AppError> {
+    if snapshot_id.is_empty()
+        || snapshot_id.len() > 128
+        || !snapshot_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'T' | b'Z')
+        })
+    {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid snapshot_id",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_key(key: &SnapshotKey) -> Result<(), AppError> {
+    if !is_valid_vendor(&key.vendor) {
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "invalid vendor"));
+    }
+    if key.dedup_key.is_empty() || key.dedup_key.len() > 512 {
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "invalid dedup_key"));
+    }
+    Ok(())
+}
+
+fn upsert_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &WireRecord,
+    uploaded_at: &str,
+) -> rusqlite::Result<bool> {
+    let changed = insert_record(tx, record, uploaded_at)?;
+    if changed == 1 {
+        return Ok(true);
+    }
+    if record_matches_existing(tx, record)? {
+        return Ok(false);
+    }
+    replace_record(tx, record, uploaded_at)?;
+    Ok(true)
 }
 
 fn insert_record(
@@ -385,6 +546,75 @@ fn insert_record(
             uploaded_at,
         ],
     )
+}
+
+fn replace_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &WireRecord,
+    uploaded_at: &str,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM records WHERE host_id = ?1 AND vendor = ?2 AND dedup_key = ?3",
+        params![record.host_id, record.vendor, record.dedup_key],
+    )?;
+    insert_record(tx, record, uploaded_at)?;
+    Ok(())
+}
+
+fn record_matches_existing(
+    tx: &rusqlite::Transaction<'_>,
+    record: &WireRecord,
+) -> rusqlite::Result<bool> {
+    let found: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM records
+             WHERE host_id = ?1
+               AND vendor = ?2
+               AND dedup_key = ?3
+               AND schema_version = ?4
+               AND timestamp_utc = ?5
+               AND session_start = ?6
+               AND session_end = ?7
+               AND model = ?8
+               AND effort IS ?9
+               AND fast_tier = ?10
+               AND input_tokens = ?11
+               AND output_tokens = ?12
+               AND cache_read = ?13
+               AND cache_creation = ?14
+               AND reasoning_out = ?15
+               AND cost_input IS ?16
+               AND cost_output IS ?17
+               AND cost_cache_read IS ?18
+               AND cost_cache_creation IS ?19
+               AND project_hash IS ?20
+             LIMIT 1",
+            params![
+                record.host_id,
+                record.vendor,
+                record.dedup_key,
+                i64::from(record.schema_version),
+                record.timestamp,
+                record.session_start_time,
+                record.session_end_time,
+                record.model,
+                record.effort,
+                i64::from(record.fast_tier),
+                record.input_tokens,
+                record.output_tokens,
+                record.cache_read_input_tokens,
+                record.cache_creation_input_tokens,
+                record.reasoning_output_tokens,
+                record.cost_input,
+                record.cost_output,
+                record.cost_cache_read,
+                record.cost_cache_creation,
+                record.project_path_sha256,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 #[derive(Debug, Deserialize)]
@@ -742,6 +972,17 @@ fn ensure_cost_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn ensure_snapshot_id_column(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(records)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "snapshot_id") {
+        conn.execute("ALTER TABLE records ADD COLUMN snapshot_id TEXT", [])?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct StoredOmpRecord {
     seq: u64,
@@ -763,16 +1004,6 @@ struct OmpFileAlias {
     output_tokens: i64,
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
-}
-
-#[derive(Debug, Clone)]
-struct StoredOmpMetadata {
-    effort: Option<String>,
-    cost_input: Option<f64>,
-    cost_output: Option<f64>,
-    cost_cache_read: Option<f64>,
-    cost_cache_creation: Option<f64>,
-    project_path_sha256: Option<String>,
 }
 
 fn cleanup_omp_alias_duplicates(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
@@ -938,91 +1169,6 @@ fn uploaded_with_omp_alias(
         return omp_stable_file_key_exists(tx, record, &key);
     }
     Ok(false)
-}
-
-fn refresh_omp_stable_record(
-    tx: &rusqlite::Transaction<'_>,
-    record: &WireRecord,
-    uploaded_at: &str,
-) -> rusqlite::Result<bool> {
-    if record.vendor != "omp"
-        || parse_omp_v220_key(&record.dedup_key).is_some()
-        || !is_stable_omp_key(&record.dedup_key)
-        || !has_omp_refresh_metadata(record)
-    {
-        return Ok(false);
-    }
-
-    let Some(existing) = load_existing_omp_metadata(tx, record)? else {
-        return Ok(false);
-    };
-
-    let mut refreshed = record.clone();
-    if refreshed
-        .effort
-        .as_deref()
-        .is_none_or(|value| value.is_empty())
-    {
-        refreshed.effort = existing.effort;
-    }
-    if refreshed.cost_input.is_none() {
-        refreshed.cost_input = existing.cost_input;
-    }
-    if refreshed.cost_output.is_none() {
-        refreshed.cost_output = existing.cost_output;
-    }
-    if refreshed.cost_cache_read.is_none() {
-        refreshed.cost_cache_read = existing.cost_cache_read;
-    }
-    if refreshed.cost_cache_creation.is_none() {
-        refreshed.cost_cache_creation = existing.cost_cache_creation;
-    }
-    if refreshed.project_path_sha256.is_none() {
-        refreshed.project_path_sha256 = existing.project_path_sha256;
-    }
-
-    tx.execute(
-        "DELETE FROM records WHERE host_id = ?1 AND vendor = 'omp' AND dedup_key = ?2",
-        params![record.host_id, record.dedup_key],
-    )?;
-    insert_record(tx, &refreshed, uploaded_at)?;
-    Ok(true)
-}
-
-fn load_existing_omp_metadata(
-    tx: &rusqlite::Transaction<'_>,
-    record: &WireRecord,
-) -> rusqlite::Result<Option<StoredOmpMetadata>> {
-    tx.query_row(
-        "SELECT effort, cost_input, cost_output, cost_cache_read, cost_cache_creation,
-            project_hash
-         FROM records
-         WHERE host_id = ?1 AND vendor = 'omp' AND dedup_key = ?2
-         LIMIT 1",
-        params![record.host_id, record.dedup_key],
-        |row| {
-            Ok(StoredOmpMetadata {
-                effort: row.get(0)?,
-                cost_input: row.get(1)?,
-                cost_output: row.get(2)?,
-                cost_cache_read: row.get(3)?,
-                cost_cache_creation: row.get(4)?,
-                project_path_sha256: row.get(5)?,
-            })
-        },
-    )
-    .optional()
-}
-
-fn has_omp_refresh_metadata(record: &WireRecord) -> bool {
-    record
-        .effort
-        .as_deref()
-        .is_some_and(|value| !value.is_empty())
-        || record.cost_input.is_some()
-        || record.cost_output.is_some()
-        || record.cost_cache_read.is_some()
-        || record.cost_cache_creation.is_some()
 }
 
 fn delete_omp_v220_aliases_for_stable_record(

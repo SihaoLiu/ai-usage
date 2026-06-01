@@ -351,6 +351,114 @@ async fn upload_deduplicates_without_advancing_sequence() {
 }
 
 #[tokio::test]
+async fn upload_updates_changed_existing_record() {
+    let app = app("changed-record-upsert").await;
+    let original = record("laptop", "codex", "same", 10);
+    let mut changed = original.clone();
+    changed.output_tokens = 99;
+    changed.fast_tier = 0;
+
+    let first = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[original])))
+        .await
+        .expect("first response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body: UploadResponse = read_json(first).await;
+    assert_eq!(first_body.accepted, 1);
+    assert_eq!(first_body.max_seq, 1);
+
+    let second = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[changed])))
+        .await
+        .expect("second response");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body: UploadResponse = read_json(second).await;
+    assert_eq!(second_body.accepted, 1);
+    assert_eq!(second_body.ignored, 0);
+    assert!(second_body.max_seq > first_body.max_seq);
+
+    let pull = app
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=codex",
+            Body::empty(),
+        ))
+        .await
+        .expect("pull response");
+    assert_eq!(pull.status(), StatusCode::OK);
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 1);
+    assert_eq!(body.records[0].seq, second_body.max_seq);
+    assert_eq!(body.records[0].record.output_tokens, 99);
+    assert_eq!(body.records[0].record.fast_tier, 0);
+}
+
+#[tokio::test]
+async fn snapshot_finalize_deletes_keys_missing_from_active_manifest() {
+    let app = app("snapshot-delete-stale").await;
+    let active = record("laptop", "claude", "active", 10);
+    let stale = record("laptop", "claude", "stale", 20);
+    let upload = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/upload",
+            ndjson(&[active.clone(), stale]),
+        ))
+        .await
+        .expect("upload response");
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let keys = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/keys",
+            json!({
+                "host_id": "laptop",
+                "snapshot_id": "snapshot-a",
+                "keys": [{"vendor": "claude", "dedup_key": "active"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("keys response");
+    assert_eq!(keys.status(), StatusCode::OK);
+
+    let finalize = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/finalize",
+            json!({
+                "host_id": "laptop",
+                "snapshot_id": "snapshot-a"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("finalize response");
+    assert_eq!(finalize.status(), StatusCode::OK);
+    let finalize_body: serde_json::Value = read_json(finalize).await;
+    assert_eq!(finalize_body["deleted"], json!(1));
+
+    let pull = app
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=claude",
+            Body::empty(),
+        ))
+        .await
+        .expect("pull response");
+    assert_eq!(pull.status(), StatusCode::OK);
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 1);
+    assert_eq!(body.records[0].record.dedup_key, active.dedup_key);
+}
+
+#[tokio::test]
 async fn upload_replaces_omp_v220_message_key_with_stable_key() {
     let app = app("omp-v220-message-key").await;
     let mut old_record = record("laptop", "omp", "placeholder", 10);

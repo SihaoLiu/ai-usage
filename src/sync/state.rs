@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -9,6 +9,7 @@ pub const SYNC_STATE_SCHEMA_VERSION: u32 = 1;
 
 const SYNC_STATE_FILE: &str = "sync_state.json";
 const SYNC_UPLOAD_LOG_FILE: &str = "sync_upload_log.bin";
+const SYNC_SNAPSHOT_STATE_FILE: &str = "sync_snapshot_state.bin";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncState {
@@ -18,6 +19,12 @@ pub struct SyncState {
     pub pull_vendors: Vec<String>,
     pub last_successful_sync: Option<String>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotUploadState {
+    pub key_set_hash: String,
+    pub record_hashes: BTreeMap<(String, String), String>,
 }
 
 impl Default for SyncState {
@@ -74,6 +81,23 @@ pub fn load_upload_log(cache_root: &Path) -> BTreeSet<(String, String)> {
 pub fn save_upload_log(cache_root: &Path, keys: &BTreeSet<(String, String)>) -> io::Result<()> {
     let path = cache_root.join(SYNC_UPLOAD_LOG_FILE);
     let content = bincode::serialize(keys).map_err(io::Error::other)?;
+    atomic_write(&path, &content)
+}
+
+pub fn load_snapshot_upload_state(cache_root: &Path) -> SnapshotUploadState {
+    let path = cache_root.join(SYNC_SNAPSHOT_STATE_FILE);
+    let Ok(content) = fs::read(path) else {
+        return SnapshotUploadState::default();
+    };
+    bincode::deserialize::<SnapshotUploadState>(&content).unwrap_or_default()
+}
+
+pub fn save_snapshot_upload_state(
+    cache_root: &Path,
+    state: &SnapshotUploadState,
+) -> io::Result<()> {
+    let path = cache_root.join(SYNC_SNAPSHOT_STATE_FILE);
+    let content = bincode::serialize(state).map_err(io::Error::other)?;
     atomic_write(&path, &content)
 }
 

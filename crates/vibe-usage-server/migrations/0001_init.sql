@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS records (
     cost_cache_read REAL,
     cost_cache_creation REAL,
     project_hash   TEXT,
+    snapshot_id    TEXT,
     uploaded_at    TEXT NOT NULL,
     UNIQUE(host_id, vendor, dedup_key)
 );

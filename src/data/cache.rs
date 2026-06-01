@@ -716,45 +716,7 @@ pub fn merge_remote_records(
 }
 
 fn refresh_remote_record(existing: &mut PersistedRemoteRecord, incoming: PersistedRemoteRecord) {
-    if incoming.vendor != "omp"
-        || !is_stable_omp_key(&incoming.dedup_key)
-        || !has_remote_refresh_metadata(&incoming)
-    {
-        return;
-    }
-
-    let mut refreshed = incoming;
-    if refreshed
-        .effort
-        .as_deref()
-        .is_none_or(|value| value.is_empty())
-    {
-        refreshed.effort = existing.effort.clone();
-    }
-    if refreshed.cost_input.is_none() {
-        refreshed.cost_input = existing.cost_input;
-    }
-    if refreshed.cost_output.is_none() {
-        refreshed.cost_output = existing.cost_output;
-    }
-    if refreshed.cost_cache_read.is_none() {
-        refreshed.cost_cache_read = existing.cost_cache_read;
-    }
-    if refreshed.cost_cache_creation.is_none() {
-        refreshed.cost_cache_creation = existing.cost_cache_creation;
-    }
-    *existing = refreshed;
-}
-
-fn has_remote_refresh_metadata(record: &PersistedRemoteRecord) -> bool {
-    record
-        .effort
-        .as_deref()
-        .is_some_and(|value| !value.is_empty())
-        || record.cost_input.is_some()
-        || record.cost_output.is_some()
-        || record.cost_cache_read.is_some()
-        || record.cost_cache_creation.is_some()
+    *existing = incoming;
 }
 
 fn deduplicate_remote_omp_aliases(
@@ -804,12 +766,6 @@ fn deduplicate_remote_omp_aliases(
         .enumerate()
         .filter_map(|(idx, record)| (!stale_indexes.contains(&idx)).then_some(record))
         .collect()
-}
-
-fn is_stable_omp_key(dedup_key: &str) -> bool {
-    dedup_key.starts_with("omp:message:")
-        || dedup_key.starts_with("omp:response:")
-        || dedup_key.starts_with("omp:file:")
 }
 
 fn parse_omp_v220_key(dedup_key: &str) -> Option<OmpV220Key> {
@@ -2033,7 +1989,7 @@ mod tests {
                     "claude".to_string(),
                     "same".to_string(),
                     Some("laptop".to_string()),
-                    10
+                    99
                 ),
                 (
                     "codex".to_string(),

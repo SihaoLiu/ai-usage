@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use vibe_usage_proto::{
-    IntegrityReport, IntegrityReportList, IntegritySubmitResponse, PullResponse, UploadResponse,
+    IntegrityReport, IntegrityReportList, IntegritySubmitResponse, PullResponse, RecordKey,
+    SnapshotFinalizeRequest, SnapshotFinalizeResponse, SnapshotKeyBatch, UploadResponse,
     WireRecord,
 };
 
@@ -114,6 +115,15 @@ pub trait SyncTransport {
     fn integrity_reports(&self) -> Result<IntegrityReportList, SyncError> {
         Err(SyncError::new("integrity unsupported"))
     }
+    fn snapshot_keys(&self, _batch: &SnapshotKeyBatch) -> Result<UploadResponse, SyncError> {
+        Err(SyncError::new("snapshot unsupported"))
+    }
+    fn snapshot_finalize(
+        &self,
+        _request: &SnapshotFinalizeRequest,
+    ) -> Result<SnapshotFinalizeResponse, SyncError> {
+        Err(SyncError::new("snapshot unsupported"))
+    }
 }
 
 #[cfg(test)]
@@ -136,7 +146,17 @@ where
 {
     run_upload_once_with_progress(cache_root, config, transport, &mut on_progress)?;
     run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
-    run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+    let verification =
+        run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+    if matches!(
+        verification,
+        Some(crate::sync::integrity::IntegrityVerification::Failed { .. })
+    ) {
+        cache::clear_remote_cache(cache_root)?;
+        state::clear_sync_state(cache_root)?;
+        run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+        run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+    }
     Ok(())
 }
 
@@ -149,6 +169,10 @@ pub fn run_upload_once_with_progress<F>(
 where
     F: FnMut(&SyncProgress),
 {
+    if run_snapshot_upload_once_with_progress(cache_root, config, transport, &mut on_progress)? {
+        return Ok(());
+    }
+
     let mut upload_log = state::load_upload_log(cache_root);
     let mut upload_groups = Vec::new();
     let mut skipped_records = 0;
@@ -257,6 +281,184 @@ where
     });
 
     Ok(())
+}
+
+fn run_snapshot_upload_once_with_progress<F>(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    transport: &impl SyncTransport,
+    mut on_progress: F,
+) -> Result<bool, SyncError>
+where
+    F: FnMut(&SyncProgress),
+{
+    let snapshot_id = snapshot_id(&config.machine_id);
+    let probe = SnapshotKeyBatch {
+        host_id: config.machine_id.clone(),
+        snapshot_id: snapshot_id.clone(),
+        keys: Vec::new(),
+    };
+    match transport.snapshot_keys(&probe) {
+        Ok(_) => {}
+        Err(err) if is_unsupported_snapshot_error(&err) => return Ok(false),
+        Err(err) => return Err(err),
+    }
+
+    let snapshot = collect_snapshot_records(cache_root, config)?;
+    let previous = state::load_snapshot_upload_state(cache_root);
+    let key_set_changed = previous.key_set_hash != snapshot.key_set_hash;
+    let changed_records = snapshot
+        .records
+        .iter()
+        .filter(|record| {
+            previous
+                .record_hashes
+                .get(&record.key)
+                .is_none_or(|hash| hash != &record.record_hash)
+        })
+        .collect::<Vec<_>>();
+    let skipped_records = snapshot.records.len().saturating_sub(changed_records.len());
+    let total_batches = changed_records.len().div_ceil(BATCH_SIZE);
+    on_progress(&SyncProgress::UploadPlanned {
+        total_records: changed_records.len(),
+        total_batches,
+        skipped_records,
+    });
+
+    let mut uploaded_records = 0usize;
+    let mut accepted = 0usize;
+    let mut ignored = 0usize;
+    for (batch_index, batch) in changed_records.chunks(BATCH_SIZE).enumerate() {
+        let wire_records = batch
+            .iter()
+            .map(|record| record.wire.clone())
+            .collect::<Vec<_>>();
+        let response = transport.upload(&wire_records)?;
+        uploaded_records += batch.len();
+        accepted += response.accepted;
+        ignored += response.ignored;
+        on_progress(&SyncProgress::UploadBatchFinished {
+            batch_index: batch_index + 1,
+            total_batches,
+            uploaded_records,
+            total_records: changed_records.len(),
+            accepted,
+            ignored,
+        });
+    }
+
+    if key_set_changed {
+        for keys in snapshot.keys.chunks(BATCH_SIZE) {
+            let batch = SnapshotKeyBatch {
+                host_id: config.machine_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                keys: keys.to_vec(),
+            };
+            transport.snapshot_keys(&batch)?;
+        }
+        transport.snapshot_finalize(&SnapshotFinalizeRequest {
+            host_id: config.machine_id.clone(),
+            snapshot_id,
+        })?;
+    }
+
+    state::save_snapshot_upload_state(
+        cache_root,
+        &state::SnapshotUploadState {
+            key_set_hash: snapshot.key_set_hash,
+            record_hashes: snapshot.record_hashes,
+        },
+    )?;
+    on_progress(&SyncProgress::UploadFinished {
+        uploaded_records,
+        total_records: changed_records.len(),
+        accepted,
+        ignored,
+    });
+    Ok(true)
+}
+
+#[derive(Debug)]
+struct SnapshotRecords {
+    records: Vec<SnapshotRecord>,
+    keys: Vec<RecordKey>,
+    key_set_hash: String,
+    record_hashes: BTreeMap<(String, String), String>,
+}
+
+#[derive(Debug)]
+struct SnapshotRecord {
+    key: (String, String),
+    wire: WireRecord,
+    record_hash: String,
+}
+
+fn collect_snapshot_records(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+) -> Result<SnapshotRecords, SyncError> {
+    let mut records = Vec::new();
+    let mut record_hashes = BTreeMap::new();
+    for vendor in VENDORS {
+        for record in cache::load_vendor_cached_records(cache_root, vendor) {
+            if record.dedup_key.is_empty() {
+                continue;
+            }
+            let key = (record.vendor.clone(), record.dedup_key.clone());
+            let wire = cached_record_to_wire(config, &record)?;
+            let record_hash = wire_record_hash(&wire)?;
+            record_hashes.insert(key.clone(), record_hash.clone());
+            records.push(SnapshotRecord {
+                key,
+                wire,
+                record_hash,
+            });
+        }
+    }
+    records.sort_by(|left, right| left.key.cmp(&right.key));
+    let keys = records
+        .iter()
+        .map(|record| RecordKey {
+            vendor: record.key.0.clone(),
+            dedup_key: record.key.1.clone(),
+        })
+        .collect::<Vec<_>>();
+    let key_set_hash = snapshot_key_set_hash(&keys);
+    Ok(SnapshotRecords {
+        records,
+        keys,
+        key_set_hash,
+        record_hashes,
+    })
+}
+
+fn snapshot_key_set_hash(keys: &[RecordKey]) -> String {
+    let mut hasher = Sha256::new();
+    for key in keys {
+        hasher.update((key.vendor.len() as u64).to_be_bytes());
+        hasher.update(key.vendor.as_bytes());
+        hasher.update((key.dedup_key.len() as u64).to_be_bytes());
+        hasher.update(key.dedup_key.as_bytes());
+    }
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn wire_record_hash(record: &WireRecord) -> Result<String, SyncError> {
+    let bytes = serde_json::to_vec(record)
+        .map_err(|err| SyncError::new(format!("serialize snapshot record: {err}")))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn snapshot_id(machine_id: &str) -> String {
+    format!("{}:{}", machine_id, Utc::now().format("%Y%m%dT%H%M%SZ"))
+}
+
+fn is_unsupported_snapshot_error(err: &SyncError) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("snapshot unsupported")
+        || message.contains("http status: 404")
+        || message.contains("http status: 405")
 }
 
 fn is_unsupported_vendor_error(err: &SyncError) -> bool {
@@ -589,6 +791,12 @@ mod tests {
         uploads: RefCell<Vec<Vec<WireRecord>>>,
     }
 
+    struct SnapshotTransport {
+        uploads: RefCell<Vec<Vec<WireRecord>>>,
+        snapshot_key_batches: RefCell<Vec<SnapshotKeyBatch>>,
+        snapshot_finalizations: RefCell<Vec<SnapshotFinalizeRequest>>,
+    }
+
     impl FakeTransport {
         fn new(pulls: Vec<PullResponse>) -> Self {
             Self {
@@ -668,6 +876,62 @@ mod tests {
                 records: Vec::new(),
                 max_seq: 0,
                 truncated: false,
+            })
+        }
+    }
+
+    impl SnapshotTransport {
+        fn new() -> Self {
+            Self {
+                uploads: RefCell::new(Vec::new()),
+                snapshot_key_batches: RefCell::new(Vec::new()),
+                snapshot_finalizations: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SyncTransport for SnapshotTransport {
+        fn upload(&self, records: &[WireRecord]) -> Result<UploadResponse, SyncError> {
+            self.uploads.borrow_mut().push(records.to_vec());
+            Ok(UploadResponse {
+                accepted: records.len(),
+                ignored: 0,
+                max_seq: records.len() as u64,
+            })
+        }
+
+        fn pull(
+            &self,
+            _after_seq: u64,
+            _exclude_host: &str,
+            _limit: usize,
+        ) -> Result<PullResponse, SyncError> {
+            Ok(PullResponse {
+                records: Vec::new(),
+                max_seq: 0,
+                truncated: false,
+            })
+        }
+
+        fn snapshot_keys(&self, batch: &SnapshotKeyBatch) -> Result<UploadResponse, SyncError> {
+            self.snapshot_key_batches.borrow_mut().push(batch.clone());
+            Ok(UploadResponse {
+                accepted: batch.keys.len(),
+                ignored: 0,
+                max_seq: 0,
+            })
+        }
+
+        fn snapshot_finalize(
+            &self,
+            request: &SnapshotFinalizeRequest,
+        ) -> Result<SnapshotFinalizeResponse, SyncError> {
+            self.snapshot_finalizations
+                .borrow_mut()
+                .push(request.clone());
+            Ok(SnapshotFinalizeResponse {
+                deleted: 0,
+                max_seq: 0,
             })
         }
     }
@@ -796,6 +1060,38 @@ mod tests {
                     reasoning_output_tokens: 5,
                 },
                 costs: None,
+            },
+        }
+    }
+
+    fn sequenced_remote_record(
+        seq: u64,
+        record: crate::data::cache::RemoteUsageRecord,
+    ) -> SequencedWireRecord {
+        SequencedWireRecord {
+            seq,
+            uploaded_at: "2026-05-18T12:10:00Z".to_string(),
+            record: WireRecord {
+                schema_version: SCHEMA_VERSION,
+                host_id: record.entry.host_id.expect("remote host id"),
+                vendor: record.vendor,
+                dedup_key: record.dedup_key,
+                timestamp: record.entry.timestamp,
+                session_start_time: record.entry.session_start_time,
+                session_end_time: record.entry.session_end_time,
+                model: record.entry.model,
+                effort: record.entry.effort,
+                fast_tier: record.entry.fast_tier,
+                input_tokens: record.entry.usage.input_tokens,
+                output_tokens: record.entry.usage.output_tokens,
+                cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
+                cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
+                reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+                cost_input: record.entry.costs.map(|costs| costs.input),
+                cost_output: record.entry.costs.map(|costs| costs.output),
+                cost_cache_read: record.entry.costs.map(|costs| costs.cache_read),
+                cost_cache_creation: record.entry.costs.map(|costs| costs.cache_creation),
+                project_path_sha256: None,
             },
         }
     }
@@ -1003,6 +1299,38 @@ mod tests {
         let upload_log = crate::sync::state::load_upload_log(&cache_root);
         assert!(upload_log.contains(&("omp".to_string(), "omp:file:/tmp/omp.jsonl:0".to_string())));
         assert!(upload_log.contains(&("omp".to_string(), "omp:file:/tmp/omp.jsonl:1".to_string())));
+    }
+
+    #[test]
+    fn snapshot_upload_sends_active_keys_and_skips_unchanged_records_after_success() {
+        let cache_root = unique_temp_dir("snapshot-upload");
+        populate_vendor_cache(&cache_root, "claude", "claude-a");
+        populate_vendor_cache(&cache_root, "codex", "codex-a");
+        let first = SnapshotTransport::new();
+
+        run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &first, |_| {})
+            .expect("first upload");
+
+        let uploads = first.uploads.borrow();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].len(), 2);
+        drop(uploads);
+        let key_batches = first.snapshot_key_batches.borrow();
+        assert_eq!(key_batches.len(), 2);
+        assert!(key_batches[0].keys.is_empty());
+        assert_eq!(key_batches[1].keys.len(), 2);
+        assert_eq!(key_batches[1].host_id, "workstation");
+        drop(key_batches);
+        assert_eq!(first.snapshot_finalizations.borrow().len(), 1);
+
+        let second = SnapshotTransport::new();
+        run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &second, |_| {})
+            .expect("second upload");
+
+        assert!(second.uploads.borrow().is_empty());
+        assert_eq!(second.snapshot_key_batches.borrow().len(), 1);
+        assert!(second.snapshot_key_batches.borrow()[0].keys.is_empty());
+        assert!(second.snapshot_finalizations.borrow().is_empty());
     }
 
     #[test]
@@ -1241,6 +1569,73 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn integrity_failure_clears_remote_cache_and_rechecks_after_repull() {
+        let cache_root = unique_temp_dir("integrity-repair");
+        let owner_cache = unique_temp_dir("integrity-repair-owner");
+        let correct =
+            remote_usage_record("laptop", "claude", "remote-a", "2000-01-01T00:00:00Z", 10);
+        let stale = remote_usage_record("laptop", "claude", "stale-a", "2000-01-01T00:00:00Z", 10);
+        crate::data::cache::merge_remote_records(&cache_root, "laptop", vec![stale])
+            .expect("seed stale cache");
+        crate::data::cache::merge_remote_records(&owner_cache, "laptop", vec![correct.clone()])
+            .expect("seed owner cache");
+        let range_end = crate::sync::integrity::integrity_range_end_utc(Utc::now());
+        let owner_report = crate::sync::integrity::build_remote_report_at(
+            &owner_cache,
+            "laptop",
+            range_end,
+            Utc::now(),
+        )
+        .expect("owner report");
+        let pulled = sequenced_remote_record(1, correct);
+        let transport = FakeTransport::new_with_integrity(
+            vec![
+                PullResponse {
+                    records: vec![pulled.clone()],
+                    max_seq: 1,
+                    truncated: false,
+                },
+                PullResponse {
+                    records: vec![pulled],
+                    max_seq: 1,
+                    truncated: false,
+                },
+            ],
+            vec![owner_report],
+        );
+        let mut events = Vec::new();
+
+        run_sync_cycle_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |event| events.push(event.clone()),
+        )
+        .expect("sync cycle");
+
+        assert_eq!(transport.pull_requests.borrow().len(), 2);
+        assert!(matches!(transport.pull_requests.borrow()[1].0, 0));
+        let integrity_events = events
+            .iter()
+            .filter_map(|event| match event {
+                SyncProgress::IntegrityCheckFinished { verification } => Some(verification),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            integrity_events[0],
+            crate::sync::integrity::IntegrityVerification::Failed { .. }
+        ));
+        assert!(matches!(
+            integrity_events[1],
+            crate::sync::integrity::IntegrityVerification::Checked { checked_hosts: 1 }
+        ));
+        let remote = crate::data::cache::load_remote_entries(&cache_root, None);
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].dedup_key, "remote-a");
     }
 
     #[test]

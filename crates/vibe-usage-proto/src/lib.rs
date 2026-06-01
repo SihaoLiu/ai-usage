@@ -53,6 +53,31 @@ pub struct UploadResponse {
     pub max_seq: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordKey {
+    pub vendor: String,
+    pub dedup_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotKeyBatch {
+    pub host_id: String,
+    pub snapshot_id: String,
+    pub keys: Vec<RecordKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotFinalizeRequest {
+    pub host_id: String,
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotFinalizeResponse {
+    pub deleted: usize,
+    pub max_seq: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PullResponse {
     pub records: Vec<SequencedWireRecord>,
@@ -113,6 +138,7 @@ pub enum ValidationError {
     InvalidProjectHash,
     InvalidIntegrityAlgorithm,
     InvalidDigest,
+    InvalidSnapshotId,
 }
 
 impl fmt::Display for ValidationError {
@@ -131,6 +157,7 @@ impl fmt::Display for ValidationError {
             Self::InvalidProjectHash => f.write_str("project_path_sha256 must be lowercase hex"),
             Self::InvalidIntegrityAlgorithm => f.write_str("invalid integrity algorithm"),
             Self::InvalidDigest => f.write_str("digest_sha256 must be lowercase hex"),
+            Self::InvalidSnapshotId => f.write_str("invalid snapshot_id"),
         }
     }
 }
@@ -191,6 +218,31 @@ impl SequencedWireRecord {
     pub fn validate(&self) -> Result<(), ValidationError> {
         self.record.validate()?;
         validate_required_timestamp("uploaded_at", &self.uploaded_at)
+    }
+}
+
+impl RecordKey {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_vendor(&self.vendor)?;
+        validate_required_text("dedup_key", &self.dedup_key, 512)
+    }
+}
+
+impl SnapshotKeyBatch {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_host_id(&self.host_id)?;
+        validate_snapshot_id(&self.snapshot_id)?;
+        for key in &self.keys {
+            key.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl SnapshotFinalizeRequest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_host_id(&self.host_id)?;
+        validate_snapshot_id(&self.snapshot_id)
     }
 }
 
@@ -288,6 +340,19 @@ fn validate_project_hash(hash: &str) -> Result<(), ValidationError> {
         Ok(())
     } else {
         Err(ValidationError::InvalidProjectHash)
+    }
+}
+
+fn validate_snapshot_id(snapshot_id: &str) -> Result<(), ValidationError> {
+    if snapshot_id.is_empty()
+        || snapshot_id.len() > 128
+        || !snapshot_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        Err(ValidationError::InvalidSnapshotId)
+    } else {
+        Ok(())
     }
 }
 

@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use vibe_usage_proto::{
     IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineList, PullResponse,
-    UploadResponse, WireRecord,
+    SnapshotFinalizeRequest, SnapshotFinalizeResponse, SnapshotKeyBatch, UploadResponse,
+    WireRecord,
 };
 
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
@@ -100,6 +101,33 @@ impl SyncHttpClient {
         read_json_response(response)
     }
 
+    pub fn snapshot_keys(&self, batch: &SnapshotKeyBatch) -> Result<UploadResponse, SyncError> {
+        let body = serde_json::to_string(batch).map_err(|err| SyncError::new(err.to_string()))?;
+        let response = self.call_with_rate_limit_retry(|| {
+            self.agent
+                .post(&self.endpoint("/v1/snapshot/keys"))
+                .header("Authorization", self.auth_header())
+                .header("Content-Type", "application/json")
+                .send(body.clone())
+        })?;
+        read_json_response(response)
+    }
+
+    pub fn snapshot_finalize(
+        &self,
+        request: &SnapshotFinalizeRequest,
+    ) -> Result<SnapshotFinalizeResponse, SyncError> {
+        let body = serde_json::to_string(request).map_err(|err| SyncError::new(err.to_string()))?;
+        let response = self.call_with_rate_limit_retry(|| {
+            self.agent
+                .post(&self.endpoint("/v1/snapshot/finalize"))
+                .header("Authorization", self.auth_header())
+                .header("Content-Type", "application/json")
+                .send(body.clone())
+        })?;
+        read_json_response(response)
+    }
+
     fn call_with_rate_limit_retry<F>(
         &self,
         mut send: F,
@@ -177,6 +205,17 @@ impl SyncTransport for SyncHttpClient {
 
     fn integrity_reports(&self) -> Result<IntegrityReportList, SyncError> {
         SyncHttpClient::integrity_reports(self)
+    }
+
+    fn snapshot_keys(&self, batch: &SnapshotKeyBatch) -> Result<UploadResponse, SyncError> {
+        SyncHttpClient::snapshot_keys(self, batch)
+    }
+
+    fn snapshot_finalize(
+        &self,
+        request: &SnapshotFinalizeRequest,
+    ) -> Result<SnapshotFinalizeResponse, SyncError> {
+        SyncHttpClient::snapshot_finalize(self, request)
     }
 }
 

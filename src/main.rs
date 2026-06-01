@@ -130,6 +130,7 @@ struct VersionCacheEntry {
 enum IntegrityStatus {
     Checking,
     Checked { duration: std::time::Duration },
+    Failed,
 }
 
 struct AppState {
@@ -953,6 +954,19 @@ fn integrity_status_marker(status: IntegrityStatus) -> (String, usize) {
         IntegrityStatus::Checked { duration } => {
             formatting::integrity_checked_marker(&format_integrity_duration(duration))
         }
+        IntegrityStatus::Failed => formatting::integrity_failed_marker(),
+    }
+}
+
+fn integrity_status_from_verification(
+    verification: &sync::integrity::IntegrityVerification,
+    duration: std::time::Duration,
+) -> IntegrityStatus {
+    match verification {
+        sync::integrity::IntegrityVerification::Checked { .. } => {
+            IntegrityStatus::Checked { duration }
+        }
+        sync::integrity::IntegrityVerification::Failed { .. } => IntegrityStatus::Failed,
     }
 }
 
@@ -1036,6 +1050,19 @@ fn format_manual_sync_progress(event: &sync::engine::SyncProgress) -> Option<Str
             max_seq,
         } => Some(format!(
             "sync pull: complete, {pages} pages, {pulled_records} records pulled, latest seq {max_seq}"
+        )),
+        sync::engine::SyncProgress::IntegrityUnsupported => {
+            Some("sync integrity: server does not support integrity reports".to_string())
+        }
+        sync::engine::SyncProgress::IntegrityReportSubmitted {
+            record_count,
+            range_end_utc,
+        } => Some(format!(
+            "sync integrity: submitted {record_count} records through {range_end_utc}"
+        )),
+        sync::engine::SyncProgress::IntegrityCheckFinished { verification } => Some(format!(
+            "sync integrity: {}",
+            format_integrity_verification(verification)
         )),
     }
 }
@@ -1126,6 +1153,14 @@ fn format_monitor_worker_progress(progress: &sync::worker::SyncWorkerProgress) -
             } => format!(
                 "pull complete, {pages} pages, {pulled_records} records pulled, latest seq {max_seq}"
             ),
+            sync::engine::SyncProgress::IntegrityUnsupported => "integrity unsupported".to_string(),
+            sync::engine::SyncProgress::IntegrityReportSubmitted {
+                record_count,
+                range_end_utc,
+            } => format!("integrity submitted {record_count} records through {range_end_utc}"),
+            sync::engine::SyncProgress::IntegrityCheckFinished { verification } => {
+                format!("integrity {}", format_integrity_verification(verification))
+            }
         },
         sync::worker::SyncWorkerProgress::Http(event) => match event {
             sync::client::HttpProgress::RateLimited {
@@ -1136,6 +1171,17 @@ fn format_monitor_worker_progress(progress: &sync::worker::SyncWorkerProgress) -
                 format_retry_duration(*retry_after)
             ),
         },
+    }
+}
+
+fn format_integrity_verification(verification: &sync::integrity::IntegrityVerification) -> String {
+    match verification {
+        sync::integrity::IntegrityVerification::Checked { checked_hosts } => {
+            format!("checked {checked_hosts} hosts")
+        }
+        sync::integrity::IntegrityVerification::Failed { failures } => {
+            format!("failed {} hosts", failures.len())
+        }
     }
 }
 
@@ -2054,27 +2100,49 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                 SyncCommand::Push => {
                     eprintln!("sync push: refreshing local cache");
                     let _ = refresh_all_vendor_raw_full(Some(&config.machine_id));
+                    let mut on_progress = |event: &sync::engine::SyncProgress| {
+                        if let Some(message) = format_manual_sync_progress(event) {
+                            eprintln!("{message}");
+                        }
+                    };
                     sync::engine::run_upload_once_with_progress(
                         &cache_root,
                         &config,
                         &client,
-                        |event| {
-                            if let Some(message) = format_manual_sync_progress(event) {
-                                eprintln!("{message}");
-                            }
-                        },
+                        &mut on_progress,
                     )
+                    .and_then(|()| {
+                        sync::engine::run_integrity_once_with_progress(
+                            &cache_root,
+                            &config,
+                            &client,
+                            &mut on_progress,
+                        )
+                        .map(|_| ())
+                    })
                 }
-                SyncCommand::Pull => sync::engine::run_pull_once_with_progress(
-                    &cache_root,
-                    &config,
-                    &client,
-                    |event| {
+                SyncCommand::Pull => {
+                    let mut on_progress = |event: &sync::engine::SyncProgress| {
                         if let Some(message) = format_manual_sync_progress(event) {
                             eprintln!("{message}");
                         }
-                    },
-                ),
+                    };
+                    sync::engine::run_pull_once_with_progress(
+                        &cache_root,
+                        &config,
+                        &client,
+                        &mut on_progress,
+                    )
+                    .and_then(|()| {
+                        sync::engine::run_integrity_once_with_progress(
+                            &cache_root,
+                            &config,
+                            &client,
+                            &mut on_progress,
+                        )
+                        .map(|_| ())
+                    })
+                }
                 SyncCommand::Clean => run_sync_clean(&cache_root, &config, &client),
                 SyncCommand::Status => unreachable!("status handled above"),
                 SyncCommand::Init { .. } => unreachable!("init handled above"),
@@ -2113,11 +2181,21 @@ fn run_sync_clean(
         }
     );
     eprintln!("sync clean: refetching records from server");
-    sync::engine::run_pull_once_with_progress(cache_root, config, client, |event| {
+    let mut on_progress = |event: &sync::engine::SyncProgress| {
         if let Some(message) = format_manual_sync_progress(event) {
             eprintln!("{message}");
         }
-    })
+    };
+    sync::engine::run_pull_once_with_progress(cache_root, config, client, &mut on_progress)
+        .and_then(|()| {
+            sync::engine::run_integrity_once_with_progress(
+                cache_root,
+                config,
+                client,
+                &mut on_progress,
+            )
+            .map(|_| ())
+        })
 }
 
 fn print_sync_status(sync_config: &sync::config::SyncConfig) {
@@ -2382,6 +2460,21 @@ fn main() {
                 poll_sync_worker_status(sync_worker.as_ref(), &mut observed_sync_revision)
             {
                 let mut redrew_display = false;
+                if sync_stats.running {
+                    state.integrity_status = IntegrityStatus::Checking;
+                    state
+                        .integrity_started_at
+                        .get_or_insert_with(std::time::Instant::now);
+                }
+                if let Some(verification) = sync_stats.integrity_verification.as_ref() {
+                    let duration = state
+                        .integrity_started_at
+                        .take()
+                        .map(|started_at| started_at.elapsed())
+                        .unwrap_or_default();
+                    state.integrity_status =
+                        integrity_status_from_verification(verification, duration);
+                }
                 if !sync_stats.running
                     && sync_stats.last_error.is_none()
                     && sync_stats.success_count > 0
@@ -3376,6 +3469,39 @@ mod tests {
         assert_eq!(
             checked_s_visible,
             "Integrity Checked in 1.23 s".chars().count()
+        );
+
+        let (failed, failed_visible) = integrity_status_marker(IntegrityStatus::Failed);
+        assert!(failed.contains("\x1b[38;5;203mIntegrity Failed\x1b[0m"));
+        assert_eq!(failed_visible, "Integrity Failed".chars().count());
+    }
+
+    #[test]
+    fn sync_integrity_verification_maps_to_prompt_status() {
+        let duration = std::time::Duration::from_millis(12);
+        assert_eq!(
+            integrity_status_from_verification(
+                &sync::integrity::IntegrityVerification::Checked { checked_hosts: 2 },
+                duration,
+            ),
+            IntegrityStatus::Checked { duration }
+        );
+
+        assert_eq!(
+            integrity_status_from_verification(
+                &sync::integrity::IntegrityVerification::Failed {
+                    failures: vec![sync::integrity::IntegrityFailure {
+                        host_id: "laptop".to_string(),
+                        range_end_utc: "2026-06-01T00:00:00Z".to_string(),
+                        expected_record_count: 1,
+                        actual_record_count: 0,
+                        expected_digest_sha256: "a".repeat(64),
+                        actual_digest_sha256: "b".repeat(64),
+                    }],
+                },
+                duration,
+            ),
+            IntegrityStatus::Failed
         );
     }
 

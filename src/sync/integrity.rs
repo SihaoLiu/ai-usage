@@ -1,0 +1,494 @@
+use crate::data::UsageEntry;
+use crate::data::cache::{self, CachedUsageRecord, RemoteUsageRecord};
+use crate::sync::config::EnabledSyncConfig;
+use crate::sync::engine::{SUPPORTED_PULL_VENDORS, SyncError};
+use chrono::{DateTime, SecondsFormat, Timelike, Utc};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::path::Path;
+use vibe_usage_proto::{INTEGRITY_ALGORITHM, IntegrityReport};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntegrityVerification {
+    Checked { checked_hosts: usize },
+    Failed { failures: Vec<IntegrityFailure> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrityFailure {
+    pub host_id: String,
+    pub range_end_utc: String,
+    pub expected_record_count: u64,
+    pub actual_record_count: u64,
+    pub expected_digest_sha256: String,
+    pub actual_digest_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct CanonicalIntegrityRecord {
+    host_id: String,
+    vendor: String,
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
+    effort: Option<String>,
+    fast_tier: i8,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+    cost_input: Option<f64>,
+    cost_output: Option<f64>,
+    cost_cache_read: Option<f64>,
+    cost_cache_creation: Option<f64>,
+}
+
+impl Eq for CanonicalIntegrityRecord {}
+
+impl PartialOrd for CanonicalIntegrityRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CanonicalIntegrityRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.host_id
+            .cmp(&other.host_id)
+            .then_with(|| self.vendor.cmp(&other.vendor))
+            .then_with(|| self.dedup_key.cmp(&other.dedup_key))
+            .then_with(|| self.timestamp.cmp(&other.timestamp))
+    }
+}
+
+pub fn integrity_range_end_utc(now: DateTime<Utc>) -> DateTime<Utc> {
+    now.with_hour(0)
+        .and_then(|value| value.with_minute(0))
+        .and_then(|value| value.with_second(0))
+        .and_then(|value| value.with_nanosecond(0))
+        .expect("UTC midnight is valid")
+}
+
+pub fn build_local_report_at(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    now: DateTime<Utc>,
+    computed_at: DateTime<Utc>,
+) -> Result<IntegrityReport, SyncError> {
+    build_local_report_for_range(
+        cache_root,
+        config,
+        integrity_range_end_utc(now),
+        computed_at,
+    )
+}
+
+pub fn build_local_report_for_range(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    range_end_utc: DateTime<Utc>,
+    computed_at: DateTime<Utc>,
+) -> Result<IntegrityReport, SyncError> {
+    let mut records = Vec::new();
+    for vendor in SUPPORTED_PULL_VENDORS {
+        records.extend(
+            cache::load_vendor_cached_records(cache_root, vendor)
+                .into_iter()
+                .map(|record| local_canonical_record(&config.machine_id, record)),
+        );
+    }
+    build_report_from_records(&config.machine_id, records, range_end_utc, computed_at)
+}
+
+pub fn build_remote_report_at(
+    cache_root: &Path,
+    host_id: &str,
+    range_end_utc: DateTime<Utc>,
+    computed_at: DateTime<Utc>,
+) -> Result<IntegrityReport, SyncError> {
+    let hosts = HashSet::from([host_id.to_string()]);
+    let records = cache::load_remote_entries(cache_root, Some(&hosts))
+        .into_iter()
+        .map(remote_canonical_record)
+        .collect::<Vec<_>>();
+    build_report_from_records(host_id, records, range_end_utc, computed_at)
+}
+
+pub fn verify_remote_reports_at(
+    cache_root: &Path,
+    local_host_id: &str,
+    reports: &[IntegrityReport],
+    computed_at: DateTime<Utc>,
+) -> Result<IntegrityVerification, SyncError> {
+    let mut checked_hosts = 0usize;
+    let mut failures = Vec::new();
+
+    for report in reports {
+        report
+            .validate()
+            .map_err(|err| SyncError::new(format!("invalid integrity report: {err}")))?;
+        if report.host_id == local_host_id {
+            continue;
+        }
+        let range_end_utc = DateTime::parse_from_rfc3339(&report.range_end_utc)
+            .map_err(|err| SyncError::new(format!("invalid integrity range end: {err}")))?
+            .with_timezone(&Utc);
+        let actual =
+            build_remote_report_at(cache_root, &report.host_id, range_end_utc, computed_at)?;
+        checked_hosts += 1;
+        if actual.digest_sha256 != report.digest_sha256
+            || actual.record_count != report.record_count
+        {
+            failures.push(IntegrityFailure {
+                host_id: report.host_id.clone(),
+                range_end_utc: report.range_end_utc.clone(),
+                expected_record_count: report.record_count,
+                actual_record_count: actual.record_count,
+                expected_digest_sha256: report.digest_sha256.clone(),
+                actual_digest_sha256: actual.digest_sha256,
+            });
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(IntegrityVerification::Checked { checked_hosts })
+    } else {
+        Ok(IntegrityVerification::Failed { failures })
+    }
+}
+
+fn build_report_from_records(
+    host_id: &str,
+    records: Vec<CanonicalIntegrityRecord>,
+    range_end_utc: DateTime<Utc>,
+    computed_at: DateTime<Utc>,
+) -> Result<IntegrityReport, SyncError> {
+    let (record_count, digest_sha256) = digest_records(records, range_end_utc)?;
+    let report = IntegrityReport {
+        host_id: host_id.to_string(),
+        algorithm: INTEGRITY_ALGORITHM.to_string(),
+        range_end_utc: format_utc_timestamp(range_end_utc),
+        record_count,
+        digest_sha256,
+        computed_at: format_utc_timestamp(computed_at),
+    };
+    report
+        .validate()
+        .map_err(|err| SyncError::new(format!("invalid integrity report: {err}")))?;
+    Ok(report)
+}
+
+fn digest_records(
+    records: Vec<CanonicalIntegrityRecord>,
+    range_end_utc: DateTime<Utc>,
+) -> Result<(u64, String), SyncError> {
+    let mut stable_records = records
+        .into_iter()
+        .filter_map(
+            |record| match DateTime::parse_from_rfc3339(&record.timestamp) {
+                Ok(timestamp) if timestamp.with_timezone(&Utc) < range_end_utc => Some(Ok(record)),
+                Ok(_) => None,
+                Err(err) => Some(Err(SyncError::new(format!(
+                    "invalid integrity record timestamp: {err}"
+                )))),
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    stable_records.sort();
+
+    let mut hasher = Sha256::new();
+    for record in &stable_records {
+        let bytes = serde_json::to_vec(record)
+            .map_err(|err| SyncError::new(format!("serialize integrity record: {err}")))?;
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let digest = hasher.finalize();
+    Ok((
+        stable_records.len() as u64,
+        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+    ))
+}
+
+fn local_canonical_record(host_id: &str, record: CachedUsageRecord) -> CanonicalIntegrityRecord {
+    canonical_record(
+        host_id.to_string(),
+        record.vendor,
+        record.dedup_key,
+        record.entry,
+    )
+}
+
+fn remote_canonical_record(record: RemoteUsageRecord) -> CanonicalIntegrityRecord {
+    let host_id = record.entry.host_id.clone().unwrap_or_default();
+    canonical_record(host_id, record.vendor, record.dedup_key, record.entry)
+}
+
+fn canonical_record(
+    host_id: String,
+    vendor: String,
+    dedup_key: String,
+    entry: UsageEntry,
+) -> CanonicalIntegrityRecord {
+    CanonicalIntegrityRecord {
+        host_id,
+        vendor,
+        dedup_key,
+        timestamp: entry.timestamp,
+        session_start_time: entry.session_start_time,
+        session_end_time: entry.session_end_time,
+        model: entry.model,
+        effort: entry.effort,
+        fast_tier: entry.fast_tier,
+        input_tokens: entry.usage.input_tokens,
+        output_tokens: entry.usage.output_tokens,
+        cache_read_input_tokens: entry.usage.cache_read_input_tokens,
+        cache_creation_input_tokens: entry.usage.cache_creation_input_tokens,
+        reasoning_output_tokens: entry.usage.reasoning_output_tokens,
+        cost_input: entry.costs.map(|costs| costs.input),
+        cost_output: entry.costs.map(|costs| costs.output),
+        cost_cache_read: entry.costs.map(|costs| costs.cache_read),
+        cost_cache_creation: entry.costs.map(|costs| costs.cache_creation),
+    }
+}
+
+fn format_utc_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::data::cache;
+    use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
+    use crate::sync::config::EnabledSyncConfig;
+    use chrono::{SecondsFormat, TimeZone, Utc};
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("vibe-usage-integrity-test-{name}-{stamp}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn enabled_config(machine_id: &str) -> EnabledSyncConfig {
+        EnabledSyncConfig {
+            server_url: "https://usage.example.com".to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_string(),
+            machine_id: machine_id.to_string(),
+            upload_project_hash: true,
+            request_timeout_seconds: 15,
+        }
+    }
+
+    fn usage_record(dedup_key: &str, timestamp: &str, input_tokens: i64) -> SourceUsageRecord {
+        SourceUsageRecord {
+            dedup_key: dedup_key.to_string(),
+            entry: UsageEntry {
+                host_id: None,
+                timestamp: timestamp.to_string(),
+                parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
+                session_start_time: timestamp.to_string(),
+                session_end_time: timestamp.to_string(),
+                model: "test-model".to_string(),
+                effort: Some("high".to_string()),
+                fast_tier: -1,
+                usage: TokenUsage {
+                    input_tokens,
+                    output_tokens: 2,
+                    cache_read_input_tokens: 3,
+                    cache_creation_input_tokens: 4,
+                    reasoning_output_tokens: 5,
+                },
+                costs: None,
+            },
+        }
+    }
+
+    fn populate_local(cache_root: &Path, records: Vec<SourceUsageRecord>) {
+        let source = cache_root.join("claude.jsonl");
+        std::fs::write(&source, "source").expect("write source");
+        cache::load_or_update_vendor_cache(cache_root, "claude", vec![source], 1, |_| {
+            records.clone()
+        });
+    }
+
+    fn remote_record(
+        host_id: &str,
+        dedup_key: &str,
+        timestamp: &str,
+        input_tokens: i64,
+    ) -> cache::RemoteUsageRecord {
+        let mut record = usage_record(dedup_key, timestamp, input_tokens);
+        record.entry.host_id = Some(host_id.to_string());
+        record.entry.fast_tier = 1;
+        cache::RemoteUsageRecord {
+            vendor: "claude".to_string(),
+            dedup_key: record.dedup_key,
+            entry: record.entry,
+        }
+    }
+
+    #[test]
+    fn integrity_range_end_uses_current_utc_midnight() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 1, 23, 59, 59)
+            .single()
+            .expect("valid timestamp");
+
+        let range_end = super::integrity_range_end_utc(now);
+
+        assert_eq!(
+            range_end.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2026-06-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn integrity_digest_matches_between_local_and_remote_stable_records() {
+        let cache_root = unique_temp_dir("local-remote");
+        populate_local(
+            &cache_root,
+            vec![
+                usage_record("stable-a", "2026-05-31T23:59:59Z", 10),
+                usage_record("cutoff", "2026-06-01T00:00:00Z", 20),
+                usage_record("current", "2026-06-01T12:00:00Z", 30),
+            ],
+        );
+        cache::merge_remote_records(
+            &cache_root,
+            "host-a",
+            vec![
+                remote_record("host-a", "stable-a", "2026-05-31T23:59:59Z", 10),
+                remote_record("host-a", "cutoff", "2026-06-01T00:00:00Z", 20),
+                remote_record("host-a", "current", "2026-06-01T12:00:00Z", 30),
+            ],
+        )
+        .expect("merge remote records");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let computed_at = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 1)
+            .single()
+            .expect("valid timestamp");
+
+        let local =
+            super::build_local_report_at(&cache_root, &enabled_config("host-a"), now, computed_at)
+                .expect("local report");
+        let remote = super::build_remote_report_at(
+            &cache_root,
+            "host-a",
+            super::integrity_range_end_utc(now),
+            computed_at,
+        )
+        .expect("remote report");
+
+        assert_eq!(local.record_count, 1);
+        assert_eq!(local.digest_sha256, remote.digest_sha256);
+        assert_eq!(local.range_end_utc, "2026-06-01T00:00:00Z");
+    }
+
+    #[test]
+    fn integrity_verification_compares_remote_records_with_owner_report() {
+        let cache_root = unique_temp_dir("verify-match");
+        cache::merge_remote_records(
+            &cache_root,
+            "host-a",
+            vec![remote_record(
+                "host-a",
+                "stable-a",
+                "2026-05-31T23:59:59Z",
+                10,
+            )],
+        )
+        .expect("merge remote records");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let computed_at = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 1)
+            .single()
+            .expect("valid timestamp");
+        let owner_report = super::build_remote_report_at(
+            &cache_root,
+            "host-a",
+            super::integrity_range_end_utc(now),
+            computed_at,
+        )
+        .expect("owner report");
+
+        let verification =
+            super::verify_remote_reports_at(&cache_root, "host-b", &[owner_report], computed_at)
+                .expect("verify reports");
+
+        assert_eq!(
+            verification,
+            super::IntegrityVerification::Checked { checked_hosts: 1 }
+        );
+    }
+
+    #[test]
+    fn integrity_verification_fails_when_remote_records_do_not_match_owner_report() {
+        let owner_cache = unique_temp_dir("owner-report");
+        let viewer_cache = unique_temp_dir("viewer-mismatch");
+        cache::merge_remote_records(
+            &owner_cache,
+            "host-a",
+            vec![remote_record(
+                "host-a",
+                "stable-a",
+                "2026-05-31T23:59:59Z",
+                10,
+            )],
+        )
+        .expect("merge owner records");
+        cache::merge_remote_records(
+            &viewer_cache,
+            "host-a",
+            vec![remote_record(
+                "host-a",
+                "stable-a",
+                "2026-05-31T23:59:59Z",
+                99,
+            )],
+        )
+        .expect("merge viewer records");
+        let range_end = super::integrity_range_end_utc(
+            Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0)
+                .single()
+                .expect("valid timestamp"),
+        );
+        let computed_at = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 1)
+            .single()
+            .expect("valid timestamp");
+        let owner_report =
+            super::build_remote_report_at(&owner_cache, "host-a", range_end, computed_at)
+                .expect("owner report");
+
+        let verification =
+            super::verify_remote_reports_at(&viewer_cache, "host-b", &[owner_report], computed_at)
+                .expect("verify reports");
+
+        match verification {
+            super::IntegrityVerification::Failed { failures } => {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].host_id, "host-a");
+                assert_eq!(failures[0].expected_record_count, 1);
+                assert_eq!(failures[0].actual_record_count, 1);
+            }
+            other => panic!("expected failed verification, got {other:?}"),
+        }
+    }
+}

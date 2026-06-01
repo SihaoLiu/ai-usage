@@ -10,7 +10,7 @@
 - Display commands merge local and remote records, so existing charts and breakdowns keep the same shape.
 - `--host <machine_id>` filters the merged view to one machine.
 
-The server is intended for one user operating their own endpoint. It stores records in SQLite and exposes `/v1/upload`, `/v1/pull`, `/v1/machines`, and `/v1/health`.
+The server is intended for one user operating their own endpoint. It stores records in SQLite and exposes `/v1/upload`, `/v1/pull`, `/v1/machines`, `/v1/integrity/report`, `/v1/integrity/reports`, and `/v1/health`.
 
 ## Server Setup
 
@@ -120,6 +120,14 @@ vibe-usage sync status
 ```
 
 Normal monitor mode starts a background sync worker after local cache refreshes when sync is enabled. If the secrets file is missing, invalid, or too widely readable, sync is disabled and the rest of the CLI continues to work.
+
+## Integrity Checks
+
+Each sync cycle computes a SHA-256 digest for the machine's own cached records, submits that report to the server, downloads the other machine reports, and recomputes the same digest over the pulled remote cache for each reported host. The monitor prompt shows `Integrity Checked` when the local remote-cache digest matches the host's own server report, and `Integrity Failed` when any reported host differs.
+
+The checked range is independent of local time zones. Clients include records with RFC3339 timestamps earlier than the current UTC day's `00:00:00Z` boundary, so every machine checks the same complete UTC-day prefix and avoids the still-changing current UTC day. The digest uses normalized usage fields that both local and remote caches persist, including vendor, dedup key, timestamps, model, effort, fast tier, token counts, and embedded costs. It does not include local source file paths or project hashes.
+
+`vibe-usage sync push` refreshes local caches, uploads records, and submits the local integrity report. `vibe-usage sync pull` downloads remote records and verifies them against the reports stored on the server. Older servers that do not expose the integrity endpoints still allow record push and pull, but they cannot produce a checked integrity result until upgraded.
 
 ## Viewing Data
 

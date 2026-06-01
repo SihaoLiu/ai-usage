@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
-use vibe_usage_proto::{PullResponse, UploadResponse, WireRecord};
+use vibe_usage_proto::{
+    IntegrityReport, IntegrityReportList, IntegritySubmitResponse, PullResponse, UploadResponse,
+    WireRecord,
+};
 
 pub const SUPPORTED_PULL_VENDORS: [&str; 4] = ["claude", "codex", "gemini", "omp"];
 const VENDORS: [&str; 4] = SUPPORTED_PULL_VENDORS;
@@ -57,6 +60,14 @@ pub enum SyncProgress {
         pulled_records: usize,
         max_seq: u64,
     },
+    IntegrityUnsupported,
+    IntegrityReportSubmitted {
+        record_count: u64,
+        range_end_utc: String,
+    },
+    IntegrityCheckFinished {
+        verification: crate::sync::integrity::IntegrityVerification,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +105,15 @@ pub trait SyncTransport {
         exclude_host: &str,
         limit: usize,
     ) -> Result<PullResponse, SyncError>;
+    fn submit_integrity_report(
+        &self,
+        _report: &IntegrityReport,
+    ) -> Result<IntegritySubmitResponse, SyncError> {
+        Err(SyncError::new("integrity unsupported"))
+    }
+    fn integrity_reports(&self) -> Result<IntegrityReportList, SyncError> {
+        Err(SyncError::new("integrity unsupported"))
+    }
 }
 
 #[cfg(test)]
@@ -115,7 +135,9 @@ where
     F: FnMut(&SyncProgress),
 {
     run_upload_once_with_progress(cache_root, config, transport, &mut on_progress)?;
-    run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)
+    run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+    run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+    Ok(())
 }
 
 pub fn run_upload_once_with_progress<F>(
@@ -391,6 +413,56 @@ where
     Ok(())
 }
 
+pub fn run_integrity_once_with_progress<F>(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    transport: &impl SyncTransport,
+    mut on_progress: F,
+) -> Result<Option<crate::sync::integrity::IntegrityVerification>, SyncError>
+where
+    F: FnMut(&SyncProgress),
+{
+    let now = Utc::now();
+    let local_report = crate::sync::integrity::build_local_report_at(cache_root, config, now, now)?;
+    match transport.submit_integrity_report(&local_report) {
+        Ok(_) => on_progress(&SyncProgress::IntegrityReportSubmitted {
+            record_count: local_report.record_count,
+            range_end_utc: local_report.range_end_utc.clone(),
+        }),
+        Err(err) if is_unsupported_integrity_error(&err) => {
+            on_progress(&SyncProgress::IntegrityUnsupported);
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    }
+
+    let reports = match transport.integrity_reports() {
+        Ok(reports) => reports,
+        Err(err) if is_unsupported_integrity_error(&err) => {
+            on_progress(&SyncProgress::IntegrityUnsupported);
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let verification = crate::sync::integrity::verify_remote_reports_at(
+        cache_root,
+        &config.machine_id,
+        &reports.reports,
+        now,
+    )?;
+    on_progress(&SyncProgress::IntegrityCheckFinished {
+        verification: verification.clone(),
+    });
+    Ok(Some(verification))
+}
+
+fn is_unsupported_integrity_error(err: &SyncError) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("integrity unsupported")
+        || message.contains("http status: 404")
+        || message.contains("http status: 405")
+}
+
 fn cached_record_to_wire(
     config: &EnabledSyncConfig,
     record: &CachedUsageRecord,
@@ -509,6 +581,8 @@ mod tests {
         uploads: RefCell<Vec<Vec<WireRecord>>>,
         pulls: RefCell<Vec<PullResponse>>,
         pull_requests: RefCell<Vec<(u64, String, usize)>>,
+        integrity_submissions: RefCell<Vec<IntegrityReport>>,
+        integrity_reports: RefCell<Vec<IntegrityReport>>,
     }
 
     struct RejectOmpTransport {
@@ -521,6 +595,15 @@ mod tests {
                 uploads: RefCell::new(Vec::new()),
                 pulls: RefCell::new(pulls),
                 pull_requests: RefCell::new(Vec::new()),
+                integrity_submissions: RefCell::new(Vec::new()),
+                integrity_reports: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn new_with_integrity(pulls: Vec<PullResponse>, reports: Vec<IntegrityReport>) -> Self {
+            Self {
+                integrity_reports: RefCell::new(reports),
+                ..Self::new(pulls)
             }
         }
     }
@@ -545,6 +628,20 @@ mod tests {
                 .borrow_mut()
                 .push((after_seq, exclude_host.to_string(), limit));
             Ok(self.pulls.borrow_mut().remove(0))
+        }
+
+        fn submit_integrity_report(
+            &self,
+            report: &IntegrityReport,
+        ) -> Result<IntegritySubmitResponse, SyncError> {
+            self.integrity_submissions.borrow_mut().push(report.clone());
+            Ok(IntegritySubmitResponse { accepted: true })
+        }
+
+        fn integrity_reports(&self) -> Result<IntegrityReportList, SyncError> {
+            Ok(IntegrityReportList {
+                reports: self.integrity_reports.borrow().clone(),
+            })
         }
     }
 
@@ -670,6 +767,37 @@ mod tests {
                     .collect()
             },
         );
+    }
+
+    fn remote_usage_record(
+        host_id: &str,
+        vendor: &str,
+        dedup_key: &str,
+        timestamp: &str,
+        input_tokens: i64,
+    ) -> crate::data::cache::RemoteUsageRecord {
+        crate::data::cache::RemoteUsageRecord {
+            vendor: vendor.to_string(),
+            dedup_key: dedup_key.to_string(),
+            entry: UsageEntry {
+                host_id: Some(host_id.to_string()),
+                timestamp: timestamp.to_string(),
+                parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
+                session_start_time: timestamp.to_string(),
+                session_end_time: timestamp.to_string(),
+                model: "remote-model".to_string(),
+                effort: None,
+                fast_tier: 1,
+                usage: TokenUsage {
+                    input_tokens,
+                    output_tokens: 2,
+                    cache_read_input_tokens: 3,
+                    cache_creation_input_tokens: 4,
+                    reasoning_output_tokens: 5,
+                },
+                costs: None,
+            },
+        }
     }
 
     fn enabled_config(machine_id: &str) -> crate::sync::config::EnabledSyncConfig {
@@ -1031,6 +1159,88 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn sync_cycle_submits_local_integrity_report_and_verifies_remote_reports() {
+        let cache_root = unique_temp_dir("integrity-cycle");
+        let owner_cache = unique_temp_dir("integrity-owner");
+        populate_vendor_cache(&cache_root, "claude", "local-a");
+        crate::data::cache::merge_remote_records(
+            &owner_cache,
+            "laptop",
+            vec![remote_usage_record(
+                "laptop",
+                "claude",
+                "remote-a",
+                "2000-01-01T00:00:00Z",
+                10,
+            )],
+        )
+        .expect("seed owner cache");
+        let range_end = crate::sync::integrity::integrity_range_end_utc(Utc::now());
+        let owner_report = crate::sync::integrity::build_remote_report_at(
+            &owner_cache,
+            "laptop",
+            range_end,
+            Utc::now(),
+        )
+        .expect("owner report");
+        let pulled = SequencedWireRecord {
+            seq: 1,
+            uploaded_at: "2000-01-01T00:00:01Z".to_string(),
+            record: WireRecord {
+                schema_version: SCHEMA_VERSION,
+                host_id: "laptop".to_string(),
+                vendor: "claude".to_string(),
+                dedup_key: "remote-a".to_string(),
+                timestamp: "2000-01-01T00:00:00Z".to_string(),
+                session_start_time: "2000-01-01T00:00:00Z".to_string(),
+                session_end_time: "2000-01-01T00:00:00Z".to_string(),
+                model: "remote-model".to_string(),
+                effort: None,
+                fast_tier: 1,
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_input_tokens: 3,
+                cache_creation_input_tokens: 4,
+                reasoning_output_tokens: 5,
+                cost_input: None,
+                cost_output: None,
+                cost_cache_read: None,
+                cost_cache_creation: None,
+                project_path_sha256: None,
+            },
+        };
+        let transport = FakeTransport::new_with_integrity(
+            vec![PullResponse {
+                records: vec![pulled],
+                max_seq: 1,
+                truncated: false,
+            }],
+            vec![owner_report],
+        );
+        let mut events = Vec::new();
+
+        run_sync_cycle_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |event| events.push(event.clone()),
+        )
+        .expect("sync cycle");
+
+        assert_eq!(transport.integrity_submissions.borrow().len(), 1);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                SyncProgress::IntegrityCheckFinished {
+                    verification: crate::sync::integrity::IntegrityVerification::Checked {
+                        checked_hosts: 1
+                    }
+                }
+            )
+        }));
     }
 
     #[test]

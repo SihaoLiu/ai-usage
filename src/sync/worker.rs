@@ -27,6 +27,7 @@ pub struct SyncStats {
     pub last_finished_at: Option<String>,
     pub last_error: Option<String>,
     pub progress: Option<SyncWorkerProgress>,
+    pub integrity_verification: Option<crate::sync::integrity::IntegrityVerification>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +239,11 @@ impl WorkerShared {
 
     fn mark_progress(&self, progress: SyncWorkerProgress) {
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if let SyncWorkerProgress::Sync(SyncProgress::IntegrityCheckFinished { verification }) =
+            &progress
+        {
+            inner.stats.integrity_verification = Some(verification.clone());
+        }
         inner.stats.progress = Some(progress);
         inner.stats.revision += 1;
     }
@@ -449,5 +455,22 @@ mod tests {
         assert_eq!(stats.error_count, 1);
         assert_eq!(stats.success_count, 1);
         worker.shutdown();
+    }
+
+    #[test]
+    fn worker_preserves_integrity_verification_after_success() {
+        let shared = WorkerShared::new();
+        let verification =
+            crate::sync::integrity::IntegrityVerification::Checked { checked_hosts: 1 };
+
+        shared.mark_running();
+        shared.mark_progress(SyncWorkerProgress::Sync(
+            SyncProgress::IntegrityCheckFinished {
+                verification: verification.clone(),
+            },
+        ));
+        shared.mark_success();
+
+        assert_eq!(shared.stats().integrity_verification, Some(verification));
     }
 }

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const INTEGRITY_ALGORITHM: &str = "usage-record-sha256-v1";
 
 fn default_fast_tier() -> i8 {
     -1
@@ -79,6 +80,26 @@ pub struct HealthResponse {
     pub uptime_seconds: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityReport {
+    pub host_id: String,
+    pub algorithm: String,
+    pub range_end_utc: String,
+    pub record_count: u64,
+    pub digest_sha256: String,
+    pub computed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegritySubmitResponse {
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityReportList {
+    pub reports: Vec<IntegrityReport>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     UnsupportedSchemaVersion(u32),
@@ -90,6 +111,8 @@ pub enum ValidationError {
     NegativeTokenCount(&'static str),
     InvalidCost(&'static str),
     InvalidProjectHash,
+    InvalidIntegrityAlgorithm,
+    InvalidDigest,
 }
 
 impl fmt::Display for ValidationError {
@@ -106,6 +129,8 @@ impl fmt::Display for ValidationError {
             Self::NegativeTokenCount(field) => write!(f, "{field} must be non-negative"),
             Self::InvalidCost(field) => write!(f, "{field} must be finite and non-negative"),
             Self::InvalidProjectHash => f.write_str("project_path_sha256 must be lowercase hex"),
+            Self::InvalidIntegrityAlgorithm => f.write_str("invalid integrity algorithm"),
+            Self::InvalidDigest => f.write_str("digest_sha256 must be lowercase hex"),
         }
     }
 }
@@ -169,6 +194,18 @@ impl SequencedWireRecord {
     }
 }
 
+impl IntegrityReport {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_host_id(&self.host_id)?;
+        if self.algorithm != INTEGRITY_ALGORITHM {
+            return Err(ValidationError::InvalidIntegrityAlgorithm);
+        }
+        validate_required_utc_timestamp("range_end_utc", &self.range_end_utc)?;
+        validate_digest(&self.digest_sha256)?;
+        validate_required_utc_timestamp("computed_at", &self.computed_at)
+    }
+}
+
 pub fn is_valid_host_id(host_id: &str) -> bool {
     !host_id.is_empty()
         && host_id.len() <= 64
@@ -228,6 +265,20 @@ fn validate_required_timestamp(field: &'static str, value: &str) -> Result<(), V
     Ok(())
 }
 
+fn validate_required_utc_timestamp(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ValidationError> {
+    validate_required_text(field, value, 64)?;
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| ValidationError::InvalidTimestamp(field))?;
+    if parsed.offset().local_minus_utc() == 0 {
+        Ok(())
+    } else {
+        Err(ValidationError::InvalidTimestamp(field))
+    }
+}
+
 fn validate_project_hash(hash: &str) -> Result<(), ValidationError> {
     if hash.len() == 64
         && hash
@@ -237,6 +288,18 @@ fn validate_project_hash(hash: &str) -> Result<(), ValidationError> {
         Ok(())
     } else {
         Err(ValidationError::InvalidProjectHash)
+    }
+}
+
+fn validate_digest(digest: &str) -> Result<(), ValidationError> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(ValidationError::InvalidDigest)
     }
 }
 
@@ -409,5 +472,34 @@ mod tests {
 
             assert!(record.validate().is_err(), "hash={hash:?}");
         }
+    }
+
+    #[test]
+    fn integrity_report_validates_algorithm_host_timestamps_and_digest() {
+        let report = IntegrityReport {
+            host_id: "workstation-home".to_string(),
+            algorithm: INTEGRITY_ALGORITHM.to_string(),
+            range_end_utc: "2026-06-01T00:00:00Z".to_string(),
+            record_count: 2,
+            digest_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            computed_at: "2026-06-01T12:00:00Z".to_string(),
+        };
+        report.validate().expect("valid integrity report");
+
+        let mut invalid_algorithm = report.clone();
+        invalid_algorithm.algorithm = "other".to_string();
+        assert_eq!(
+            invalid_algorithm.validate(),
+            Err(ValidationError::InvalidIntegrityAlgorithm)
+        );
+
+        let mut invalid_digest = report.clone();
+        invalid_digest.digest_sha256 =
+            "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        assert_eq!(
+            invalid_digest.validate(),
+            Err(ValidationError::InvalidDigest)
+        );
     }
 }

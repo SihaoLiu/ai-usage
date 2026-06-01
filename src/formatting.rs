@@ -268,6 +268,7 @@ const ROW_PCT_COLOR: &str = "\x1b[33m"; // yellow
 const WATERMARK_COLOR: &str = "\x1b[38;5;240m"; // muted gray for background watermark
 const INTEGRITY_CHECKING_COLOR: &str = "\x1b[38;5;143m"; // muted yellow
 const INTEGRITY_CHECKED_COLOR: &str = "\x1b[38;5;108m"; // muted green
+const INTEGRITY_FAILED_COLOR: &str = "\x1b[38;5;203m"; // muted red
 const COLOR_RESET: &str = "\x1b[0m";
 
 /// Format a remaining duration as a zero-padded `HH:MM:SS` countdown string.
@@ -312,6 +313,10 @@ pub fn integrity_checked_marker(duration: &str) -> (String, usize) {
         &format!("Integrity Checked in {duration}"),
         INTEGRITY_CHECKED_COLOR,
     )
+}
+
+pub fn integrity_failed_marker() -> (String, usize) {
+    colored_prompt_placeholder("Integrity Failed", INTEGRITY_FAILED_COLOR)
 }
 
 fn colored_prompt_placeholder(text: &str, color: &str) -> (String, usize) {

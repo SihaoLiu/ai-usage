@@ -33,3 +33,16 @@ CREATE TABLE IF NOT EXISTS machines (
     last_seen    TEXT NOT NULL,
     record_count INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS integrity_reports (
+    host_id        TEXT NOT NULL,
+    algorithm      TEXT NOT NULL,
+    range_end_utc  TEXT NOT NULL,
+    record_count   INTEGER NOT NULL,
+    digest_sha256  TEXT NOT NULL,
+    computed_at    TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    PRIMARY KEY(host_id, algorithm)
+);
+
+CREATE INDEX IF NOT EXISTS idx_integrity_reports_host ON integrity_reports(host_id);

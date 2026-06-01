@@ -3,7 +3,10 @@ use crate::sync::engine::{SUPPORTED_PULL_VENDORS, SyncError, SyncTransport};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
-use vibe_usage_proto::{MachineList, PullResponse, UploadResponse, WireRecord};
+use vibe_usage_proto::{
+    IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineList, PullResponse,
+    UploadResponse, WireRecord,
+};
 
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
 const DEFAULT_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_millis(1100);
@@ -66,6 +69,31 @@ impl SyncHttpClient {
         let response = self.call_with_rate_limit_retry(|| {
             self.agent
                 .get(&self.endpoint("/v1/machines"))
+                .header("Authorization", self.auth_header())
+                .call()
+        })?;
+        read_json_response(response)
+    }
+
+    pub fn submit_integrity_report(
+        &self,
+        report: &IntegrityReport,
+    ) -> Result<IntegritySubmitResponse, SyncError> {
+        let body = serde_json::to_string(report).map_err(|err| SyncError::new(err.to_string()))?;
+        let response = self.call_with_rate_limit_retry(|| {
+            self.agent
+                .post(&self.endpoint("/v1/integrity/report"))
+                .header("Authorization", self.auth_header())
+                .header("Content-Type", "application/json")
+                .send(body.clone())
+        })?;
+        read_json_response(response)
+    }
+
+    pub fn integrity_reports(&self) -> Result<IntegrityReportList, SyncError> {
+        let response = self.call_with_rate_limit_retry(|| {
+            self.agent
+                .get(&self.endpoint("/v1/integrity/reports"))
                 .header("Authorization", self.auth_header())
                 .call()
         })?;
@@ -139,6 +167,17 @@ impl SyncTransport for SyncHttpClient {
         })?;
         read_json_response(response)
     }
+
+    fn submit_integrity_report(
+        &self,
+        report: &IntegrityReport,
+    ) -> Result<IntegritySubmitResponse, SyncError> {
+        SyncHttpClient::submit_integrity_report(self, report)
+    }
+
+    fn integrity_reports(&self) -> Result<IntegrityReportList, SyncError> {
+        SyncHttpClient::integrity_reports(self)
+    }
 }
 
 fn read_json_response<T: DeserializeOwned>(
@@ -191,7 +230,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use vibe_usage_proto::{SCHEMA_VERSION, WireRecord};
+    use vibe_usage_proto::{INTEGRITY_ALGORITHM, IntegrityReport, SCHEMA_VERSION, WireRecord};
     use vibe_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -378,6 +417,48 @@ mod tests {
         assert_eq!(pull.records.len(), 1);
         assert_eq!(pull.records[0].record.vendor, "omp");
         assert_eq!(pull.records[0].record.dedup_key, "remote-omp-a");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_submits_and_lists_integrity_reports() {
+        let state = AppState::new(server_config("transport-integrity")).expect("server state");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, build_app(state))
+                .await
+                .expect("server");
+        });
+        let client = SyncHttpClient::new(client_config(format!("http://{addr}")));
+        let report = IntegrityReport {
+            host_id: "workstation".to_string(),
+            algorithm: INTEGRITY_ALGORITHM.to_string(),
+            range_end_utc: "2026-06-01T00:00:00Z".to_string(),
+            record_count: 1,
+            digest_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            computed_at: "2026-06-01T12:00:00Z".to_string(),
+        };
+
+        let submit_client = client.clone();
+        let submit_report = report.clone();
+        let submit = tokio::task::spawn_blocking(move || {
+            submit_client.submit_integrity_report(&submit_report)
+        })
+        .await
+        .expect("submit join")
+        .expect("submit response");
+        assert!(submit.accepted);
+
+        let list_client = client.clone();
+        let reports = tokio::task::spawn_blocking(move || list_client.integrity_reports())
+            .await
+            .expect("list join")
+            .expect("list response");
+        assert_eq!(reports.reports, vec![report]);
         server.abort();
     }
 

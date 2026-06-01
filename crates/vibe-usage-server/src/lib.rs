@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use vibe_usage_proto::{
-    HealthResponse, MachineInfo, MachineList, PullResponse, SCHEMA_VERSION, SequencedWireRecord,
-    UploadResponse, WireRecord, is_valid_vendor,
+    HealthResponse, IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineInfo,
+    MachineList, PullResponse, SCHEMA_VERSION, SequencedWireRecord, UploadResponse, WireRecord,
+    is_valid_vendor,
 };
 
 type DbPool = Pool<SqliteConnectionManager>;
@@ -162,6 +163,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/upload", post(upload))
         .route("/v1/pull", get(pull))
         .route("/v1/machines", get(machines))
+        .route("/v1/integrity/report", post(submit_integrity_report))
+        .route("/v1/integrity/reports", get(integrity_reports))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
@@ -552,6 +555,82 @@ async fn machines(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(MachineList { machines }))
+}
+
+async fn submit_integrity_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Json<IntegritySubmitResponse>, AppError> {
+    authorize(&state, &headers)?;
+    let report: IntegrityReport = serde_json::from_str(&body)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))?;
+    report
+        .validate()
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    if state
+        .config
+        .allowed_hosts
+        .as_ref()
+        .is_some_and(|hosts| !hosts.contains(&report.host_id))
+    {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "host_id is not allowed",
+        ));
+    }
+
+    let conn = state.pool.get()?;
+    let updated_at = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO integrity_reports (
+            host_id, algorithm, range_end_utc, record_count, digest_sha256, computed_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(host_id, algorithm) DO UPDATE SET
+            range_end_utc = excluded.range_end_utc,
+            record_count = excluded.record_count,
+            digest_sha256 = excluded.digest_sha256,
+            computed_at = excluded.computed_at,
+            updated_at = excluded.updated_at",
+        params![
+            report.host_id,
+            report.algorithm,
+            report.range_end_utc,
+            report.record_count as i64,
+            report.digest_sha256,
+            report.computed_at,
+            updated_at,
+        ],
+    )?;
+
+    Ok(Json(IntegritySubmitResponse { accepted: true }))
+}
+
+async fn integrity_reports(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<IntegrityReportList>, AppError> {
+    authorize(&state, &headers)?;
+    let conn = state.pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT host_id, algorithm, range_end_utc, record_count, digest_sha256, computed_at
+         FROM integrity_reports
+         ORDER BY host_id ASC, algorithm ASC",
+    )?;
+    let reports = stmt
+        .query_map([], |row| {
+            Ok(IntegrityReport {
+                host_id: row.get(0)?,
+                algorithm: row.get(1)?,
+                range_end_utc: row.get(2)?,
+                record_count: row.get::<_, i64>(3)? as u64,
+                digest_sha256: row.get(4)?,
+                computed_at: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(IntegrityReportList { reports }))
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {

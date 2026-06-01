@@ -6,7 +6,10 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
-use vibe_usage_proto::{PullResponse, SCHEMA_VERSION, UploadResponse, WireRecord};
+use vibe_usage_proto::{
+    INTEGRITY_ALGORITHM, IntegrityReport, IntegrityReportList, IntegritySubmitResponse,
+    PullResponse, SCHEMA_VERSION, UploadResponse, WireRecord,
+};
 use vibe_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -757,6 +760,73 @@ async fn machines_reports_last_seen_and_record_count() {
     let body: serde_json::Value = read_json(response).await;
     assert_eq!(body["machines"][0]["host_id"], json!("laptop"));
     assert_eq!(body["machines"][0]["record_count"], json!(2));
+}
+
+#[tokio::test]
+async fn integrity_report_round_trips_through_server() {
+    let app = app("integrity-report").await;
+    let report = IntegrityReport {
+        host_id: "laptop".to_string(),
+        algorithm: INTEGRITY_ALGORITHM.to_string(),
+        range_end_utc: "2026-06-01T00:00:00Z".to_string(),
+        record_count: 2,
+        digest_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            .to_string(),
+        computed_at: "2026-06-01T12:00:00Z".to_string(),
+    };
+
+    let submit = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/integrity/report",
+            serde_json::to_string(&report).expect("serialize report"),
+        ))
+        .await
+        .expect("submit response");
+    assert_eq!(submit.status(), StatusCode::OK);
+    let submit_body: IntegritySubmitResponse = read_json(submit).await;
+    assert!(submit_body.accepted);
+
+    let list = app
+        .oneshot(authed_request(
+            "GET",
+            "/v1/integrity/reports",
+            Body::empty(),
+        ))
+        .await
+        .expect("list response");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body: IntegrityReportList = read_json(list).await;
+
+    assert_eq!(body.reports, vec![report]);
+}
+
+#[tokio::test]
+async fn integrity_report_rejects_disallowed_hosts() {
+    let mut cfg = config("integrity-allowed-hosts");
+    cfg.allowed_hosts = Some(HashSet::from(["workstation".to_string()]));
+    let app = build_app(AppState::new(cfg).expect("app state"));
+    let report = IntegrityReport {
+        host_id: "laptop".to_string(),
+        algorithm: INTEGRITY_ALGORITHM.to_string(),
+        range_end_utc: "2026-06-01T00:00:00Z".to_string(),
+        record_count: 2,
+        digest_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            .to_string(),
+        computed_at: "2026-06-01T12:00:00Z".to_string(),
+    };
+
+    let response = app
+        .oneshot(authed_request(
+            "POST",
+            "/v1/integrity/report",
+            serde_json::to_string(&report).expect("serialize report"),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

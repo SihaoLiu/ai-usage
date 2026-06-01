@@ -129,6 +129,10 @@ The checked range is independent of local time zones. Clients include records wi
 
 `vibe-usage sync push` refreshes local caches, uploads records, and submits the local integrity report. `vibe-usage sync pull` downloads remote records and verifies them against the reports stored on the server. Older servers that do not expose the integrity endpoints still allow record push and pull, but they cannot produce a checked integrity result until upgraded.
 
+Each integrity run writes compact JSONL transcripts below the cache root under `integrity/`. The local machine report is written as `local-<machine_id>.jsonl`; each remote verification view is written as `remote-<machine_id>.jsonl`. The first line is a summary with the range, digest, record count, and expected-versus-actual server comparison for remote views. Later lines are sorted per-record fingerprints with the hashed dedup key, canonical record hash, timestamps, model, token counts, and costs.
+
+To debug a mismatch between two machines, copy the owner machine's `local-<machine_id>.jsonl` to the other machine and compare it with that machine's `remote-<machine_id>.jsonl`. For example, if `kilia` is checking records from `icarus3`, compare `kilia`'s `~/.cache/ai-usage/integrity/remote-icarus3.jsonl` with `icarus3`'s copied `~/.cache/ai-usage/integrity/local-icarus3.jsonl`.
+
 ## Viewing Data
 
 Aggregate all local and remote records:

@@ -1513,7 +1513,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibe-usage"
-version = "2.3.6"
+version = "2.3.7"
 dependencies = [
  "axum",
  "bincode",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-usage-server"
-version = "2.3.6"
+version = "2.3.7"
 dependencies = [
  "axum",
  "chrono",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-usage-updater"
-version = "2.3.6"
+version = "2.3.7"
 dependencies = [
  "libc",
  "serde_json",

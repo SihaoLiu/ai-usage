@@ -1,6 +1,7 @@
 use crate::data::cache::{self, CachedUsageRecord, RemoteUsageRecord};
 use crate::data::{TokenUsage, UsageCost, UsageEntry};
 use crate::sync::config::EnabledSyncConfig;
+use crate::sync::keys::assign_sync_dedup_keys;
 use crate::sync::state;
 use crate::time_utils::parse_timestamp;
 use chrono::Utc;
@@ -176,19 +177,16 @@ where
     for vendor in VENDORS {
         let mut vendor_records = Vec::new();
         let mut vendor_refresh_records = Vec::new();
-        for record in cache::load_vendor_cached_records(cache_root, vendor) {
-            if record.dedup_key.is_empty() {
-                skipped_records += 1;
-                continue;
-            }
-            let key = (record.vendor.clone(), record.dedup_key.clone());
+        for keyed in assign_sync_dedup_keys(cache::load_vendor_cached_records(cache_root, vendor)) {
+            let record = keyed.record;
+            let key = (record.vendor.clone(), keyed.dedup_key.clone());
             let logged = upload_log.contains(&key);
             if logged || uploaded_with_omp_v220_key(&record, &upload_log) {
                 if logged
                     && let Some(refresh_key) = omp_metadata_refresh_log_key(&record)
                     && !upload_log.contains(&refresh_key)
                 {
-                    let wire = cached_record_to_wire(config, &record)?;
+                    let wire = cached_record_to_wire(config, &record, &key.1)?;
                     vendor_refresh_records.push(UploadCandidate {
                         key,
                         refresh_key: Some(refresh_key),
@@ -199,7 +197,7 @@ where
                 skipped_records += 1;
                 continue;
             }
-            let wire = cached_record_to_wire(config, &record)?;
+            let wire = cached_record_to_wire(config, &record, &key.1)?;
             vendor_records.push(UploadCandidate {
                 key,
                 refresh_key: None,
@@ -433,12 +431,10 @@ fn collect_snapshot_records(
     let mut records = Vec::new();
     let mut record_hashes = BTreeMap::new();
     for vendor in VENDORS {
-        for record in cache::load_vendor_cached_records(cache_root, vendor) {
-            if record.dedup_key.is_empty() {
-                continue;
-            }
-            let key = (record.vendor.clone(), record.dedup_key.clone());
-            let wire = cached_record_to_wire(config, &record)?;
+        for keyed in assign_sync_dedup_keys(cache::load_vendor_cached_records(cache_root, vendor)) {
+            let record = keyed.record;
+            let key = (record.vendor.clone(), keyed.dedup_key.clone());
+            let wire = cached_record_to_wire(config, &record, &key.1)?;
             let record_hash = wire_record_hash(&wire)?;
             record_hashes.insert(key.clone(), record_hash.clone());
             records.push(SnapshotRecord {
@@ -770,12 +766,13 @@ fn is_unsupported_integrity_error(err: &SyncError) -> bool {
 fn cached_record_to_wire(
     config: &EnabledSyncConfig,
     record: &CachedUsageRecord,
+    dedup_key: &str,
 ) -> Result<WireRecord, SyncError> {
     let wire = WireRecord {
         schema_version: vibe_usage_proto::SCHEMA_VERSION,
         host_id: config.machine_id.clone(),
         vendor: record.vendor.clone(),
-        dedup_key: record.dedup_key.clone(),
+        dedup_key: dedup_key.to_string(),
         timestamp: record.entry.timestamp.clone(),
         session_start_time: record.entry.session_start_time.clone(),
         session_end_time: record.entry.session_end_time.clone(),
@@ -1458,6 +1455,37 @@ mod tests {
         assert!(second.snapshot_diffs.borrow().is_empty());
         assert!(second.snapshot_record_batches.borrow().is_empty());
         assert!(second.snapshot_finalizations.borrow().is_empty());
+    }
+
+    #[test]
+    fn snapshot_upload_assigns_stable_keys_to_empty_dedup_records() {
+        let cache_root = unique_temp_dir("snapshot-empty-dedup");
+        populate_vendor_cache_with_records(
+            &cache_root,
+            "claude",
+            vec![
+                usage_record("", "2026-05-18T12:00:00Z", 10),
+                usage_record("", "2026-05-18T12:01:00Z", 20),
+            ],
+        );
+        let transport = DiffSnapshotTransport::new(Vec::new());
+
+        run_upload_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("upload");
+
+        let diffs = transport.snapshot_diffs.borrow();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].records.len(), 2);
+        assert_eq!(diffs[0].records[0].vendor, "claude");
+        assert_eq!(diffs[0].records[1].vendor, "claude");
+        assert!(diffs[0].records[0].dedup_key.starts_with("fallback:v1:"));
+        assert!(diffs[0].records[1].dedup_key.starts_with("fallback:v1:"));
+        assert_ne!(diffs[0].records[0].dedup_key, diffs[0].records[1].dedup_key);
     }
 
     #[test]

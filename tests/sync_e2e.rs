@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,6 +60,24 @@ fn write_claude_usage(home: &Path, model: &str, timestamp: &str) {
         r#"{{"timestamp":"{timestamp}","requestId":"req-a","message":{{"id":"msg-a","model":"{model}","usage":{{"input_tokens":123,"output_tokens":45,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
     );
     fs::write(dir.join("session.jsonl"), format!("{line}\n")).expect("write usage file");
+}
+
+fn write_claude_usage_without_ids(home: &Path) {
+    let dir = home
+        .join(".config")
+        .join("claude")
+        .join("projects")
+        .join("e2e-empty-ids");
+    fs::create_dir_all(&dir).expect("create usage dir");
+    let first_timestamp = (Utc::now() - Duration::days(2)).to_rfc3339();
+    let second_timestamp = (Utc::now() - Duration::days(2) + Duration::minutes(1)).to_rfc3339();
+    let first = format!(
+        r#"{{"timestamp":"{first_timestamp}","message":{{"model":"empty-id-model","usage":{{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+    );
+    let second = format!(
+        r#"{{"timestamp":"{second_timestamp}","message":{{"model":"empty-id-model","usage":{{"input_tokens":20,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+    );
+    fs::write(dir.join("session.jsonl"), format!("{first}\n{second}\n")).expect("write usage file");
 }
 
 fn ensure_claude_dir(home: &Path) {
@@ -205,6 +223,64 @@ async fn sync_clean_refetches_records_from_server_after_local_wipe() {
         "host-b display after clean",
     );
     assert!(after_clean.contains("clean-model"), "{after_clean}");
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integrity_passes_for_claude_records_without_source_ids() {
+    let root = unique_temp_dir("empty-source-ids");
+    let home_a = root.join("home-a");
+    let home_b = root.join("home-b");
+    fs::create_dir_all(&home_a).expect("create home a");
+    fs::create_dir_all(&home_b).expect("create home b");
+
+    let state = AppState::new(server_config(root.join("server.db"))).expect("server state");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("server addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, build_app(state))
+            .await
+            .expect("server");
+    });
+    let server_url = format!("http://{addr}");
+
+    write_client_config(&home_a, &server_url, "host-a");
+    write_client_config(&home_b, &server_url, "host-b");
+    ensure_claude_dir(&home_b);
+    write_claude_usage_without_ids(&home_a);
+
+    assert_success(run_cli(&home_a, &["sync", "push"]), "host-a push");
+    assert_success(run_cli(&home_b, &["sync", "pull"]), "host-b pull");
+
+    let transcript_path = home_b
+        .join(".cache")
+        .join("ai-usage")
+        .join("integrity")
+        .join("remote-host-a.jsonl");
+    let transcript = fs::read_to_string(&transcript_path).expect("read remote transcript");
+    let lines = transcript
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse transcript"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["status"], "checked");
+    assert_eq!(lines[0]["expected_record_count"], 2);
+    assert_eq!(lines[0]["actual_record_count"], 2);
+    let first_hash = lines[1]["dedup_key_sha256"]
+        .as_str()
+        .expect("first dedup hash");
+    let second_hash = lines[2]["dedup_key_sha256"]
+        .as_str()
+        .expect("second dedup hash");
+    assert_ne!(
+        first_hash,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_ne!(first_hash, second_hash);
 
     server.abort();
 }

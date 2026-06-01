@@ -2,6 +2,7 @@ use crate::data::UsageEntry;
 use crate::data::cache::{self, CachedUsageRecord, RemoteUsageRecord};
 use crate::sync::config::EnabledSyncConfig;
 use crate::sync::engine::{SUPPORTED_PULL_VENDORS, SyncError};
+use crate::sync::keys::assign_sync_dedup_keys;
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 use serde::Serialize;
 use serde_json::json;
@@ -115,11 +116,13 @@ pub fn build_local_report_for_range(
 ) -> Result<IntegrityReport, SyncError> {
     let mut records = Vec::new();
     for vendor in SUPPORTED_PULL_VENDORS {
-        records.extend(
-            cache::load_vendor_cached_records(cache_root, vendor)
-                .into_iter()
-                .map(|record| local_canonical_record(&config.machine_id, record)),
-        );
+        for keyed in assign_sync_dedup_keys(cache::load_vendor_cached_records(cache_root, vendor)) {
+            records.push(local_canonical_record(
+                &config.machine_id,
+                keyed.record,
+                keyed.dedup_key,
+            ));
+        }
     }
     let (report, digest) =
         build_report_from_records(&config.machine_id, records, range_end_utc, computed_at)?;
@@ -398,13 +401,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn local_canonical_record(host_id: &str, record: CachedUsageRecord) -> CanonicalIntegrityRecord {
-    canonical_record(
-        host_id.to_string(),
-        record.vendor,
-        record.dedup_key,
-        record.entry,
-    )
+fn local_canonical_record(
+    host_id: &str,
+    record: CachedUsageRecord,
+    dedup_key: String,
+) -> CanonicalIntegrityRecord {
+    canonical_record(host_id.to_string(), record.vendor, dedup_key, record.entry)
 }
 
 fn remote_canonical_record(record: RemoteUsageRecord) -> CanonicalIntegrityRecord {
@@ -645,6 +647,50 @@ mod tests {
         let text = std::fs::read_to_string(path).expect("read transcript text");
         assert!(!text.contains("stable-a"));
         assert!(!text.contains("current"));
+    }
+
+    #[test]
+    fn local_integrity_uses_stable_keys_for_empty_dedup_records() {
+        let cache_root = unique_temp_dir("local-empty-dedup");
+        populate_local(
+            &cache_root,
+            vec![
+                usage_record("", "2026-05-31T23:58:00Z", 10),
+                usage_record("", "2026-05-31T23:59:00Z", 20),
+            ],
+        );
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let computed_at = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 1)
+            .single()
+            .expect("valid timestamp");
+
+        let report =
+            super::build_local_report_at(&cache_root, &enabled_config("host-a"), now, computed_at)
+                .expect("local report");
+
+        let path = cache_root.join("integrity").join("local-host-a.jsonl");
+        let lines = read_jsonl(&path);
+        assert_eq!(report.record_count, 2);
+        assert_eq!(lines.len(), 3);
+        let first = lines[1]["dedup_key_sha256"]
+            .as_str()
+            .expect("first dedup hash");
+        let second = lines[2]["dedup_key_sha256"]
+            .as_str()
+            .expect("second dedup hash");
+        assert_ne!(
+            first,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_ne!(
+            second,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_ne!(first, second);
     }
 
     #[test]

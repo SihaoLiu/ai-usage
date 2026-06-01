@@ -60,10 +60,39 @@ pub struct RecordKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordFingerprint {
+    pub vendor: String,
+    pub dedup_key: String,
+    pub record_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotKeyBatch {
     pub host_id: String,
     pub snapshot_id: String,
     pub keys: Vec<RecordKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDiffRequest {
+    pub host_id: String,
+    pub snapshot_id: String,
+    pub records: Vec<RecordFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDiffResponse {
+    pub needed: Vec<RecordKey>,
+    pub matched: usize,
+    pub missing_or_changed: usize,
+    pub max_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotRecordBatch {
+    pub host_id: String,
+    pub snapshot_id: String,
+    pub records: Vec<WireRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,12 +257,45 @@ impl RecordKey {
     }
 }
 
+impl RecordFingerprint {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_vendor(&self.vendor)?;
+        validate_required_text("dedup_key", &self.dedup_key, 512)?;
+        validate_digest(&self.record_hash)
+    }
+}
+
 impl SnapshotKeyBatch {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_host_id(&self.host_id)?;
         validate_snapshot_id(&self.snapshot_id)?;
         for key in &self.keys {
             key.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl SnapshotDiffRequest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_host_id(&self.host_id)?;
+        validate_snapshot_id(&self.snapshot_id)?;
+        for record in &self.records {
+            record.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl SnapshotRecordBatch {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_host_id(&self.host_id)?;
+        validate_snapshot_id(&self.snapshot_id)?;
+        for record in &self.records {
+            record.validate()?;
+            if record.host_id != self.host_id {
+                return Err(ValidationError::InvalidHostId);
+            }
         }
         Ok(())
     }

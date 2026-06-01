@@ -9,6 +9,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,8 +17,9 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use vibe_usage_proto::{
     HealthResponse, IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineInfo,
-    MachineList, PullResponse, SCHEMA_VERSION, SequencedWireRecord, UploadResponse, WireRecord,
-    is_valid_host_id, is_valid_vendor,
+    MachineList, PullResponse, RecordKey, SCHEMA_VERSION, SequencedWireRecord, SnapshotDiffRequest,
+    SnapshotDiffResponse, SnapshotRecordBatch, UploadResponse, WireRecord, is_valid_host_id,
+    is_valid_vendor,
 };
 
 type DbPool = Pool<SqliteConnectionManager>;
@@ -162,6 +164,8 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/upload", post(upload))
+        .route("/v1/snapshot/diff", post(snapshot_diff))
+        .route("/v1/snapshot/records", post(snapshot_records))
         .route("/v1/snapshot/keys", post(snapshot_keys))
         .route("/v1/snapshot/finalize", post(snapshot_finalize))
         .route("/v1/pull", get(pull))
@@ -414,6 +418,115 @@ async fn snapshot_keys(
     }))
 }
 
+async fn snapshot_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Json<SnapshotDiffResponse>, AppError> {
+    authorize(&state, &headers)?;
+    let request: SnapshotDiffRequest = serde_json::from_str(&body)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))?;
+    request
+        .validate()
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    validate_snapshot_host(&state, &request.host_id)?;
+
+    let mut conn = state.pool.get()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut needed = Vec::new();
+    let mut matched = 0usize;
+    for record in &request.records {
+        let existing_hash =
+            stored_record_hash(&tx, &request.host_id, &record.vendor, &record.dedup_key)?;
+        if existing_hash
+            .as_deref()
+            .is_some_and(|hash| hash == record.record_hash)
+        {
+            mark_snapshot_key(
+                &tx,
+                &request.host_id,
+                &record.vendor,
+                &record.dedup_key,
+                &request.snapshot_id,
+            )?;
+            matched += 1;
+        } else {
+            needed.push(RecordKey {
+                vendor: record.vendor.clone(),
+                dedup_key: record.dedup_key.clone(),
+            });
+        }
+    }
+    let max_seq = max_seq_in_tx(&tx)?;
+    tx.commit()?;
+
+    Ok(Json(SnapshotDiffResponse {
+        missing_or_changed: needed.len(),
+        needed,
+        matched,
+        max_seq,
+    }))
+}
+
+async fn snapshot_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Json<UploadResponse>, AppError> {
+    authorize(&state, &headers)?;
+    let batch: SnapshotRecordBatch = serde_json::from_str(&body)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))?;
+    batch
+        .validate()
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    validate_snapshot_host(&state, &batch.host_id)?;
+    if batch.records.len() > state.config.max_batch_records {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "batch exceeds max_batch_records",
+        ));
+    }
+
+    let mut conn = state.pool.get()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let uploaded_at = Utc::now().to_rfc3339();
+    let mut accepted = 0usize;
+    let mut ignored = 0usize;
+    for record in &batch.records {
+        let accepted_record = upsert_record(&tx, record, &uploaded_at)?;
+        if accepted_record {
+            accepted += 1;
+        } else {
+            ignored += 1;
+        }
+        mark_snapshot_key(
+            &tx,
+            &batch.host_id,
+            &record.vendor,
+            &record.dedup_key,
+            &batch.snapshot_id,
+        )?;
+        delete_omp_v220_aliases_for_stable_record(&tx, record)?;
+    }
+
+    tx.execute(
+        "INSERT INTO machines (host_id, last_seen, record_count)
+         VALUES (?1, ?2, (SELECT COUNT(*) FROM records WHERE host_id = ?1))
+         ON CONFLICT(host_id) DO UPDATE SET
+            last_seen = excluded.last_seen,
+            record_count = (SELECT COUNT(*) FROM records WHERE host_id = ?1)",
+        params![batch.host_id, uploaded_at],
+    )?;
+    let max_seq = max_seq_in_tx(&tx)?;
+    tx.commit()?;
+
+    Ok(Json(UploadResponse {
+        accepted,
+        ignored,
+        max_seq,
+    }))
+}
+
 async fn snapshot_finalize(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -491,6 +604,47 @@ fn validate_snapshot_key(key: &SnapshotKey) -> Result<(), AppError> {
         return Err(AppError::new(StatusCode::BAD_REQUEST, "invalid dedup_key"));
     }
     Ok(())
+}
+
+fn mark_snapshot_key(
+    tx: &rusqlite::Transaction<'_>,
+    host_id: &str,
+    vendor: &str,
+    dedup_key: &str,
+    snapshot_id: &str,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        "UPDATE records
+         SET snapshot_id = ?1
+         WHERE host_id = ?2 AND vendor = ?3 AND dedup_key = ?4",
+        params![snapshot_id, host_id, vendor, dedup_key],
+    )
+}
+
+fn stored_record_hash(
+    tx: &rusqlite::Transaction<'_>,
+    host_id: &str,
+    vendor: &str,
+    dedup_key: &str,
+) -> rusqlite::Result<Option<String>> {
+    tx.query_row(
+        "SELECT host_id, vendor, dedup_key, schema_version, timestamp_utc,
+            session_start, session_end, model, effort, fast_tier, input_tokens,
+            output_tokens, cache_read, cache_creation, reasoning_out, cost_input,
+            cost_output, cost_cache_read, cost_cache_creation, project_hash
+         FROM records
+         WHERE host_id = ?1 AND vendor = ?2 AND dedup_key = ?3
+         LIMIT 1",
+        params![host_id, vendor, dedup_key],
+        |row| row_to_wire_record(row).map(|record| wire_record_hash(&record)),
+    )
+    .optional()
+}
+
+fn wire_record_hash(record: &WireRecord) -> String {
+    let bytes = serde_json::to_vec(record).expect("wire record serialization cannot fail");
+    let digest = Sha256::digest(&bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn upsert_record(
@@ -911,29 +1065,40 @@ fn check_rate_limit(state: &AppState, token: &str) -> Result<(), AppError> {
 fn row_to_sequenced_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SequencedWireRecord> {
     Ok(SequencedWireRecord {
         seq: row.get::<_, i64>(0)? as u64,
-        record: WireRecord {
-            host_id: row.get(1)?,
-            vendor: row.get(2)?,
-            dedup_key: row.get(3)?,
-            schema_version: row.get::<_, i64>(4)? as u32,
-            timestamp: row.get(5)?,
-            session_start_time: row.get(6)?,
-            session_end_time: row.get(7)?,
-            model: row.get(8)?,
-            effort: row.get(9)?,
-            fast_tier: row.get(10)?,
-            input_tokens: row.get(11)?,
-            output_tokens: row.get(12)?,
-            cache_read_input_tokens: row.get(13)?,
-            cache_creation_input_tokens: row.get(14)?,
-            reasoning_output_tokens: row.get(15)?,
-            cost_input: row.get(16)?,
-            cost_output: row.get(17)?,
-            cost_cache_read: row.get(18)?,
-            cost_cache_creation: row.get(19)?,
-            project_path_sha256: row.get(20)?,
-        },
+        record: row_to_wire_record_with_offset(row, 1)?,
         uploaded_at: row.get(21)?,
+    })
+}
+
+fn row_to_wire_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WireRecord> {
+    row_to_wire_record_with_offset(row, 0)
+}
+
+fn row_to_wire_record_with_offset(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<WireRecord> {
+    Ok(WireRecord {
+        host_id: row.get(offset)?,
+        vendor: row.get(offset + 1)?,
+        dedup_key: row.get(offset + 2)?,
+        schema_version: row.get::<_, i64>(offset + 3)? as u32,
+        timestamp: row.get(offset + 4)?,
+        session_start_time: row.get(offset + 5)?,
+        session_end_time: row.get(offset + 6)?,
+        model: row.get(offset + 7)?,
+        effort: row.get(offset + 8)?,
+        fast_tier: row.get(offset + 9)?,
+        input_tokens: row.get(offset + 10)?,
+        output_tokens: row.get(offset + 11)?,
+        cache_read_input_tokens: row.get(offset + 12)?,
+        cache_creation_input_tokens: row.get(offset + 13)?,
+        reasoning_output_tokens: row.get(offset + 14)?,
+        cost_input: row.get(offset + 15)?,
+        cost_output: row.get(offset + 16)?,
+        cost_cache_read: row.get(offset + 17)?,
+        cost_cache_creation: row.get(offset + 18)?,
+        project_path_sha256: row.get(offset + 19)?,
     })
 }
 

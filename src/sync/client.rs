@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use vibe_usage_proto::{
     IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineList, PullResponse,
-    SnapshotFinalizeRequest, SnapshotFinalizeResponse, SnapshotKeyBatch, UploadResponse,
-    WireRecord,
+    SnapshotDiffRequest, SnapshotDiffResponse, SnapshotFinalizeRequest, SnapshotFinalizeResponse,
+    SnapshotRecordBatch, UploadResponse, WireRecord,
 };
 
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
@@ -101,11 +101,29 @@ impl SyncHttpClient {
         read_json_response(response)
     }
 
-    pub fn snapshot_keys(&self, batch: &SnapshotKeyBatch) -> Result<UploadResponse, SyncError> {
+    pub fn snapshot_diff(
+        &self,
+        request: &SnapshotDiffRequest,
+    ) -> Result<SnapshotDiffResponse, SyncError> {
+        let body = serde_json::to_string(request).map_err(|err| SyncError::new(err.to_string()))?;
+        let response = self.call_with_rate_limit_retry(|| {
+            self.agent
+                .post(&self.endpoint("/v1/snapshot/diff"))
+                .header("Authorization", self.auth_header())
+                .header("Content-Type", "application/json")
+                .send(body.clone())
+        })?;
+        read_json_response(response)
+    }
+
+    pub fn snapshot_records(
+        &self,
+        batch: &SnapshotRecordBatch,
+    ) -> Result<UploadResponse, SyncError> {
         let body = serde_json::to_string(batch).map_err(|err| SyncError::new(err.to_string()))?;
         let response = self.call_with_rate_limit_retry(|| {
             self.agent
-                .post(&self.endpoint("/v1/snapshot/keys"))
+                .post(&self.endpoint("/v1/snapshot/records"))
                 .header("Authorization", self.auth_header())
                 .header("Content-Type", "application/json")
                 .send(body.clone())
@@ -207,8 +225,15 @@ impl SyncTransport for SyncHttpClient {
         SyncHttpClient::integrity_reports(self)
     }
 
-    fn snapshot_keys(&self, batch: &SnapshotKeyBatch) -> Result<UploadResponse, SyncError> {
-        SyncHttpClient::snapshot_keys(self, batch)
+    fn snapshot_diff(
+        &self,
+        request: &SnapshotDiffRequest,
+    ) -> Result<SnapshotDiffResponse, SyncError> {
+        SyncHttpClient::snapshot_diff(self, request)
+    }
+
+    fn snapshot_records(&self, batch: &SnapshotRecordBatch) -> Result<UploadResponse, SyncError> {
+        SyncHttpClient::snapshot_records(self, batch)
     }
 
     fn snapshot_finalize(
@@ -591,6 +616,97 @@ mod tests {
             vec![
                 "omp:file:/tmp/omp.jsonl:0".to_string(),
                 "omp:file:/tmp/omp.jsonl:1".to_string(),
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_reconciles_snapshot_with_diff_upload() {
+        let state = AppState::new(server_config("transport-snapshot-diff")).expect("server state");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, build_app(state))
+                .await
+                .expect("server");
+        });
+        let config = client_config(format!("http://{addr}"));
+        let client = SyncHttpClient::new(config.clone());
+
+        let active = record("workstation", "active");
+        let mut old_changed = record("workstation", "changed");
+        old_changed.input_tokens = 20;
+        let stale = record("workstation", "stale");
+        let seed_client = client.clone();
+        tokio::task::spawn_blocking(move || seed_client.upload(&[active, old_changed, stale]))
+            .await
+            .expect("seed join")
+            .expect("seed upload");
+
+        let cache_root = unique_db_path("snapshot-diff-cache");
+        std::fs::create_dir_all(&cache_root).expect("create cache root");
+        let source = cache_root.join("claude.jsonl");
+        std::fs::write(&source, "source").expect("write source");
+        crate::data::cache::load_or_update_vendor_cache(
+            &cache_root,
+            "claude",
+            vec![source],
+            -1,
+            |_| {
+                vec![
+                    source_record("active", "2026-05-18T12:00:00Z"),
+                    source_record("changed", "2026-05-18T12:01:00Z"),
+                    source_record("missing", "2026-05-18T12:02:00Z"),
+                ]
+            },
+        );
+
+        let upload_client = client.clone();
+        let upload_config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            engine::run_upload_once_with_progress(
+                &cache_root,
+                &upload_config,
+                &upload_client,
+                |_| {},
+            )
+        })
+        .await
+        .expect("upload join")
+        .expect("snapshot upload");
+
+        let viewer_cache = unique_db_path("snapshot-diff-viewer-cache");
+        std::fs::create_dir_all(&viewer_cache).expect("create viewer cache");
+        let mut viewer_config = config.clone();
+        viewer_config.machine_id = "laptop".to_string();
+        let pull_client = client.clone();
+        let rows = tokio::task::spawn_blocking(move || {
+            engine::run_pull_once_with_progress(
+                &viewer_cache,
+                &viewer_config,
+                &pull_client,
+                |_| {},
+            )?;
+            let mut remote = crate::data::cache::load_remote_entries(&viewer_cache, None)
+                .into_iter()
+                .map(|record| (record.dedup_key, record.entry.usage.input_tokens))
+                .collect::<Vec<_>>();
+            remote.sort();
+            Ok::<_, engine::SyncError>(remote)
+        })
+        .await
+        .expect("pull join")
+        .expect("pull response");
+
+        assert_eq!(
+            rows,
+            vec![
+                ("active".to_string(), 10),
+                ("changed".to_string(), 10),
+                ("missing".to_string(), 10),
             ]
         );
         server.abort();

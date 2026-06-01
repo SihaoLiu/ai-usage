@@ -2,6 +2,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use rusqlite::params;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,6 +79,12 @@ fn ndjson(records: &[WireRecord]) -> String {
         .map(|record| serde_json::to_string(record).expect("serialize record"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn record_hash(record: &WireRecord) -> String {
+    let bytes = serde_json::to_vec(record).expect("serialize record");
+    let digest = Sha256::digest(&bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn omp_v220_key(message_id: &str, response_id: &str, model: &str, record: &WireRecord) -> String {
@@ -456,6 +463,144 @@ async fn snapshot_finalize_deletes_keys_missing_from_active_manifest() {
     let body: PullResponse = read_json(pull).await;
     assert_eq!(body.records.len(), 1);
     assert_eq!(body.records[0].record.dedup_key, active.dedup_key);
+}
+
+#[tokio::test]
+async fn snapshot_diff_uploads_only_missing_or_changed_records_and_deletes_stale() {
+    let app = app("snapshot-diff").await;
+    let active = record("laptop", "claude", "active", 10);
+    let old_changed = record("laptop", "claude", "changed", 20);
+    let stale = record("laptop", "claude", "stale", 30);
+    let mut changed = old_changed.clone();
+    changed.input_tokens = 99;
+    let missing = record("laptop", "codex", "missing", 40);
+
+    let upload = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/upload",
+            ndjson(&[active.clone(), old_changed, stale]),
+        ))
+        .await
+        .expect("upload response");
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let diff = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/diff",
+            json!({
+                "host_id": "laptop",
+                "snapshot_id": "snapshot-b",
+                "records": [
+                    {
+                        "vendor": "claude",
+                        "dedup_key": "active",
+                        "record_hash": record_hash(&active)
+                    },
+                    {
+                        "vendor": "claude",
+                        "dedup_key": "changed",
+                        "record_hash": record_hash(&changed)
+                    },
+                    {
+                        "vendor": "codex",
+                        "dedup_key": "missing",
+                        "record_hash": record_hash(&missing)
+                    }
+                ]
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("diff response");
+    assert_eq!(diff.status(), StatusCode::OK);
+    let diff_body: serde_json::Value = read_json(diff).await;
+    assert_eq!(diff_body["matched"], json!(1));
+    assert_eq!(diff_body["needed"].as_array().expect("needed").len(), 2);
+    assert!(
+        diff_body["needed"]
+            .as_array()
+            .expect("needed")
+            .contains(&json!({
+                "vendor": "claude",
+                "dedup_key": "changed"
+            }))
+    );
+    assert!(
+        diff_body["needed"]
+            .as_array()
+            .expect("needed")
+            .contains(&json!({
+                "vendor": "codex",
+                "dedup_key": "missing"
+            }))
+    );
+
+    let snapshot_upload = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/records",
+            json!({
+                "host_id": "laptop",
+                "snapshot_id": "snapshot-b",
+                "records": [changed, missing]
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("snapshot upload response");
+    assert_eq!(snapshot_upload.status(), StatusCode::OK);
+
+    let finalize = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/finalize",
+            json!({
+                "host_id": "laptop",
+                "snapshot_id": "snapshot-b"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("finalize response");
+    assert_eq!(finalize.status(), StatusCode::OK);
+    let finalize_body: serde_json::Value = read_json(finalize).await;
+    assert_eq!(finalize_body["deleted"], json!(1));
+
+    let pull = app
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=claude,codex",
+            Body::empty(),
+        ))
+        .await
+        .expect("pull response");
+    assert_eq!(pull.status(), StatusCode::OK);
+    let body: PullResponse = read_json(pull).await;
+    let rows = body
+        .records
+        .iter()
+        .map(|record| {
+            (
+                record.record.vendor.as_str(),
+                record.record.dedup_key.as_str(),
+                record.record.input_tokens,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            ("claude", "active", 10),
+            ("claude", "changed", 99),
+            ("codex", "missing", 40),
+        ]
+    );
 }
 
 #[tokio::test]

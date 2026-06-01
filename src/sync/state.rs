@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SYNC_STATE_SCHEMA_VERSION: u32 = 1;
+pub const SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION: u32 = 2;
 
 const SYNC_STATE_FILE: &str = "sync_state.json";
 const SYNC_UPLOAD_LOG_FILE: &str = "sync_upload_log.bin";
@@ -23,6 +24,8 @@ pub struct SyncState {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotUploadState {
+    pub schema_version: u32,
+    pub full_hash: String,
     pub key_set_hash: String,
     pub record_hashes: BTreeMap<(String, String), String>,
 }

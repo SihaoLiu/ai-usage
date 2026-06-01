@@ -12,6 +12,7 @@ use vibe_usage_proto::{
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
 const DEFAULT_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_millis(1100);
 const MAX_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_JSON_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpProgress {
@@ -258,6 +259,8 @@ fn read_json_response<T: DeserializeOwned>(
     }
     let body = response
         .body_mut()
+        .with_config()
+        .limit(MAX_JSON_RESPONSE_BYTES)
         .read_to_string()
         .map_err(|err| SyncError::new(err.to_string()))?;
     serde_json::from_str(&body).map_err(|err| SyncError::new(err.to_string()))
@@ -288,13 +291,16 @@ mod tests {
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::response::{IntoResponse, Response};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use vibe_usage_proto::{INTEGRITY_ALGORITHM, IntegrityReport, SCHEMA_VERSION, WireRecord};
+    use vibe_usage_proto::{
+        INTEGRITY_ALGORITHM, IntegrityReport, PullResponse, SCHEMA_VERSION, SequencedWireRecord,
+        WireRecord,
+    };
     use vibe_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -481,6 +487,45 @@ mod tests {
         assert_eq!(pull.records.len(), 1);
         assert_eq!(pull.records[0].record.vendor, "omp");
         assert_eq!(pull.records[0].record.dedup_key, "remote-omp-a");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_reads_large_pull_response() {
+        async fn pull() -> Response {
+            let mut large = record("laptop", "large");
+            large.model = "x".repeat(11 * 1024 * 1024);
+            Json(PullResponse {
+                records: vec![SequencedWireRecord {
+                    seq: 1,
+                    uploaded_at: "2026-05-18T12:10:00Z".to_string(),
+                    record: large,
+                }],
+                max_seq: 1,
+                truncated: false,
+            })
+            .into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let app = Router::new().route("/v1/pull", get(pull));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let client = SyncHttpClient::new(client_config(format!("http://{addr}")));
+
+        let pull_client = client.clone();
+        let pull = tokio::task::spawn_blocking(move || pull_client.pull(0, "workstation", 20_000))
+            .await
+            .expect("pull join")
+            .expect("pull response");
+
+        assert_eq!(pull.records.len(), 1);
+        assert_eq!(pull.records[0].record.dedup_key, "large");
+        assert_eq!(pull.records[0].record.model.len(), 11 * 1024 * 1024);
         server.abort();
     }
 

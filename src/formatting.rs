@@ -545,12 +545,8 @@ pub fn print_model_breakdown(
         sum_total_with_cache += cache_hit + prefill + decoding;
     }
 
-    // Filter rows for display (1% message threshold), but keep all data for sums
-    let threshold = (sum_messages as f64 * 0.01) as i64;
-    let display_stats: Vec<&ModelBreakdownRow> = model_stats
-        .iter()
-        .filter(|r| r.count >= threshold)
-        .collect();
+    // Display every model row; the sums above already cover the full data set.
+    let display_stats: Vec<&ModelBreakdownRow> = model_stats.iter().collect();
 
     // Determine display mode
     let mode = match (terminal_width, terminal_height) {

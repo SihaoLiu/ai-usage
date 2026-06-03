@@ -73,8 +73,10 @@ pub type ModelTimeSeries = HashMap<DateTime<Local>, HashMap<String, IntervalToke
 /// Time series: interval -> vendor -> total tokens
 pub type VendorTimeSeries = HashMap<DateTime<Local>, HashMap<String, f64>>;
 
-/// Calculate model breakdown with 1% threshold filtering.
+/// Calculate the per-model breakdown across all entries.
 ///
+/// Rows are aggregated per model (optionally split by effort), `<synthetic>`
+/// models are dropped, and the result is sorted by message count descending.
 /// Cost is computed per-entry using `ModelPricing::tier_cost` so that the
 /// 200k-tier premium for Claude 1M-context models is applied correctly.
 pub(crate) fn calculate_model_breakdown_generic(

@@ -13,7 +13,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "2.3.12"
+version = "2.3.13"
 
 [[bin]]
 name = "vibe-usage"

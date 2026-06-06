@@ -81,20 +81,56 @@ On first run, you will be prompted to enter your monthly subscription fees for e
 
 ## Supported Models
 
-**Claude**: Opus 4.6, Opus 4.5, Sonnet 4.6, Sonnet 4.5, Sonnet 4, Haiku 4.5
+Model display names and pricing are resolved **dynamically**, so newly released
+models (e.g. a future `claude-opus-4-9`, `gpt-5.6`, `gemini-3.2-pro`) render and
+price correctly with no upgrade required.
 
-**Codex/OpenAI**: GPT-5, GPT-5.1, GPT-5.3, GPT-4.1, o1, o3, o3-mini, o4-mini
+**Display names** are derived algorithmically from the model id:
 
-**Gemini**: 3 Pro Preview, 2.5 Pro/Flash/Flash-Lite, 2.0 Flash/Flash-Lite
+- `claude-opus-4-8` -> `Opus 4.8`
+- `gpt-5.5-codex` -> `GPT-5.5 Cdx`, `gpt-5.5:xhigh` -> `GPT-5.5(XH)`
+- `gemini-3.2-pro-preview` -> `Gem 3.2 Pro`
 
-Model pricing is defined in `pricing.json` and can be updated manually.
+**Pricing** is layered, newest wins:
+
+1. Embedded `pricing.json` baseline.
+2. Cached LiteLLM snapshot at `~/.cache/ai-usage/pricing-cache.json`.
+3. Live LiteLLM price list (fetched at most once every 24h).
+
+For a model not yet in any table, pricing falls back to the newest known model
+of the same provider, family, and size class (so a brand-new `claude-opus-4-8`
+is priced like the latest Opus, never like the vendor default), and `-mini` /
+`-nano` variants never inherit a base model's rate.
+
+### Model Overrides (`models.toml`)
+
+To pin a display name or price for any model -- including private vendors and
+the day-one gap before LiteLLM lists a new model -- create
+`~/.config/ai-usage/models.toml` (honors `$XDG_CONFIG_HOME`). Overrides win over
+both the algorithm and live pricing:
+
+```toml
+# Force a display name for any model id.
+[display."anthropic/claude-opus-4-8"]
+short = "Opus 4.8"
+
+# Pin pricing in $/MTok; cache_read / cache_write default to the input rate.
+[pricing."some-private-model"]
+input = 3.0
+output = 15.0
+cache_read = 0.30
+cache_write = 3.75
+```
 
 ## Architecture
 
 ```
 src/
   main.rs            # Entry point, CLI args, monitor loop
-  constants.rs       # Pricing loader (pricing.json + .fee.env)
+  constants.rs       # Pricing tables + class-aware lookup (pricing.json + .fee.env)
+  pricing.rs         # Layered pricing loader (embedded -> cache -> LiteLLM)
+  model_id.rs        # Algorithmic model-id parser (label / sort / color)
+  model_overrides.rs # User overrides loader (~/.config/ai-usage/models.toml)
   formatting.rs      # Responsive table formatting
   charts.rs          # ASCII chart rendering
   time_utils.rs      # Timezone and time utilities

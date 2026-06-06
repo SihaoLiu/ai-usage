@@ -1,125 +1,20 @@
-use std::collections::HashMap;
-
 use crate::constants::SubscriptionFees;
+use crate::model_id::{parse_model_identity, short_label};
+use crate::model_overrides;
 use crate::stats::ModelBreakdownRow;
 
-// Short model name mappings for Claude
-fn claude_short_model_names() -> HashMap<&'static str, &'static str> {
-    HashMap::from([
-        ("claude-opus-4-7", "Opus 4.7"),
-        ("claude-opus-4-6", "Opus 4.6"),
-        ("claude-opus-4-5-20251101", "Opus 4.5"),
-        ("claude-opus-4-1-20250805", "Opus 4.1"),
-        ("claude-sonnet-4-6", "Sonnet 4.6"),
-        ("claude-sonnet-4-5-20250929", "Sonnet 4.5"),
-        ("claude-sonnet-4-20250514", "Sonnet 4"),
-        ("claude-haiku-4-5-20251001", "Haiku 4.5"),
-        ("<synthetic>", "synthetic"),
-    ])
-}
-
-// Short model name mappings for Codex
-fn codex_short_model_names() -> HashMap<&'static str, &'static str> {
-    HashMap::from([
-        ("gpt-5.4", "GPT-5.4"),
-        ("gpt-5.4-codex", "GPT-5.4 Cdx"),
-        ("gpt-5.4-mini", "GPT-5.4 Mini"),
-        ("gpt-5.4-nano", "GPT-5.4 Nano"),
-        ("gpt-5.3-codex", "GPT-5.3 Cdx"),
-        ("gpt-5.3-codex-spark", "GPT-5.3 Sprk"),
-        ("gpt-5.2-codex", "GPT-5.2 Cdx"),
-        ("gpt-5.1-codex", "GPT-5.1 Cdx"),
-        ("gpt-5.1-codex-max", "GPT-5.1 Max"),
-        ("gpt-5.1-codex-mini", "GPT-5.1 Mini"),
-        ("gpt-5-codex", "GPT-5 Codex"),
-        ("codex-mini-latest", "Codex Mini"),
-        ("gpt-5.2", "GPT-5.2"),
-        ("gpt-5.1", "GPT-5.1"),
-        ("gpt-5", "GPT-5"),
-        ("gpt-5-mini", "GPT-5 Mini"),
-        ("gpt-5-nano", "GPT-5 Nano"),
-        ("gpt-4.1", "GPT-4.1"),
-        ("gpt-4.1-mini", "GPT-4.1 Mini"),
-        ("gpt-4.1-nano", "GPT-4.1 Nano"),
-        ("o1", "o1"),
-        ("o3", "o3"),
-        ("o3-mini", "o3-mini"),
-        ("o4-mini", "o4-mini"),
-    ])
-}
-
-// Short model name mappings for Gemini
-fn gemini_short_model_names() -> HashMap<&'static str, &'static str> {
-    HashMap::from([
-        ("gemini-3.1-pro-preview", "Gem 3.1 Pro"),
-        ("gemini-3.1-flash-lite-preview", "Gem 3.1 Lt"),
-        ("gemini-3-pro-preview", "Gem 3 Pro"),
-        ("gemini-3-pro-image-preview", "Gem 3 Img"),
-        ("gemini-3-flash-preview", "Gem 3 Fl"),
-        ("gemini-2.5-pro", "Gem 2.5 Pro"),
-        ("gemini-2.5-flash", "Gem 2.5 Fl"),
-        ("gemini-2.5-flash-preview-09-2025", "Gem 2.5 Fl"),
-        ("gemini-2.5-flash-lite", "Gem 2.5 Lt"),
-        ("gemini-2.5-flash-lite-preview-09-2025", "Gem 2.5 Lt"),
-        ("gemini-2.0-flash", "Gem 2.0 Fl"),
-        ("gemini-2.0-flash-lite", "Gem 2.0 Lt"),
-    ])
-}
-
 /// Get short display name for a model.
-pub fn get_short_model_name(model: &str, vendor: &str) -> String {
-    match vendor {
-        "codex" => {
-            // Some model names may include effort level in parentheses.
-            if model.contains(" (")
-                && model.ends_with(')')
-                && let Some(idx) = model.rfind(" (")
-            {
-                let base_model = &model[..idx];
-                let effort = &model[idx + 2..model.len() - 1];
-                let names = codex_short_model_names();
-                let short_base = names
-                    .get(base_model)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| truncate(base_model, 10));
-                let effort_short = match effort {
-                    "low" => "L",
-                    "medium" => "M",
-                    "high" => "H",
-                    "xhigh" => "XH",
-                    _ => &effort[..1],
-                };
-                return format!("{}({})", short_base, effort_short);
-            }
-            let names = codex_short_model_names();
-            names
-                .get(model)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| truncate(model, 12))
-        }
-        "gemini" => {
-            let names = gemini_short_model_names();
-            names
-                .get(model)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| truncate(model, 12))
-        }
-        _ => {
-            let names = claude_short_model_names();
-            names
-                .get(model)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| truncate(model, 12))
-        }
+///
+/// Resolution order: user override file (`models.toml`) wins, otherwise the
+/// label is derived algorithmically from the id. The `_vendor` hint is unused
+/// on purpose -- the parser infers the provider from the id itself, which is
+/// what lets meta-vendors like `omp` (whose ids carry a real `provider/`
+/// prefix) and freshly released models render correctly with no code change.
+pub fn get_short_model_name(model: &str, _vendor: &str) -> String {
+    if let Some(label) = model_overrides::load().display.get(model) {
+        return label.clone();
     }
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        s[..max_len].to_string()
-    }
+    short_label(&parse_model_identity(model))
 }
 
 fn format_model_name_with_vendor_prefix(
@@ -1181,6 +1076,27 @@ mod tests {
         assert_eq!(format_countdown(Duration::from_secs(3600)), "01:00:00");
         assert_eq!(format_countdown(Duration::from_secs(3661)), "01:01:01");
         assert_eq!(format_countdown(Duration::from_secs(360_000)), "100:00:00");
+    }
+
+    #[test]
+    fn short_model_name_renders_new_models_without_a_table() {
+        // The reported regression: an unmapped model truncated to "claude-opus-".
+        assert_eq!(get_short_model_name("claude-opus-4-8", "claude"), "Opus 4.8");
+        assert_eq!(get_short_model_name("claude-opus-4-7", "claude"), "Opus 4.7");
+        assert_eq!(get_short_model_name("opus", "claude"), "Opus");
+        assert_eq!(get_short_model_name("<synthetic>", "claude"), "synthetic");
+        assert_eq!(get_short_model_name("gpt-5.5", "codex"), "GPT-5.5");
+        assert_eq!(get_short_model_name("gpt-5.5 (high)", "codex"), "GPT-5.5(H)");
+        assert_eq!(get_short_model_name("gpt-5.5:xhigh", "codex"), "GPT-5.5(XH)");
+        assert_eq!(
+            get_short_model_name("gemini-3.2-pro-preview", "gemini"),
+            "Gem 3.2 Pro"
+        );
+        // Meta-vendor `omp`: family inferred from the id's real provider prefix.
+        assert_eq!(
+            get_short_model_name("anthropic/claude-opus-4-8", "omp"),
+            "Opus 4.8"
+        );
     }
 
     #[test]

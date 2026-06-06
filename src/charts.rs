@@ -92,19 +92,6 @@ impl ChartGranularity {
     }
 }
 
-// Model display configuration for Claude (order matters)
-fn model_config() -> Vec<(&'static str, &'static str, usize)> {
-    vec![
-        ("claude-opus-4-6", "Opus 4.6", 0),
-        ("claude-opus-4-5-20251101", "Opus 4.5", 1),
-        ("claude-opus-4-1-20250805", "Opus 4.1", 2),
-        ("claude-sonnet-4-6", "Sonnet 4.6", 3),
-        ("claude-sonnet-4-5-20250929", "Sonnet 4.5", 4),
-        ("claude-sonnet-4-20250514", "Sonnet 4", 5),
-        ("claude-haiku-4-5-20251001", "Haiku 4.5", 6),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,20 +842,6 @@ mod tests {
     }
 }
 
-fn model_order(model: &str) -> Option<usize> {
-    model_config()
-        .iter()
-        .find(|(m, _, _)| *m == model)
-        .map(|(_, _, o)| *o)
-}
-
-fn model_short_name(model: &str) -> Option<&'static str> {
-    model_config()
-        .iter()
-        .find(|(m, _, _)| *m == model)
-        .map(|(_, s, _)| *s)
-}
-
 // Line color configuration (ANSI 256-color)
 fn line_color(key: &str) -> &'static str {
     match key {
@@ -902,32 +875,6 @@ fn vendor_color(vendor: &str) -> &'static str {
         "Oh My Pi" => "\x1b[38;5;141m",
         "All" => "\x1b[38;5;226m",
         _ => "\x1b[38;5;135m",
-    }
-}
-
-fn get_short_model_name_for_chart(model: &str) -> String {
-    if let Some(short) = model_short_name(model) {
-        return short.to_string();
-    }
-    if model.contains(" (")
-        && model.ends_with(')')
-        && let Some(idx) = model.rfind(" (")
-    {
-        let base = &model[..idx];
-        let effort = &model[idx + 2..model.len() - 1];
-        let effort_short = match effort {
-            "low" => "L",
-            "medium" => "M",
-            "high" => "H",
-            "xhigh" => "XH",
-            _ => &effort[..1],
-        };
-        return format!("{}({})", base, effort_short);
-    }
-    if model.len() > 12 {
-        model[..12].to_string()
-    } else {
-        model.to_string()
     }
 }
 
@@ -1787,64 +1734,58 @@ pub fn print_multi_line_chart(
         all_models.retain(|m| included.contains(m));
     }
 
-    let config = model_config();
-    let known_set: HashSet<&str> = config.iter().map(|(m, _, _)| *m).collect();
+    // Group by chart color family: Claude's opus/sonnet/haiku get dedicated
+    // palette entries and lead the chart ordered by family then newest version;
+    // everything else gets cycled through the indexed palette, sorted by name.
+    use crate::model_id::{color_family, parse_model_identity, short_label, sort_key};
 
-    let mut known_models: Vec<String> = all_models
+    let mut named_models: Vec<String> = all_models
         .iter()
-        .filter(|m| known_set.contains(m.as_str()))
+        .filter(|m| color_family(&parse_model_identity(m)).is_some())
         .cloned()
         .collect();
     let mut other_models: Vec<String> = all_models
         .iter()
-        .filter(|m| !known_set.contains(m.as_str()))
+        .filter(|m| color_family(&parse_model_identity(m)).is_none())
         .cloned()
         .collect();
 
-    known_models.sort_by_key(|m| model_order(m).unwrap_or(99));
+    named_models.sort_by(|a, b| {
+        sort_key(&parse_model_identity(a)).cmp(&sort_key(&parse_model_identity(b)))
+    });
     other_models.sort();
 
-    let all_models_sorted: Vec<String> = known_models.into_iter().chain(other_models).collect();
+    let all_models_sorted: Vec<String> =
+        named_models.into_iter().chain(other_models).collect();
 
     // Build line configurations
     let mut lines: Vec<LineConfig> = Vec::new();
-    for (model_idx, model) in all_models_sorted.iter().enumerate() {
-        if known_set.contains(model.as_str()) {
-            let short_label = model_short_name(model).unwrap_or(model);
-            let model_short = short_label.to_lowercase();
-            let model_prefix = model_short.split_whitespace().next().unwrap_or("unknown");
+    let mut other_color_idx = 0usize;
+    for model in all_models_sorted.iter() {
+        let identity = parse_model_identity(model);
+        let label = short_label(&identity);
+        let color_prefix = match color_family(&identity) {
+            Some(family) => family.to_string(),
+            None => {
+                let prefix = format!("model{}", other_color_idx % 6);
+                other_color_idx += 1;
+                prefix
+            }
+        };
 
-            for token_type in &token_types {
-                let color_suffix = if *token_type == "input" || *token_type == "cache_read" {
-                    "input"
-                } else {
-                    "output"
-                };
-                let color_key = format!("{}_{}", model_prefix, color_suffix);
-                lines.push(LineConfig {
-                    model: model.clone(),
-                    token_type: token_type.to_string(),
-                    color: line_color(&color_key).to_string(),
-                    label: format!("{} {}", short_label, type_labels[token_type]),
-                });
-            }
-        } else {
-            let short_label = get_short_model_name_for_chart(model);
-            let color_idx = model_idx % 6;
-            for token_type in &token_types {
-                let color_suffix = if *token_type == "input" || *token_type == "cache_read" {
-                    "input"
-                } else {
-                    "output"
-                };
-                let color_key = format!("model{}_{}", color_idx, color_suffix);
-                lines.push(LineConfig {
-                    model: model.clone(),
-                    token_type: token_type.to_string(),
-                    color: line_color(&color_key).to_string(),
-                    label: format!("{} {}", short_label, type_labels[token_type]),
-                });
-            }
+        for token_type in &token_types {
+            let color_suffix = if *token_type == "input" || *token_type == "cache_read" {
+                "input"
+            } else {
+                "output"
+            };
+            let color_key = format!("{}_{}", color_prefix, color_suffix);
+            lines.push(LineConfig {
+                model: model.clone(),
+                token_type: token_type.to_string(),
+                color: line_color(&color_key).to_string(),
+                label: format!("{} {}", label, type_labels[token_type]),
+            });
         }
     }
 

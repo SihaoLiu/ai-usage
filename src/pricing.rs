@@ -41,7 +41,11 @@ pub fn load_layered() -> AllPricing {
         combined.overlay(live.claude, live.codex, live.gemini);
     }
 
-    combined.finalize()
+    let mut finalized = combined.finalize();
+    // User overrides are the top layer, applied after date-alias expansion so
+    // they win over the embedded baseline, the cache, and live LiteLLM data.
+    finalized.set_pricing_overrides(crate::model_overrides::load().pricing.clone());
+    finalized
 }
 
 /// Per-vendor model tables. Shape used both for the on-disk cache file and as

@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+use crate::model_id::{Provider, parse_model_identity};
+
 /// Embedded pricing data from pricing.json
 const PRICING_JSON: &str = include_str!("../pricing.json");
 
@@ -106,6 +108,9 @@ pub struct AllPricing {
     pub codex_default: ModelPricing,
     pub gemini_models: HashMap<String, ModelPricing>,
     pub gemini_default: ModelPricing,
+    /// User-supplied per-model price overrides (from `models.toml`), keyed by
+    /// exact model id and consulted before any table, regardless of vendor.
+    overrides_pricing: HashMap<String, ModelPricing>,
     fast_tiers: HashMap<String, HashMap<i8, FastTierPricing>>,
 }
 
@@ -122,8 +127,14 @@ impl AllPricing {
             codex_default: data.codex.default,
             gemini_models: data.gemini.models,
             gemini_default: data.gemini.default,
+            overrides_pricing: HashMap::new(),
             fast_tiers: normalize_fast_tiers(data.fast_tiers),
         }
+    }
+
+    /// Install user price overrides (highest priority, vendor-agnostic).
+    pub fn set_pricing_overrides(&mut self, overrides: HashMap<String, ModelPricing>) {
+        self.overrides_pricing = overrides;
     }
 
     /// Apply `-YYYYMMDD` date-alias expansion to every vendor table. Must be
@@ -151,6 +162,12 @@ impl AllPricing {
     }
 
     pub fn get_pricing(&self, vendor: &str, model: &str) -> &ModelPricing {
+        // User overrides win regardless of vendor routing (covers private
+        // vendors and the day-one gap before LiteLLM lists a new model).
+        if let Some(p) = self.overrides_pricing.get(model) {
+            return p;
+        }
+
         let (table, default) = match vendor {
             "codex" => (&self.codex_models, &self.codex_default),
             "gemini" => (&self.gemini_models, &self.gemini_default),
@@ -168,6 +185,14 @@ impl AllPricing {
         if let Some(stripped) = strip_date_suffix(model)
             && let Some(p) = table.get(stripped)
         {
+            return p;
+        }
+
+        // Class-aware same-family fallback: borrow the newest known model that
+        // shares provider + family + size/modifier class. Keeps a brand-new
+        // claude-opus-4-8 priced like opus instead of the vendor default, while
+        // never letting a `-mini`/`-nano` variant inherit the base model's rate.
+        if let Some(p) = same_class_fallback(table, model) {
             return p;
         }
 
@@ -243,6 +268,41 @@ fn overlay_table(target: &mut HashMap<String, ModelPricing>, src: HashMap<String
         }
         target.insert(key, new);
     }
+}
+
+/// Find the newest known model that shares the target's provider, family, and
+/// size/modifier class. Returns `None` for unknown-provider ids (no safe peer)
+/// so the caller drops to the vendor default.
+fn same_class_fallback<'a>(
+    table: &'a HashMap<String, ModelPricing>,
+    model: &str,
+) -> Option<&'a ModelPricing> {
+    let target = parse_model_identity(model);
+    if target.provider == Provider::Unknown {
+        return None;
+    }
+    table
+        .iter()
+        .filter_map(|(key, pricing)| {
+            let candidate = parse_model_identity(key);
+            same_class(&target, &candidate).then_some((candidate.version_key, pricing))
+        })
+        .max_by_key(|(version_key, _)| *version_key)
+        .map(|(_, pricing)| pricing)
+}
+
+/// Two ids are the same pricing class when they agree on provider, family, and
+/// the exact set of size/modifier tokens (so `gpt-5.5-mini` never matches the
+/// base `gpt-5.5`).
+fn same_class(a: &crate::model_id::ModelIdentity, b: &crate::model_id::ModelIdentity) -> bool {
+    if a.provider != b.provider || a.family != b.family {
+        return false;
+    }
+    let mut am = a.modifiers.clone();
+    let mut bm = b.modifiers.clone();
+    am.sort();
+    bm.sort();
+    am == bm
 }
 
 /// Strip a trailing `-YYYYMMDD` (8 digits, hyphen-separated) from a model name.
@@ -460,6 +520,61 @@ mod tests {
             cache_output_above_200k: None,
             _comment: None,
         }
+    }
+
+    #[test]
+    fn pricing_falls_back_to_newest_in_same_family() {
+        let p = AllPricing::load_raw().finalize();
+        // claude-opus-4-8 is not embedded; it must borrow the newest opus rate
+        // (5/25), not the sonnet-priced vendor default (3/15).
+        let opus_new = p.get_pricing("claude", "claude-opus-4-8");
+        assert!((opus_new.input - 5.0).abs() < 1e-9);
+        assert!((opus_new.output - 25.0).abs() < 1e-9);
+
+        // gemini-3.2-pro borrows the newest pro rate (2.00), not the flash-priced
+        // gemini default (0.50).
+        let gem_new = p.get_pricing("gemini", "gemini-3.2-pro-preview");
+        assert!((gem_new.input - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pricing_fallback_respects_size_class() {
+        let p = AllPricing::load_raw().finalize();
+        // A future `-mini` must borrow a mini rate (newest = gpt-5.4-mini 0.75),
+        // never the much pricier base gpt rate.
+        let mini = p.get_pricing("codex", "gpt-5.9-mini");
+        assert!((mini.input - 0.75).abs() < 1e-9);
+        assert!(mini.input < 1.0, "must not inherit a base-class rate");
+    }
+
+    #[test]
+    fn pricing_unknown_model_uses_vendor_default() {
+        let p = AllPricing::load_raw().finalize();
+        let unknown = p.get_pricing("claude", "totally-mystery-thing");
+        assert!((unknown.input - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pricing_override_wins_over_table_and_fallback() {
+        let mut p = AllPricing::load_raw().finalize();
+        let mut ov = HashMap::new();
+        ov.insert(
+            "claude-opus-4-7".to_string(),
+            ModelPricing {
+                input: 99.0,
+                output: 199.0,
+                cache_input: 9.0,
+                cache_output: 9.0,
+                input_above_200k: None,
+                output_above_200k: None,
+                cache_input_above_200k: None,
+                cache_output_above_200k: None,
+                _comment: None,
+            },
+        );
+        p.set_pricing_overrides(ov);
+        let got = p.get_pricing("claude", "claude-opus-4-7");
+        assert!((got.input - 99.0).abs() < 1e-9);
     }
 
     #[test]

@@ -45,7 +45,10 @@ Environment variables can override default paths:
 ```
 src/
   main.rs            # Entry point, CLI args, monitor loop, vendor aggregation
-  constants.rs       # Pricing loader (pricing.json + .fee.env)
+  constants.rs       # Pricing tables, class-aware lookup (pricing.json + .fee.env)
+  pricing.rs         # Layered pricing loader (embedded -> cache -> LiteLLM)
+  model_id.rs        # Algorithmic model-id parser (display label, sort, color)
+  model_overrides.rs # User overrides loader (~/.config/ai-usage/models.toml)
   formatting.rs      # Output formatting and responsive tables
   charts.rs          # ASCII chart visualization
   time_utils.rs      # Timezone and time formatting utilities
@@ -63,6 +66,7 @@ pricing.json         # API pricing data for all vendors
 ```
 
 **Key implementation notes:**
+- Model display names are derived algorithmically from the id (`model_id.rs`); no per-model table to maintain. New models render and price automatically; unknown-but-priced models fall back to the newest same-class model, and `models.toml` overrides win over everything.
 - Token values are displayed in thousands (KTok) in charts
 - Cache tokens (creation and read) are tracked separately
 - Time series data is bucketed into 8-hour intervals for trend analysis

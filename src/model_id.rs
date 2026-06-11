@@ -49,8 +49,9 @@ pub struct ModelIdentity {
 /// Snapshot/preview markers stripped from the tail of an id.
 const TAIL_MARKERS: &[&str] = &["preview", "latest", "exp", "beta", "snapshot"];
 
-/// Claude sub-family tokens.
-const CLAUDE_FAMILIES: &[&str] = &["opus", "sonnet", "haiku"];
+/// Claude sub-family tokens. `fable`/`mythos` are the Mythos-class tier above
+/// opus (e.g. `claude-fable-5`).
+const CLAUDE_FAMILIES: &[&str] = &["fable", "mythos", "opus", "sonnet", "haiku"];
 
 fn is_all_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
@@ -394,10 +395,11 @@ pub fn short_label(id: &ModelIdentity) -> String {
 fn family_rank(id: &ModelIdentity) -> u32 {
     match id.provider {
         Provider::Claude => match id.family.as_str() {
-            "opus" => 0,
-            "sonnet" => 1,
-            "haiku" => 2,
-            _ => 3,
+            "fable" | "mythos" => 0,
+            "opus" => 1,
+            "sonnet" => 2,
+            "haiku" => 3,
+            _ => 4,
         },
         Provider::Openai => 10,
         Provider::Google => 20,
@@ -415,11 +417,13 @@ pub fn sort_key(id: &ModelIdentity) -> (u32, std::cmp::Reverse<(u32, u32)>, Stri
     )
 }
 
-/// Chart color family. Only Claude's three sub-families get dedicated palette
-/// entries today; everything else falls back to the indexed palette.
+/// Chart color family. Only Claude's sub-families get dedicated palette
+/// entries today; everything else falls back to the indexed palette. Fable and
+/// Mythos share one palette entry (same model behind two ids).
 pub fn color_family(id: &ModelIdentity) -> Option<&'static str> {
     if id.provider == Provider::Claude {
         match id.family.as_str() {
+            "fable" | "mythos" => Some("fable"),
             "opus" => Some("opus"),
             "sonnet" => Some("sonnet"),
             "haiku" => Some("haiku"),
@@ -440,6 +444,9 @@ mod tests {
 
     #[test]
     fn claude_labels_derive_family_and_version() {
+        assert_eq!(label("claude-fable-5"), "Fable 5");
+        assert_eq!(label("claude-mythos-5"), "Mythos 5");
+        assert_eq!(label("claude-mythos-preview"), "Mythos");
         assert_eq!(label("claude-opus-4-8"), "Opus 4.8");
         assert_eq!(label("claude-opus-4-7"), "Opus 4.7");
         assert_eq!(label("claude-opus-4-5-20251101"), "Opus 4.5");
@@ -502,6 +509,14 @@ mod tests {
 
     #[test]
     fn color_family_is_claude_subfamily_only() {
+        assert_eq!(
+            color_family(&parse_model_identity("claude-fable-5")),
+            Some("fable")
+        );
+        assert_eq!(
+            color_family(&parse_model_identity("claude-mythos-5")),
+            Some("fable")
+        );
         assert_eq!(color_family(&parse_model_identity("claude-opus-4-8")), Some("opus"));
         assert_eq!(
             color_family(&parse_model_identity("claude-sonnet-4-6")),
@@ -542,6 +557,7 @@ mod tests {
 
     #[test]
     fn sort_key_groups_family_then_newest_first() {
+        let fable5 = sort_key(&parse_model_identity("claude-fable-5"));
         let opus8 = sort_key(&parse_model_identity("claude-opus-4-8"));
         let opus7 = sort_key(&parse_model_identity("claude-opus-4-7"));
         let sonnet6 = sort_key(&parse_model_identity("claude-sonnet-4-6"));
@@ -550,7 +566,8 @@ mod tests {
 
         // Newer version sorts before older within a family.
         assert!(opus8 < opus7);
-        // opus < sonnet < haiku, all before OpenAI.
+        // fable < opus < sonnet < haiku, all before OpenAI.
+        assert!(fable5 < opus8);
         assert!(opus7 < sonnet6);
         assert!(sonnet6 < haiku5);
         assert!(haiku5 < gpt);

@@ -845,6 +845,8 @@ mod tests {
 // Line color configuration (ANSI 256-color)
 fn line_color(key: &str) -> &'static str {
     match key {
+        "fable_input" => "\x1b[38;5;129m",
+        "fable_output" => "\x1b[38;5;183m",
         "opus_input" => "\x1b[38;5;196m",
         "opus_output" => "\x1b[38;5;203m",
         "sonnet_input" => "\x1b[38;5;33m",

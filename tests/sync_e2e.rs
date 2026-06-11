@@ -148,7 +148,8 @@ async fn two_homes_exchange_usage_through_local_server() {
         "host-b display",
     );
 
-    assert!(output.contains("e2e-model"), "{output}");
+    // Unknown model ids render as derived title-case labels.
+    assert!(output.contains("E2e Model"), "{output}");
     assert!(
         home_b
             .join(".cache")
@@ -222,7 +223,8 @@ async fn sync_clean_refetches_records_from_server_after_local_wipe() {
         ),
         "host-b display after clean",
     );
-    assert!(after_clean.contains("clean-model"), "{after_clean}");
+    // Unknown model ids render as derived title-case labels.
+    assert!(after_clean.contains("Clean Model"), "{after_clean}");
 
     server.abort();
 }

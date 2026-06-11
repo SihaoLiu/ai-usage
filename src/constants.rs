@@ -525,16 +525,76 @@ mod tests {
     #[test]
     fn pricing_falls_back_to_newest_in_same_family() {
         let p = AllPricing::load_raw().finalize();
-        // claude-opus-4-8 is not embedded; it must borrow the newest opus rate
+        // claude-opus-4-9 is not embedded; it must borrow the newest opus rate
         // (5/25), not the sonnet-priced vendor default (3/15).
-        let opus_new = p.get_pricing("claude", "claude-opus-4-8");
+        let opus_new = p.get_pricing("claude", "claude-opus-4-9");
         assert!((opus_new.input - 5.0).abs() < 1e-9);
         assert!((opus_new.output - 25.0).abs() < 1e-9);
+
+        // A future fable release borrows the newest fable rate (10/50).
+        let fable_new = p.get_pricing("claude", "claude-fable-5-1");
+        assert!((fable_new.input - 10.0).abs() < 1e-9);
+        assert!((fable_new.output - 50.0).abs() < 1e-9);
 
         // gemini-3.2-pro borrows the newest pro rate (2.00), not the flash-priced
         // gemini default (0.50).
         let gem_new = p.get_pricing("gemini", "gemini-3.2-pro-preview");
         assert!((gem_new.input - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pricing_embedded_covers_current_claude_models() {
+        let p = AllPricing::load_raw().finalize();
+        let fable = p.get_pricing("claude", "claude-fable-5");
+        assert!((fable.input - 10.0).abs() < 1e-9);
+        assert!((fable.output - 50.0).abs() < 1e-9);
+        assert!((fable.cache_input - 1.0).abs() < 1e-9);
+        assert!((fable.cache_output - 12.5).abs() < 1e-9);
+        assert!(fable.input_above_200k.is_none());
+
+        let mythos = p.get_pricing("claude", "claude-mythos-5");
+        assert!((mythos.input - 10.0).abs() < 1e-9);
+
+        let opus8 = p.get_pricing("claude", "claude-opus-4-8");
+        assert!((opus8.input - 5.0).abs() < 1e-9);
+        assert!((opus8.output - 25.0).abs() < 1e-9);
+        assert!(opus8.input_above_200k.is_none());
+    }
+
+    #[test]
+    fn overlay_remote_rates_win_over_embedded_baseline() {
+        // The layered loader applies remote (cache/LiteLLM) tables on top of
+        // the embedded baseline: remote base rates must win per-model, while
+        // the embedded entry only fills in tier fields the remote layer omits
+        // and keeps covering models the remote layer does not know about.
+        let mut p = AllPricing::load_raw();
+        let mut remote = HashMap::new();
+        remote.insert(
+            "claude-opus-4-7".to_string(),
+            ModelPricing {
+                input: 4.0,
+                output: 20.0,
+                cache_input: 0.4,
+                cache_output: 5.0,
+                input_above_200k: None,
+                output_above_200k: None,
+                cache_input_above_200k: None,
+                cache_output_above_200k: None,
+                _comment: None,
+            },
+        );
+        p.overlay(remote, HashMap::new(), HashMap::new());
+        let p = p.finalize();
+
+        let opus7 = p.get_pricing("claude", "claude-opus-4-7");
+        assert!((opus7.input - 4.0).abs() < 1e-9);
+        assert!((opus7.output - 20.0).abs() < 1e-9);
+        // Tier fields omitted by the remote layer survive from the baseline.
+        assert_eq!(opus7.input_above_200k, Some(10.0));
+
+        // Models absent from the remote layer keep their embedded rates.
+        let fable = p.get_pricing("claude", "claude-fable-5");
+        assert!((fable.input - 10.0).abs() < 1e-9);
     }
 
     #[test]

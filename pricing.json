@@ -1,11 +1,32 @@
 {
   "_meta": {
     "description": "API pricing and subscription costs for AI services",
-    "last_updated": "2026-04-16",
+    "last_updated": "2026-06-11",
     "notes": "All prices are per million tokens (MTok) at standard API rates. Update this file when pricing changes."
   },
   "claude": {
     "models": {
+      "claude-fable-5": {
+        "input": 10.00,
+        "output": 50.00,
+        "cache_input": 1.00,
+        "cache_output": 12.50,
+        "_comment": "1M context at standard pricing, no long-context premium tier"
+      },
+      "claude-mythos-5": {
+        "input": 10.00,
+        "output": 50.00,
+        "cache_input": 1.00,
+        "cache_output": 12.50,
+        "_comment": "Same model and pricing as claude-fable-5"
+      },
+      "claude-opus-4-8": {
+        "input": 5.00,
+        "output": 25.00,
+        "cache_input": 0.50,
+        "cache_output": 6.25,
+        "_comment": "1M context at standard pricing, no long-context premium tier"
+      },
       "claude-opus-4-7": {
         "input": 5.00,
         "output": 25.00,
@@ -317,7 +338,8 @@
         "default": 1.0,
         "models": {
           "claude-opus-4-6": 6.0,
-          "claude-opus-4-7": 6.0
+          "claude-opus-4-7": 6.0,
+          "claude-opus-4-8": 6.0
         },
         "_comment": "Fast mode published rate is 30/150 per MTok for listed Opus models."
       }

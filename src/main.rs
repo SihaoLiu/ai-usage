@@ -479,8 +479,8 @@ fn calculate_chart_height(
 
     // Table: 1 blank + 1 title + 1 =border + 1 header + 1 -border
     //        + num_models rows + 1 -border + 1 TOTAL + 1 Cost + 1 =border
-    //        + 1 cost summary = 10 + num_models
-    let table_lines = if table_printed { 10 + num_models } else { 0 };
+    //        + 1 cost summary + 1 insight summary = 11 + num_models
+    let table_lines = if table_printed { 11 + num_models } else { 0 };
 
     // Time span info: 1 line + 1 blank
     let time_span_lines = 2;

@@ -44,6 +44,10 @@ const MIN_TERMINAL_HEIGHT: u16 = 35;
 const PREFETCH_PAGE_WINDOWS: i32 = 8;
 const FULL_CACHE_HORIZON: i64 = i64::MAX / 4;
 const DATA_LOADED_NOTICE_MS: u64 = 3_000;
+const DAY_PRESET_DAYS: i64 = 1;
+const WEEK_PRESET_DAYS: i64 = 7;
+const MONTH_PRESET_DAYS: i64 = 30;
+const YEAR_PRESET_DAYS: i64 = 365;
 
 /// Render `body` into an off-screen buffer (by redirecting stdout into a
 /// pipe), then write the whole frame in a single `write_all` so the terminal
@@ -565,6 +569,10 @@ fn display_chart_granularity(
 ) -> charts::ChartGranularity {
     let span_minutes = ((*range_end - *range_start).num_seconds() / 60).max(1);
     charts::ChartGranularity::from_span_minutes(span_minutes)
+}
+
+fn is_current_rolling_days_preset(window: &TimeWindow, days: i64) -> bool {
+    matches!(window, TimeWindow::RollingDays { days: current } if *current == days)
 }
 
 fn round_to_nice_interval(optimal: f64) -> i64 {
@@ -2737,9 +2745,12 @@ fn main() {
                                 }
                             }
                             "d" | "day" | "days" => {
-                                if state.days != 1 {
-                                    state.days = 1;
-                                    state.time_window = TimeWindow::rolling_days(1);
+                                if !is_current_rolling_days_preset(
+                                    &state.time_window,
+                                    DAY_PRESET_DAYS,
+                                ) {
+                                    state.days = DAY_PRESET_DAYS;
+                                    state.time_window = TimeWindow::rolling_days(DAY_PRESET_DAYS);
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!("\n\r{}\r", "=".repeat(width as usize));
                                     println!("CHANGED TO 1 DAY\r");
@@ -2748,37 +2759,61 @@ fn main() {
                                     terminal_too_small = result.is_none();
                                     did_refresh = true;
                                 } else {
-                                    println!("Already showing 1 day.\r");
+                                    println!("Already showing last 1 day.\r");
                                 }
                             }
                             "w" | "week" => {
-                                if state.days != 7 {
-                                    state.days = 7;
-                                    state.time_window = TimeWindow::rolling_days(7);
+                                if !is_current_rolling_days_preset(
+                                    &state.time_window,
+                                    WEEK_PRESET_DAYS,
+                                ) {
+                                    state.days = WEEK_PRESET_DAYS;
+                                    state.time_window = TimeWindow::rolling_days(WEEK_PRESET_DAYS);
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!("\n\r{}\r", "=".repeat(width as usize));
-                                    println!("CHANGED TO 7 DAYS (WEEK MODE)\r");
+                                    println!("CHANGED TO 7 DAYS\r");
                                     println!("{}\n\r", "=".repeat(width as usize));
                                     let result = refresh_display(&mut state);
                                     terminal_too_small = result.is_none();
                                     did_refresh = true;
                                 } else {
-                                    println!("Already showing 7 days (week mode).\r");
+                                    println!("Already showing last 7 days.\r");
                                 }
                             }
                             "m" | "month" => {
-                                if state.days != 30 {
-                                    state.days = 30;
-                                    state.time_window = TimeWindow::rolling_days(30);
+                                if !is_current_rolling_days_preset(
+                                    &state.time_window,
+                                    MONTH_PRESET_DAYS,
+                                ) {
+                                    state.days = MONTH_PRESET_DAYS;
+                                    state.time_window = TimeWindow::rolling_days(MONTH_PRESET_DAYS);
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!("\n\r{}\r", "=".repeat(width as usize));
-                                    println!("CHANGED TO 30 DAYS (MONTH MODE)\r");
+                                    println!("CHANGED TO 30 DAYS\r");
                                     println!("{}\n\r", "=".repeat(width as usize));
                                     let result = refresh_display(&mut state);
                                     terminal_too_small = result.is_none();
                                     did_refresh = true;
                                 } else {
-                                    println!("Already showing 30 days (month mode).\r");
+                                    println!("Already showing last 30 days.\r");
+                                }
+                            }
+                            "y" | "year" => {
+                                if !is_current_rolling_days_preset(
+                                    &state.time_window,
+                                    YEAR_PRESET_DAYS,
+                                ) {
+                                    state.days = YEAR_PRESET_DAYS;
+                                    state.time_window = TimeWindow::rolling_days(YEAR_PRESET_DAYS);
+                                    println!("{}\r", "-".repeat(width as usize));
+                                    println!("\n\r{}\r", "=".repeat(width as usize));
+                                    println!("CHANGED TO 365 DAYS\r");
+                                    println!("{}\n\r", "=".repeat(width as usize));
+                                    let result = refresh_display(&mut state);
+                                    terminal_too_small = result.is_none();
+                                    did_refresh = true;
+                                } else {
+                                    println!("Already showing last 365 days.\r");
                                 }
                             }
                             "h" | "help" => {
@@ -2792,8 +2827,9 @@ fn main() {
                                 println!("  n                - Rotate to next tool\r");
                                 println!("  a                - Jump to tool=all\r");
                                 println!("  d, day, days [N] - Change days (default: 1 if no N)\r");
-                                println!("  w, week          - Week mode (7 days)\r");
-                                println!("  m, month         - Month mode (30 days)\r");
+                                println!("  w, week          - Show last 7 days\r");
+                                println!("  m, month         - Show last 30 days\r");
+                                println!("  y, year          - Show last 365 days\r");
                                 println!("  date YYYY-MM-DD  - Show one complete local day\r");
                                 println!(
                                     "  range A B        - Show inclusive local date span (any order)\r"
@@ -3929,6 +3965,29 @@ mod tests {
         };
 
         assert_eq!(days, 5);
+    }
+
+    #[test]
+    fn rolling_days_preset_is_current_only_for_matching_rolling_window() {
+        assert!(is_current_rolling_days_preset(
+            &TimeWindow::rolling_days(30),
+            30
+        ));
+        assert!(!is_current_rolling_days_preset(
+            &TimeWindow::rolling_days(7),
+            30
+        ));
+    }
+
+    #[test]
+    fn zoomed_rolling_days_window_is_not_current_preset() {
+        let now = Local
+            .with_ymd_and_hms(2026, 6, 15, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let zoomed = TimeWindow::rolling_days(30).zoom_in(now).expect("zoom in");
+
+        assert!(!is_current_rolling_days_preset(&zoomed, 30));
     }
 
     #[test]

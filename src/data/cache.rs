@@ -10,6 +10,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageCost, UsageEntry};
+use crate::model_id::{Provider, is_reasoning_effort, parse_model_identity};
 use crate::time_utils::parse_timestamp;
 
 const CACHE_VERSION: u32 = 1;
@@ -18,7 +19,7 @@ const REMOTE_FILE_MAGIC: &[u8; 8] = b"AIUREMT1";
 const MANIFEST_FILE: &str = "manifest.json";
 const ENTRIES_DIR: &str = "entries";
 const REMOTE_DIR: &str = "remote";
-const OMP_PARSER_REVISION: u32 = 1;
+const OMP_PARSER_REVISION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheManifest {
@@ -816,7 +817,24 @@ fn remote_omp_file_alias_from_key(key: &OmpV220Key) -> OmpRemoteFileAlias {
 
 fn omp_model_candidates_for(model: &str, effort: Option<&str>) -> Vec<String> {
     let mut models = vec![model.to_string()];
-    if let Some(provider) = effort.filter(|value| !value.is_empty()) {
+    match parse_model_identity(model).provider {
+        Provider::Claude => {
+            models.push(format!("anthropic/{model}"));
+            models.push(format!("claude/{model}"));
+        }
+        Provider::Google => {
+            models.push(format!("gemini/{model}"));
+            models.push(format!("google/{model}"));
+            models.push(format!("vertex/{model}"));
+        }
+        Provider::Openai => {
+            models.push(format!("openai/{model}"));
+            models.push(format!("openai-codex/{model}"));
+        }
+        Provider::Unknown => {}
+    }
+    if let Some(provider) = effort.filter(|value| !value.is_empty() && !is_reasoning_effort(value))
+    {
         models.push(format!("{provider}/{model}"));
     }
     models.sort();
@@ -1837,6 +1855,17 @@ mod tests {
     }
 
     #[test]
+    fn omp_alias_candidates_ignore_reasoning_effort_values() {
+        let with_provider = super::omp_model_candidates_for("gpt-5", Some("rust-cat"));
+        let with_effort = super::omp_model_candidates_for("gpt-5", Some("xhigh"));
+
+        assert!(with_provider.contains(&"rust-cat/gpt-5".to_string()));
+        assert!(with_provider.contains(&"openai-codex/gpt-5".to_string()));
+        assert!(!with_effort.contains(&"xhigh/gpt-5".to_string()));
+        assert!(with_effort.contains(&"openai-codex/gpt-5".to_string()));
+    }
+
+    #[test]
     fn local_cache_entries_have_no_host_id() {
         let cache_root = unique_temp_dir("local-host");
         let source = cache_root.join("source.jsonl");
@@ -2142,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn old_omp_manifest_reparses_unchanged_sources_for_provider_fields() {
+    fn old_omp_manifest_reparses_unchanged_sources_after_parser_change() {
         let cache_root = unique_temp_dir("omp-provider-refresh");
         let source = cache_root.join("source.jsonl");
         write_source(&source, "first");
@@ -2181,13 +2210,13 @@ mod tests {
                 calls.fetch_add(1, Ordering::Relaxed);
                 let mut record = usage_record("omp:message:msg-a", "2026-05-01T00:00:00Z", 42);
                 record.entry.model = "claude-sonnet-4-5-20250929".to_string();
-                record.entry.effort = Some("anthropic".to_string());
+                record.entry.effort = None;
                 vec![record]
             });
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(refreshed.len(), 1);
-        assert_eq!(refreshed[0].effort.as_deref(), Some("anthropic"));
+        assert_eq!(refreshed[0].effort.as_deref(), None);
     }
 
     #[test]

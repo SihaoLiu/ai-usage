@@ -5,6 +5,7 @@ use std::time::SystemTime;
 use walkdir::WalkDir;
 
 use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageCost, UsageEntry};
+use crate::model_id::normalize_reasoning_effort;
 use crate::time_utils::parse_timestamp;
 
 /// Get the Oh My Pi configuration directory.
@@ -38,6 +39,16 @@ fn non_empty_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str>
         .get(key)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+}
+
+fn explicit_reasoning_effort(
+    usage: &serde_json::Value,
+    message: &serde_json::Value,
+) -> Option<String> {
+    ["effort", "reasoningEffort", "reasoning_effort"]
+        .into_iter()
+        .filter_map(|key| non_empty_str(usage, key).or_else(|| non_empty_str(message, key)))
+        .find_map(normalize_reasoning_effort)
 }
 
 fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
@@ -80,10 +91,8 @@ fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
             .or_else(|| message.get("model"))
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let (model, provider_from_model) = normalize_model(raw_model);
-        let provider = provider_from_model
-            .or_else(|| non_empty_str(usage, "provider"))
-            .or_else(|| non_empty_str(message, "provider"));
+        let (model, _) = normalize_model(raw_model);
+        let effort = explicit_reasoning_effort(usage, message);
 
         let input_tokens = as_i64(usage, "input");
         let output_tokens = as_i64(usage, "output");
@@ -130,7 +139,7 @@ fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
                 session_start_time: timestamp.clone(),
                 session_end_time: timestamp,
                 model: model.to_string(),
-                effort: provider.map(str::to_string),
+                effort,
                 fast_tier: UNKNOWN_FAST_TIER,
                 usage: TokenUsage {
                     input_tokens,
@@ -231,7 +240,7 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].entry.model, "gpt-5.5");
-        assert_eq!(records[0].entry.effort.as_deref(), Some("openai-codex"));
+        assert_eq!(records[0].entry.effort.as_deref(), None);
         assert_eq!(records[0].entry.usage.input_tokens, 917);
         assert_eq!(records[0].entry.usage.output_tokens, 27);
         assert_eq!(records[0].entry.usage.cache_read_input_tokens, 20224);
@@ -271,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn uses_explicit_provider_when_model_has_no_prefix() {
+    fn provider_fields_do_not_become_effort() {
         let path = unique_temp_file("explicit-provider");
         fs::write(
             &path,
@@ -286,8 +295,26 @@ mod tests {
 
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].entry.model, "claude-sonnet-4-5-20250929");
-        assert_eq!(records[0].entry.effort.as_deref(), Some("anthropic"));
+        assert_eq!(records[0].entry.effort.as_deref(), None);
         assert_eq!(records[1].entry.model, "gemini-2.5-pro");
-        assert_eq!(records[1].entry.effort.as_deref(), Some("google"));
+        assert_eq!(records[1].entry.effort.as_deref(), None);
+    }
+
+    #[test]
+    fn explicit_reasoning_effort_survives_endpoint_provider() {
+        let path = unique_temp_file("reasoning-effort");
+        fs::write(
+            &path,
+            r#"{"type":"message","id":"msg-a","timestamp":"2026-05-27T08:34:02Z","message":{"role":"assistant","provider":"rust-cat","model":"rust-cat/gpt-5","usage":{"effort":"xhigh","input":10,"output":2,"cacheRead":3,"cacheWrite":4,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"responseId":"resp-a"}}
+"#,
+        )
+        .expect("write omp fixture");
+
+        let records = read_omp_file_records(&path);
+        fs::remove_file(&path).ok();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry.model, "gpt-5");
+        assert_eq!(records[0].entry.effort.as_deref(), Some("xhigh"));
     }
 }

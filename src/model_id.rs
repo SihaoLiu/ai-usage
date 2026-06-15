@@ -37,8 +37,7 @@ pub struct ModelIdentity {
     /// Recognized price/size-class tokens (e.g. `mini`, `codex`, `flash`,
     /// `lite`), in the order they appear. Empty for a base model.
     pub modifiers: Vec<String>,
-    /// Reasoning-effort annotation (`low`/`medium`/`high`/`xhigh`) when the id
-    /// carried a trailing ` (effort)`.
+    /// Reasoning-effort annotation when the id carried a trailing effort tag.
     pub effort: Option<String>,
     /// Provider/date/effort-stripped, lowercased id.
     pub normalized_id: String,
@@ -57,28 +56,35 @@ fn is_all_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Recognized reasoning-effort annotations (used to disambiguate the colon
-/// form from a model name that merely contains a colon).
-const EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+/// Recognized reasoning-effort annotations.
+const EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+
+pub fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let effort = value.trim().to_ascii_lowercase();
+    EFFORTS.contains(&effort.as_str()).then_some(effort)
+}
+
+pub fn is_reasoning_effort(value: &str) -> bool {
+    normalize_reasoning_effort(value).is_some()
+}
 
 /// Split off a trailing effort annotation, returning `(base, effort)`. Handles
-/// both the parenthetical form (`gpt-5.5 (high)`) and Codex's colon form
+/// both the parenthetical form (`gpt-5.5 (high)`) and the colon form
 /// (`gpt-5.5:xhigh`).
 fn split_effort(s: &str) -> (&str, Option<String>) {
     let s = s.trim();
     if s.ends_with(')')
         && let Some(idx) = s.rfind(" (")
     {
-        let effort = &s[idx + 2..s.len() - 1];
-        if !effort.is_empty() {
-            return (&s[..idx], Some(effort.to_ascii_lowercase()));
-        }
+        return (
+            &s[..idx],
+            normalize_reasoning_effort(&s[idx + 2..s.len() - 1]),
+        );
     }
-    if let Some(idx) = s.rfind(':') {
-        let effort = s[idx + 1..].to_ascii_lowercase();
-        if EFFORTS.contains(&effort.as_str()) {
-            return (&s[..idx], Some(effort));
-        }
+    if let Some(idx) = s.rfind(':')
+        && let Some(effort) = normalize_reasoning_effort(&s[idx + 1..])
+    {
+        return (&s[..idx], Some(effort));
     }
     (s, None)
 }
@@ -336,6 +342,7 @@ fn effort_abbrev(effort: &str) -> String {
         "medium" => "M".to_string(),
         "high" => "H".to_string(),
         "xhigh" => "XH".to_string(),
+        "max" => "Max".to_string(),
         other => capitalize(&other[..1]),
     }
 }
@@ -481,9 +488,10 @@ mod tests {
         assert_eq!(label("o4-mini"), "o4-mini");
         assert_eq!(label("gpt-5.5 (high)"), "GPT-5.5(H)");
         assert_eq!(label("gpt-5.4-codex (medium)"), "GPT-5.4 Cdx(M)");
-        // Codex also encodes effort with a colon, e.g. `gpt-5.5:xhigh`.
         assert_eq!(label("gpt-5.5:xhigh"), "GPT-5.5(XH)");
         assert_eq!(label("gpt-5.5:high"), "GPT-5.5(H)");
+        assert_eq!(label("gpt-5.5:max"), "GPT-5.5(Max)");
+        assert_eq!(label("gpt-5.5 (rust-cat)"), "GPT-5.5");
     }
 
     #[test]

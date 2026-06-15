@@ -9,6 +9,7 @@ use chrono::{DateTime, Local};
 
 use crate::constants::{AllPricing, ModelPricing};
 use crate::data::UsageEntry;
+use crate::model_id::{Provider, normalize_reasoning_effort, parse_model_identity};
 use crate::time_utils::{
     TokenFractions, distribute_tokens_to_intervals, parse_timestamp, to_interval,
 };
@@ -18,20 +19,24 @@ pub(crate) fn pricing_vendor_for_entry<'a>(vendor: &'a str, entry: &'a UsageEntr
         return vendor;
     }
 
-    let Some(provider) = entry.effort.as_deref() else {
-        return "codex";
-    };
-    let provider = provider.to_ascii_lowercase();
-    if provider.contains("anthropic") || provider.contains("claude") {
-        "claude"
-    } else if provider.contains("gemini")
-        || provider.contains("google")
-        || provider.contains("vertex")
-    {
-        "gemini"
-    } else {
-        "codex"
+    match parse_model_identity(&entry.model).provider {
+        Provider::Claude => "claude",
+        Provider::Google => "gemini",
+        Provider::Openai | Provider::Unknown => "codex",
     }
+}
+
+fn model_key_for_entry(entry: &UsageEntry, combine_effort: bool) -> String {
+    if !combine_effort {
+        return entry.model.clone();
+    }
+
+    entry
+        .effort
+        .as_deref()
+        .and_then(normalize_reasoning_effort)
+        .map(|effort| format!("{} ({effort})", entry.model))
+        .unwrap_or_else(|| entry.model.clone())
 }
 
 /// Model breakdown row (shared across all vendors).
@@ -88,15 +93,7 @@ pub(crate) fn calculate_model_breakdown_generic(
     let mut model_stats: HashMap<String, ModelBreakdownRow> = HashMap::new();
 
     for entry in usage_data {
-        let model_key = if combine_effort {
-            if let Some(ref effort) = entry.effort {
-                format!("{} ({})", entry.model, effort)
-            } else {
-                entry.model.clone()
-            }
-        } else {
-            entry.model.clone()
-        };
+        let model_key = model_key_for_entry(entry, combine_effort);
 
         let row = model_stats
             .entry(model_key.clone())
@@ -135,7 +132,9 @@ pub(crate) fn calculate_model_breakdown_generic(
                 row.cache_creation += entry.usage.cache_creation_input_tokens;
             }
         }
-        if let Some(costs) = entry.costs {
+        if vendor != "omp"
+            && let Some(costs) = entry.costs
+        {
             row.input_cost += costs.input;
             row.output_cost += costs.output;
             row.cache_read_cost += costs.cache_read;
@@ -143,9 +142,6 @@ pub(crate) fn calculate_model_breakdown_generic(
             continue;
         }
 
-        // Apply tiered pricing per-entry. OMP records carry the underlying
-        // provider in `effort`; use that provider's rate table while preserving
-        // OMP as the display vendor.
         let pricing_vendor = pricing_vendor_for_entry(vendor, entry);
         let p = pricing.pricing_for_entry(pricing_vendor, &entry.model, entry.fast_tier);
         row.input_cost +=
@@ -163,14 +159,11 @@ pub(crate) fn calculate_model_breakdown_generic(
                 p.cache_output,
                 p.cache_output_above_200k,
             ),
-            // Codex bills reasoning at the output rate; tier rules track output.
             (_, "codex") => ModelPricing::tier_cost(
                 entry.usage.reasoning_output_tokens,
                 p.output,
                 p.output_above_200k,
             ),
-            // Gemini's "thoughts" land in cache_creation_input_tokens and bill
-            // at the output rate.
             (_, "gemini") => ModelPricing::tier_cost(
                 entry.usage.cache_creation_input_tokens,
                 p.output,
@@ -216,15 +209,7 @@ pub(crate) fn calculate_model_token_breakdown_time_series_generic(
             continue;
         }
 
-        let model_key = if combine_effort {
-            if let Some(ref effort) = entry.effort {
-                format!("{} ({})", entry.model, effort)
-            } else {
-                entry.model.clone()
-            }
-        } else {
-            entry.model.clone()
-        };
+        let model_key = model_key_for_entry(entry, combine_effort);
 
         let tokens = TokenFractions {
             input: entry.usage.input_tokens as f64,
@@ -289,3 +274,65 @@ pub use omp::{calculate_omp_model_breakdown, calculate_omp_model_token_breakdown
 // Re-export the generic functions for use by vendor modules
 pub(crate) use self::calculate_model_breakdown_generic as _calc_breakdown;
 pub(crate) use self::calculate_model_token_breakdown_time_series_generic as _calc_time_series;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{TokenUsage, UNKNOWN_FAST_TIER, UsageCost};
+
+    fn usage_entry(model: &str, effort: Option<&str>, costs: Option<UsageCost>) -> UsageEntry {
+        UsageEntry {
+            host_id: None,
+            timestamp: String::new(),
+            parsed_timestamp: None,
+            session_start_time: String::new(),
+            session_end_time: String::new(),
+            model: model.to_string(),
+            effort: effort.map(str::to_string),
+            fast_tier: UNKNOWN_FAST_TIER,
+            usage: TokenUsage {
+                input_tokens: 1_000_000,
+                output_tokens: 100_000,
+                cache_read_input_tokens: 500_000,
+                cache_creation_input_tokens: 20_000,
+                reasoning_output_tokens: 0,
+            },
+            costs,
+        }
+    }
+
+    #[test]
+    fn omp_breakdown_ignores_endpoint_provider_in_effort() {
+        let pricing = AllPricing::load_raw().finalize();
+        let entry = usage_entry("gpt-5", Some("rust-cat"), Some(UsageCost::default()));
+
+        let rows = calculate_model_breakdown_generic(&[entry], "omp", true, &pricing);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "gpt-5");
+        assert!(rows[0].input_cost > 0.0);
+        assert!(rows[0].output_cost > 0.0);
+    }
+
+    #[test]
+    fn omp_breakdown_keeps_recognized_effort() {
+        let pricing = AllPricing::load_raw().finalize();
+        let entry = usage_entry("gpt-5", Some("xhigh"), None);
+
+        let rows = calculate_model_breakdown_generic(&[entry], "omp", true, &pricing);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "gpt-5 (xhigh)");
+    }
+
+    #[test]
+    fn omp_pricing_vendor_comes_from_model_id() {
+        let claude = usage_entry("claude-sonnet-4-5-20250929", Some("rust-cat"), None);
+        let google = usage_entry("gemini-2.5-pro", Some("rust-cat"), None);
+        let open = usage_entry("gpt-5", Some("rust-cat"), None);
+
+        assert_eq!(pricing_vendor_for_entry("omp", &claude), "claude");
+        assert_eq!(pricing_vendor_for_entry("omp", &google), "gemini");
+        assert_eq!(pricing_vendor_for_entry("omp", &open), "codex");
+    }
+}

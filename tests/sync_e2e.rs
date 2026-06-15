@@ -141,10 +141,7 @@ async fn two_homes_exchange_usage_through_local_server() {
     assert_success(run_cli(&home_a, &["sync", "push"]), "host-a push");
     assert_success(run_cli(&home_b, &["sync", "pull"]), "host-b pull");
     let output = assert_success(
-        run_cli(
-            &home_b,
-            &["--once", "--vendor", "claude", "--host", "host-a"],
-        ),
+        run_cli(&home_b, &["--once", "--tool", "claude", "--host", "host-a"]),
         "host-b display",
     );
 
@@ -217,10 +214,7 @@ async fn sync_clean_refetches_records_from_server_after_local_wipe() {
     );
 
     let after_clean = assert_success(
-        run_cli(
-            &home_b,
-            &["--once", "--vendor", "claude", "--host", "host-a"],
-        ),
+        run_cli(&home_b, &["--once", "--tool", "claude", "--host", "host-a"]),
         "host-b display after clean",
     );
     // Unknown model ids render as derived title-case labels.

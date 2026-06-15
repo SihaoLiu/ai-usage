@@ -6,12 +6,12 @@ pub fn calculate_codex_model_breakdown(
     usage_data: &[UsageEntry],
     pricing: &AllPricing,
 ) -> Vec<ModelBreakdownRow> {
-    _calc_breakdown(usage_data, "codex", true, pricing)
+    _calc_breakdown(usage_data, "codex", false, pricing)
 }
 
 pub fn calculate_codex_model_token_breakdown_time_series(
     usage_data: &[UsageEntry],
     interval_minutes: i64,
 ) -> ModelTimeSeries {
-    _calc_time_series(usage_data, interval_minutes, true, "codex")
+    _calc_time_series(usage_data, interval_minutes, false, "codex")
 }

@@ -14,9 +14,9 @@ use crate::time_utils::{
     TokenFractions, distribute_tokens_to_intervals, parse_timestamp, to_interval,
 };
 
-pub(crate) fn pricing_vendor_for_entry<'a>(vendor: &'a str, entry: &'a UsageEntry) -> &'a str {
-    if vendor != "omp" {
-        return vendor;
+pub(crate) fn pricing_provider_for_entry<'a>(tool: &'a str, entry: &'a UsageEntry) -> &'a str {
+    if tool != "omp" {
+        return tool;
     }
 
     match parse_model_identity(&entry.model).provider {
@@ -39,7 +39,7 @@ fn model_key_for_entry(entry: &UsageEntry, combine_effort: bool) -> String {
         .unwrap_or_else(|| entry.model.clone())
 }
 
-/// Model breakdown row (shared across all vendors).
+/// Model breakdown row (shared across all tools).
 /// Cost component fields are populated during aggregation by applying tiered
 /// pricing on each individual entry, then summing. This is the only correct
 /// way to handle Claude's 1M-context >200k-tier pricing — applying the tier
@@ -47,7 +47,7 @@ fn model_key_for_entry(entry: &UsageEntry, combine_effort: bool) -> String {
 #[derive(Debug, Clone)]
 pub struct ModelBreakdownRow {
     pub model: String,
-    pub vendor: String,
+    pub tool: String,
     pub count: i64,
     pub input: i64,
     pub output: i64,
@@ -75,8 +75,8 @@ pub struct IntervalTokenBreakdown {
 /// Time series: interval -> model -> token breakdown
 pub type ModelTimeSeries = HashMap<DateTime<Local>, HashMap<String, IntervalTokenBreakdown>>;
 
-/// Time series: interval -> vendor -> total tokens
-pub type VendorTimeSeries = HashMap<DateTime<Local>, HashMap<String, f64>>;
+/// Time series: interval -> tool -> total tokens
+pub type ToolTimeSeries = HashMap<DateTime<Local>, HashMap<String, f64>>;
 
 /// Calculate the per-model breakdown across all entries.
 ///
@@ -86,7 +86,7 @@ pub type VendorTimeSeries = HashMap<DateTime<Local>, HashMap<String, f64>>;
 /// 200k-tier premium for Claude 1M-context models is applied correctly.
 pub(crate) fn calculate_model_breakdown_generic(
     usage_data: &[UsageEntry],
-    vendor: &str,
+    tool: &str,
     combine_effort: bool,
     pricing: &AllPricing,
 ) -> Vec<ModelBreakdownRow> {
@@ -99,7 +99,7 @@ pub(crate) fn calculate_model_breakdown_generic(
             .entry(model_key.clone())
             .or_insert_with(|| ModelBreakdownRow {
                 model: model_key,
-                vendor: vendor.to_string(),
+                tool: tool.to_string(),
                 count: 0,
                 input: 0,
                 output: 0,
@@ -120,7 +120,7 @@ pub(crate) fn calculate_model_breakdown_generic(
         row.output += entry.usage.output_tokens;
         row.cache_read += entry.usage.cache_read_input_tokens;
 
-        match vendor {
+        match tool {
             "codex" => {
                 row.reasoning += entry.usage.reasoning_output_tokens;
             }
@@ -132,7 +132,7 @@ pub(crate) fn calculate_model_breakdown_generic(
                 row.cache_creation += entry.usage.cache_creation_input_tokens;
             }
         }
-        if vendor != "omp"
+        if tool != "omp"
             && let Some(costs) = entry.costs
         {
             row.input_cost += costs.input;
@@ -142,8 +142,8 @@ pub(crate) fn calculate_model_breakdown_generic(
             continue;
         }
 
-        let pricing_vendor = pricing_vendor_for_entry(vendor, entry);
-        let p = pricing.pricing_for_entry(pricing_vendor, &entry.model, entry.fast_tier);
+        let pricing_provider = pricing_provider_for_entry(tool, entry);
+        let p = pricing.pricing_for_entry(pricing_provider, &entry.model, entry.fast_tier);
         row.input_cost +=
             ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
         row.output_cost +=
@@ -153,7 +153,7 @@ pub(crate) fn calculate_model_breakdown_generic(
             p.cache_input,
             p.cache_input_above_200k,
         );
-        row.cache_creation_cost += match (vendor, pricing_vendor) {
+        row.cache_creation_cost += match (tool, pricing_provider) {
             ("omp", _) => ModelPricing::tier_cost(
                 entry.usage.cache_creation_input_tokens,
                 p.cache_output,
@@ -182,7 +182,7 @@ pub(crate) fn calculate_model_breakdown_generic(
         .filter(|r| !r.model.contains("<synthetic>"))
         .map(|mut r| {
             r.total = r.input + r.output;
-            r.total_with_cache = match vendor {
+            r.total_with_cache = match tool {
                 "codex" => r.input + r.output + r.cache_read + r.reasoning,
                 "gemini" => r.input + r.output + r.cache_read + r.thinking,
                 _ => r.input + r.output + r.cache_creation + r.cache_read,
@@ -200,7 +200,7 @@ pub(crate) fn calculate_model_token_breakdown_time_series_generic(
     usage_data: &[UsageEntry],
     interval_minutes: i64,
     combine_effort: bool,
-    vendor: &str,
+    tool: &str,
 ) -> ModelTimeSeries {
     let mut time_series: ModelTimeSeries = HashMap::new();
 
@@ -214,7 +214,7 @@ pub(crate) fn calculate_model_token_breakdown_time_series_generic(
         let tokens = TokenFractions {
             input: entry.usage.input_tokens as f64,
             output: entry.usage.output_tokens as f64,
-            cache_creation: match vendor {
+            cache_creation: match tool {
                 "codex" => entry.usage.reasoning_output_tokens as f64,
                 _ => entry.usage.cache_creation_input_tokens as f64,
             },
@@ -258,7 +258,7 @@ pub(crate) fn calculate_model_token_breakdown_time_series_generic(
     time_series
 }
 
-// Public wrappers for each vendor
+// Public wrappers for each tool
 pub use claude::{
     calculate_model_breakdown as calculate_claude_model_breakdown,
     calculate_model_token_breakdown_time_series as calculate_claude_model_token_breakdown_time_series,
@@ -271,7 +271,7 @@ pub use gemini::{
 };
 pub use omp::{calculate_omp_model_breakdown, calculate_omp_model_token_breakdown_time_series};
 
-// Re-export the generic functions for use by vendor modules
+// Re-export the generic functions for use by tool modules
 pub(crate) use self::calculate_model_breakdown_generic as _calc_breakdown;
 pub(crate) use self::calculate_model_token_breakdown_time_series_generic as _calc_time_series;
 
@@ -283,7 +283,7 @@ mod tests {
     fn usage_entry(model: &str, effort: Option<&str>, costs: Option<UsageCost>) -> UsageEntry {
         UsageEntry {
             host_id: None,
-            timestamp: String::new(),
+            timestamp: "2026-06-15T12:00:00Z".to_string(),
             parsed_timestamp: None,
             session_start_time: String::new(),
             session_end_time: String::new(),
@@ -315,24 +315,52 @@ mod tests {
     }
 
     #[test]
-    fn omp_breakdown_keeps_recognized_effort() {
+    fn codex_breakdown_groups_same_model_across_efforts() {
         let pricing = AllPricing::load_raw().finalize();
-        let entry = usage_entry("gpt-5", Some("xhigh"), None);
+        let high = usage_entry("gpt-5", Some("high"), None);
+        let max = usage_entry("gpt-5", Some("max"), None);
 
-        let rows = calculate_model_breakdown_generic(&[entry], "omp", true, &pricing);
+        let rows = codex::calculate_codex_model_breakdown(&[high, max], &pricing);
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].model, "gpt-5 (xhigh)");
+        assert_eq!(rows[0].model, "gpt-5");
+        assert_eq!(rows[0].count, 2);
     }
 
     #[test]
-    fn omp_pricing_vendor_comes_from_model_id() {
+    fn omp_breakdown_groups_same_model_across_efforts() {
+        let pricing = AllPricing::load_raw().finalize();
+        let xhigh = usage_entry("gpt-5", Some("xhigh"), None);
+        let max = usage_entry("gpt-5", Some("max"), None);
+
+        let rows = omp::calculate_omp_model_breakdown(&[xhigh, max], &pricing);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "gpt-5");
+        assert_eq!(rows[0].count, 2);
+    }
+
+    #[test]
+    fn model_time_series_groups_same_model_across_efforts() {
+        let high = usage_entry("gpt-5", Some("high"), None);
+        let max = usage_entry("gpt-5", Some("max"), None);
+
+        let series = codex::calculate_codex_model_token_breakdown_time_series(&[high, max], 60);
+        let models: Vec<&String> = series.values().flat_map(|models| models.keys()).collect();
+
+        assert!(models.iter().any(|model| model.as_str() == "gpt-5"));
+        assert!(!models.iter().any(|model| model.contains("high")));
+        assert!(!models.iter().any(|model| model.contains("max")));
+    }
+
+    #[test]
+    fn omp_pricing_provider_comes_from_model_id() {
         let claude = usage_entry("claude-sonnet-4-5-20250929", Some("rust-cat"), None);
         let google = usage_entry("gemini-2.5-pro", Some("rust-cat"), None);
         let open = usage_entry("gpt-5", Some("rust-cat"), None);
 
-        assert_eq!(pricing_vendor_for_entry("omp", &claude), "claude");
-        assert_eq!(pricing_vendor_for_entry("omp", &google), "gemini");
-        assert_eq!(pricing_vendor_for_entry("omp", &open), "codex");
+        assert_eq!(pricing_provider_for_entry("omp", &claude), "claude");
+        assert_eq!(pricing_provider_for_entry("omp", &google), "gemini");
+        assert_eq!(pricing_provider_for_entry("omp", &open), "codex");
     }
 }

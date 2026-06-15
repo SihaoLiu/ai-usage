@@ -6,40 +6,40 @@ use crate::stats::ModelBreakdownRow;
 /// Get short display name for a model.
 ///
 /// Resolution order: user override file (`models.toml`) wins, otherwise the
-/// label is derived algorithmically from the id. The `_vendor` hint is unused
+/// label is derived algorithmically from the id. The `_tool` hint is unused
 /// on purpose -- the parser infers the provider from the id itself, which is
-/// what lets meta-vendors like `omp` (whose ids carry a real `provider/`
-/// prefix) and freshly released models render correctly with no code change.
-pub fn get_short_model_name(model: &str, _vendor: &str) -> String {
+/// this lets tool logs that carry a real `provider/` prefix and freshly
+/// released models render correctly with no code change.
+pub fn get_short_model_name(model: &str, _tool: &str) -> String {
     if let Some(label) = model_overrides::load().display.get(model) {
         return label.clone();
     }
     short_label(&parse_model_identity(model))
 }
 
-fn format_model_name_with_vendor_prefix(
+fn format_model_name_with_tool_prefix(
     model: &str,
-    vendor: &str,
-    show_vendor_prefix: bool,
+    tool: &str,
+    show_tool_prefix: bool,
     use_short_name: bool,
     prefix_width: usize,
 ) -> String {
     let name = if use_short_name {
-        get_short_model_name(model, vendor)
+        get_short_model_name(model, tool)
     } else {
         model.to_string()
     };
-    if !show_vendor_prefix {
+    if !show_tool_prefix {
         return name;
     }
-    let display_vendor = match vendor {
-        "claude" => "Claude",
-        "codex" => "OpenAI",
-        "gemini" => "Google",
+    let display_tool = match tool {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "gemini" => "Gemini CLI",
         "omp" => "Oh My Pi",
-        _ => vendor,
+        _ => tool,
     };
-    format!("{:<width$}: {}", display_vendor, name, width = prefix_width)
+    format!("{:<width$}: {}", display_tool, name, width = prefix_width)
 }
 
 fn fit_text_to_width(text: &str, width: usize) -> String {
@@ -495,7 +495,7 @@ pub fn get_table_width(mode: &str) -> usize {
 /// Get strategy totals for a model breakdown row.
 fn get_strategy_totals(stats: &ModelBreakdownRow) -> (i64, i64, i64) {
     let cache_hit = stats.cache_read;
-    match stats.vendor.as_str() {
+    match stats.tool.as_str() {
         "claude" | "omp" => {
             let prefill = stats.input + stats.cache_creation;
             let decoding = stats.output;
@@ -521,10 +521,10 @@ fn get_strategy_costs(
     output_cost: f64,
     cache_output_cost: f64,
     cache_input_cost: f64,
-    vendor: &str,
+    tool: &str,
 ) -> (f64, f64, f64) {
     let cache_hit_cost = cache_input_cost;
-    match vendor {
+    match tool {
         "claude" | "omp" => {
             let prefill_cost = input_cost + cache_output_cost;
             let decoding_cost = output_cost;
@@ -545,7 +545,7 @@ pub fn print_model_breakdown(
     days_in_data: f64,
     terminal_width: Option<u16>,
     terminal_height: Option<u16>,
-    vendor: &str,
+    tool: &str,
     subscription_fees: &SubscriptionFees,
 ) -> bool {
     // Calculate sums
@@ -582,7 +582,7 @@ pub fn print_model_breakdown(
     let mut prefill_cost: f64 = 0.0;
     let mut decoding_cost: f64 = 0.0;
 
-    let subscription_price = subscription_fees.get(vendor);
+    let subscription_price = subscription_fees.get(tool);
 
     for stats in model_stats {
         // Costs are pre-computed per-entry during aggregation (so tiered
@@ -593,7 +593,7 @@ pub fn print_model_breakdown(
             stats.output_cost,
             stats.cache_creation_cost,
             stats.cache_read_cost,
-            &stats.vendor,
+            &stats.tool,
         );
         cache_hit_cost += row_ch;
         prefill_cost += row_pf;
@@ -602,7 +602,7 @@ pub fn print_model_breakdown(
 
     let total_cost = cache_hit_cost + prefill_cost + decoding_cost;
 
-    let show_vendor_prefix = vendor == "all";
+    let show_tool_prefix = tool == "all";
 
     let tw = terminal_width.unwrap_or(200) as usize;
 
@@ -619,8 +619,8 @@ pub fn print_model_breakdown(
             cache_hit_cost,
             prefill_cost,
             decoding_cost,
-            vendor,
-            show_vendor_prefix,
+            tool,
+            show_tool_prefix,
             tw,
         ),
         "medium" => print_table_medium(
@@ -634,8 +634,8 @@ pub fn print_model_breakdown(
             cache_hit_cost,
             prefill_cost,
             decoding_cost,
-            vendor,
-            show_vendor_prefix,
+            tool,
+            show_tool_prefix,
             tw,
         ),
         "compact" => print_table_compact(
@@ -649,8 +649,8 @@ pub fn print_model_breakdown(
             cache_hit_cost,
             prefill_cost,
             decoding_cost,
-            vendor,
-            show_vendor_prefix,
+            tool,
+            show_tool_prefix,
             tw,
         ),
         "minimal" => print_table_minimal(
@@ -664,8 +664,8 @@ pub fn print_model_breakdown(
             cache_hit_cost,
             prefill_cost,
             decoding_cost,
-            vendor,
-            show_vendor_prefix,
+            tool,
+            show_tool_prefix,
             tw,
         ),
         _ => {}
@@ -704,7 +704,7 @@ pub fn print_model_breakdown(
             format_cost_per_mtok(cost_per_mtok)
         );
         println!("{}{}", cost_pad, line);
-        if let Some(line) = top_model_insight_line(&display_stats, total_cost, show_vendor_prefix) {
+        if let Some(line) = top_model_insight_line(&display_stats, total_cost, show_tool_prefix) {
             println!("{}{}", cost_pad, fit_text_to_width(&line, table_width));
         }
     } else {
@@ -721,7 +721,7 @@ pub fn print_model_breakdown(
 fn top_model_insight_line(
     model_stats: &[&ModelBreakdownRow],
     total_cost: f64,
-    show_vendor_prefix: bool,
+    show_tool_prefix: bool,
 ) -> Option<String> {
     let top_spend = model_stats
         .iter()
@@ -737,22 +737,22 @@ fn top_model_insight_line(
         .max_by(|a, b| model_cost_per_mtok(a).total_cmp(&model_cost_per_mtok(b)))?;
 
     let spend_name = fit_text_to_width(
-        &format_model_name_with_vendor_prefix(
+        &format_model_name_with_tool_prefix(
             &top_spend.model,
-            &top_spend.vendor,
-            show_vendor_prefix,
+            &top_spend.tool,
+            show_tool_prefix,
             true,
-            6,
+            0,
         ),
         28,
     );
     let rate_name = fit_text_to_width(
-        &format_model_name_with_vendor_prefix(
+        &format_model_name_with_tool_prefix(
             &highest_rate.model,
-            &highest_rate.vendor,
-            show_vendor_prefix,
+            &highest_rate.tool,
+            show_tool_prefix,
             true,
-            6,
+            0,
         ),
         28,
     );
@@ -794,8 +794,8 @@ fn print_table_full(
     cache_hit_cost: f64,
     prefill_cost: f64,
     decoding_cost: f64,
-    _vendor: &str,
-    show_vendor_prefix: bool,
+    _tool: &str,
+    show_tool_prefix: bool,
     terminal_width: usize,
 ) {
     let w_model = 35;
@@ -835,14 +835,14 @@ fn print_table_full(
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
     for stats in model_stats {
-        let effective_vendor = &stats.vendor;
+        let effective_tool = &stats.tool;
         let model_name = fit_text_to_width(
-            &format_model_name_with_vendor_prefix(
+            &format_model_name_with_tool_prefix(
                 &stats.model,
-                effective_vendor,
-                show_vendor_prefix,
+                effective_tool,
+                show_tool_prefix,
                 false,
-                6,
+                0,
             ),
             w_model,
         );
@@ -946,8 +946,8 @@ fn print_table_medium(
     cache_hit_cost: f64,
     prefill_cost: f64,
     decoding_cost: f64,
-    _vendor: &str,
-    show_vendor_prefix: bool,
+    _tool: &str,
+    show_tool_prefix: bool,
     terminal_width: usize,
 ) {
     let w_model = 22;
@@ -985,14 +985,14 @@ fn print_table_medium(
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
     for stats in model_stats {
-        let effective_vendor = &stats.vendor;
+        let effective_tool = &stats.tool;
         let model_name = fit_text_to_width(
-            &format_model_name_with_vendor_prefix(
+            &format_model_name_with_tool_prefix(
                 &stats.model,
-                effective_vendor,
-                show_vendor_prefix,
+                effective_tool,
+                show_tool_prefix,
                 true,
-                6,
+                0,
             ),
             w_model,
         );
@@ -1079,8 +1079,8 @@ fn print_table_compact(
     cache_hit_cost: f64,
     prefill_cost: f64,
     decoding_cost: f64,
-    _vendor: &str,
-    show_vendor_prefix: bool,
+    _tool: &str,
+    show_tool_prefix: bool,
     terminal_width: usize,
 ) {
     let w_model = 12;
@@ -1112,14 +1112,14 @@ fn print_table_compact(
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
     for stats in model_stats {
-        let effective_vendor = &stats.vendor;
+        let effective_tool = &stats.tool;
         let model_name = fit_text_to_width(
-            &format_model_name_with_vendor_prefix(
+            &format_model_name_with_tool_prefix(
                 &stats.model,
-                effective_vendor,
-                show_vendor_prefix,
+                effective_tool,
+                show_tool_prefix,
                 true,
-                6,
+                0,
             ),
             w_model,
         );
@@ -1184,8 +1184,8 @@ fn print_table_minimal(
     _cache_hit_cost: f64,
     _prefill_cost: f64,
     _decoding_cost: f64,
-    _vendor: &str,
-    show_vendor_prefix: bool,
+    _tool: &str,
+    show_tool_prefix: bool,
     terminal_width: usize,
 ) {
     let w_model = 12;
@@ -1217,14 +1217,14 @@ fn print_table_minimal(
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
     for stats in model_stats {
-        let effective_vendor = &stats.vendor;
+        let effective_tool = &stats.tool;
         let model_name = fit_text_to_width(
-            &format_model_name_with_vendor_prefix(
+            &format_model_name_with_tool_prefix(
                 &stats.model,
-                effective_vendor,
-                show_vendor_prefix,
+                effective_tool,
+                show_tool_prefix,
                 true,
-                6,
+                0,
             ),
             w_model,
         );
@@ -1345,10 +1345,26 @@ mod tests {
             get_short_model_name("gemini-3.2-pro-preview", "gemini"),
             "Gem 3.2 Pro"
         );
-        // Meta-vendor `omp`: family inferred from the id's real provider prefix.
+        // Meta-tool `omp`: family inferred from the id's real provider prefix.
         assert_eq!(
             get_short_model_name("anthropic/claude-opus-4-8", "omp"),
             "Opus 4.8"
+        );
+    }
+
+    #[test]
+    fn all_mode_prefixes_model_rows_with_tool_names() {
+        assert_eq!(
+            format_model_name_with_tool_prefix("gpt-5.5", "codex", true, true, 0),
+            "Codex: GPT-5.5"
+        );
+        assert_eq!(
+            format_model_name_with_tool_prefix("gemini-3.2-pro-preview", "gemini", true, true, 0),
+            "Gemini CLI: Gem 3.2 Pro"
+        );
+        assert_eq!(
+            format_model_name_with_tool_prefix("claude-opus-4-8", "claude", true, true, 0),
+            "Claude Code: Opus 4.8"
         );
     }
 
@@ -1378,7 +1394,7 @@ mod tests {
     fn model_cost_helpers_report_total_cost_and_rate() {
         let row = ModelBreakdownRow {
             model: "gpt-5.5".to_string(),
-            vendor: "codex".to_string(),
+            tool: "codex".to_string(),
             count: 3,
             input: 1_000_000,
             output: 400_000,

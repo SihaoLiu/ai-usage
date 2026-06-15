@@ -4,7 +4,7 @@ use crate::time_utils::{generate_interval_times, round_to_interval_start};
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Weekday};
 
 use crate::formatting::{center_pad, format_total_value, format_y_axis_value};
-use crate::stats::{ModelTimeSeries, VendorTimeSeries};
+use crate::stats::{ModelTimeSeries, ToolTimeSeries};
 
 const RESET_COLOR: &str = "\x1b[0m";
 const DIM_COLOR: &str = "\x1b[38;5;240m";
@@ -869,11 +869,11 @@ fn line_color(key: &str) -> &'static str {
     }
 }
 
-fn vendor_color(vendor: &str) -> &'static str {
-    match vendor {
-        "Claude" => "\x1b[38;5;173m",
+fn tool_color(tool: &str) -> &'static str {
+    match tool {
+        "Claude Code" => "\x1b[38;5;173m",
         "Codex" => "\x1b[38;5;255m",
-        "Gemini" => "\x1b[38;5;33m",
+        "Gemini CLI" => "\x1b[38;5;33m",
         "Oh My Pi" => "\x1b[38;5;141m",
         "All" => "\x1b[38;5;226m",
         _ => "\x1b[38;5;135m",
@@ -1674,7 +1674,7 @@ pub fn print_multi_line_chart(
     target_width: Option<usize>,
     interval_minutes: i64,
     granularity: ChartGranularity,
-    vendor: &str,
+    tool: &str,
     included_models: Option<&HashSet<String>>,
     show_legend: bool,
     terminal_width: Option<usize>,
@@ -1699,7 +1699,7 @@ pub fn print_multi_line_chart(
             "Models Input / Output Token Consumption".to_string(),
         )
     } else {
-        let labels = match vendor {
+        let labels = match tool {
             "codex" => HashMap::from([
                 ("cache_read", "Cache Read In"),
                 ("cache_creation", "Reasoning Out"),
@@ -1713,7 +1713,7 @@ pub fn print_multi_line_chart(
                 ("cache_creation", "Cache Create In"),
             ]),
         };
-        let title = match vendor {
+        let title = match tool {
             "codex" => "Models Cache Read Input / Reasoning Output Token Consumption",
             "gemini" => "Models Cache Read Input / Thinking Output Token Consumption",
             _ => "Models Cache Read Input / Cache Creation Input Token Consumption",
@@ -1757,8 +1757,7 @@ pub fn print_multi_line_chart(
     });
     other_models.sort();
 
-    let all_models_sorted: Vec<String> =
-        named_models.into_iter().chain(other_models).collect();
+    let all_models_sorted: Vec<String> = named_models.into_iter().chain(other_models).collect();
 
     // Build line configurations
     let mut lines: Vec<LineConfig> = Vec::new();
@@ -1880,10 +1879,10 @@ pub fn print_multi_line_chart(
     }
 }
 
-/// Print a vendor comparison chart.
+/// Print a tool comparison chart.
 #[allow(clippy::too_many_arguments)]
-pub fn print_vendor_comparison_chart(
-    time_series: &VendorTimeSeries,
+pub fn print_tool_comparison_chart(
+    time_series: &ToolTimeSeries,
     height: usize,
     range_start: &DateTime<Local>,
     range_end: &DateTime<Local>,
@@ -1906,38 +1905,38 @@ pub fn print_vendor_comparison_chart(
         return;
     }
 
-    // Collect all vendors
-    let mut all_vendors: HashSet<String> = HashSet::new();
+    // Collect all tools.
+    let mut all_tools: HashSet<String> = HashSet::new();
     for time in &layout.sorted_times {
-        if let Some(vendor_map) = time_series.get(time) {
-            all_vendors.extend(vendor_map.keys().cloned());
+        if let Some(tool_map) = time_series.get(time) {
+            all_tools.extend(tool_map.keys().cloned());
         }
     }
 
-    let vendor_order = ["Claude", "Codex", "Gemini", "Oh My Pi"];
-    let mut vendors_sorted: Vec<String> = vendor_order
+    let tool_order = ["Claude Code", "Codex", "Gemini CLI", "Oh My Pi"];
+    let mut tools_sorted: Vec<String> = tool_order
         .iter()
-        .filter(|v| all_vendors.contains(**v))
+        .filter(|v| all_tools.contains(**v))
         .map(|v| v.to_string())
         .collect();
-    let mut remaining: Vec<&String> = all_vendors
+    let mut remaining: Vec<&String> = all_tools
         .iter()
-        .filter(|v| !vendor_order.contains(&v.as_str()))
+        .filter(|v| !tool_order.contains(&v.as_str()))
         .collect();
     remaining.sort_unstable();
     for v in remaining {
-        vendors_sorted.push(v.clone());
+        tools_sorted.push(v.clone());
     }
 
     // Add "All" as last entry
-    if !vendors_sorted.is_empty() {
-        vendors_sorted.push("All".to_string());
+    if !tools_sorted.is_empty() {
+        tools_sorted.push("All".to_string());
     }
 
-    // Build vendor data
-    let mut vendor_data: HashMap<String, Vec<f64>> = HashMap::new();
-    for vendor in &vendors_sorted {
-        if vendor == "All" {
+    // Build tool data.
+    let mut tool_data: HashMap<String, Vec<f64>> = HashMap::new();
+    for tool in &tools_sorted {
+        if tool == "All" {
             continue;
         }
         let values: Vec<f64> = layout
@@ -1946,30 +1945,30 @@ pub fn print_vendor_comparison_chart(
             .map(|time| {
                 time_series
                     .get(time)
-                    .and_then(|vm| vm.get(vendor))
+                    .and_then(|vm| vm.get(tool))
                     .copied()
                     .unwrap_or(0.0)
             })
             .collect();
-        vendor_data.insert(vendor.clone(), values);
+        tool_data.insert(tool.clone(), values);
     }
 
     // Calculate "All" as sum
     let all_values: Vec<f64> = (0..layout.sorted_times.len())
         .map(|i| {
-            vendors_sorted
+            tools_sorted
                 .iter()
                 .filter(|v| *v != "All")
-                .map(|v| vendor_data.get(v).map(|vals| vals[i]).unwrap_or(0.0))
+                .map(|v| tool_data.get(v).map(|vals| vals[i]).unwrap_or(0.0))
                 .sum()
         })
         .collect();
-    if vendors_sorted.iter().any(|v| v == "All") {
-        vendor_data.insert("All".to_string(), all_values.clone());
+    if tools_sorted.iter().any(|v| v == "All") {
+        tool_data.insert("All".to_string(), all_values.clone());
     }
 
     // Find max value
-    let max_value_raw = vendor_data
+    let max_value_raw = tool_data
         .values()
         .flat_map(|vals| vals.iter())
         .cloned()
@@ -1988,23 +1987,23 @@ pub fn print_vendor_comparison_chart(
     };
 
     // Build line configs
-    let lines: Vec<LineConfig> = vendors_sorted
+    let lines: Vec<LineConfig> = tools_sorted
         .iter()
         .map(|v| LineConfig {
             model: v.clone(),
             token_type: String::new(),
-            color: vendor_color(v).to_string(),
+            color: tool_color(v).to_string(),
             label: v.clone(),
         })
         .collect();
 
-    let line_values: HashMap<usize, Vec<f64>> = vendors_sorted
+    let line_values: HashMap<usize, Vec<f64>> = tools_sorted
         .iter()
         .enumerate()
-        .map(|(i, v)| (i, vendor_data[v].clone()))
+        .map(|(i, v)| (i, tool_data[v].clone()))
         .collect();
 
-    let chart_title = "Total Token Consumption by Vendor";
+    let chart_title = "Total Token Consumption by Tool";
     let chart_width = layout.columns.len() + 7;
     let tw = terminal_width.unwrap_or(chart_width);
     let pad = center_pad(tw, chart_width);
@@ -2028,29 +2027,28 @@ pub fn print_vendor_comparison_chart(
 
     print_x_axis_labels(&layout, interval_minutes, granularity, &pad);
 
-    if show_legend && !vendors_sorted.is_empty() {
-        // Calculate vendor totals and percentages
-        let vendor_totals: HashMap<String, f64> = vendors_sorted
+    if show_legend && !tools_sorted.is_empty() {
+        // Calculate tool totals and percentages.
+        let tool_totals: HashMap<String, f64> = tools_sorted
             .iter()
             .filter(|v| *v != "All")
-            .map(|v| (v.clone(), vendor_data[v].iter().sum::<f64>()))
+            .map(|v| (v.clone(), tool_data[v].iter().sum::<f64>()))
             .collect();
-        let grand_total: f64 = vendor_totals.values().sum();
+        let grand_total: f64 = tool_totals.values().sum();
 
-        let mut legend_vendors: Vec<&String> =
-            vendors_sorted.iter().filter(|v| *v != "All").collect();
-        legend_vendors.sort_by(|a, b| {
-            vendor_totals[*b]
-                .partial_cmp(&vendor_totals[*a])
+        let mut legend_tools: Vec<&String> = tools_sorted.iter().filter(|v| *v != "All").collect();
+        legend_tools.sort_by(|a, b| {
+            tool_totals[*b]
+                .partial_cmp(&tool_totals[*a])
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.cmp(b))
         });
 
         let mut legend_items: Vec<String> = Vec::new();
-        for v in legend_vendors {
-            let color = vendor_color(v);
+        for v in legend_tools {
+            let color = tool_color(v);
             let pct = if grand_total > 0.0 {
-                vendor_totals[v] / grand_total * 100.0
+                tool_totals[v] / grand_total * 100.0
             } else {
                 0.0
             };
@@ -2059,7 +2057,7 @@ pub fn print_vendor_comparison_chart(
                 color, RESET_COLOR, v, pct
             ));
         }
-        let all_color = vendor_color("All");
+        let all_color = tool_color("All");
         legend_items.push(format!("{}\u{2501}{} All(100%)", all_color, RESET_COLOR));
         println!("{}Legend: {}", pad, legend_items.join("  "));
     }

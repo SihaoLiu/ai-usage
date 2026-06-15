@@ -84,11 +84,7 @@ impl PricingEntry {
 pub fn parse_from_str(s: &str) -> Result<ModelOverrides, toml::de::Error> {
     let raw: RawOverrides = toml::from_str(s)?;
     Ok(ModelOverrides {
-        display: raw
-            .display
-            .into_iter()
-            .map(|(k, v)| (k, v.short))
-            .collect(),
+        display: raw.display.into_iter().map(|(k, v)| (k, v.short)).collect(),
         pricing: raw
             .pricing
             .into_iter()
@@ -151,12 +147,20 @@ input_above_200k = 6.0
         let ov = parse_from_str(toml).expect("valid toml");
 
         assert_eq!(
-            ov.display.get("anthropic/claude-opus-4-8").map(String::as_str),
+            ov.display
+                .get("anthropic/claude-opus-4-8")
+                .map(String::as_str),
             Some("Opus 4.8")
         );
-        assert_eq!(ov.display.get("weird-private-model").map(String::as_str), Some("Weird"));
+        assert_eq!(
+            ov.display.get("weird-private-model").map(String::as_str),
+            Some("Weird")
+        );
 
-        let p = ov.pricing.get("some-private-model").expect("pricing present");
+        let p = ov
+            .pricing
+            .get("some-private-model")
+            .expect("pricing present");
         assert!((p.input - 3.0).abs() < 1e-9);
         assert!((p.output - 15.0).abs() < 1e-9);
         assert!((p.cache_input - 0.30).abs() < 1e-9);

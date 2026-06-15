@@ -8,6 +8,7 @@ mod pricing;
 mod stats;
 mod sync;
 mod time_utils;
+mod tool;
 mod updater;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -34,8 +35,9 @@ use data::codex::{detect_fast_tier_snapshot as detect_codex_fast_tier_snapshot, 
 use data::gemini::get_gemini_dir;
 use data::omp::get_omp_dir;
 use formatting::print_model_breakdown;
-use stats::{ModelBreakdownRow, VendorTimeSeries};
+use stats::{ModelBreakdownRow, ToolTimeSeries};
 use time_utils::TimeWindow;
+use tool::Tool;
 
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 35;
@@ -136,7 +138,7 @@ enum IntegrityStatus {
 }
 
 struct AppState {
-    vendor: String,
+    tool: String,
     host: Option<String>,
     local_host_id: Option<String>,
     days: i64,
@@ -145,14 +147,14 @@ struct AppState {
     pricing: AllPricing,
     subscription_fees: SubscriptionFees,
     version_cache: HashMap<String, VersionCacheEntry>,
-    all_vendor_prompt: Option<String>,
+    all_tool_prompt: Option<String>,
     raw_cache: Option<RawDataCache>,
     raw_refresh: Option<mpsc::Receiver<RawDataCache>>,
     integrity_status: IntegrityStatus,
     integrity_started_at: Option<std::time::Instant>,
 }
 
-/// In-memory snapshot of raw vendor entries, scoped to a known scan
+/// In-memory snapshot of raw tool entries, scoped to a known scan
 /// horizon (in days back from `now`). PageUp/PageDown reuse this cache so
 /// they feel instant; only manual `r` and auto-refresh invalidate it.
 struct RawDataCache {
@@ -342,9 +344,9 @@ struct Args {
     #[arg(long)]
     once: bool,
 
-    /// Vendor to collect statistics from
+    /// Tool to collect statistics from
     #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "omp", "all"])]
-    vendor: String,
+    tool: String,
 
     /// Filter usage to a single machine id
     #[arg(long)]
@@ -462,14 +464,14 @@ fn print_loading_data_screen(width: u16, height: u16) {
 }
 
 /// Calculate chart height(s) that fit within the terminal.
-/// For single vendor: returns per-chart height (2 charts displayed).
-/// For all vendor: returns the single chart height.
+/// For one tool: returns per-chart height (2 charts displayed).
+/// For all tools: returns the single chart height.
 /// Also returns whether the layout fits (true) or overflows (false).
 fn calculate_chart_height(
     is_monitor_mode: bool,
     table_printed: bool,
     num_models: usize,
-    is_all_vendor: bool,
+    is_all_tool: bool,
 ) -> (usize, bool) {
     let (_, height) = get_terminal_size();
     let th = height as usize;
@@ -496,7 +498,7 @@ fn calculate_chart_height(
 
     let min_chart = 5usize;
 
-    if is_all_vendor {
+    if is_all_tool {
         // Single chart
         let fixed = header_lines
             + table_lines
@@ -666,9 +668,9 @@ fn collect_interval_slide_directions(
     directions
 }
 
-/// Get the data directory for a vendor, or None for "all".
-fn get_vendor_data_dir(vendor: &str) -> Option<PathBuf> {
-    match vendor {
+/// Get the data directory for a tool, or None for "all".
+fn get_tool_data_dir(tool: &str) -> Option<PathBuf> {
+    match tool {
         "codex" => Some(get_codex_dir().join("sessions")),
         "gemini" => Some(get_gemini_dir().join("tmp")),
         "omp" => Some(get_omp_dir().join("agent").join("sessions")),
@@ -681,7 +683,7 @@ fn get_vendor_data_dir(vendor: &str) -> Option<PathBuf> {
                     .unwrap_or_else(|| PathBuf::from("~/.claude/projects")),
             )
         }
-        _ => None, // "all" has no single directory
+        _ => None,
     }
 }
 
@@ -727,11 +729,11 @@ fn merge_remote_records_into_raw_cache(
     }
 }
 
-fn load_local_vendor_cached_records(
+fn load_local_tool_cached_records(
     cache_root: &Path,
-    vendor: &str,
+    tool: &str,
 ) -> (Vec<UsageEntry>, HashSet<(String, String)>) {
-    let records = data::cache::load_vendor_cached_records(cache_root, vendor);
+    let records = data::cache::load_vendor_cached_records(cache_root, tool);
     let entries = records
         .iter()
         .map(|record| record.entry.clone())
@@ -739,7 +741,7 @@ fn load_local_vendor_cached_records(
     let keys = records
         .into_iter()
         .filter(|record| !record.dedup_key.is_empty())
-        .map(|record| (vendor.to_string(), record.dedup_key))
+        .map(|record| (tool.to_string(), record.dedup_key))
         .collect::<HashSet<_>>();
     (entries, keys)
 }
@@ -751,25 +753,25 @@ fn local_cached_raw_cache(
 ) -> RawDataCache {
     let mut local_record_keys = HashSet::new();
     let (claude, claude_keys) = if include_local {
-        load_local_vendor_cached_records(cache_root, "claude")
+        load_local_tool_cached_records(cache_root, "claude")
     } else {
         (Vec::new(), HashSet::new())
     };
     local_record_keys.extend(claude_keys);
     let (codex, codex_keys) = if include_local {
-        load_local_vendor_cached_records(cache_root, "codex")
+        load_local_tool_cached_records(cache_root, "codex")
     } else {
         (Vec::new(), HashSet::new())
     };
     local_record_keys.extend(codex_keys);
     let (gemini, gemini_keys) = if include_local {
-        load_local_vendor_cached_records(cache_root, "gemini")
+        load_local_tool_cached_records(cache_root, "gemini")
     } else {
         (Vec::new(), HashSet::new())
     };
     local_record_keys.extend(gemini_keys);
     let (omp, omp_keys) = if include_local {
-        load_local_vendor_cached_records(cache_root, "omp")
+        load_local_tool_cached_records(cache_root, "omp")
     } else {
         (Vec::new(), HashSet::new())
     };
@@ -794,7 +796,7 @@ fn clear_local_raw_cache(cache: &mut RawDataCache) {
     cache.local_record_keys.clear();
 }
 
-fn read_all_vendor_cached_snapshot_for_hosts(
+fn read_all_tool_cached_snapshot_for_hosts(
     host_filter: Option<&str>,
     local_host_id: Option<&str>,
 ) -> RawDataCache {
@@ -807,7 +809,7 @@ fn read_all_vendor_cached_snapshot_for_hosts(
     cache
 }
 
-fn refresh_all_vendor_raw_full(local_host_id: Option<&str>) -> RawDataCache {
+fn refresh_all_tool_raw_full(local_host_id: Option<&str>) -> RawDataCache {
     let cache_root = data::cache::default_cache_dir();
     let claude_fast_tier = detect_claude_fast_tier_snapshot();
     let _ = data::cache::refresh_retaining_vendor_cache(
@@ -858,7 +860,7 @@ fn ensure_raw_cache(state: &mut AppState, required_horizon: i64) -> &RawDataCach
         Some(cache) => cache.horizon_days < required_horizon,
     };
     if needs_load {
-        state.raw_cache = Some(read_all_vendor_cached_snapshot_for_hosts(
+        state.raw_cache = Some(read_all_tool_cached_snapshot_for_hosts(
             state.host.as_deref(),
             state.local_host_id.as_deref(),
         ));
@@ -877,7 +879,7 @@ fn start_background_raw_refresh(state: &mut AppState) {
     state.integrity_status = IntegrityStatus::Checking;
     state.integrity_started_at = Some(std::time::Instant::now());
     thread::spawn(move || {
-        let mut refreshed = refresh_all_vendor_raw_full(local_host_id.as_deref());
+        let mut refreshed = refresh_all_tool_raw_full(local_host_id.as_deref());
         if !include_local_for_host_filter(host_filter.as_deref(), local_host_id.as_deref()) {
             clear_local_raw_cache(&mut refreshed);
         }
@@ -1265,14 +1267,14 @@ fn format_monitor_status_line(left: &str, right: Option<&str>, width: usize) -> 
 }
 
 fn monitor_status_title(state: &mut AppState) -> String {
-    if state.vendor == "all" {
+    if Tool::from_key(&state.tool).is_some_and(Tool::is_all) {
         state
-            .all_vendor_prompt
+            .all_tool_prompt
             .clone()
-            .unwrap_or_else(|| "All Vendors Comparison".to_string())
+            .unwrap_or_else(|| "All Tools Comparison".to_string())
     } else {
-        let vendor = state.vendor.clone();
-        get_version(state, &vendor)
+        let tool = state.tool.clone();
+        get_version(state, &tool)
     }
 }
 
@@ -1380,8 +1382,8 @@ fn known_host_ids(local_host_id: Option<&str>) -> Vec<String> {
     hosts
 }
 
-/// Loaded and filtered data for all vendors.
-struct AllVendorData {
+/// Loaded and filtered data for all tools.
+struct AllToolData {
     claude: Vec<UsageEntry>,
     codex: Vec<UsageEntry>,
     gemini: Vec<UsageEntry>,
@@ -1403,25 +1405,25 @@ fn classify_window_data(has_source_data: bool, has_window_data: bool) -> WindowD
     }
 }
 
-fn raw_cache_has_any_vendor_data(cache: &RawDataCache) -> bool {
+fn raw_cache_has_any_tool_data(cache: &RawDataCache) -> bool {
     !cache.claude.is_empty()
         || !cache.codex.is_empty()
         || !cache.gemini.is_empty()
         || !cache.omp.is_empty()
 }
 
-fn all_vendor_data_has_window_data(all_data: &AllVendorData) -> bool {
+fn all_tool_data_has_window_data(all_data: &AllToolData) -> bool {
     !all_data.claude.is_empty()
         || !all_data.codex.is_empty()
         || !all_data.gemini.is_empty()
         || !all_data.omp.is_empty()
 }
 
-fn load_all_vendor_data(state: &mut AppState, now: DateTime<Local>) -> AllVendorData {
+fn load_all_tool_data(state: &mut AppState, now: DateTime<Local>) -> AllToolData {
     let horizon = compute_required_horizon(&state.time_window, now);
     let window = state.time_window.clone();
     let cache = ensure_raw_cache(state, horizon);
-    AllVendorData {
+    AllToolData {
         claude: data::filter_usage_data_by_window(&cache.claude, &window, now),
         codex: data::filter_usage_data_by_window(&cache.codex, &window, now),
         gemini: data::filter_usage_data_by_window(&cache.gemini, &window, now),
@@ -1429,20 +1431,21 @@ fn load_all_vendor_data(state: &mut AppState, now: DateTime<Local>) -> AllVendor
     }
 }
 
-fn calculate_vendor_aggregate_time_series(
-    all_data: &AllVendorData,
+fn calculate_tool_aggregate_time_series(
+    all_data: &AllToolData,
     interval_minutes: i64,
-) -> VendorTimeSeries {
-    let mut time_series: VendorTimeSeries = HashMap::new();
+) -> ToolTimeSeries {
+    let mut time_series: ToolTimeSeries = HashMap::new();
 
-    let process_data = |entries: &[UsageEntry], vendor_label: &str, ts: &mut VendorTimeSeries| {
+    let process_data = |entries: &[UsageEntry], tool: Tool, ts: &mut ToolTimeSeries| {
+        let tool_label = tool.comparison_label();
         for entry in entries {
             if entry.timestamp.is_empty() {
                 continue;
             }
 
-            let total = match vendor_label {
-                "Codex" => {
+            let total = match tool {
+                Tool::Codex => {
                     entry.usage.input_tokens
                         + entry.usage.output_tokens
                         + entry.usage.cache_read_input_tokens
@@ -1464,30 +1467,30 @@ fn calculate_vendor_aggregate_time_series(
                 let interval_time = time_utils::to_interval(&dt, interval_minutes);
                 *ts.entry(interval_time)
                     .or_default()
-                    .entry(vendor_label.to_string())
+                    .entry(tool_label.to_string())
                     .or_insert(0.0) += total;
             }
         }
     };
 
     if !all_data.claude.is_empty() {
-        process_data(&all_data.claude, "Claude", &mut time_series);
+        process_data(&all_data.claude, Tool::Claude, &mut time_series);
     }
     if !all_data.codex.is_empty() {
-        process_data(&all_data.codex, "Codex", &mut time_series);
+        process_data(&all_data.codex, Tool::Codex, &mut time_series);
     }
     if !all_data.gemini.is_empty() {
-        process_data(&all_data.gemini, "Gemini", &mut time_series);
+        process_data(&all_data.gemini, Tool::Gemini, &mut time_series);
     }
     if !all_data.omp.is_empty() {
-        process_data(&all_data.omp, "Oh My Pi", &mut time_series);
+        process_data(&all_data.omp, Tool::Omp, &mut time_series);
     }
 
     time_series
 }
 
 fn calculate_all_model_breakdown(
-    all_data: &AllVendorData,
+    all_data: &AllToolData,
     pricing: &AllPricing,
 ) -> Vec<ModelBreakdownRow> {
     let mut all_stats: Vec<ModelBreakdownRow> = Vec::new();
@@ -1518,24 +1521,24 @@ fn calculate_all_model_breakdown(
     all_stats
 }
 
-/// Calculate weighted average cost per MTok and total monthly savings across all vendors.
+/// Calculate weighted average cost per MTok and total monthly savings across all tools.
 /// Returns (weighted_cost_per_mtok, total_monthly_savings).
 fn calculate_weighted_cost_per_mtok(
-    all_data: &AllVendorData,
+    all_data: &AllToolData,
     days: f64,
     pricing: &AllPricing,
     subscription_fees: &SubscriptionFees,
 ) -> (f64, f64) {
-    let vendor_configs: &[(&str, &[UsageEntry], f64)] = &[
+    let tool_configs: &[(&str, &[UsageEntry], f64)] = &[
         ("claude", &all_data.claude, subscription_fees.claude),
         ("codex", &all_data.codex, subscription_fees.codex),
         ("gemini", &all_data.gemini, subscription_fees.gemini),
         ("omp", &all_data.omp, 0.0),
     ];
 
-    let mut vendor_data: Vec<(i64, f64, f64)> = Vec::new(); // (tokens, api_cost, sub_price)
+    let mut tool_data: Vec<(i64, f64, f64)> = Vec::new();
 
-    for &(vendor, entries, sub_price) in vendor_configs {
+    for &(tool, entries, sub_price) in tool_configs {
         if entries.is_empty() {
             continue;
         }
@@ -1552,7 +1555,7 @@ fn calculate_weighted_cost_per_mtok(
                 continue;
             }
 
-            let extra = match vendor {
+            let extra = match tool {
                 "codex" => entry.usage.reasoning_output_tokens,
                 _ => entry.usage.cache_creation_input_tokens,
             };
@@ -1566,8 +1569,8 @@ fn calculate_weighted_cost_per_mtok(
                 continue;
             }
 
-            let pricing_vendor = stats::pricing_vendor_for_entry(vendor, entry);
-            let p = pricing.pricing_for_entry(pricing_vendor, &entry.model, entry.fast_tier);
+            let pricing_provider = stats::pricing_provider_for_entry(tool, entry);
+            let p = pricing.pricing_for_entry(pricing_provider, &entry.model, entry.fast_tier);
             api_cost +=
                 ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
             api_cost +=
@@ -1577,7 +1580,7 @@ fn calculate_weighted_cost_per_mtok(
                 p.cache_input,
                 p.cache_input_above_200k,
             );
-            api_cost += match (vendor, pricing_vendor) {
+            api_cost += match (tool, pricing_provider) {
                 ("omp", _) => ModelPricing::tier_cost(
                     entry.usage.cache_creation_input_tokens,
                     p.cache_output,
@@ -1605,10 +1608,10 @@ fn calculate_weighted_cost_per_mtok(
             continue;
         }
 
-        vendor_data.push((total_tokens, api_cost, sub_price));
+        tool_data.push((total_tokens, api_cost, sub_price));
     }
 
-    let grand_total: i64 = vendor_data.iter().map(|(t, _, _)| t).sum();
+    let grand_total: i64 = tool_data.iter().map(|(t, _, _)| t).sum();
     if grand_total == 0 || days <= 0.0 {
         return (0.0, 0.0);
     }
@@ -1616,7 +1619,7 @@ fn calculate_weighted_cost_per_mtok(
     let mut weighted_cost = 0.0;
     let mut total_savings = 0.0;
 
-    for (tokens, api_cost, sub_price) in &vendor_data {
+    for (tokens, api_cost, sub_price) in &tool_data {
         let percentage = *tokens as f64 / grand_total as f64;
         let monthly_tokens = (*tokens as f64 / days) * 30.0;
         let cost_per_mtok = if monthly_tokens > 0.0 {
@@ -1635,15 +1638,15 @@ fn calculate_weighted_cost_per_mtok(
     (weighted_cost, total_savings)
 }
 
-fn get_version(state: &mut AppState, vendor: &str) -> String {
-    if let Some(cached) = state.version_cache.get(vendor) {
+fn get_version(state: &mut AppState, tool: &str) -> String {
+    if let Some(cached) = state.version_cache.get(tool) {
         return cached.version_str.clone();
     }
 
-    let (cmd, display_name) = match vendor {
-        "claude" => ("claude", "Claude Code"),
-        "codex" => ("codex", "Codex"),
-        "gemini" => ("gemini", "Gemini CLI"),
+    let (cmd, display_name) = match Tool::from_key(tool) {
+        Some(Tool::Claude) => ("claude", Tool::Claude.display_name()),
+        Some(Tool::Codex) => ("codex", Tool::Codex.display_name()),
+        Some(Tool::Gemini) => ("gemini", Tool::Gemini.display_name()),
         _ => return String::new(),
     };
 
@@ -1687,7 +1690,7 @@ fn get_version(state: &mut AppState, vendor: &str) -> String {
     let version_str = format_local_version_label(display_name, current_version);
 
     state.version_cache.insert(
-        vendor.to_string(),
+        tool.to_string(),
         VersionCacheEntry {
             version_str: version_str.clone(),
         },
@@ -1789,16 +1792,16 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let horizon = compute_required_horizon(&state.time_window, now);
     let _ = ensure_raw_cache(state, horizon);
     let cache = state.raw_cache.as_ref().expect("cache populated");
-    let vendor = state.vendor.clone();
-    let raw_for_vendor: &[UsageEntry] = match vendor.as_str() {
+    let tool = state.tool.clone();
+    let raw_for_tool: &[UsageEntry] = match tool.as_str() {
         "claude" => &cache.claude,
         "codex" => &cache.codex,
         "gemini" => &cache.gemini,
         "omp" => &cache.omp,
         _ => &cache.claude,
     };
-    let filtered = data::filter_usage_data_by_window(raw_for_vendor, &state.time_window, now);
-    if classify_window_data(!raw_for_vendor.is_empty(), !filtered.is_empty())
+    let filtered = data::filter_usage_data_by_window(raw_for_tool, &state.time_window, now);
+    if classify_window_data(!raw_for_tool.is_empty(), !filtered.is_empty())
         == WindowDataState::NoSourceData
     {
         if !once {
@@ -1807,8 +1810,8 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         println!("No usage data found.");
         return Some(false);
     }
-    let vendor = &vendor;
-    let model_stats = match vendor.as_str() {
+    let tool = &tool;
+    let model_stats = match tool.as_str() {
         "codex" => stats::calculate_codex_model_breakdown(&filtered, &state.pricing),
         "gemini" => stats::calculate_gemini_model_breakdown(&filtered, &state.pricing),
         "omp" => stats::calculate_omp_model_breakdown(&filtered, &state.pricing),
@@ -1834,14 +1837,11 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         return None;
     }
 
-    let vendor_name = match vendor.as_str() {
-        "codex" => "Codex",
-        "gemini" => "Gemini CLI",
-        "omp" => "Oh My Pi",
-        _ => "Claude Code",
-    };
+    let tool_name = Tool::from_key(tool)
+        .map(Tool::display_name)
+        .unwrap_or("Claude Code");
 
-    println!("Calculating {} usage...", vendor_name);
+    println!("Calculating {} usage...", tool_name);
     println!("{}", showing_data_line(&state.time_window, now));
     if !once {
         println!(
@@ -1857,7 +1857,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         projection_days,
         Some(width),
         Some(effective_height),
-        vendor,
+        tool,
         &state.subscription_fees,
     );
 
@@ -1866,7 +1866,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         calculate_optimal_interval_minutes(&range_start, &range_end, target_width, granularity);
     let interval_minutes = round_to_nice_interval(optimal);
 
-    let model_ts = match vendor.as_str() {
+    let model_ts = match tool.as_str() {
         "codex" => {
             stats::calculate_codex_model_token_breakdown_time_series(&filtered, interval_minutes)
         }
@@ -1910,7 +1910,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         Some(target_width),
         interval_minutes,
         granularity,
-        vendor,
+        tool,
         Some(&included_models),
         true,
         Some(width as usize),
@@ -1925,7 +1925,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         Some(target_width),
         interval_minutes,
         granularity,
-        vendor,
+        tool,
         Some(&included_models),
         true,
         Some(width as usize),
@@ -1950,7 +1950,7 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         calculate_optimal_interval_minutes(&range_start, &range_end, target_width, granularity);
     let interval_minutes = round_to_nice_interval(optimal);
 
-    let all_data = load_all_vendor_data(state, now);
+    let all_data = load_all_tool_data(state, now);
 
     // Compute and cache the weighted cost prompt for show_prompt reuse
     let (weighted_cost, total_savings) = calculate_weighted_cost_per_mtok(
@@ -1959,9 +1959,9 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         &state.pricing,
         &state.subscription_fees,
     );
-    state.all_vendor_prompt = if weighted_cost > 0.0 {
+    state.all_tool_prompt = if weighted_cost > 0.0 {
         Some(format!(
-            "All Vendors Comparison, {} / MTok, Monthly Saving ${:.2}",
+            "All Tools Comparison, {} / MTok, Monthly Saving ${:.2}",
             formatting::format_cost_per_mtok(weighted_cost),
             total_savings,
         ))
@@ -1969,16 +1969,16 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         None
     };
 
-    let vendor_time_series = calculate_vendor_aggregate_time_series(&all_data, interval_minutes);
+    let tool_time_series = calculate_tool_aggregate_time_series(&all_data, interval_minutes);
     let all_model_stats = calculate_all_model_breakdown(&all_data, &state.pricing);
     let has_source_data = state
         .raw_cache
         .as_ref()
-        .is_some_and(raw_cache_has_any_vendor_data);
+        .is_some_and(raw_cache_has_any_tool_data);
     let data_state =
-        classify_window_data(has_source_data, all_vendor_data_has_window_data(&all_data));
+        classify_window_data(has_source_data, all_tool_data_has_window_data(&all_data));
     if data_state == WindowDataState::NoSourceData {
-        println!("No usage data found from any vendor.");
+        println!("No usage data found from any tool.");
         return Some(false);
     }
 
@@ -2001,7 +2001,7 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         return None;
     }
 
-    println!("Calculating usage across all vendors...");
+    println!("Calculating usage across all tools...");
     println!("{}", showing_data_line(&state.time_window, now));
     if !once {
         println!(
@@ -2039,8 +2039,8 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         &table_pad,
     );
 
-    charts::print_vendor_comparison_chart(
-        &vendor_time_series,
+    charts::print_tool_comparison_chart(
+        &tool_time_series,
         chart_height,
         &range_start,
         &range_end,
@@ -2055,7 +2055,7 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
 }
 
 fn print_stats(state: &mut AppState, once: bool) -> Option<bool> {
-    if state.vendor == "all" {
+    if state.tool == "all" {
         print_stats_all(state, once)
     } else {
         print_stats_single(state, once)
@@ -2101,7 +2101,7 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
             let result = match command {
                 SyncCommand::Push => {
                     eprintln!("sync push: refreshing local cache");
-                    let _ = refresh_all_vendor_raw_full(Some(&config.machine_id));
+                    let _ = refresh_all_tool_raw_full(Some(&config.machine_id));
                     let mut on_progress = |event: &sync::engine::SyncProgress| {
                         if let Some(message) = format_manual_sync_progress(event) {
                             eprintln!("{message}");
@@ -2254,8 +2254,8 @@ fn main() {
         sync::config::SyncConfig::Disabled => None,
     };
 
-    // Validate vendor data directory on startup (matches Python behavior)
-    if let Some(data_dir) = get_vendor_data_dir(&args.vendor)
+    // Validate tool data directory on startup.
+    if let Some(data_dir) = get_tool_data_dir(&args.tool)
         && !data_dir.exists()
     {
         eprintln!("Error: Data directory not found at {}", data_dir.display());
@@ -2263,7 +2263,7 @@ fn main() {
     }
 
     let mut state = AppState {
-        vendor: args.vendor.clone(),
+        tool: args.tool.clone(),
         host: args.host.clone(),
         local_host_id,
         days: args.days,
@@ -2272,7 +2272,7 @@ fn main() {
         pricing,
         subscription_fees,
         version_cache: HashMap::new(),
-        all_vendor_prompt: None,
+        all_tool_prompt: None,
         raw_cache: None,
         raw_refresh: None,
         integrity_status: IntegrityStatus::Checking,
@@ -2280,7 +2280,7 @@ fn main() {
     };
 
     if args.once {
-        let mut refreshed = refresh_all_vendor_raw_full(state.local_host_id.as_deref());
+        let mut refreshed = refresh_all_tool_raw_full(state.local_host_id.as_deref());
         if !include_local_for_host_filter(state.host.as_deref(), state.local_host_id.as_deref()) {
             clear_local_raw_cache(&mut refreshed);
         }
@@ -2303,7 +2303,7 @@ fn main() {
         let (width, height) = get_terminal_size();
         let load_started = std::time::Instant::now();
         print_loading_data_screen(width, height);
-        state.raw_cache = Some(read_all_vendor_cached_snapshot_for_hosts(
+        state.raw_cache = Some(read_all_tool_cached_snapshot_for_hosts(
             state.host.as_deref(),
             state.local_host_id.as_deref(),
         ));
@@ -2467,7 +2467,7 @@ fn main() {
                     && sync_stats.last_error.is_none()
                     && sync_stats.success_count > 0
                 {
-                    state.raw_cache = Some(read_all_vendor_cached_snapshot_for_hosts(
+                    state.raw_cache = Some(read_all_tool_cached_snapshot_for_hosts(
                         state.host.as_deref(),
                         state.local_host_id.as_deref(),
                     ));
@@ -2688,48 +2688,52 @@ fn main() {
                                 did_refresh = true;
                             }
                             "n" => {
-                                let rotation = ["all", "claude", "codex", "gemini", "omp"];
+                                let rotation = Tool::ROTATION;
+                                let current = Tool::from_key(&state.tool).unwrap_or(Tool::All);
                                 let idx = rotation
                                     .iter()
-                                    .position(|&v| v == state.vendor)
+                                    .position(|tool| *tool == current)
                                     .unwrap_or(0);
-                                let mut new_vendor = rotation[(idx + 1) % rotation.len()];
-                                // Validate directory; skip missing vendors
+                                let mut new_tool = rotation[(idx + 1) % rotation.len()];
+                                // Validate directory; skip missing tools.
                                 for _ in 0..rotation.len() {
-                                    if let Some(dir) = get_vendor_data_dir(new_vendor)
+                                    if let Some(dir) = get_tool_data_dir(new_tool.key())
                                         && !dir.exists()
                                     {
-                                        println!("Skipping {} (no data dir)...\r", new_vendor);
+                                        println!(
+                                            "Skipping {} (no data dir)...\r",
+                                            new_tool.display_name()
+                                        );
                                         let skip_idx = rotation
                                             .iter()
-                                            .position(|&v| v == new_vendor)
+                                            .position(|tool| *tool == new_tool)
                                             .unwrap_or(0);
-                                        new_vendor = rotation[(skip_idx + 1) % rotation.len()];
+                                        new_tool = rotation[(skip_idx + 1) % rotation.len()];
                                         continue;
                                     }
                                     break;
                                 }
-                                state.vendor = new_vendor.to_string();
+                                state.tool = new_tool.key().to_string();
                                 println!("{}\r", "-".repeat(width as usize));
                                 println!("\n\r{}\r", "=".repeat(width as usize));
-                                println!("SWITCHED TO {}\r", state.vendor.to_uppercase());
+                                println!("SWITCHED TO {}\r", new_tool.display_name());
                                 println!("{}\n\r", "=".repeat(width as usize));
                                 let result = refresh_display(&mut state);
                                 terminal_too_small = result.is_none();
                                 did_refresh = true;
                             }
                             "a" => {
-                                if state.vendor != "all" {
-                                    state.vendor = "all".to_string();
+                                if state.tool != "all" {
+                                    state.tool = "all".to_string();
                                     println!("{}\r", "-".repeat(width as usize));
                                     println!("\n\r{}\r", "=".repeat(width as usize));
-                                    println!("SWITCHED TO ALL VENDORS\r");
+                                    println!("SWITCHED TO ALL TOOLS\r");
                                     println!("{}\n\r", "=".repeat(width as usize));
                                     let result = refresh_display(&mut state);
                                     terminal_too_small = result.is_none();
                                     did_refresh = true;
                                 } else {
-                                    println!("Already monitoring all vendors.\r");
+                                    println!("Already monitoring all tools.\r");
                                 }
                             }
                             "d" | "day" | "days" => {
@@ -2782,11 +2786,11 @@ fn main() {
                                 println!("Available Commands:\r");
                                 println!("  r, refresh       - Refresh statistics immediately\r");
                                 println!(
-                                    "  v, vendor [X]    - Switch vendor (claude|codex|gemini|omp|all)\r"
+                                    "  t, tool [X]      - Switch tool (claude|codex|gemini|omp|all)\r"
                                 );
                                 println!("  host [X]         - Switch host (all or machine id)\r");
-                                println!("  n                - Rotate to next vendor\r");
-                                println!("  a                - Jump to vendor=all\r");
+                                println!("  n                - Rotate to next tool\r");
+                                println!("  a                - Jump to tool=all\r");
                                 println!("  d, day, days [N] - Change days (default: 1 if no N)\r");
                                 println!("  w, week          - Week mode (7 days)\r");
                                 println!("  m, month         - Month mode (30 days)\r");
@@ -2816,8 +2820,8 @@ fn main() {
                                 println!("  e, exit          - Exit monitor mode\r");
                                 println!("{}\r", "-".repeat(width as usize));
                                 println!(
-                                    "Current: vendor={}, host={}, window={}, interval={}s\r",
-                                    state.vendor,
+                                    "Current: tool={}, host={}, window={}, interval={}s\r",
+                                    state.tool,
                                     host_label(state.host.as_deref()),
                                     state.time_window.display_label(Local::now()),
                                     state.monitor_interval
@@ -2881,13 +2885,11 @@ fn main() {
                                 } else {
                                     let parts: Vec<&str> = command.splitn(2, ' ').collect();
                                     match parts[0] {
-                                        "v" | "vendor" if parts.len() == 2 => {
-                                            let nv = parts[1];
-                                            if ["claude", "codex", "gemini", "omp", "all"]
-                                                .contains(&nv)
-                                            {
+                                        "t" | "tool" if parts.len() == 2 => {
+                                            let requested = parts[1];
+                                            if let Some(new_tool) = Tool::from_key(requested) {
                                                 // Validate directory before switching
-                                                if let Some(dir) = get_vendor_data_dir(nv)
+                                                if let Some(dir) = get_tool_data_dir(new_tool.key())
                                                     && !dir.exists()
                                                 {
                                                     println!(
@@ -2904,17 +2906,20 @@ fn main() {
                                                     );
                                                     continue 'monitor;
                                                 }
-                                                state.vendor = nv.to_string();
+                                                state.tool = new_tool.key().to_string();
                                                 println!("{}\r", "-".repeat(width as usize));
                                                 println!("\n\r{}\r", "=".repeat(width as usize));
-                                                println!("SWITCHED TO {}\r", nv.to_uppercase());
+                                                println!(
+                                                    "SWITCHED TO {}\r",
+                                                    new_tool.display_name()
+                                                );
                                                 println!("{}\n\r", "=".repeat(width as usize));
                                                 let result = refresh_display(&mut state);
                                                 terminal_too_small = result.is_none();
                                                 did_refresh = true;
                                             } else {
                                                 println!(
-                                                    "Usage: v, vendor [claude|codex|gemini|omp|all]\r"
+                                                    "Usage: t, tool [claude|codex|gemini|omp|all]\r"
                                                 );
                                             }
                                         }
@@ -3001,10 +3006,10 @@ fn main() {
                                                 println!("Invalid interval value.\r");
                                             }
                                         }
-                                        "v" | "vendor" => {
-                                            println!("Current vendor: {}\r", state.vendor);
+                                        "t" | "tool" => {
+                                            println!("Current tool: {}\r", state.tool);
                                             println!(
-                                                "Usage: v, vendor [claude|codex|gemini|omp|all]\r"
+                                                "Usage: t, tool [claude|codex|gemini|omp|all]\r"
                                             );
                                         }
                                         "host" => {
@@ -3985,6 +3990,21 @@ mod tests {
     }
 
     #[test]
+    fn tool_flag_selects_usage_source() {
+        let args = Args::try_parse_from(["vibe-usage", "--tool", "omp"]).expect("tool flag parses");
+
+        assert_eq!(args.tool, "omp");
+    }
+
+    #[test]
+    fn vendor_flag_is_not_a_cli_alias() {
+        let err = Args::try_parse_from(["vibe-usage", "--vendor", "omp"])
+            .expect_err("vendor should not be accepted");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
     fn auto_update_flag_parses_interval() {
         let args = Args::try_parse_from([
             "vibe-usage",
@@ -4012,18 +4032,15 @@ mod tests {
 
     #[test]
     fn monitor_status_line_places_sync_on_same_line() {
-        let line = format_monitor_status_line(
-            "All Vendors Comparison",
-            Some("Sync: checked just now"),
-            60,
-        );
+        let line =
+            format_monitor_status_line("All Tools Comparison", Some("Sync: checked just now"), 60);
 
         assert_eq!(
             line,
             format!(
                 "{}{}{}",
-                "All Vendors Comparison",
-                " ".repeat(16),
+                "All Tools Comparison",
+                " ".repeat(18),
                 "Sync: checked just now"
             )
         );
@@ -4032,13 +4049,10 @@ mod tests {
 
     #[test]
     fn monitor_status_line_truncates_left_before_sync() {
-        let line = format_monitor_status_line(
-            "All Vendors Comparison",
-            Some("Sync: checked just now"),
-            28,
-        );
+        let line =
+            format_monitor_status_line("All Tools Comparison", Some("Sync: checked just now"), 28);
 
-        assert_eq!(line, "All V Sync: checked just now");
+        assert_eq!(line, "All T Sync: checked just now");
     }
 
     #[test]
@@ -4066,7 +4080,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_records_merge_into_vendor_buckets() {
+    fn remote_records_merge_into_tool_buckets() {
         let timestamp = "2026-05-18T12:00:00Z";
         let mut cache = RawDataCache {
             claude: Vec::new(),

@@ -159,40 +159,39 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
         .first()
         .is_some_and(|t| t.starts_with('o') && t[1..].starts_with(|c: char| c.is_ascii_digit()));
 
-    let (provider, family, version, version_key, modifiers) = if stripped.starts_with("claude")
-        || has_claude_family
-    {
-        parse_claude(&tokens)
-    } else if is_o_series {
-        // o-series ids are rendered verbatim, but we still parse the series
-        // number and any size suffix so ordering and pricing fallback work.
-        let major = tokens[0][1..].parse::<u32>().unwrap_or(0);
-        let modifiers = collect_modifiers(tokens.get(1..).unwrap_or(&[]), OPENAI_MODIFIERS);
-        (
-            Provider::Openai,
-            "o".to_string(),
-            String::new(),
-            (major, 0),
-            modifiers,
-        )
-    } else if tokens.first().is_some_and(|t| t == "gpt") {
-        parse_versioned(Provider::Openai, "gpt", &tokens, OPENAI_MODIFIERS)
-    } else if tokens.first().is_some_and(|t| t == "codex") {
-        // `codex-mini-latest` etc.: no numeric version, modifiers follow.
-        let modifiers = collect_modifiers(&tokens[1..], OPENAI_MODIFIERS);
-        (
-            Provider::Openai,
-            "codex".to_string(),
-            String::new(),
-            (0, 0),
-            modifiers,
-        )
-    } else if tokens.first().is_some_and(|t| t == "gemini") {
-        parse_versioned(Provider::Google, "gemini", &tokens, GEMINI_MODIFIERS)
-    } else {
-        let family = tokens.first().cloned().unwrap_or_default();
-        (Provider::Unknown, family, String::new(), (0, 0), Vec::new())
-    };
+    let (provider, family, version, version_key, modifiers) =
+        if stripped.starts_with("claude") || has_claude_family {
+            parse_claude(&tokens)
+        } else if is_o_series {
+            // o-series ids are rendered verbatim, but we still parse the series
+            // number and any size suffix so ordering and pricing fallback work.
+            let major = tokens[0][1..].parse::<u32>().unwrap_or(0);
+            let modifiers = collect_modifiers(tokens.get(1..).unwrap_or(&[]), OPENAI_MODIFIERS);
+            (
+                Provider::Openai,
+                "o".to_string(),
+                String::new(),
+                (major, 0),
+                modifiers,
+            )
+        } else if tokens.first().is_some_and(|t| t == "gpt") {
+            parse_versioned(Provider::Openai, "gpt", &tokens, OPENAI_MODIFIERS)
+        } else if tokens.first().is_some_and(|t| t == "codex") {
+            // `codex-mini-latest` etc.: no numeric version, modifiers follow.
+            let modifiers = collect_modifiers(&tokens[1..], OPENAI_MODIFIERS);
+            (
+                Provider::Openai,
+                "codex".to_string(),
+                String::new(),
+                (0, 0),
+                modifiers,
+            )
+        } else if tokens.first().is_some_and(|t| t == "gemini") {
+            parse_versioned(Provider::Google, "gemini", &tokens, GEMINI_MODIFIERS)
+        } else {
+            let family = tokens.first().cloned().unwrap_or_default();
+            (Provider::Unknown, family, String::new(), (0, 0), Vec::new())
+        };
 
     ModelIdentity {
         provider,
@@ -256,7 +255,13 @@ fn parse_versioned(
     };
     let rest_start = if version.is_empty() { 1 } else { 2 };
     let modifiers = collect_modifiers(tokens.get(rest_start..).unwrap_or(&[]), recognized);
-    (provider, family.to_string(), version, version_key, modifiers)
+    (
+        provider,
+        family.to_string(),
+        version,
+        version_key,
+        modifiers,
+    )
 }
 
 /// `5.5` -> `(5, 5)`, `2.0` -> `(2, 0)`, `3` -> `(3, 0)`.
@@ -525,7 +530,10 @@ mod tests {
             color_family(&parse_model_identity("claude-mythos-5")),
             Some("fable")
         );
-        assert_eq!(color_family(&parse_model_identity("claude-opus-4-8")), Some("opus"));
+        assert_eq!(
+            color_family(&parse_model_identity("claude-opus-4-8")),
+            Some("opus")
+        );
         assert_eq!(
             color_family(&parse_model_identity("claude-sonnet-4-6")),
             Some("sonnet")

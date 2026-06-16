@@ -431,7 +431,7 @@ def termios_tiocswinsz():
 
 
 def spawn_monitor(repo_root, columns, rows, vendor, days):
-    binary = repo_root / "target" / "release" / "vibe-usage"
+    binary = repo_root / "target" / "release" / "ai-usage"
     if not binary.exists():
         raise SystemExit(f"Missing {binary}; run `cargo build --release` first")
 

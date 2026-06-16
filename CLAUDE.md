@@ -13,18 +13,18 @@ A Rust utility for monitoring token usage and costs across multiple AI coding as
 cargo build --release
 
 # All vendors, last 7 days (monitor mode)
-./target/release/vibe-usage
+./target/release/ai-usage
 
 # Single snapshot
-./target/release/vibe-usage --once
+./target/release/ai-usage --once
 
 # Last 30 days
-./target/release/vibe-usage --days 30
+./target/release/ai-usage --days 30
 
 # Specific vendor only
-./target/release/vibe-usage --vendor claude
-./target/release/vibe-usage --vendor codex
-./target/release/vibe-usage --vendor gemini
+./target/release/ai-usage --vendor claude
+./target/release/ai-usage --vendor codex
+./target/release/ai-usage --vendor gemini
 ```
 
 ## Data Sources

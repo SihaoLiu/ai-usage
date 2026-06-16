@@ -1,5 +1,5 @@
 [package]
-name = "vibe-usage-updater"
+name = "ai-usage-updater"
 version.workspace = true
 edition = "2024"
 build = "build.rs"

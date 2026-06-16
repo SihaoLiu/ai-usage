@@ -5,17 +5,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=vibe-usage
-Group=vibe-usage
-WorkingDirectory=/var/lib/vibe-usage
-ExecStart=/var/lib/vibe-usage/bin/vibe-usage-server /etc/vibe-usage-server/config.yaml
+User=ai-usage
+Group=ai-usage
+WorkingDirectory=/var/lib/ai-usage
+ExecStart=/var/lib/ai-usage/bin/ai-usage-server /etc/ai-usage-server/config.yaml
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/vibe-usage
+ReadWritePaths=/var/lib/ai-usage
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]

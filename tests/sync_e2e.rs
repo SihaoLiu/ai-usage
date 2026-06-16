@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
-use vibe_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
+use ai_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -13,7 +13,7 @@ fn unique_temp_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("vibe-usage-e2e-{name}-{stamp}"));
+    let dir = std::env::temp_dir().join(format!("ai-usage-e2e-{name}-{stamp}"));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
@@ -86,21 +86,21 @@ fn ensure_claude_dir(home: &Path) {
 }
 
 fn run_cli(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_vibe-usage"))
+    Command::new(env!("CARGO_BIN_EXE_ai-usage"))
         .args(args)
         .env("HOME", home)
         .env("AI_USAGE_CACHE_DIR", home.join(".cache").join("ai-usage"))
         .env(
-            "VIBE_USAGE_SECRETS",
+            "AI_USAGE_SECRETS",
             home.join(".secrets").join("ai-usage.yaml"),
         )
-        .env("VIBE_USAGE_ALLOW_INSECURE_HTTP_FOR_TESTS", "1")
+        .env("AI_USAGE_ALLOW_INSECURE_HTTP_FOR_TESTS", "1")
         .env("COLUMNS", "140")
         .env("LINES", "50")
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .output()
-        .expect("run vibe-usage")
+        .expect("run ai-usage")
 }
 
 fn assert_success(output: Output, label: &str) -> String {

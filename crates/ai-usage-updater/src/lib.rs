@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const DEFAULT_REPO: &str = "SihaoLiu/ai-usage";
-pub const BUILD_TARGET: &str = env!("VIBE_USAGE_BUILD_TARGET");
+pub const BUILD_TARGET: &str = env!("AI_USAGE_BUILD_TARGET");
 pub const DEFAULT_AUTO_UPDATE_INTERVAL_SECONDS: u64 = 3600;
 pub const MIN_AUTO_UPDATE_INTERVAL_SECONDS: u64 = 60;
 
@@ -303,28 +303,28 @@ mod tests {
     #[test]
     fn asset_name_strips_unknown_vendor() {
         assert_eq!(
-            expected_asset_name("vibe-usage", "x86_64-unknown-linux-musl"),
-            "vibe-usage-x86_64-linux-musl"
+            expected_asset_name("ai-usage", "x86_64-unknown-linux-musl"),
+            "ai-usage-x86_64-linux-musl"
         );
         assert_eq!(
-            expected_asset_name("vibe-usage", "aarch64-unknown-linux-musl"),
-            "vibe-usage-aarch64-linux-musl"
+            expected_asset_name("ai-usage", "aarch64-unknown-linux-musl"),
+            "ai-usage-aarch64-linux-musl"
         );
     }
 
     #[test]
     fn asset_name_keeps_apple_vendor() {
         assert_eq!(
-            expected_asset_name("vibe-usage", "aarch64-apple-darwin"),
-            "vibe-usage-aarch64-apple-darwin"
+            expected_asset_name("ai-usage", "aarch64-apple-darwin"),
+            "ai-usage-aarch64-apple-darwin"
         );
     }
 
     #[test]
     fn asset_name_supports_server_binary() {
         assert_eq!(
-            expected_asset_name("vibe-usage-server", "x86_64-unknown-linux-gnu"),
-            "vibe-usage-server-x86_64-linux-gnu"
+            expected_asset_name("ai-usage-server", "x86_64-unknown-linux-gnu"),
+            "ai-usage-server-x86_64-linux-gnu"
         );
     }
 
@@ -334,18 +334,18 @@ mod tests {
           "tag_name": "v2.3.0",
           "assets": [
             {
-              "name": "vibe-usage-x86_64-linux-gnu",
-              "browser_download_url": "https://example.com/vibe-usage"
+              "name": "ai-usage-x86_64-linux-gnu",
+              "browser_download_url": "https://example.com/ai-usage"
             }
           ]
         }"#;
 
-        let release = parse_latest_release(&config("vibe-usage"), body).expect("release parses");
+        let release = parse_latest_release(&config("ai-usage"), body).expect("release parses");
 
         assert_eq!(release.tag, "v2.3.0");
         assert_eq!(release.version, "2.3.0");
-        assert_eq!(release.asset_name, "vibe-usage-x86_64-linux-gnu");
-        assert_eq!(release.asset_url, "https://example.com/vibe-usage");
+        assert_eq!(release.asset_name, "ai-usage-x86_64-linux-gnu");
+        assert_eq!(release.asset_url, "https://example.com/ai-usage");
     }
 
     #[test]
@@ -354,17 +354,17 @@ mod tests {
           "tag_name": "v2.3.0",
           "assets": [
             {
-              "name": "vibe-usage-x86_64-linux-gnu",
-              "browser_download_url": "https://example.com/vibe-usage"
+              "name": "ai-usage-x86_64-linux-gnu",
+              "browser_download_url": "https://example.com/ai-usage"
             }
           ]
         }"#;
 
-        let err = parse_latest_release(&config("vibe-usage-server"), body)
+        let err = parse_latest_release(&config("ai-usage-server"), body)
             .expect_err("server asset should be missing");
 
-        assert!(err.contains("vibe-usage-server-x86_64-linux-gnu"));
-        assert!(err.contains("vibe-usage-x86_64-linux-gnu"));
+        assert!(err.contains("ai-usage-server-x86_64-linux-gnu"));
+        assert!(err.contains("ai-usage-x86_64-linux-gnu"));
     }
 
     #[test]

@@ -356,7 +356,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("vibe-usage-worker-test-{name}-{stamp}"));
+        let dir = std::env::temp_dir().join(format!("ai-usage-worker-test-{name}-{stamp}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }

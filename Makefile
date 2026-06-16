@@ -1,4 +1,4 @@
-BIN := vibe-usage
+BIN := ai-usage
 MUSL_TARGET := x86_64-unknown-linux-musl
 DEMO := docs/assets/ai-usage.gif
 

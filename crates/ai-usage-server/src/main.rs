@@ -1,12 +1,12 @@
 use std::path::PathBuf;
-use vibe_usage_server::{AppState, ServerConfig, build_app, spawn_auto_update_worker};
+use ai_usage_server::{AppState, ServerConfig, build_app, spawn_auto_update_worker};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/etc/vibe-usage-server/config.yaml"));
+        .unwrap_or_else(|| PathBuf::from("/etc/ai-usage-server/config.yaml"));
     let config = ServerConfig::load_from_path(&config_path)?;
     let listen = config.listen.clone();
     let auto_update = config.auto_update.clone();

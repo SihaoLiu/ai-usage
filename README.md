@@ -20,11 +20,11 @@ Download the pre-built binary for your platform from [Releases](https://github.c
 
 | Platform | Asset |
 |----------|-------|
-| Linux x86_64 (musl, fully static) | `vibe-usage-x86_64-linux-musl` |
-| Linux aarch64 (musl, fully static) | `vibe-usage-aarch64-linux-musl` |
-| Linux x86_64 (glibc) | `vibe-usage-x86_64-linux-gnu` |
-| Linux aarch64 (glibc) | `vibe-usage-aarch64-linux-gnu` |
-| macOS Apple Silicon | `vibe-usage-aarch64-apple-darwin` |
+| Linux x86_64 (musl, fully static) | `ai-usage-x86_64-linux-musl` |
+| Linux aarch64 (musl, fully static) | `ai-usage-aarch64-linux-musl` |
+| Linux x86_64 (glibc) | `ai-usage-x86_64-linux-gnu` |
+| Linux aarch64 (glibc) | `ai-usage-aarch64-linux-gnu` |
+| macOS Apple Silicon | `ai-usage-aarch64-apple-darwin` |
 
 Place it anywhere in your `$PATH` and `chmod +x` it. Once installed, you can keep it up to date by typing `update` in monitor mode, or by starting monitor mode with `--auto-update` for periodic checks.
 
@@ -43,13 +43,13 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ```bash
 # All vendors, last 3 days (monitor mode)
-vibe-usage
+ai-usage
 
 # Single snapshot, then exit
-vibe-usage --once
+ai-usage --once
 
 # Last 30 days, specific vendor
-vibe-usage --days 30 --vendor claude
+ai-usage --days 30 --vendor claude
 ```
 
 See [docs/usage.md](docs/usage.md) for full usage details, data sources, monitor mode controls, and configuration. For optional cross-machine sync, see [docs/sync.md](docs/sync.md).

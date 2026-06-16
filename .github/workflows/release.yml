@@ -19,32 +19,48 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # legacy_asset / legacy_server_asset carry the former "vibe-usage" names.
+      # Already-deployed binaries built before the rename look for those exact
+      # asset names in releases/latest, so we keep publishing them (identical
+      # bytes, second filename) until every deployment has self-updated onto the
+      # renamed ai-usage binary. Drop the legacy_* fields and their staging once
+      # no deployment older than the rename remains.
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            asset: vibe-usage-x86_64-linux-musl
-            server_asset: vibe-usage-server-x86_64-linux-musl
+            asset: ai-usage-x86_64-linux-musl
+            server_asset: ai-usage-server-x86_64-linux-musl
+            legacy_asset: vibe-usage-x86_64-linux-musl
+            legacy_server_asset: vibe-usage-server-x86_64-linux-musl
             use_cross: true
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            asset: vibe-usage-aarch64-linux-musl
-            server_asset: vibe-usage-server-aarch64-linux-musl
+            asset: ai-usage-aarch64-linux-musl
+            server_asset: ai-usage-server-aarch64-linux-musl
+            legacy_asset: vibe-usage-aarch64-linux-musl
+            legacy_server_asset: vibe-usage-server-aarch64-linux-musl
             use_cross: true
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            asset: vibe-usage-x86_64-linux-gnu
-            server_asset: vibe-usage-server-x86_64-linux-gnu
+            asset: ai-usage-x86_64-linux-gnu
+            server_asset: ai-usage-server-x86_64-linux-gnu
+            legacy_asset: vibe-usage-x86_64-linux-gnu
+            legacy_server_asset: vibe-usage-server-x86_64-linux-gnu
             use_cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            asset: vibe-usage-aarch64-linux-gnu
-            server_asset: vibe-usage-server-aarch64-linux-gnu
+            asset: ai-usage-aarch64-linux-gnu
+            server_asset: ai-usage-server-aarch64-linux-gnu
+            legacy_asset: vibe-usage-aarch64-linux-gnu
+            legacy_server_asset: vibe-usage-server-aarch64-linux-gnu
             use_cross: true
           - target: aarch64-apple-darwin
             os: macos-14
-            asset: vibe-usage-aarch64-apple-darwin
-            server_asset: vibe-usage-server-aarch64-apple-darwin
+            asset: ai-usage-aarch64-apple-darwin
+            server_asset: ai-usage-server-aarch64-apple-darwin
+            legacy_asset: vibe-usage-aarch64-apple-darwin
+            legacy_server_asset: vibe-usage-server-aarch64-apple-darwin
             use_cross: false
     steps:
       - name: Checkout
@@ -96,29 +112,36 @@ jobs:
       - name: Build (cross)
         if: matrix.use_cross
         run: |
-          cross build --release --bin vibe-usage --target ${{ matrix.target }}
-          cross build --release -p vibe-usage-server --target ${{ matrix.target }}
+          cross build --release --bin ai-usage --target ${{ matrix.target }}
+          cross build --release -p ai-usage-server --target ${{ matrix.target }}
 
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
         run: |
-          cargo build --release --bin vibe-usage --target ${{ matrix.target }}
-          cargo build --release -p vibe-usage-server --target ${{ matrix.target }}
+          cargo build --release --bin ai-usage --target ${{ matrix.target }}
+          cargo build --release -p ai-usage-server --target ${{ matrix.target }}
 
       - name: Stage asset
         shell: bash
         run: |
           mkdir -p dist
-          src="target/${{ matrix.target }}/release/vibe-usage"
+          src="target/${{ matrix.target }}/release/ai-usage"
           dest="dist/${{ matrix.asset }}"
           cp "$src" "$dest"
           chmod +x "$dest"
-          server_src="target/${{ matrix.target }}/release/vibe-usage-server"
+          server_src="target/${{ matrix.target }}/release/ai-usage-server"
           server_dest="dist/${{ matrix.server_asset }}"
           cp "$server_src" "$server_dest"
           chmod +x "$server_dest"
-          ls -lh "$dest"
-          ls -lh "$server_dest"
+          # Legacy-named copies so binaries built before the rename can still
+          # find their expected asset and self-update onto the renamed binary.
+          legacy_dest="dist/${{ matrix.legacy_asset }}"
+          cp "$src" "$legacy_dest"
+          chmod +x "$legacy_dest"
+          legacy_server_dest="dist/${{ matrix.legacy_server_asset }}"
+          cp "$server_src" "$legacy_server_dest"
+          chmod +x "$legacy_server_dest"
+          ls -lh "$dest" "$server_dest" "$legacy_dest" "$legacy_server_dest"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3.0.0
@@ -127,6 +150,8 @@ jobs:
           files: |
             dist/${{ matrix.asset }}
             dist/${{ matrix.server_asset }}
+            dist/${{ matrix.legacy_asset }}
+            dist/${{ matrix.legacy_server_asset }}
           fail_on_unmatched_files: true
           draft: false
           prerelease: false

@@ -363,7 +363,7 @@ struct Args {
     /// Seconds between automatic release checks when --auto-update is enabled
     #[arg(
         long,
-        default_value_t = vibe_usage_updater::DEFAULT_AUTO_UPDATE_INTERVAL_SECONDS
+        default_value_t = ai_usage_updater::DEFAULT_AUTO_UPDATE_INTERVAL_SECONDS
     )]
     auto_update_interval_seconds: u64,
 
@@ -1009,7 +1009,7 @@ fn auto_update_deadline_after(
     now: std::time::Instant,
     auto_update_interval_seconds: u64,
 ) -> std::time::Instant {
-    now + vibe_usage_updater::normalize_auto_update_interval(auto_update_interval_seconds)
+    now + ai_usage_updater::normalize_auto_update_interval(auto_update_interval_seconds)
 }
 
 fn format_manual_sync_progress(event: &sync::engine::SyncProgress) -> Option<String> {
@@ -1367,7 +1367,7 @@ fn parse_host_selection(selection: &str) -> Result<Option<String>, &'static str>
     if selection == "all" {
         return Ok(None);
     }
-    if vibe_usage_proto::is_valid_host_id(selection) {
+    if ai_usage_proto::is_valid_host_id(selection) {
         Ok(Some(selection.to_string()))
     } else {
         Err("Usage: host [all|HOST], where HOST matches [a-z0-9_-]{1,64}")
@@ -2089,17 +2089,17 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                 0
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                eprintln!("vibe-usage: sync config already exists; pass --force to replace it");
+                eprintln!("ai-usage: sync config already exists; pass --force to replace it");
                 1
             }
             Err(err) => {
-                eprintln!("vibe-usage: sync init failed: {err}");
+                eprintln!("ai-usage: sync init failed: {err}");
                 1
             }
         },
         SyncCommand::Push | SyncCommand::Pull | SyncCommand::Clean => {
             let sync::config::SyncConfig::Enabled(config) = sync_config else {
-                eprintln!("vibe-usage: sync is disabled");
+                eprintln!("ai-usage: sync is disabled");
                 return 1;
             };
             let cache_root = data::cache::default_cache_dir();
@@ -2154,7 +2154,7 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                 }
                 Err(err) => {
                     eprintln!(
-                        "vibe-usage: sync {} failed: {}",
+                        "ai-usage: sync {} failed: {}",
                         sync_command_name(command),
                         err
                     );
@@ -3992,7 +3992,7 @@ mod tests {
 
     #[test]
     fn sync_subcommands_parse() {
-        let push = Args::try_parse_from(["vibe-usage", "sync", "push"]).expect("push parses");
+        let push = Args::try_parse_from(["ai-usage", "sync", "push"]).expect("push parses");
         assert!(matches!(
             push.command,
             Some(CliCommand::Sync {
@@ -4000,7 +4000,7 @@ mod tests {
             })
         ));
 
-        let pull = Args::try_parse_from(["vibe-usage", "sync", "pull"]).expect("pull parses");
+        let pull = Args::try_parse_from(["ai-usage", "sync", "pull"]).expect("pull parses");
         assert!(matches!(
             pull.command,
             Some(CliCommand::Sync {
@@ -4008,7 +4008,7 @@ mod tests {
             })
         ));
 
-        let status = Args::try_parse_from(["vibe-usage", "sync", "status"]).expect("status parses");
+        let status = Args::try_parse_from(["ai-usage", "sync", "status"]).expect("status parses");
         assert!(matches!(
             status.command,
             Some(CliCommand::Sync {
@@ -4017,7 +4017,7 @@ mod tests {
         ));
 
         let init =
-            Args::try_parse_from(["vibe-usage", "sync", "init", "--force"]).expect("init parses");
+            Args::try_parse_from(["ai-usage", "sync", "init", "--force"]).expect("init parses");
         assert!(matches!(
             init.command,
             Some(CliCommand::Sync {
@@ -4025,7 +4025,7 @@ mod tests {
             })
         ));
 
-        let clean = Args::try_parse_from(["vibe-usage", "sync", "clean"]).expect("clean parses");
+        let clean = Args::try_parse_from(["ai-usage", "sync", "clean"]).expect("clean parses");
         assert!(matches!(
             clean.command,
             Some(CliCommand::Sync {
@@ -4036,13 +4036,13 @@ mod tests {
 
     #[test]
     fn host_arg_parses() {
-        let args = Args::try_parse_from(["vibe-usage", "--host", "laptop"]).expect("host parses");
+        let args = Args::try_parse_from(["ai-usage", "--host", "laptop"]).expect("host parses");
         assert_eq!(args.host.as_deref(), Some("laptop"));
     }
 
     #[test]
     fn auto_update_flag_defaults_off() {
-        let args = Args::try_parse_from(["vibe-usage"]).expect("args parse");
+        let args = Args::try_parse_from(["ai-usage"]).expect("args parse");
 
         assert!(!args.auto_update);
         assert_eq!(args.auto_update_interval_seconds, 3600);
@@ -4050,14 +4050,14 @@ mod tests {
 
     #[test]
     fn tool_flag_selects_usage_source() {
-        let args = Args::try_parse_from(["vibe-usage", "--tool", "omp"]).expect("tool flag parses");
+        let args = Args::try_parse_from(["ai-usage", "--tool", "omp"]).expect("tool flag parses");
 
         assert_eq!(args.tool, "omp");
     }
 
     #[test]
     fn vendor_flag_is_not_a_cli_alias() {
-        let err = Args::try_parse_from(["vibe-usage", "--vendor", "omp"])
+        let err = Args::try_parse_from(["ai-usage", "--vendor", "omp"])
             .expect_err("vendor should not be accepted");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
@@ -4066,7 +4066,7 @@ mod tests {
     #[test]
     fn auto_update_flag_parses_interval() {
         let args = Args::try_parse_from([
-            "vibe-usage",
+            "ai-usage",
             "--auto-update",
             "--auto-update-interval-seconds",
             "7200",
@@ -4079,7 +4079,7 @@ mod tests {
 
     #[test]
     fn version_flag_prints_cargo_pkg_version() {
-        let err = Args::try_parse_from(["vibe-usage", "--version"])
+        let err = Args::try_parse_from(["ai-usage", "--version"])
             .expect_err("--version should short-circuit parsing");
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         let rendered = err.to_string();

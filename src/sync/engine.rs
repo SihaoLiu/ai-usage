@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
-use vibe_usage_proto::{
+use ai_usage_proto::{
     IntegrityReport, IntegrityReportList, IntegritySubmitResponse, PullResponse, RecordFingerprint,
     SnapshotDiffRequest, SnapshotDiffResponse, SnapshotFinalizeRequest, SnapshotFinalizeResponse,
     SnapshotRecordBatch, UploadResponse, WireRecord,
@@ -769,7 +769,7 @@ fn cached_record_to_wire(
     dedup_key: &str,
 ) -> Result<WireRecord, SyncError> {
     let wire = WireRecord {
-        schema_version: vibe_usage_proto::SCHEMA_VERSION,
+        schema_version: ai_usage_proto::SCHEMA_VERSION,
         host_id: config.machine_id.clone(),
         vendor: record.vendor.clone(),
         dedup_key: dedup_key.to_string(),
@@ -874,7 +874,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use vibe_usage_proto::{
+    use ai_usage_proto::{
         PullResponse, RecordKey, SCHEMA_VERSION, SequencedWireRecord, UploadResponse, WireRecord,
     };
 
@@ -1063,7 +1063,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("vibe-usage-engine-test-{name}-{stamp}"));
+        let dir = std::env::temp_dir().join(format!("ai-usage-engine-test-{name}-{stamp}"));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }

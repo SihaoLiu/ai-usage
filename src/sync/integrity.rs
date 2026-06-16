@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use vibe_usage_proto::{INTEGRITY_ALGORITHM, IntegrityReport};
+use ai_usage_proto::{INTEGRITY_ALGORITHM, IntegrityReport};
 
 const TRANSCRIPT_FORMAT: &str = "integrity-transcript-v1";
 const TRANSCRIPT_DIR: &str = "integrity";
@@ -460,7 +460,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("vibe-usage-integrity-test-{name}-{stamp}"));
+        let dir = std::env::temp_dir().join(format!("ai-usage-integrity-test-{name}-{stamp}"));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }

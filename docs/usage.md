@@ -3,7 +3,7 @@
 ## CLI Options
 
 ```bash
-vibe-usage [OPTIONS]
+ai-usage [OPTIONS]
 
 Options:
   --once              Show stats once and exit (no monitor loop)
@@ -42,7 +42,7 @@ Default behavior (no flags) enters monitor mode showing all vendors for the last
 
 Monitor mode date and date-time inputs are interpreted in the running machine's local timezone. For date-only ranges, the ending date is included for the full local day. For example, `range 2026-05-01 2026-05-07` covers local time from `2026-05-01 00:00:00` through the end of `2026-05-07`. The two arguments to `range` may be supplied in any order; the earlier instant is treated as the start and the later one as the end.
 
-Automatic updates are disabled unless `--auto-update` is provided. When enabled, monitor mode checks the latest GitHub release on the configured interval, downloads the matching `vibe-usage-<target>` asset when a newer version exists, replaces the current executable, and restarts in place.
+Automatic updates are disabled unless `--auto-update` is provided. When enabled, monitor mode checks the latest GitHub release on the configured interval, downloads the matching `ai-usage-<target>` asset when a newer version exists, replaces the current executable, and restarts in place.
 
 ## Data Sources
 

@@ -220,7 +220,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("vibe-usage-omp-test-{name}-{stamp}.jsonl"))
+        std::env::temp_dir().join(format!("ai-usage-omp-test-{name}-{stamp}.jsonl"))
     }
 
     #[test]

@@ -18,6 +18,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-usage"
+version = "2.4.0"
+dependencies = [
+ "ai-usage-proto",
+ "ai-usage-server",
+ "ai-usage-updater",
+ "axum",
+ "bincode",
+ "chrono",
+ "clap",
+ "crossterm",
+ "libc",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tokio",
+ "toml",
+ "ureq",
+ "walkdir",
+]
+
+[[package]]
+name = "ai-usage-proto"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ai-usage-server"
+version = "2.4.0"
+dependencies = [
+ "ai-usage-proto",
+ "ai-usage-updater",
+ "axum",
+ "chrono",
+ "r2d2",
+ "r2d2_sqlite",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "subtle",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ai-usage-updater"
+version = "2.4.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1560,70 +1624,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vibe-usage"
-version = "2.3.19"
-dependencies = [
- "axum",
- "bincode",
- "chrono",
- "clap",
- "crossterm",
- "libc",
- "rayon",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tokio",
- "toml",
- "ureq",
- "vibe-usage-proto",
- "vibe-usage-server",
- "vibe-usage-updater",
- "walkdir",
-]
-
-[[package]]
-name = "vibe-usage-proto"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "vibe-usage-server"
-version = "2.3.19"
-dependencies = [
- "axum",
- "chrono",
- "r2d2",
- "r2d2_sqlite",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "subtle",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
- "vibe-usage-proto",
- "vibe-usage-updater",
-]
-
-[[package]]
-name = "vibe-usage-updater"
-version = "2.3.19"
-dependencies = [
- "libc",
- "serde_json",
- "ureq",
-]
 
 [[package]]
 name = "walkdir"

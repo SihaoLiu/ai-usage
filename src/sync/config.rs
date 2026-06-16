@@ -49,7 +49,7 @@ pub fn load_sync_config(debug_sync: bool) -> SyncConfig {
         eprintln!("{warning}");
     } else if debug_sync && matches!(result.config, SyncConfig::Disabled) {
         eprintln!(
-            "vibe-usage: sync config not found at {}; sync disabled",
+            "ai-usage: sync config not found at {}; sync disabled",
             path.display()
         );
     }
@@ -121,7 +121,7 @@ fn load_sync_config_from_path(path: &Path, fallback_hostname: &str) -> ConfigLoa
     let machine_id = raw
         .machine_id
         .unwrap_or_else(|| sanitize_hostname(fallback_hostname));
-    if !vibe_usage_proto::is_valid_host_id(&machine_id) {
+    if !ai_usage_proto::is_valid_host_id(&machine_id) {
         return invalid(path, "machine_id must match [a-z0-9_-]{1,64}");
     }
 
@@ -191,7 +191,7 @@ fn is_allowed_server_url(server_url: &str) -> bool {
 
 #[cfg(debug_assertions)]
 fn allow_loopback_http_for_tests(server_url: &str) -> bool {
-    std::env::var("VIBE_USAGE_ALLOW_INSECURE_HTTP_FOR_TESTS").as_deref() == Ok("1")
+    std::env::var("AI_USAGE_ALLOW_INSECURE_HTTP_FOR_TESTS").as_deref() == Ok("1")
         && (server_url.starts_with("http://127.0.0.1:")
             || server_url.starts_with("http://localhost:")
             || server_url.starts_with("http://[::1]:"))
@@ -206,7 +206,7 @@ fn invalid(path: &Path, reason: impl AsRef<str>) -> ConfigLoadResult {
     ConfigLoadResult {
         config: SyncConfig::Disabled,
         warning: Some(format!(
-            "vibe-usage: invalid sync config at {}: {}",
+            "ai-usage: invalid sync config at {}: {}",
             path.display(),
             reason.as_ref()
         )),
@@ -220,7 +220,7 @@ fn resolve_secrets_path(home: &Path, env_override: Option<&Path>) -> PathBuf {
 }
 
 fn default_secrets_path() -> PathBuf {
-    if let Ok(path) = std::env::var("VIBE_USAGE_SECRETS") {
+    if let Ok(path) = std::env::var("AI_USAGE_SECRETS") {
         return PathBuf::from(path);
     }
     let home = std::env::var_os("HOME")
@@ -289,7 +289,7 @@ fn permission_warning(path: &Path) -> Option<String> {
         None
     } else {
         Some(format!(
-            "vibe-usage: refusing to read {}: permissions must be 0600",
+            "ai-usage: refusing to read {}: permissions must be 0600",
             path.display()
         ))
     }
@@ -309,7 +309,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("vibe-usage-config-test-{name}-{stamp}"));
+        let dir = std::env::temp_dir().join(format!("ai-usage-config-test-{name}-{stamp}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }
@@ -405,7 +405,7 @@ mod tests {
         assert_eq!(
             result.warning,
             Some(format!(
-                "vibe-usage: refusing to read {}: permissions must be 0600",
+                "ai-usage: refusing to read {}: permissions must be 0600",
                 path.display()
             ))
         );

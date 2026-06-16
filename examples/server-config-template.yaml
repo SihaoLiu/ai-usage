@@ -1,5 +1,5 @@
 listen: "127.0.0.1:8787"
-db_path: "/var/lib/vibe-usage/data.db"
+db_path: "/var/lib/ai-usage/data.db"
 shared_token: "replace-me"
 allowed_hosts:
   - "workstation-home"

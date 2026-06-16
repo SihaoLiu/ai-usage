@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
-use vibe_usage_proto::{
+use ai_usage_proto::{
     HealthResponse, IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineInfo,
     MachineList, PullResponse, RecordKey, SCHEMA_VERSION, SequencedWireRecord, SnapshotDiffRequest,
     SnapshotDiffResponse, SnapshotRecordBatch, UploadResponse, WireRecord, is_valid_host_id,
@@ -68,7 +68,7 @@ impl Default for AutoUpdateConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            interval_seconds: vibe_usage_updater::DEFAULT_AUTO_UPDATE_INTERVAL_SECONDS,
+            interval_seconds: ai_usage_updater::DEFAULT_AUTO_UPDATE_INTERVAL_SECONDS,
         }
     }
 }
@@ -82,8 +82,8 @@ impl AutoUpdateConfig {
             enabled: raw.enabled.unwrap_or(false),
             interval_seconds: raw
                 .interval_seconds
-                .unwrap_or(vibe_usage_updater::DEFAULT_AUTO_UPDATE_INTERVAL_SECONDS)
-                .max(vibe_usage_updater::MIN_AUTO_UPDATE_INTERVAL_SECONDS),
+                .unwrap_or(ai_usage_updater::DEFAULT_AUTO_UPDATE_INTERVAL_SECONDS)
+                .max(ai_usage_updater::MIN_AUTO_UPDATE_INTERVAL_SECONDS),
         }
     }
 }
@@ -181,16 +181,16 @@ pub fn spawn_auto_update_worker(config: AutoUpdateConfig) {
         return;
     }
     if let Err(err) = std::thread::Builder::new()
-        .name("vibe-usage-server-auto-update".to_string())
+        .name("ai-usage-server-auto-update".to_string())
         .spawn(move || {
             let interval =
-                vibe_usage_updater::normalize_auto_update_interval(config.interval_seconds);
+                ai_usage_updater::normalize_auto_update_interval(config.interval_seconds);
             loop {
                 match run_server_auto_update_once() {
-                    Ok(vibe_usage_updater::InstallOutcome::AlreadyLatest { current, latest }) => {
+                    Ok(ai_usage_updater::InstallOutcome::AlreadyLatest { current, latest }) => {
                         tracing::debug!("auto-update checked: current=v{current} latest=v{latest}");
                     }
-                    Ok(vibe_usage_updater::InstallOutcome::Updated(update)) => {
+                    Ok(ai_usage_updater::InstallOutcome::Updated(update)) => {
                         tracing::info!(
                             "auto-update installed {}; exiting for service restart",
                             update.tag
@@ -209,10 +209,10 @@ pub fn spawn_auto_update_worker(config: AutoUpdateConfig) {
     }
 }
 
-fn run_server_auto_update_once() -> Result<vibe_usage_updater::InstallOutcome, String> {
+fn run_server_auto_update_once() -> Result<ai_usage_updater::InstallOutcome, String> {
     let config =
-        vibe_usage_updater::UpdateConfig::current("vibe-usage-server", env!("CARGO_PKG_VERSION"));
-    vibe_usage_updater::check_and_install(&config, |_| {})
+        ai_usage_updater::UpdateConfig::current("ai-usage-server", env!("CARGO_PKG_VERSION"));
+    ai_usage_updater::check_and_install(&config, |_| {})
 }
 
 #[derive(Debug)]

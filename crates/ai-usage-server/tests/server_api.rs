@@ -7,11 +7,11 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
-use vibe_usage_proto::{
+use ai_usage_proto::{
     INTEGRITY_ALGORITHM, IntegrityReport, IntegrityReportList, IntegritySubmitResponse,
     PullResponse, SCHEMA_VERSION, UploadResponse, WireRecord,
 };
-use vibe_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
+use ai_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -20,7 +20,7 @@ fn unique_db_path(name: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("vibe-usage-server-test-{name}-{stamp}.db"))
+    std::env::temp_dir().join(format!("ai-usage-server-test-{name}-{stamp}.db"))
 }
 
 fn config(name: &str) -> ServerConfig {
@@ -41,7 +41,7 @@ fn unique_config_path(name: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("vibe-usage-server-config-{name}-{stamp}.yaml"))
+    std::env::temp_dir().join(format!("ai-usage-server-config-{name}-{stamp}.yaml"))
 }
 
 async fn app(name: &str) -> axum::Router {
@@ -218,11 +218,11 @@ auto_update:
 
 #[test]
 fn systemd_unit_uses_auto_update_compatible_restart_and_path() {
-    let unit = include_str!("../deploy/vibe-usage-server.service.example");
+    let unit = include_str!("../deploy/ai-usage-server.service.example");
 
-    assert!(unit.contains("ExecStart=/var/lib/vibe-usage/bin/vibe-usage-server "));
+    assert!(unit.contains("ExecStart=/var/lib/ai-usage/bin/ai-usage-server "));
     assert!(unit.contains("Restart=always"));
-    assert!(unit.contains("ReadWritePaths=/var/lib/vibe-usage"));
+    assert!(unit.contains("ReadWritePaths=/var/lib/ai-usage"));
 }
 
 #[tokio::test]
@@ -304,7 +304,7 @@ async fn startup_removes_existing_omp_alias_duplicates_before_pull() {
         .await
         .expect("machines response");
     assert_eq!(machines.status(), StatusCode::OK);
-    let body: vibe_usage_proto::MachineList = read_json(machines).await;
+    let body: ai_usage_proto::MachineList = read_json(machines).await;
     assert_eq!(body.machines.len(), 1);
     assert_eq!(body.machines[0].record_count, 4);
 }

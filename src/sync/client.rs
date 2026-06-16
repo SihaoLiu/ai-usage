@@ -3,7 +3,7 @@ use crate::sync::engine::{SUPPORTED_PULL_VENDORS, SyncError, SyncTransport};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
-use vibe_usage_proto::{
+use ai_usage_proto::{
     IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineList, PullResponse,
     SnapshotDiffRequest, SnapshotDiffResponse, SnapshotFinalizeRequest, SnapshotFinalizeResponse,
     SnapshotRecordBatch, UploadResponse, WireRecord,
@@ -297,11 +297,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use vibe_usage_proto::{
+    use ai_usage_proto::{
         INTEGRITY_ALGORITHM, IntegrityReport, PullResponse, SCHEMA_VERSION, SequencedWireRecord,
         WireRecord,
     };
-    use vibe_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
+    use ai_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -310,7 +310,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("vibe-usage-client-test-{name}-{stamp}.db"))
+        std::env::temp_dir().join(format!("ai-usage-client-test-{name}-{stamp}.db"))
     }
 
     fn server_config(name: &str) -> ServerConfig {

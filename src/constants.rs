@@ -512,12 +512,10 @@ pub fn load_subscription_fees() -> Option<SubscriptionFees> {
     let path = fee_env_path();
     let content = std::fs::read_to_string(&path).ok()?;
     let parsed = parse_fee_lines(&content);
-    for (vendor, value) in &parsed {
-        if value.is_none()
-            && let Some((key, _)) = FEE_KEYS.iter().find(|(_, v)| v == vendor)
-        {
+    for &(key, vendor) in FEE_KEYS {
+        if parsed.get(vendor) == Some(&None) {
             eprintln!(
-                "Error: invalid value for {key} in {}; fix the line or remove it",
+                "Error: invalid value for {key} in {}; fix its value (a plain number)",
                 path.display()
             );
         }
@@ -553,7 +551,7 @@ pub fn prompt_subscription_fees() -> SubscriptionFees {
         std::process::exit(1);
     }
 
-    println!("Subscription fee configuration not found.");
+    println!("Subscription fee configuration is missing or incomplete.");
     println!("Please enter your monthly subscription fees:\n");
 
     let prompts = [

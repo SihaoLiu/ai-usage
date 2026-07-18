@@ -329,7 +329,7 @@ pub fn is_valid_host_id(host_id: &str) -> bool {
 }
 
 pub fn is_valid_vendor(vendor: &str) -> bool {
-    matches!(vendor, "claude" | "codex" | "gemini" | "omp")
+    matches!(vendor, "claude" | "codex" | "gemini" | "kimi" | "omp")
 }
 
 fn validate_host_id(host_id: &str) -> Result<(), ValidationError> {
@@ -494,6 +494,16 @@ mod tests {
         record.vendor = "unknown".to_string();
 
         assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_every_tracked_vendor() {
+        for vendor in ["claude", "codex", "gemini", "kimi", "omp"] {
+            let mut record = valid_record();
+            record.vendor = vendor.to_string();
+
+            assert!(record.validate().is_ok(), "vendor={vendor:?}");
+        }
     }
 
     #[test]

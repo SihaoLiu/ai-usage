@@ -16,6 +16,7 @@ pub enum Provider {
     Claude,
     Openai,
     Google,
+    Kimi,
     Unknown,
 }
 
@@ -188,6 +189,11 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
             )
         } else if tokens.first().is_some_and(|t| t == "gemini") {
             parse_versioned(Provider::Google, "gemini", &tokens, GEMINI_MODIFIERS)
+        } else if tokens
+            .first()
+            .is_some_and(|t| t == "kimi" || is_k_version_token(t))
+        {
+            parse_kimi(&tokens)
         } else {
             let family = tokens.first().cloned().unwrap_or_default();
             (Provider::Unknown, family, String::new(), (0, 0), Vec::new())
@@ -207,6 +213,36 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
 
 const OPENAI_MODIFIERS: &[&str] = &["mini", "nano", "max", "spark", "codex", "pro"];
 const GEMINI_MODIFIERS: &[&str] = &["pro", "flash", "lite", "image", "ultra"];
+const KIMI_MODIFIERS: &[&str] = &["coding", "highspeed", "turbo"];
+
+/// A bare `k<version>` token like `k3` or `k2.5` (the Kimi flagship line).
+fn is_k_version_token(t: &str) -> bool {
+    t.strip_prefix('k').is_some_and(|rest| {
+        rest.starts_with(|c: char| c.is_ascii_digit())
+            && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+    })
+}
+
+/// Parse Kimi ids: `k3`, `kimi-k2.5`, `kimi-for-coding`,
+/// `kimi-for-coding-highspeed`, `kimi-latest`.
+fn parse_kimi(tokens: &[String]) -> (Provider, String, String, (u32, u32), Vec<String>) {
+    let (version, version_key) =
+        tokens
+            .iter()
+            .find(|t| is_k_version_token(t))
+            .map_or((String::new(), (0, 0)), |t| {
+                let v = &t[1..];
+                (v.to_string(), parse_dotted_version(v))
+            });
+    let modifiers = collect_modifiers(tokens, KIMI_MODIFIERS);
+    (
+        Provider::Kimi,
+        "kimi".to_string(),
+        version,
+        version_key,
+        modifiers,
+    )
+}
 
 fn collect_modifiers(tokens: &[String], recognized: &[&str]) -> Vec<String> {
     tokens
@@ -337,6 +373,18 @@ fn modifier_abbrev(provider: Provider, modifiers: &[String]) -> Option<&'static 
                 None
             }
         }
+        Provider::Kimi => {
+            // Speed variants beat the bare `coding` marker.
+            if has("highspeed") {
+                Some("HS")
+            } else if has("turbo") {
+                Some("Tb")
+            } else if has("coding") {
+                Some("Coding")
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -389,6 +437,17 @@ pub fn short_label(id: &ModelIdentity) -> String {
                 None => head,
             }
         }
+        Provider::Kimi => {
+            let head = if id.version.is_empty() {
+                "Kimi".to_string()
+            } else {
+                format!("K{}", id.version)
+            };
+            match modifier_abbrev(id.provider, &id.modifiers) {
+                Some(abbr) => format!("{} {}", head, abbr),
+                None => head,
+            }
+        }
         Provider::Unknown => {
             if id.normalized_id == "<synthetic>" {
                 "synthetic".to_string()
@@ -415,6 +474,7 @@ fn family_rank(id: &ModelIdentity) -> u32 {
         },
         Provider::Openai => 10,
         Provider::Google => 20,
+        Provider::Kimi => 25,
         Provider::Unknown => 30,
     }
 }
@@ -511,6 +571,56 @@ mod tests {
         assert_eq!(label("gemini-2.5-flash-lite"), "Gem 2.5 Lt");
         assert_eq!(label("gemini-2.0-flash"), "Gem 2.0 Fl");
         assert_eq!(label("gemini-2.5-flash-preview-09-2025"), "Gem 2.5 Fl");
+    }
+
+    #[test]
+    fn kimi_labels_derive_version_and_modifiers() {
+        assert_eq!(label("k3"), "K3");
+        assert_eq!(label("kimi-code/k3"), "K3");
+        assert_eq!(label("kimi-k2.5"), "K2.5");
+        assert_eq!(label("kimi-k2"), "K2");
+        assert_eq!(label("kimi-for-coding"), "Kimi Coding");
+        assert_eq!(label("kimi-for-coding-highspeed"), "Kimi HS");
+        assert_eq!(label("kimi-latest"), "Kimi");
+        assert_eq!(label("k3 (max)"), "K3(Max)");
+        assert_eq!(label("k3:high"), "K3(H)");
+    }
+
+    #[test]
+    fn kimi_parse_exposes_provider_family_version_modifiers() {
+        let k = parse_model_identity("k3");
+        assert_eq!(k.provider, Provider::Kimi);
+        assert_eq!(k.family, "kimi");
+        assert_eq!(k.version_key, (3, 0));
+        assert!(k.modifiers.is_empty());
+
+        let k25 = parse_model_identity("kimi-k2.5");
+        assert_eq!(k25.provider, Provider::Kimi);
+        assert_eq!(k25.family, "kimi");
+        assert_eq!(k25.version_key, (2, 5));
+
+        let coding = parse_model_identity("kimi-for-coding");
+        assert_eq!(coding.provider, Provider::Kimi);
+        assert_eq!(coding.version_key, (0, 0));
+        assert_eq!(coding.modifiers, vec!["coding".to_string()]);
+
+        let highspeed = parse_model_identity("kimi-for-coding-highspeed");
+        assert_eq!(
+            highspeed.modifiers,
+            vec!["coding".to_string(), "highspeed".to_string()]
+        );
+    }
+
+    #[test]
+    fn kimi_sorts_after_google_before_unknown_newest_first() {
+        let k3 = sort_key(&parse_model_identity("k3"));
+        let k25 = sort_key(&parse_model_identity("kimi-k2.5"));
+        let gem = sort_key(&parse_model_identity("gemini-2.5-pro"));
+        let unknown = sort_key(&parse_model_identity("mystery-model"));
+
+        assert!(gem < k3);
+        assert!(k3 < k25);
+        assert!(k25 < unknown);
     }
 
     #[test]

@@ -31,14 +31,14 @@ pub fn load_layered() -> AllPricing {
     let mut combined = AllPricing::load_raw();
 
     if let Some(cached) = read_cache_file() {
-        combined.overlay(cached.claude, cached.codex, cached.gemini);
+        combined.overlay(cached.claude, cached.codex, cached.gemini, cached.kimi);
     }
 
     if cache_is_stale()
         && let Some(live) = fetch_live(FETCH_TIMEOUT)
     {
         let _ = write_cache_file(&live);
-        combined.overlay(live.claude, live.codex, live.gemini);
+        combined.overlay(live.claude, live.codex, live.gemini, live.kimi);
     }
 
     let mut finalized = combined.finalize();
@@ -58,6 +58,8 @@ struct VendorTables {
     codex: HashMap<String, ModelPricing>,
     #[serde(default)]
     gemini: HashMap<String, ModelPricing>,
+    #[serde(default)]
+    kimi: HashMap<String, ModelPricing>,
 }
 
 // ---- cache file -----------------------------------------------------------
@@ -213,6 +215,7 @@ fn parse_litellm_payload(s: &str) -> Option<VendorTables> {
             "claude" => &mut tables.claude,
             "codex" => &mut tables.codex,
             "gemini" => &mut tables.gemini,
+            "kimi" => &mut tables.kimi,
             _ => continue,
         };
         bucket.insert(canonical, pricing);
@@ -249,6 +252,9 @@ fn classify_vendor(name: &str, provider: Option<&str>) -> Option<&'static str> {
                 return Some("gemini");
             }
         }
+        if pl.contains("moonshot") {
+            return Some("kimi");
+        }
     }
 
     let lower = name.to_ascii_lowercase();
@@ -257,6 +263,9 @@ fn classify_vendor(name: &str, provider: Option<&str>) -> Option<&'static str> {
     }
     if lower.starts_with("gemini") || lower.starts_with("models/gemini") {
         return Some("gemini");
+    }
+    if lower.starts_with("kimi-") {
+        return Some("kimi");
     }
     if lower.starts_with("gpt-")
         || lower.starts_with("o1")
@@ -289,6 +298,32 @@ mod tests {
         assert_eq!(classify_vendor("o1", None), Some("codex"));
         assert_eq!(classify_vendor("claude-opus-4-7", None), Some("claude"));
         assert_eq!(classify_vendor("mistral-large", Some("mistral")), None);
+    }
+
+    #[test]
+    fn classify_routes_kimi_and_moonshot_to_kimi() {
+        assert_eq!(classify_vendor("kimi-k2.5", Some("moonshot")), Some("kimi"));
+        assert_eq!(classify_vendor("k3", Some("moonshot")), Some("kimi"));
+        assert_eq!(classify_vendor("kimi-k2", None), Some("kimi"));
+        assert_eq!(classify_vendor("kimi-for-coding", None), Some("kimi"));
+    }
+
+    #[test]
+    fn litellm_moonshot_entries_land_in_kimi_table() {
+        let payload = r#"{
+            "moonshot/kimi-k2.5": {
+                "input_cost_per_token": 0.0000006,
+                "output_cost_per_token": 0.000003,
+                "cache_read_input_token_cost": 0.0000001,
+                "litellm_provider": "moonshot",
+                "mode": "chat"
+            }
+        }"#;
+        let tables = parse_litellm_payload(payload).expect("parse");
+        let entry = tables.kimi.get("kimi-k2.5").expect("kimi entry present");
+        assert!((entry.input - 0.6).abs() < 1e-9);
+        assert!((entry.output - 3.0).abs() < 1e-9);
+        assert!((entry.cache_input - 0.1).abs() < 1e-9);
     }
 
     #[test]

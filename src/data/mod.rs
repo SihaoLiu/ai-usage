@@ -2,6 +2,7 @@ pub mod cache;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod kimi;
 pub mod omp;
 
 use crate::time_utils::{TimeWindow, parse_timestamp};

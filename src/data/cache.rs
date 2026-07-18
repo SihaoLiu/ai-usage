@@ -831,7 +831,7 @@ fn omp_model_candidates_for(model: &str, effort: Option<&str>) -> Vec<String> {
             models.push(format!("openai/{model}"));
             models.push(format!("openai-codex/{model}"));
         }
-        Provider::Unknown => {}
+        Provider::Kimi | Provider::Unknown => {}
     }
     if let Some(provider) = effort.filter(|value| !value.is_empty() && !is_reasoning_effort(value))
     {

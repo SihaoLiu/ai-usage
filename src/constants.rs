@@ -96,11 +96,12 @@ struct PricingData {
     claude: VendorPricing,
     codex: VendorPricing,
     gemini: VendorPricing,
+    kimi: VendorPricing,
     #[serde(default)]
     fast_tiers: HashMap<String, HashMap<String, FastTierPricing>>,
 }
 
-/// All pricing tables for the three vendors.
+/// All pricing tables for the tracked vendors.
 pub struct AllPricing {
     pub claude_models: HashMap<String, ModelPricing>,
     pub claude_default: ModelPricing,
@@ -108,6 +109,8 @@ pub struct AllPricing {
     pub codex_default: ModelPricing,
     pub gemini_models: HashMap<String, ModelPricing>,
     pub gemini_default: ModelPricing,
+    pub kimi_models: HashMap<String, ModelPricing>,
+    pub kimi_default: ModelPricing,
     /// User-supplied per-model price overrides (from `models.toml`), keyed by
     /// exact model id and consulted before any table, regardless of vendor.
     overrides_pricing: HashMap<String, ModelPricing>,
@@ -127,6 +130,8 @@ impl AllPricing {
             codex_default: data.codex.default,
             gemini_models: data.gemini.models,
             gemini_default: data.gemini.default,
+            kimi_models: data.kimi.models,
+            kimi_default: data.kimi.default,
             overrides_pricing: HashMap::new(),
             fast_tiers: normalize_fast_tiers(data.fast_tiers),
         }
@@ -143,6 +148,7 @@ impl AllPricing {
         self.claude_models = expand_date_aliases(self.claude_models);
         self.codex_models = expand_date_aliases(self.codex_models);
         self.gemini_models = expand_date_aliases(self.gemini_models);
+        self.kimi_models = expand_date_aliases(self.kimi_models);
         self
     }
 
@@ -155,10 +161,12 @@ impl AllPricing {
         claude: HashMap<String, ModelPricing>,
         codex: HashMap<String, ModelPricing>,
         gemini: HashMap<String, ModelPricing>,
+        kimi: HashMap<String, ModelPricing>,
     ) {
         overlay_table(&mut self.claude_models, claude);
         overlay_table(&mut self.codex_models, codex);
         overlay_table(&mut self.gemini_models, gemini);
+        overlay_table(&mut self.kimi_models, kimi);
     }
 
     pub fn get_pricing(&self, vendor: &str, model: &str) -> &ModelPricing {
@@ -171,6 +179,7 @@ impl AllPricing {
         let (table, default) = match vendor {
             "codex" => (&self.codex_models, &self.codex_default),
             "gemini" => (&self.gemini_models, &self.gemini_default),
+            "kimi" => (&self.kimi_models, &self.kimi_default),
             _ => (&self.claude_models, &self.claude_default),
         };
 
@@ -337,6 +346,7 @@ const FEE_KEYS: &[(&str, &str)] = &[
     ("CLAUDE_MONTHLY_FEE", "claude"),
     ("CODEX_MONTHLY_FEE", "codex"),
     ("GEMINI_MONTHLY_FEE", "gemini"),
+    ("KIMI_MONTHLY_FEE", "kimi"),
 ];
 
 #[derive(Debug, Clone)]
@@ -344,6 +354,7 @@ pub struct SubscriptionFees {
     pub claude: f64,
     pub codex: f64,
     pub gemini: f64,
+    pub kimi: f64,
 }
 
 impl Default for SubscriptionFees {
@@ -352,6 +363,7 @@ impl Default for SubscriptionFees {
             claude: 0.0,
             codex: 0.0,
             gemini: 0.0,
+            kimi: 0.0,
         }
     }
 }
@@ -362,7 +374,8 @@ impl SubscriptionFees {
             "claude" => self.claude,
             "codex" => self.codex,
             "gemini" => self.gemini,
-            "all" => self.claude + self.codex + self.gemini,
+            "kimi" => self.kimi,
+            "all" => self.claude + self.codex + self.gemini + self.kimi,
             _ => 0.0,
         }
     }
@@ -417,14 +430,20 @@ pub fn load_subscription_fees() -> Option<SubscriptionFees> {
         }
     }
 
-    if fees.len() == 3 {
-        Some(SubscriptionFees {
-            claude: fees["claude"],
-            codex: fees["codex"],
-            gemini: fees["gemini"],
-        })
-    } else {
-        None
+    // The three original keys are required; later additions are optional so a
+    // pre-existing .fee.env keeps loading (their fee reads as 0 until set).
+    match (
+        fees.get("claude").copied(),
+        fees.get("codex").copied(),
+        fees.get("gemini").copied(),
+    ) {
+        (Some(claude), Some(codex), Some(gemini)) => Some(SubscriptionFees {
+            claude,
+            codex,
+            gemini,
+            kimi: fees.get("kimi").copied().unwrap_or(0.0),
+        }),
+        _ => None,
     }
 }
 
@@ -432,8 +451,8 @@ pub fn load_subscription_fees() -> Option<SubscriptionFees> {
 pub fn save_subscription_fees(fees: &SubscriptionFees) -> std::io::Result<()> {
     let path = fee_env_path();
     let content = format!(
-        "CLAUDE_MONTHLY_FEE={}\nCODEX_MONTHLY_FEE={}\nGEMINI_MONTHLY_FEE={}\n",
-        fees.claude, fees.codex, fees.gemini
+        "CLAUDE_MONTHLY_FEE={}\nCODEX_MONTHLY_FEE={}\nGEMINI_MONTHLY_FEE={}\nKIMI_MONTHLY_FEE={}\n",
+        fees.claude, fees.codex, fees.gemini, fees.kimi
     );
     std::fs::write(&path, content)
 }
@@ -448,6 +467,7 @@ pub fn prompt_subscription_fees() -> SubscriptionFees {
         eprintln!("  CLAUDE_MONTHLY_FEE=200");
         eprintln!("  CODEX_MONTHLY_FEE=200");
         eprintln!("  GEMINI_MONTHLY_FEE=19.99");
+        eprintln!("  KIMI_MONTHLY_FEE=40");
         std::process::exit(1);
     }
 
@@ -458,6 +478,7 @@ pub fn prompt_subscription_fees() -> SubscriptionFees {
         ("claude", "Claude Code (Max)  monthly fee", 200.0),
         ("codex", "OpenAI Codex (Pro) monthly fee", 200.0),
         ("gemini", "Gemini CLI         monthly fee", 19.99),
+        ("kimi", "Kimi Code          monthly fee", 40.0),
     ];
 
     let stdin = io::stdin();
@@ -491,6 +512,7 @@ pub fn prompt_subscription_fees() -> SubscriptionFees {
         claude: values[0],
         codex: values[1],
         gemini: values[2],
+        kimi: values[3],
     };
 
     if let Err(e) = save_subscription_fees(&fees) {
@@ -583,7 +605,7 @@ mod tests {
                 _comment: None,
             },
         );
-        p.overlay(remote, HashMap::new(), HashMap::new());
+        p.overlay(remote, HashMap::new(), HashMap::new(), HashMap::new());
         let p = p.finalize();
 
         let opus7 = p.get_pricing("claude", "claude-opus-4-7");
@@ -605,6 +627,47 @@ mod tests {
         let mini = p.get_pricing("codex", "gpt-5.9-mini");
         assert!((mini.input - 0.75).abs() < 1e-9);
         assert!(mini.input < 1.0, "must not inherit a base-class rate");
+    }
+
+    #[test]
+    fn pricing_embedded_covers_kimi_models() {
+        let p = AllPricing::load_raw().finalize();
+        let k3 = p.get_pricing("kimi", "k3");
+        assert!((k3.input - 3.0).abs() < 1e-9);
+        assert!((k3.output - 15.0).abs() < 1e-9);
+        assert!((k3.cache_input - 0.30).abs() < 1e-9);
+        assert!(k3.input_above_200k.is_none());
+
+        let coding = p.get_pricing("kimi", "kimi-for-coding");
+        assert!((coding.input - 0.95).abs() < 1e-9);
+        assert!((coding.output - 4.0).abs() < 1e-9);
+        assert!((coding.cache_input - 0.19).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pricing_kimi_fallback_and_default() {
+        let p = AllPricing::load_raw().finalize();
+        // A future flagship borrows the newest same-class rate (k3), not the
+        // coding-tier rate.
+        let k4 = p.get_pricing("kimi", "k4");
+        assert!((k4.input - 3.0).abs() < 1e-9);
+        assert!((k4.output - 15.0).abs() < 1e-9);
+        // Unknown-provider ids drop to the kimi vendor default.
+        let unknown = p.get_pricing("kimi", "totally-mystery-thing");
+        assert!((unknown.input - 3.0).abs() < 1e-9);
+        assert!((unknown.output - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn subscription_fees_include_kimi_in_all() {
+        let fees = SubscriptionFees {
+            claude: 1.0,
+            codex: 2.0,
+            gemini: 3.0,
+            kimi: 4.0,
+        };
+        assert!((fees.get("kimi") - 4.0).abs() < f64::EPSILON);
+        assert!((fees.get("all") - 10.0).abs() < f64::EPSILON);
     }
 
     #[test]

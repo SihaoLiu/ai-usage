@@ -332,6 +332,56 @@
       "_comment": "Fallback, using Gemini 3 Flash pricing"
     }
   },
+  "kimi": {
+    "models": {
+      "k3": {
+        "input": 3.00,
+        "output": 15.00,
+        "cache_input": 0.30,
+        "cache_output": 3.00,
+        "_comment": "Flat pricing across the 1M context window, no long-context tier. Cache writes are not billed separately; cache_output mirrors input."
+      },
+      "kimi-for-coding": {
+        "input": 0.95,
+        "output": 4.00,
+        "cache_input": 0.19,
+        "cache_output": 0.95,
+        "_comment": "Kimi for Coding subscription alias (K2.7 Coding), nominal API rate"
+      },
+      "kimi-for-coding-highspeed": {
+        "input": 0.95,
+        "output": 4.00,
+        "cache_input": 0.19,
+        "cache_output": 0.95,
+        "_comment": "Highspeed variant, same nominal rate as kimi-for-coding"
+      },
+      "kimi-k2.6": {
+        "input": 0.95,
+        "output": 4.00,
+        "cache_input": 0.16,
+        "cache_output": 0.95
+      },
+      "kimi-k2.5": {
+        "input": 0.60,
+        "output": 3.00,
+        "cache_input": 0.10,
+        "cache_output": 0.60
+      },
+      "kimi-k2": {
+        "input": 0.60,
+        "output": 2.50,
+        "cache_input": 0.15,
+        "cache_output": 0.60
+      }
+    },
+    "default": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_input": 0.30,
+      "cache_output": 3.00,
+      "_comment": "Fallback, unknown Kimi models assume flagship k3 rates"
+    }
+  },
   "fast_tiers": {
     "claude": {
       "1": {

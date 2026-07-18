@@ -874,6 +874,7 @@ fn tool_color(tool: &str) -> &'static str {
         "Claude Code" => "\x1b[38;5;173m",
         "Codex" => "\x1b[38;5;255m",
         "Gemini CLI" => "\x1b[38;5;33m",
+        "Kimi Code" => "\x1b[38;5;49m",
         "Oh My Pi" => "\x1b[38;5;141m",
         "All" => "\x1b[38;5;226m",
         _ => "\x1b[38;5;135m",
@@ -1913,7 +1914,13 @@ pub fn print_tool_comparison_chart(
         }
     }
 
-    let tool_order = ["Claude Code", "Codex", "Gemini CLI", "Oh My Pi"];
+    let tool_order = [
+        "Claude Code",
+        "Codex",
+        "Gemini CLI",
+        "Kimi Code",
+        "Oh My Pi",
+    ];
     let mut tools_sorted: Vec<String> = tool_order
         .iter()
         .filter(|v| all_tools.contains(**v))

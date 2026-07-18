@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod kimi;
 pub mod omp;
 
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ pub(crate) fn pricing_provider_for_entry<'a>(tool: &'a str, entry: &'a UsageEntr
     match parse_model_identity(&entry.model).provider {
         Provider::Claude => "claude",
         Provider::Google => "gemini",
+        Provider::Kimi => "kimi",
         Provider::Openai | Provider::Unknown => "codex",
     }
 }
@@ -269,6 +271,7 @@ pub use codex::{
 pub use gemini::{
     calculate_gemini_model_breakdown, calculate_gemini_model_token_breakdown_time_series,
 };
+pub use kimi::{calculate_kimi_model_breakdown, calculate_kimi_model_token_breakdown_time_series};
 pub use omp::{calculate_omp_model_breakdown, calculate_omp_model_token_breakdown_time_series};
 
 // Re-export the generic functions for use by tool modules
@@ -358,9 +361,11 @@ mod tests {
         let claude = usage_entry("claude-sonnet-4-5-20250929", Some("rust-cat"), None);
         let google = usage_entry("gemini-2.5-pro", Some("rust-cat"), None);
         let open = usage_entry("gpt-5", Some("rust-cat"), None);
+        let kimi = usage_entry("kimi-k2.5", Some("rust-cat"), None);
 
         assert_eq!(pricing_provider_for_entry("omp", &claude), "claude");
         assert_eq!(pricing_provider_for_entry("omp", &google), "gemini");
         assert_eq!(pricing_provider_for_entry("omp", &open), "codex");
+        assert_eq!(pricing_provider_for_entry("omp", &kimi), "kimi");
     }
 }

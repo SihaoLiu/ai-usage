@@ -8,7 +8,7 @@ ai-usage [OPTIONS]
 Options:
   --once              Show stats once and exit (no monitor loop)
   --days <N>          Number of days to analyze (default: 3)
-  --vendor <VENDOR>   Filter to a single vendor: claude, codex, gemini, or omp
+  --tool <TOOL>       Filter to a single tool: claude, codex, gemini, kimi, or omp
   --host <HOST>       Filter to a single machine id
   --auto-update       Periodically check GitHub Releases in monitor mode
   --auto-update-interval-seconds <N>
@@ -24,7 +24,7 @@ Default behavior (no flags) enters monitor mode showing all vendors for the last
 | `q` / `Esc` | Quit |
 | `n` | Cycle to next vendor |
 | `r` | Refresh now |
-| `v claude` / `v codex` / `v gemini` / `v omp` / `v all` | Switch vendor |
+| `v claude` / `v codex` / `v gemini` / `v kimi` / `v omp` / `v all` | Switch vendor |
 | `host all` / `host <HOST>` | Switch between all machines and one machine |
 | `d <N>` | Change days range |
 | `a` | Switch to all vendors |
@@ -53,6 +53,7 @@ The tool reads local usage data written by each vendor's CLI:
 | Claude | `~/.claude/projects/` | `**/*.jsonl` |
 | Codex | `~/.codex/sessions/` | `YYYY/MM/DD/*.jsonl` |
 | Gemini | `~/.gemini/tmp/` | `<hash>/chats/session-*.json` |
+| Kimi Code | `~/.kimi-code/sessions/` | `**/agents/*/wire.jsonl` |
 | Oh My Pi | `~/.omp/agent/sessions/` | `**/*.jsonl` |
 
 ### Environment Variable Overrides
@@ -62,6 +63,7 @@ Override default config directories:
 - `CLAUDE_CONFIG_DIR` (default: `~/.claude`)
 - `CODEX_CONFIG_DIR` (default: `~/.codex`)
 - `GEMINI_CONFIG_DIR` (default: `~/.gemini`)
+- `KIMI_CONFIG_DIR` (default: `~/.kimi-code`)
 - `OMP_CONFIG_DIR` (default: `~/.omp`)
 
 ## Display Modes
@@ -90,6 +92,7 @@ price correctly with no upgrade required.
 - `claude-opus-4-8` -> `Opus 4.8`
 - `gpt-5.5-codex` -> `GPT-5.5 Cdx`, `gpt-5.5:xhigh` -> `GPT-5.5(XH)`
 - `gemini-3.2-pro-preview` -> `Gem 3.2 Pro`
+- `k3` -> `K3`, `kimi-for-coding` -> `Kimi Coding`
 
 **Pricing** is layered, newest wins:
 
@@ -139,28 +142,21 @@ src/
     claude.rs        # Claude JSONL reader
     codex.rs         # Codex JSONL reader
     gemini.rs        # Gemini JSON reader
-    omp.rs            # Oh My Pi JSONL reader
+    kimi.rs          # Kimi Code wire JSONL reader
+    omp.rs           # Oh My Pi JSONL reader
   stats/
     mod.rs           # Model breakdown and time series calculation
     claude.rs        # Claude statistics
     codex.rs         # Codex statistics
     gemini.rs        # Gemini statistics
-    omp.rs            # Oh My Pi statistics
+    kimi.rs          # Kimi Code statistics
+    omp.rs           # Oh My Pi statistics
 pricing.json         # API pricing data
 ```
 
 ## Testing
 
 ```bash
-# Run all tests (requires release build)
-cargo build --release && cargo test
-
-# Snapshot tests only
-cargo test --test snapshot_test
-
-# Performance benchmarks
-./scripts/bench.sh
-
-# Capture Python/Rust comparison snapshots
-./scripts/capture-snapshots.sh
+# Run all tests (requires release build for the sync end-to-end tests)
+cargo build --release && cargo test --workspace
 ```

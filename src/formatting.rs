@@ -2,6 +2,7 @@ use crate::constants::SubscriptionFees;
 use crate::model_id::{parse_model_identity, short_label};
 use crate::model_overrides;
 use crate::stats::ModelBreakdownRow;
+use crate::tool::Tool;
 
 /// Get short display name for a model.
 ///
@@ -32,13 +33,7 @@ fn format_model_name_with_tool_prefix(
     if !show_tool_prefix {
         return name;
     }
-    let display_tool = match tool {
-        "claude" => "Claude Code",
-        "codex" => "Codex",
-        "gemini" => "Gemini CLI",
-        "omp" => "Oh My Pi",
-        _ => tool,
-    };
+    let display_tool = Tool::from_key(tool).map(Tool::display_name).unwrap_or(tool);
     format!("{:<width$}: {}", display_tool, name, width = prefix_width)
 }
 
@@ -496,7 +491,7 @@ pub fn get_table_width(mode: &str) -> usize {
 fn get_strategy_totals(stats: &ModelBreakdownRow) -> (i64, i64, i64) {
     let cache_hit = stats.cache_read;
     match stats.tool.as_str() {
-        "claude" | "omp" => {
+        "claude" | "kimi" | "omp" => {
             let prefill = stats.input + stats.cache_creation;
             let decoding = stats.output;
             (cache_hit, prefill, decoding)
@@ -525,7 +520,7 @@ fn get_strategy_costs(
 ) -> (f64, f64, f64) {
     let cache_hit_cost = cache_input_cost;
     match tool {
-        "claude" | "omp" => {
+        "claude" | "kimi" | "omp" => {
             let prefill_cost = input_cost + cache_output_cost;
             let decoding_cost = output_cost;
             (cache_hit_cost, prefill_cost, decoding_cost)

@@ -147,10 +147,10 @@ Show one machine:
 ai-usage --host laptop
 ```
 
-Combine host and vendor filters:
+Combine host and tool filters:
 
 ```bash
-ai-usage --vendor claude --host laptop
+ai-usage --tool claude --host laptop
 ```
 
 ## Operations

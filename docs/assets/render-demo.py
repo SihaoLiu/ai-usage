@@ -446,7 +446,7 @@ def spawn_monitor(repo_root, columns, rows, vendor, days):
             }
         )
         os.chdir(repo_root)
-        cmd = [str(binary), "--vendor", vendor, "--days", str(days)]
+        cmd = [str(binary), "--tool", vendor, "--days", str(days)]
         try:
             os.execvpe(cmd[0], cmd, env)
         except OSError as exc:

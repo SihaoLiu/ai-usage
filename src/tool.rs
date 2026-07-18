@@ -7,16 +7,18 @@ pub enum Tool {
     Claude,
     Codex,
     Gemini,
+    Kimi,
     Omp,
     All,
 }
 
 impl Tool {
-    pub const ROTATION: [Tool; 5] = [
+    pub const ROTATION: [Tool; 6] = [
         Tool::All,
         Tool::Claude,
         Tool::Codex,
         Tool::Gemini,
+        Tool::Kimi,
         Tool::Omp,
     ];
 
@@ -25,6 +27,7 @@ impl Tool {
             Tool::Claude => "claude",
             Tool::Codex => "codex",
             Tool::Gemini => "gemini",
+            Tool::Kimi => "kimi",
             Tool::Omp => "omp",
             Tool::All => "all",
         }
@@ -35,6 +38,7 @@ impl Tool {
             Tool::Claude => "Claude Code",
             Tool::Codex => "Codex",
             Tool::Gemini => "Gemini CLI",
+            Tool::Kimi => "Kimi Code",
             Tool::Omp => "Oh My Pi",
             Tool::All => "All Tools",
         }
@@ -52,6 +56,7 @@ impl Tool {
             "claude" => Some(Tool::Claude),
             "codex" => Some(Tool::Codex),
             "gemini" => Some(Tool::Gemini),
+            "kimi" => Some(Tool::Kimi),
             "omp" => Some(Tool::Omp),
             "all" => Some(Tool::All),
             _ => None,

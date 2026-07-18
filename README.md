@@ -1,6 +1,6 @@
 # AI Usage Monitor
 
-A fast terminal dashboard for tracking token usage and costs across **Claude Code**, **OpenAI Codex**, **Google Gemini CLI**, and **Oh My Pi**. Written in Rust.
+A fast terminal dashboard for tracking token usage and costs across **Claude Code**, **OpenAI Codex**, **Google Gemini CLI**, **Kimi Code**, and **Oh My Pi**. Written in Rust.
 
 <img src="docs/assets/ai-usage.gif" alt="AI Usage Monitor demo" width="100%">
 
@@ -48,8 +48,8 @@ ai-usage
 # Single snapshot, then exit
 ai-usage --once
 
-# Last 30 days, specific vendor
-ai-usage --days 30 --vendor claude
+# Last 30 days, specific tool
+ai-usage --days 30 --tool claude
 ```
 
 See [docs/usage.md](docs/usage.md) for full usage details, data sources, monitor mode controls, and configuration. For optional cross-machine sync, see [docs/sync.md](docs/sync.md).

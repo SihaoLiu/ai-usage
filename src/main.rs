@@ -33,6 +33,7 @@ use data::UsageEntry;
 use data::claude::detect_fast_tier_snapshot as detect_claude_fast_tier_snapshot;
 use data::codex::{detect_fast_tier_snapshot as detect_codex_fast_tier_snapshot, get_codex_dir};
 use data::gemini::get_gemini_dir;
+use data::kimi::get_kimi_dir;
 use data::omp::get_omp_dir;
 use formatting::print_model_breakdown;
 use stats::{ModelBreakdownRow, ToolTimeSeries};
@@ -165,6 +166,7 @@ struct RawDataCache {
     claude: Vec<UsageEntry>,
     codex: Vec<UsageEntry>,
     gemini: Vec<UsageEntry>,
+    kimi: Vec<UsageEntry>,
     omp: Vec<UsageEntry>,
     horizon_days: i64,
     local_host_id: Option<String>,
@@ -349,7 +351,7 @@ struct Args {
     once: bool,
 
     /// Tool to collect statistics from
-    #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "omp", "all"])]
+    #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "kimi", "omp", "all"])]
     tool: String,
 
     /// Filter usage to a single machine id
@@ -681,6 +683,7 @@ fn get_tool_data_dir(tool: &str) -> Option<PathBuf> {
     match tool {
         "codex" => Some(get_codex_dir().join("sessions")),
         "gemini" => Some(get_gemini_dir().join("tmp")),
+        "kimi" => Some(get_kimi_dir().join("sessions")),
         "omp" => Some(get_omp_dir().join("agent").join("sessions")),
         "claude" => {
             let dirs = data::claude::get_claude_dirs();
@@ -731,6 +734,7 @@ fn merge_remote_records_into_raw_cache(
             "claude" => cache.claude.push(record.entry),
             "codex" => cache.codex.push(record.entry),
             "gemini" => cache.gemini.push(record.entry),
+            "kimi" => cache.kimi.push(record.entry),
             "omp" => cache.omp.push(record.entry),
             _ => {}
         }
@@ -778,6 +782,12 @@ fn local_cached_raw_cache(
         (Vec::new(), HashSet::new())
     };
     local_record_keys.extend(gemini_keys);
+    let (kimi, kimi_keys) = if include_local {
+        load_local_tool_cached_records(cache_root, "kimi")
+    } else {
+        (Vec::new(), HashSet::new())
+    };
+    local_record_keys.extend(kimi_keys);
     let (omp, omp_keys) = if include_local {
         load_local_tool_cached_records(cache_root, "omp")
     } else {
@@ -789,6 +799,7 @@ fn local_cached_raw_cache(
         claude,
         codex,
         gemini,
+        kimi,
         omp,
         horizon_days: FULL_CACHE_HORIZON,
         local_host_id: local_host_id.map(str::to_string),
@@ -800,6 +811,7 @@ fn clear_local_raw_cache(cache: &mut RawDataCache) {
     cache.claude.clear();
     cache.codex.clear();
     cache.gemini.clear();
+    cache.kimi.clear();
     cache.omp.clear();
     cache.local_record_keys.clear();
 }
@@ -845,6 +857,15 @@ fn refresh_all_tool_raw_full(local_host_id: Option<&str>) -> RawDataCache {
         data::gemini::collect_usage_files(&gemini_dir, None),
         0,
         data::gemini::read_gemini_file_records,
+    );
+
+    let kimi_dir = get_kimi_dir().join("sessions");
+    let _ = data::cache::refresh_retaining_vendor_cache(
+        &cache_root,
+        "kimi",
+        data::kimi::collect_usage_files(&kimi_dir, None),
+        0,
+        data::kimi::read_kimi_file_records,
     );
 
     let omp_dir = get_omp_dir().join("agent").join("sessions");
@@ -1395,6 +1416,7 @@ struct AllToolData {
     claude: Vec<UsageEntry>,
     codex: Vec<UsageEntry>,
     gemini: Vec<UsageEntry>,
+    kimi: Vec<UsageEntry>,
     omp: Vec<UsageEntry>,
 }
 
@@ -1417,6 +1439,7 @@ fn raw_cache_has_any_tool_data(cache: &RawDataCache) -> bool {
     !cache.claude.is_empty()
         || !cache.codex.is_empty()
         || !cache.gemini.is_empty()
+        || !cache.kimi.is_empty()
         || !cache.omp.is_empty()
 }
 
@@ -1424,6 +1447,7 @@ fn all_tool_data_has_window_data(all_data: &AllToolData) -> bool {
     !all_data.claude.is_empty()
         || !all_data.codex.is_empty()
         || !all_data.gemini.is_empty()
+        || !all_data.kimi.is_empty()
         || !all_data.omp.is_empty()
 }
 
@@ -1435,6 +1459,7 @@ fn load_all_tool_data(state: &mut AppState, now: DateTime<Local>) -> AllToolData
         claude: data::filter_usage_data_by_window(&cache.claude, &window, now),
         codex: data::filter_usage_data_by_window(&cache.codex, &window, now),
         gemini: data::filter_usage_data_by_window(&cache.gemini, &window, now),
+        kimi: data::filter_usage_data_by_window(&cache.kimi, &window, now),
         omp: data::filter_usage_data_by_window(&cache.omp, &window, now),
     }
 }
@@ -1490,6 +1515,9 @@ fn calculate_tool_aggregate_time_series(
     if !all_data.gemini.is_empty() {
         process_data(&all_data.gemini, Tool::Gemini, &mut time_series);
     }
+    if !all_data.kimi.is_empty() {
+        process_data(&all_data.kimi, Tool::Kimi, &mut time_series);
+    }
     if !all_data.omp.is_empty() {
         process_data(&all_data.omp, Tool::Omp, &mut time_series);
     }
@@ -1521,6 +1549,12 @@ fn calculate_all_model_breakdown(
             pricing,
         ));
     }
+    if !all_data.kimi.is_empty() {
+        all_stats.extend(stats::calculate_kimi_model_breakdown(
+            &all_data.kimi,
+            pricing,
+        ));
+    }
     if !all_data.omp.is_empty() {
         all_stats.extend(stats::calculate_omp_model_breakdown(&all_data.omp, pricing));
     }
@@ -1541,6 +1575,7 @@ fn calculate_weighted_cost_per_mtok(
         ("claude", &all_data.claude, subscription_fees.claude),
         ("codex", &all_data.codex, subscription_fees.codex),
         ("gemini", &all_data.gemini, subscription_fees.gemini),
+        ("kimi", &all_data.kimi, subscription_fees.kimi),
         ("omp", &all_data.omp, 0.0),
     ];
 
@@ -1655,6 +1690,7 @@ fn get_version(state: &mut AppState, tool: &str) -> String {
         Some(Tool::Claude) => ("claude", Tool::Claude.display_name()),
         Some(Tool::Codex) => ("codex", Tool::Codex.display_name()),
         Some(Tool::Gemini) => ("gemini", Tool::Gemini.display_name()),
+        Some(Tool::Kimi) => ("kimi", Tool::Kimi.display_name()),
         _ => return String::new(),
     };
 
@@ -1805,6 +1841,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         "claude" => &cache.claude,
         "codex" => &cache.codex,
         "gemini" => &cache.gemini,
+        "kimi" => &cache.kimi,
         "omp" => &cache.omp,
         _ => &cache.claude,
     };
@@ -1822,6 +1859,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let model_stats = match tool.as_str() {
         "codex" => stats::calculate_codex_model_breakdown(&filtered, &state.pricing),
         "gemini" => stats::calculate_gemini_model_breakdown(&filtered, &state.pricing),
+        "kimi" => stats::calculate_kimi_model_breakdown(&filtered, &state.pricing),
         "omp" => stats::calculate_omp_model_breakdown(&filtered, &state.pricing),
         _ => stats::calculate_claude_model_breakdown(&filtered, &state.pricing),
     };
@@ -1880,6 +1918,9 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         }
         "gemini" => {
             stats::calculate_gemini_model_token_breakdown_time_series(&filtered, interval_minutes)
+        }
+        "kimi" => {
+            stats::calculate_kimi_model_token_breakdown_time_series(&filtered, interval_minutes)
         }
         "omp" => {
             stats::calculate_omp_model_token_breakdown_time_series(&filtered, interval_minutes)
@@ -2821,7 +2862,7 @@ fn main() {
                                 println!("Available Commands:\r");
                                 println!("  r, refresh       - Refresh statistics immediately\r");
                                 println!(
-                                    "  t, tool [X]      - Switch tool (claude|codex|gemini|omp|all)\r"
+                                    "  t, tool [X]      - Switch tool (claude|codex|gemini|kimi|omp|all)\r"
                                 );
                                 println!("  host [X]         - Switch host (all or machine id)\r");
                                 println!("  n                - Rotate to next tool\r");
@@ -2955,7 +2996,7 @@ fn main() {
                                                 did_refresh = true;
                                             } else {
                                                 println!(
-                                                    "Usage: t, tool [claude|codex|gemini|omp|all]\r"
+                                                    "Usage: t, tool [claude|codex|gemini|kimi|omp|all]\r"
                                                 );
                                             }
                                         }
@@ -3045,7 +3086,7 @@ fn main() {
                                         "t" | "tool" => {
                                             println!("Current tool: {}\r", state.tool);
                                             println!(
-                                                "Usage: t, tool [claude|codex|gemini|omp|all]\r"
+                                                "Usage: t, tool [claude|codex|gemini|kimi|omp|all]\r"
                                             );
                                         }
                                         "host" => {
@@ -4145,6 +4186,7 @@ mod tests {
             claude: Vec::new(),
             codex: Vec::new(),
             gemini: Vec::new(),
+            kimi: Vec::new(),
             omp: Vec::new(),
             horizon_days: FULL_CACHE_HORIZON,
             local_host_id: None,
@@ -4211,6 +4253,7 @@ mod tests {
             }],
             codex: Vec::new(),
             gemini: Vec::new(),
+            kimi: Vec::new(),
             omp: Vec::new(),
             horizon_days: FULL_CACHE_HORIZON,
             local_host_id: Some("laptop".to_string()),

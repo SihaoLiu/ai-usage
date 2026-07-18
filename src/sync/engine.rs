@@ -15,8 +15,8 @@ use ai_usage_proto::{
     SnapshotRecordBatch, UploadResponse, WireRecord,
 };
 
-pub const SUPPORTED_PULL_VENDORS: [&str; 4] = ["claude", "codex", "gemini", "omp"];
-const VENDORS: [&str; 4] = SUPPORTED_PULL_VENDORS;
+pub const SUPPORTED_PULL_VENDORS: [&str; 5] = ["claude", "codex", "gemini", "kimi", "omp"];
+const VENDORS: [&str; 5] = SUPPORTED_PULL_VENDORS;
 const BATCH_SIZE: usize = 1000;
 const PULL_LIMIT: usize = 20_000;
 const SNAPSHOT_DIFF_TARGET_BYTES: usize = 900_000;

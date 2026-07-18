@@ -511,7 +511,18 @@ fn append_missing_fee_keys(path: &Path, keys: &[&str]) {
 pub fn load_subscription_fees() -> Option<SubscriptionFees> {
     let path = fee_env_path();
     let content = std::fs::read_to_string(&path).ok()?;
-    let (fees, missing_keys) = interpret_fee_keys(&parse_fee_lines(&content))?;
+    let parsed = parse_fee_lines(&content);
+    for (vendor, value) in &parsed {
+        if value.is_none()
+            && let Some((key, _)) = FEE_KEYS.iter().find(|(_, v)| v == vendor)
+        {
+            eprintln!(
+                "Error: invalid value for {key} in {}; fix the line or remove it",
+                path.display()
+            );
+        }
+    }
+    let (fees, missing_keys) = interpret_fee_keys(&parsed)?;
     if !missing_keys.is_empty() {
         append_missing_fee_keys(&path, &missing_keys);
     }
@@ -533,8 +544,8 @@ pub fn prompt_subscription_fees() -> SubscriptionFees {
     use std::io::{self, BufRead, Write};
 
     if !std::io::stdin().is_terminal() {
-        eprintln!("Error: .fee.env not found and stdin is not a terminal.");
-        eprintln!("Create .fee.env manually with:");
+        eprintln!("Error: no usable .fee.env and stdin is not a terminal.");
+        eprintln!("Create or fix .fee.env manually with:");
         eprintln!("  CLAUDE_MONTHLY_FEE=200");
         eprintln!("  CODEX_MONTHLY_FEE=200");
         eprintln!("  GEMINI_MONTHLY_FEE=19.99");

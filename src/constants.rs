@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::model_id::{Provider, parse_model_identity};
 
@@ -415,11 +415,12 @@ pub fn fee_env_path() -> PathBuf {
     PathBuf::from(".fee.env")
 }
 
-/// Load subscription fees from .fee.env file.
-pub fn load_subscription_fees() -> Option<SubscriptionFees> {
-    let path = fee_env_path();
-    let content = std::fs::read_to_string(&path).ok()?;
+/// Vendors whose fee keys every .fee.env has always contained. A file
+/// missing one of these is incomplete user input and defers to the
+/// interactive prompt, exactly as before newer vendors existed.
+const LEGACY_FEE_VENDORS: [&str; 3] = ["claude", "codex", "gemini"];
 
+fn parse_fee_lines(content: &str) -> HashMap<String, f64> {
     let mut fees: HashMap<String, f64> = HashMap::new();
     for line in content.lines() {
         let line = line.trim();
@@ -438,32 +439,77 @@ pub fn load_subscription_fees() -> Option<SubscriptionFees> {
             }
         }
     }
+    fees
+}
 
-    if fees.is_empty() {
+/// Interpret the parsed fee keys. `None` defers to the interactive prompt
+/// (a legacy key is absent, so the file is incomplete user input); otherwise
+/// returns the fees plus the env keys of newer vendors the file does not
+/// name yet, which default to 0 until the user sets them.
+fn interpret_fee_keys(
+    fees: &HashMap<String, f64>,
+) -> Option<(SubscriptionFees, Vec<&'static str>)> {
+    if LEGACY_FEE_VENDORS
+        .iter()
+        .any(|vendor| !fees.contains_key(*vendor))
+    {
         return None;
     }
+    let missing: Vec<&'static str> = FEE_KEYS
+        .iter()
+        .filter(|(_, vendor)| !fees.contains_key(*vendor))
+        .map(|(key, _)| *key)
+        .collect();
+    Some((
+        SubscriptionFees {
+            claude: fees["claude"],
+            codex: fees["codex"],
+            gemini: fees["gemini"],
+            kimi: fees.get("kimi").copied().unwrap_or(0.0),
+        },
+        missing,
+    ))
+}
 
-    // Keys can be missing when the file predates a vendor or a line failed
-    // to parse. Interactively, fall through to the prompt so the user
-    // supplies the real values; headless (cron, pipes), warn and assume 0
-    // for the missing fees rather than aborting a previously working run.
-    // The file itself is never rewritten here.
-    if fees.len() != FEE_KEYS.len() {
-        if std::io::stdin().is_terminal() {
-            return None;
-        }
-        for &(key, vendor) in FEE_KEYS {
-            if !fees.contains_key(vendor) {
-                eprintln!("Warning: {key} missing from .fee.env, assuming 0");
-            }
-        }
+/// Append `KEY=0` lines for fee keys the file predates, preserving every
+/// existing line and comment. Keeps the file complete so the note below
+/// appears only once per upgrade.
+fn append_missing_fee_keys(path: &Path, keys: &[&str]) {
+    use std::io::Write;
+
+    let needs_newline = std::fs::read_to_string(path)
+        .map(|content| !content.is_empty() && !content.ends_with('\n'))
+        .unwrap_or(false);
+    let mut lines = String::new();
+    if needs_newline {
+        lines.push('\n');
     }
-    Some(SubscriptionFees {
-        claude: fees.get("claude").copied().unwrap_or(0.0),
-        codex: fees.get("codex").copied().unwrap_or(0.0),
-        gemini: fees.get("gemini").copied().unwrap_or(0.0),
-        kimi: fees.get("kimi").copied().unwrap_or(0.0),
-    })
+    for key in keys {
+        lines.push_str(key);
+        lines.push_str("=0\n");
+    }
+    let appended = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(lines.as_bytes()));
+    if appended.is_ok() {
+        eprintln!(
+            "Note: added {} = 0 to {}; edit the file if you pay for that subscription.",
+            keys.join(", "),
+            path.display()
+        );
+    }
+}
+
+/// Load subscription fees from the .fee.env file.
+pub fn load_subscription_fees() -> Option<SubscriptionFees> {
+    let path = fee_env_path();
+    let content = std::fs::read_to_string(&path).ok()?;
+    let (fees, missing_keys) = interpret_fee_keys(&parse_fee_lines(&content))?;
+    if !missing_keys.is_empty() {
+        append_missing_fee_keys(&path, &missing_keys);
+    }
+    Some(fees)
 }
 
 /// Save subscription fees to .fee.env file.
@@ -678,6 +724,63 @@ mod tests {
         let unknown = p.get_pricing("kimi", "totally-mystery-thing");
         assert!((unknown.input - 3.0).abs() < 1e-9);
         assert!((unknown.output - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fee_lines_parse_ignores_comments_and_bad_values() {
+        let parsed = parse_fee_lines(
+            "# switched to Max plan in June\nCLAUDE_MONTHLY_FEE=$200\nCODEX_MONTHLY_FEE=200\nGEMINI_MONTHLY_FEE=19.99\nUNRELATED=5\n",
+        );
+        assert_eq!(parsed.len(), 2);
+        assert!(!parsed.contains_key("claude"));
+        assert!((parsed["codex"] - 200.0).abs() < f64::EPSILON);
+        assert!((parsed["gemini"] - 19.99).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fee_keys_missing_a_legacy_vendor_defer_to_the_prompt() {
+        let mut fees = HashMap::new();
+        fees.insert("codex".to_string(), 200.0);
+        fees.insert("gemini".to_string(), 19.99);
+        assert!(interpret_fee_keys(&fees).is_none());
+        assert!(interpret_fee_keys(&HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn fee_keys_missing_only_newer_vendors_load_with_zero() {
+        let mut fees = HashMap::new();
+        fees.insert("claude".to_string(), 100.0);
+        fees.insert("codex".to_string(), 200.0);
+        fees.insert("gemini".to_string(), 19.99);
+
+        let (loaded, missing) = interpret_fee_keys(&fees).expect("legacy-complete file loads");
+        assert!((loaded.claude - 100.0).abs() < f64::EPSILON);
+        assert!((loaded.kimi - 0.0).abs() < f64::EPSILON);
+        assert_eq!(missing, vec!["KIMI_MONTHLY_FEE"]);
+
+        fees.insert("kimi".to_string(), 40.0);
+        let (loaded, missing) = interpret_fee_keys(&fees).expect("complete file loads");
+        assert!((loaded.kimi - 40.0).abs() < f64::EPSILON);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn appending_missing_fee_keys_preserves_existing_lines() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ai-usage-fee-test-{stamp}.env"));
+        std::fs::write(&path, "# my comment\nCLAUDE_MONTHLY_FEE=100").expect("write fee file");
+
+        append_missing_fee_keys(&path, &["KIMI_MONTHLY_FEE"]);
+        let content = std::fs::read_to_string(&path).expect("read fee file");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            content,
+            "# my comment\nCLAUDE_MONTHLY_FEE=100\nKIMI_MONTHLY_FEE=0\n"
+        );
     }
 
     #[test]

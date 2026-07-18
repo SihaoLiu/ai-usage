@@ -90,7 +90,7 @@ pricing.json         # API pricing data for all vendors
 - All times are displayed in the system's local timezone
 - Display adapts to terminal width (Full/Medium/Compact/Minimal modes)
 - Monitor mode uses crossterm raw mode; disable before printing, re-enable after
-- Adding a vendor touches: `data/<vendor>.rs`, `stats/<vendor>.rs`, `tool.rs`, `main.rs` wiring, `pricing.json` + `constants.rs`/`pricing.rs`, `formatting.rs`, `charts.rs`, `sync/engine.rs`, and `ai-usage-proto::is_valid_vendor`
+- Adding a vendor touches: `data/<vendor>.rs`, `stats/<vendor>.rs`, `tool.rs`, `main.rs` wiring, `pricing.json` + `constants.rs`/`pricing.rs`, `formatting.rs`, `charts.rs`, `sync/engine/mod.rs`, and `ai-usage-proto::is_valid_vendor`
 
 ## Testing
 

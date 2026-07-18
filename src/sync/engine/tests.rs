@@ -730,6 +730,29 @@ fn upload_skips_any_vendor_batch_an_older_server_rejects() {
 }
 
 #[test]
+fn upload_fails_loudly_when_a_core_vendor_is_rejected() {
+    let cache_root = unique_temp_dir("upload-core-rejected");
+    populate_vendor_cache(&cache_root, "claude", "claude-a");
+    let transport = RejectVendorTransport {
+        rejected: "claude",
+        uploads: RefCell::new(Vec::new()),
+    };
+
+    let result = run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &transport,
+        |_| {},
+    );
+
+    // No legitimate older server rejects a core vendor: this signals a
+    // broken server or proxy and must not be silently held back.
+    assert!(result.is_err());
+    let upload_log = crate::sync::state::load_upload_log(&cache_root);
+    assert!(!upload_log.contains(&("claude".to_string(), "claude-a".to_string())));
+}
+
+#[test]
 fn snapshot_upload_falls_back_to_batch_when_server_rejects_vendor() {
     let cache_root = unique_temp_dir("snapshot-older-server-kimi");
     populate_vendor_cache(&cache_root, "claude", "claude-a");
@@ -889,11 +912,12 @@ fn pull_preserves_cache_and_downgrades_when_older_server_rejects_new_vendor() {
         "kimi",
     );
 
+    let mut events = Vec::new();
     run_pull_once_with_progress(
         &cache_root,
         &enabled_config("workstation"),
         &transport,
-        |_| {},
+        |event| events.push(event.clone()),
     )
     .expect("pull should fall back to the previous vendor set");
 
@@ -903,6 +927,12 @@ fn pull_preserves_cache_and_downgrades_when_older_server_rejects_new_vendor() {
     assert!(requests[0].3.contains(&"kimi".to_string()));
     assert!(!requests[1].3.contains(&"kimi".to_string()));
     assert_eq!(requests[1].0, 10);
+    // The degraded pull names the vendors the server could not serve.
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SyncProgress::PullVendorsUnavailable { vendors }
+            if vendors == &vec!["kimi".to_string()]
+    )));
     // The pre-existing cached record survived and the new one merged in.
     let mut remote_keys: Vec<String> = crate::data::cache::load_remote_entries(&cache_root, None)
         .iter()

@@ -1087,6 +1087,10 @@ fn format_manual_sync_progress(event: &sync::engine::SyncProgress) -> Option<Str
         sync::engine::SyncProgress::UploadVendorHeldBack { vendor, records } => Some(format!(
             "sync push: server does not accept vendor {vendor} yet, holding back {records} record(s)"
         )),
+        sync::engine::SyncProgress::PullVendorsUnavailable { vendors } => Some(format!(
+            "sync pull: server does not serve vendor(s) {} yet, their remote records are unavailable",
+            vendors.join(", ")
+        )),
         sync::engine::SyncProgress::IntegrityUnsupported => {
             Some("sync integrity: server does not support integrity reports".to_string())
         }
@@ -1176,6 +1180,12 @@ fn format_monitor_worker_progress(progress: &sync::worker::SyncWorkerProgress) -
             } => format!("push complete, {uploaded_records}/{total_records} records"),
             sync::engine::SyncProgress::UploadVendorHeldBack { vendor, records } => {
                 format!("push holding back {records} {vendor} record(s), server too old")
+            }
+            sync::engine::SyncProgress::PullVendorsUnavailable { vendors } => {
+                format!(
+                    "pull missing {} from server, server too old",
+                    vendors.join(", ")
+                )
             }
             sync::engine::SyncProgress::PullPageFinished {
                 page_index,

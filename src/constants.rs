@@ -443,21 +443,27 @@ pub fn load_subscription_fees() -> Option<SubscriptionFees> {
         return None;
     }
 
-    // Keys added after the file was written (e.g. a pre-2.5.0 .fee.env
-    // without KIMI_MONTHLY_FEE) default to 0 and are persisted back, so the
-    // file stays the single visible place holding every vendor's fee and
-    // headless runs keep working across upgrades.
-    let complete = fees.len() == FEE_KEYS.len();
-    let loaded = SubscriptionFees {
+    // Keys can be missing when the file predates a vendor or a line failed
+    // to parse. Interactively, fall through to the prompt so the user
+    // supplies the real values; headless (cron, pipes), warn and assume 0
+    // for the missing fees rather than aborting a previously working run.
+    // The file itself is never rewritten here.
+    if fees.len() != FEE_KEYS.len() {
+        if std::io::stdin().is_terminal() {
+            return None;
+        }
+        for &(key, vendor) in FEE_KEYS {
+            if !fees.contains_key(vendor) {
+                eprintln!("Warning: {key} missing from .fee.env, assuming 0");
+            }
+        }
+    }
+    Some(SubscriptionFees {
         claude: fees.get("claude").copied().unwrap_or(0.0),
         codex: fees.get("codex").copied().unwrap_or(0.0),
         gemini: fees.get("gemini").copied().unwrap_or(0.0),
         kimi: fees.get("kimi").copied().unwrap_or(0.0),
-    };
-    if !complete {
-        let _ = save_subscription_fees(&loaded);
-    }
-    Some(loaded)
+    })
 }
 
 /// Save subscription fees to .fee.env file.

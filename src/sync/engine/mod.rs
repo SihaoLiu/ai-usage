@@ -21,6 +21,10 @@ const VENDORS: [&str; 5] = SUPPORTED_PULL_VENDORS;
 /// server rejects [`SUPPORTED_PULL_VENDORS`]. Keeps sync alive (minus the new
 /// vendor) while the client is upgraded before the server.
 const PREVIOUS_PULL_VENDORS: [&str; 4] = ["claude", "codex", "gemini", "omp"];
+/// Vendors every supported server generation knows. An "invalid vendor"
+/// rejection for one of these signals a broken server or proxy rather than
+/// version skew, and must fail the upload loudly instead of being held back.
+const CORE_VENDORS: [&str; 3] = ["claude", "codex", "gemini"];
 const BATCH_SIZE: usize = 1000;
 const PULL_LIMIT: usize = 20_000;
 const SNAPSHOT_DIFF_TARGET_BYTES: usize = 900_000;
@@ -71,6 +75,9 @@ pub enum SyncProgress {
     UploadVendorHeldBack {
         vendor: String,
         records: usize,
+    },
+    PullVendorsUnavailable {
+        vendors: Vec<String>,
     },
     IntegrityUnsupported,
     IntegrityReportSubmitted {
@@ -269,7 +276,10 @@ where
                 .collect();
             let response = match transport.upload(&wire_records) {
                 Ok(response) => response,
-                Err(err) if is_unsupported_vendor_error(&err) => {
+                Err(err)
+                    if is_unsupported_vendor_error(&err)
+                        && !CORE_VENDORS.contains(&wire_records[0].vendor.as_str()) =>
+                {
                     // An older server that does not know this group's vendor
                     // yet (groups are single-vendor). Hold the whole vendor
                     // back: drop its remaining batches from the plan so the
@@ -420,11 +430,17 @@ where
             .iter()
             .map(|record| record.wire.clone())
             .collect::<Vec<_>>();
-        let response = transport.snapshot_records(&SnapshotRecordBatch {
+        let response = match transport.snapshot_records(&SnapshotRecordBatch {
             host_id: config.machine_id.clone(),
             snapshot_id: snapshot_id.clone(),
             records,
-        })?;
+        }) {
+            Ok(response) => response,
+            // A server that defers vendor validation to the record upload:
+            // fall back to batch upload, which holds unknown vendors back.
+            Err(err) if is_unsupported_vendor_error(&err) => return Ok(false),
+            Err(err) => return Err(err),
+        };
         uploaded_records += batch.len();
         accepted += response.accepted;
         ignored += response.ignored;
@@ -726,6 +742,16 @@ where
 {
     let mut sync_state = state::load_sync_state(cache_root);
     let (vendors, fingerprint, mut response) = negotiate_first_pull_page(transport, &sync_state)?;
+    if vendors != SUPPORTED_PULL_VENDORS {
+        let unavailable: Vec<String> = SUPPORTED_PULL_VENDORS
+            .iter()
+            .filter(|vendor| !vendors.contains(vendor))
+            .map(|vendor| (*vendor).to_string())
+            .collect();
+        on_progress(&SyncProgress::PullVendorsUnavailable {
+            vendors: unavailable,
+        });
+    }
 
     // Commit the vendor-set migration only after the server has accepted the
     // set: an older server rejecting the new vendor must never wipe the

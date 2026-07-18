@@ -155,6 +155,14 @@ ai-usage --tool claude --host laptop
 
 ## Operations
 
+### Upgrade ordering when a release adds a vendor
+
+When a release adds a new tracked vendor (as v2.5.0 adds `kimi`), upgrade the server binary first, then upgrade every client promptly.
+
+A newer client against an older server degrades gracefully: it holds the new vendor's uploads back (reported as `holding back ... record(s)`), pulls the previous vendor set (reported as `server does not serve vendor(s) ... yet`), and skips integrity checking for that cycle. Everything self-heals on the first sync after the server upgrade.
+
+The reverse skew is the one to keep short: a client still on the previous release cannot pull the new vendor's records, so its integrity verification of hosts that already upload them fails on every cycle and repeatedly clears and refetches its remote cache. This resolves as soon as that machine upgrades (monitor mode's `update` command or `--auto-update` handles this).
+
 The server uses SQLite WAL mode and stores its database at the configured `db_path`. A simple backup can be taken with SQLite's online backup command:
 
 ```bash

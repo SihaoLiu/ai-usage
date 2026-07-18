@@ -1,23 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageCost, UsageEntry};
+use crate::data::{
+    SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageCost, UsageEntry, as_i64,
+};
 use crate::model_id::normalize_reasoning_effort;
 use crate::time_utils::parse_timestamp;
 
 /// Get the Oh My Pi configuration directory.
 pub fn get_omp_dir() -> PathBuf {
-    std::env::var("OMP_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".omp"))
-                .unwrap_or_else(|_| PathBuf::from("~/.omp"))
-        })
-}
-
-fn as_i64(value: &serde_json::Value, key: &str) -> i64 {
-    value.get(key).and_then(|v| v.as_i64()).unwrap_or(0)
+    crate::data::config_dir("OMP_CONFIG_DIR", ".omp")
 }
 
 fn normalize_model(raw: &str) -> (&str, Option<&str>) {

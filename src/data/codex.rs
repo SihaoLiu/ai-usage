@@ -20,13 +20,7 @@ const FORK_REPLAY_FALLBACK_WINDOW_MS: i64 = 500;
 
 /// Get the Codex configuration directory.
 pub fn get_codex_dir() -> PathBuf {
-    std::env::var("CODEX_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".codex"))
-                .unwrap_or_else(|_| PathBuf::from("~/.codex"))
-        })
+    crate::data::config_dir("CODEX_CONFIG_DIR", ".codex")
 }
 
 fn read_top_level_service_tier_from_config() -> Option<String> {

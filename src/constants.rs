@@ -439,19 +439,25 @@ pub fn load_subscription_fees() -> Option<SubscriptionFees> {
         }
     }
 
-    // Every tracked vendor's fee must be present; an incomplete file (e.g.
-    // one written before a vendor was added) returns None so the caller
-    // re-prompts and the file is rewritten with the full key set.
-    if fees.len() == FEE_KEYS.len() {
-        Some(SubscriptionFees {
-            claude: fees["claude"],
-            codex: fees["codex"],
-            gemini: fees["gemini"],
-            kimi: fees["kimi"],
-        })
-    } else {
-        None
+    if fees.is_empty() {
+        return None;
     }
+
+    // Keys added after the file was written (e.g. a pre-2.5.0 .fee.env
+    // without KIMI_MONTHLY_FEE) default to 0 and are persisted back, so the
+    // file stays the single visible place holding every vendor's fee and
+    // headless runs keep working across upgrades.
+    let complete = fees.len() == FEE_KEYS.len();
+    let loaded = SubscriptionFees {
+        claude: fees.get("claude").copied().unwrap_or(0.0),
+        codex: fees.get("codex").copied().unwrap_or(0.0),
+        gemini: fees.get("gemini").copied().unwrap_or(0.0),
+        kimi: fees.get("kimi").copied().unwrap_or(0.0),
+    };
+    if !complete {
+        let _ = save_subscription_fees(&loaded);
+    }
+    Some(loaded)
 }
 
 /// Save subscription fees to .fee.env file.

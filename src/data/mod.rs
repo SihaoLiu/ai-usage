@@ -60,6 +60,23 @@ pub(crate) fn has_jsonl_extension(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "jsonl")
 }
 
+/// Resolve a vendor's config directory: the env override wins, else
+/// `$HOME/<dir_name>`, else a literal `~/<dir_name>` placeholder.
+pub(crate) fn config_dir(env_var: &str, dir_name: &str) -> PathBuf {
+    std::env::var(env_var)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(dir_name))
+                .unwrap_or_else(|_| PathBuf::from(format!("~/{dir_name}")))
+        })
+}
+
+/// Fetch an integer field from a JSON object, defaulting to 0.
+pub(crate) fn as_i64(value: &serde_json::Value, key: &str) -> i64 {
+    value.get(key).and_then(|v| v.as_i64()).unwrap_or(0)
+}
+
 /// Normalized usage entry shared across all vendors.
 /// All vendor-specific data is normalized into this common format.
 #[derive(Debug, Clone)]

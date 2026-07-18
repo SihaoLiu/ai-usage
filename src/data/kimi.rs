@@ -3,22 +3,12 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
 
-use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
+use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry, as_i64};
 use crate::model_id::normalize_reasoning_effort;
 
 /// Get the Kimi Code configuration directory.
 pub fn get_kimi_dir() -> PathBuf {
-    std::env::var("KIMI_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".kimi-code"))
-                .unwrap_or_else(|_| PathBuf::from("~/.kimi-code"))
-        })
-}
-
-fn as_i64(value: &serde_json::Value, key: &str) -> i64 {
-    value.get(key).and_then(|v| v.as_i64()).unwrap_or(0)
+    crate::data::config_dir("KIMI_CONFIG_DIR", ".kimi-code")
 }
 
 /// Strip the `kimi-code/` style provider prefix from a model alias.
@@ -108,12 +98,20 @@ fn read_single_kimi_file(path: &Path) -> Vec<SourceUsageRecord> {
             .and_then(|v| v.as_str())
             .map_or("unknown", normalize_model);
 
-        let time_ms = data.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
-        let parsed_timestamp =
-            DateTime::from_timestamp_millis(time_ms).map(|dt| dt.with_timezone(&Local));
-        let timestamp = parsed_timestamp
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_default();
+        // A record without a usable time cannot be windowed or keyed; skip
+        // it rather than fabricating an epoch-1970 timestamp.
+        let Some(time_ms) = data
+            .get("time")
+            .and_then(|v| v.as_i64())
+            .filter(|ms| *ms > 0)
+        else {
+            continue;
+        };
+        let Some(parsed) = DateTime::from_timestamp_millis(time_ms) else {
+            continue;
+        };
+        let parsed_timestamp = Some(parsed.with_timezone(&Local));
+        let timestamp = parsed.with_timezone(&Local).to_rfc3339();
 
         let dedup_key = match &session_agent {
             Some((session, agent)) => {
@@ -279,6 +277,23 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].entry.usage.input_tokens, 10);
         assert_eq!(records[1].entry.usage.input_tokens, 20);
+    }
+
+    #[test]
+    fn records_without_a_usable_time_are_skipped() {
+        let root = unique_temp_dir("no-time");
+        let content = r#"{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":10,"output":1,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn"}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":20,"output":2,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":"not-a-number"}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":30,"output":3,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1784329646400}
+"#;
+        let path = write_wire_file(&session_wire_path(&root), content);
+
+        let records = read_kimi_file_records(&path);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry.usage.input_tokens, 30);
+        assert!(records[0].entry.parsed_timestamp.is_some());
     }
 
     #[test]

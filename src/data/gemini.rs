@@ -6,13 +6,7 @@ use crate::time_utils::parse_timestamp;
 
 /// Get the Gemini configuration directory.
 pub fn get_gemini_dir() -> PathBuf {
-    std::env::var("GEMINI_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".gemini"))
-                .unwrap_or_else(|_| PathBuf::from("~/.gemini"))
-        })
+    crate::data::config_dir("GEMINI_CONFIG_DIR", ".gemini")
 }
 
 /// Read a single Gemini session JSON file, returning each entry with a

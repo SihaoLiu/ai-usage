@@ -1084,6 +1084,9 @@ fn format_manual_sync_progress(event: &sync::engine::SyncProgress) -> Option<Str
         } => Some(format!(
             "sync pull: complete, {pages} pages, {pulled_records} records pulled, latest seq {max_seq}"
         )),
+        sync::engine::SyncProgress::UploadVendorHeldBack { vendor, records } => Some(format!(
+            "sync push: server does not accept vendor {vendor} yet, holding back {records} record(s)"
+        )),
         sync::engine::SyncProgress::IntegrityUnsupported => {
             Some("sync integrity: server does not support integrity reports".to_string())
         }
@@ -1171,6 +1174,9 @@ fn format_monitor_worker_progress(progress: &sync::worker::SyncWorkerProgress) -
                 total_records,
                 ..
             } => format!("push complete, {uploaded_records}/{total_records} records"),
+            sync::engine::SyncProgress::UploadVendorHeldBack { vendor, records } => {
+                format!("push holding back {records} {vendor} record(s), server too old")
+            }
             sync::engine::SyncProgress::PullPageFinished {
                 page_index,
                 pulled_records,
@@ -2162,7 +2168,12 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                         &client,
                         &mut on_progress,
                     )
-                    .and_then(|()| {
+                    .and_then(|outcome| {
+                        if !outcome.held_back_vendors.is_empty() {
+                            // Integrity digests would count the held-back
+                            // records the server cannot distribute yet.
+                            return Ok(());
+                        }
                         sync::engine::run_integrity_once_with_repair(
                             &cache_root,
                             &config,

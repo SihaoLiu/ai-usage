@@ -15,9 +15,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::constants::{AllPricing, ModelPricing};
+use crate::constants::{AllPricing, ModelPricing, VendorTables};
 
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
@@ -31,14 +31,14 @@ pub fn load_layered() -> AllPricing {
     let mut combined = AllPricing::load_raw();
 
     if let Some(cached) = read_cache_file() {
-        combined.overlay(cached.claude, cached.codex, cached.gemini, cached.kimi);
+        combined.overlay(cached);
     }
 
     if cache_is_stale()
         && let Some(live) = fetch_live(FETCH_TIMEOUT)
     {
         let _ = write_cache_file(&live);
-        combined.overlay(live.claude, live.codex, live.gemini, live.kimi);
+        combined.overlay(live);
     }
 
     let mut finalized = combined.finalize();
@@ -46,20 +46,6 @@ pub fn load_layered() -> AllPricing {
     // they win over the embedded baseline, the cache, and live LiteLLM data.
     finalized.set_pricing_overrides(crate::model_overrides::load().pricing.clone());
     finalized
-}
-
-/// Per-vendor model tables. Shape used both for the on-disk cache file and as
-/// the parser output for the live LiteLLM response.
-#[derive(Debug, Default, Deserialize, Serialize)]
-struct VendorTables {
-    #[serde(default)]
-    claude: HashMap<String, ModelPricing>,
-    #[serde(default)]
-    codex: HashMap<String, ModelPricing>,
-    #[serde(default)]
-    gemini: HashMap<String, ModelPricing>,
-    #[serde(default)]
-    kimi: HashMap<String, ModelPricing>,
 }
 
 // ---- cache file -----------------------------------------------------------

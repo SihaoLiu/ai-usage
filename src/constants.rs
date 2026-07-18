@@ -88,6 +88,21 @@ struct VendorPricing {
     default: ModelPricing,
 }
 
+/// Per-vendor model pricing tables, one field per tracked vendor. Used both
+/// as an overlay payload for [`AllPricing::overlay`] and as the on-disk /
+/// LiteLLM parse shape in `crate::pricing`.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct VendorTables {
+    #[serde(default)]
+    pub claude: HashMap<String, ModelPricing>,
+    #[serde(default)]
+    pub codex: HashMap<String, ModelPricing>,
+    #[serde(default)]
+    pub gemini: HashMap<String, ModelPricing>,
+    #[serde(default)]
+    pub kimi: HashMap<String, ModelPricing>,
+}
+
 #[derive(Debug, Deserialize)]
 struct PricingData {
     #[serde(rename = "_meta")]
@@ -156,17 +171,11 @@ impl AllPricing {
     /// incoming layer win (so live LiteLLM data refreshes prices), but optional
     /// tier-pricing fields fall back to the existing entry when the incoming
     /// one omits them.
-    pub fn overlay(
-        &mut self,
-        claude: HashMap<String, ModelPricing>,
-        codex: HashMap<String, ModelPricing>,
-        gemini: HashMap<String, ModelPricing>,
-        kimi: HashMap<String, ModelPricing>,
-    ) {
-        overlay_table(&mut self.claude_models, claude);
-        overlay_table(&mut self.codex_models, codex);
-        overlay_table(&mut self.gemini_models, gemini);
-        overlay_table(&mut self.kimi_models, kimi);
+    pub fn overlay(&mut self, tables: VendorTables) {
+        overlay_table(&mut self.claude_models, tables.claude);
+        overlay_table(&mut self.codex_models, tables.codex);
+        overlay_table(&mut self.gemini_models, tables.gemini);
+        overlay_table(&mut self.kimi_models, tables.kimi);
     }
 
     pub fn get_pricing(&self, vendor: &str, model: &str) -> &ModelPricing {
@@ -430,20 +439,18 @@ pub fn load_subscription_fees() -> Option<SubscriptionFees> {
         }
     }
 
-    // The three original keys are required; later additions are optional so a
-    // pre-existing .fee.env keeps loading (their fee reads as 0 until set).
-    match (
-        fees.get("claude").copied(),
-        fees.get("codex").copied(),
-        fees.get("gemini").copied(),
-    ) {
-        (Some(claude), Some(codex), Some(gemini)) => Some(SubscriptionFees {
-            claude,
-            codex,
-            gemini,
-            kimi: fees.get("kimi").copied().unwrap_or(0.0),
-        }),
-        _ => None,
+    // Every tracked vendor's fee must be present; an incomplete file (e.g.
+    // one written before a vendor was added) returns None so the caller
+    // re-prompts and the file is rewritten with the full key set.
+    if fees.len() == FEE_KEYS.len() {
+        Some(SubscriptionFees {
+            claude: fees["claude"],
+            codex: fees["codex"],
+            gemini: fees["gemini"],
+            kimi: fees["kimi"],
+        })
+    } else {
+        None
     }
 }
 
@@ -605,7 +612,10 @@ mod tests {
                 _comment: None,
             },
         );
-        p.overlay(remote, HashMap::new(), HashMap::new(), HashMap::new());
+        p.overlay(VendorTables {
+            claude: remote,
+            ..VendorTables::default()
+        });
         let p = p.finalize();
 
         let opus7 = p.get_pricing("claude", "claude-opus-4-7");

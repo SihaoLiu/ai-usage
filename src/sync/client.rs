@@ -1,5 +1,5 @@
 use crate::sync::config::EnabledSyncConfig;
-use crate::sync::engine::{SUPPORTED_PULL_VENDORS, SyncError, SyncTransport};
+use crate::sync::engine::{SyncError, SyncTransport};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
@@ -201,8 +201,9 @@ impl SyncTransport for SyncHttpClient {
         after_seq: u64,
         exclude_host: &str,
         limit: usize,
+        supported_vendors: &[&str],
     ) -> Result<PullResponse, SyncError> {
-        let supported_vendors = SUPPORTED_PULL_VENDORS.join(",");
+        let supported_vendors = supported_vendors.join(",");
         let path = format!(
             "/v1/pull?after_seq={after_seq}&exclude_host={exclude_host}&limit={limit}&supported_vendors={supported_vendors}"
         );
@@ -286,7 +287,7 @@ mod tests {
     use super::*;
     use crate::data::{SourceUsageRecord, TokenUsage, UsageEntry};
     use crate::sync::config::EnabledSyncConfig;
-    use crate::sync::engine::SyncTransport;
+    use crate::sync::engine::{SUPPORTED_PULL_VENDORS, SyncTransport};
     use crate::sync::{engine, state};
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -435,10 +436,12 @@ mod tests {
         assert_eq!(upload.ignored, 0);
 
         let pull_client = client.clone();
-        let pull = tokio::task::spawn_blocking(move || pull_client.pull(0, "workstation", 100))
-            .await
-            .expect("pull join")
-            .expect("pull response");
+        let pull = tokio::task::spawn_blocking(move || {
+            pull_client.pull(0, "workstation", 100, &SUPPORTED_PULL_VENDORS)
+        })
+        .await
+        .expect("pull join")
+        .expect("pull response");
 
         assert_eq!(pull.records.len(), 1);
         assert_eq!(pull.records[0].record.host_id, "laptop");
@@ -479,10 +482,12 @@ mod tests {
         .expect("upload response");
 
         let pull_client = client.clone();
-        let pull = tokio::task::spawn_blocking(move || pull_client.pull(0, "workstation", 100))
-            .await
-            .expect("pull join")
-            .expect("pull response");
+        let pull = tokio::task::spawn_blocking(move || {
+            pull_client.pull(0, "workstation", 100, &SUPPORTED_PULL_VENDORS)
+        })
+        .await
+        .expect("pull join")
+        .expect("pull response");
 
         assert_eq!(pull.records.len(), 1);
         assert_eq!(pull.records[0].record.vendor, "omp");
@@ -518,10 +523,12 @@ mod tests {
         let client = SyncHttpClient::new(client_config(format!("http://{addr}")));
 
         let pull_client = client.clone();
-        let pull = tokio::task::spawn_blocking(move || pull_client.pull(0, "workstation", 20_000))
-            .await
-            .expect("pull join")
-            .expect("pull response");
+        let pull = tokio::task::spawn_blocking(move || {
+            pull_client.pull(0, "workstation", 20_000, &SUPPORTED_PULL_VENDORS)
+        })
+        .await
+        .expect("pull join")
+        .expect("pull response");
 
         assert_eq!(pull.records.len(), 1);
         assert_eq!(pull.records[0].record.dedup_key, "large");

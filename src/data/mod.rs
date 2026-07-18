@@ -5,10 +5,60 @@ pub mod gemini;
 pub mod kimi;
 pub mod omp;
 
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
 use crate::time_utils::{TimeWindow, parse_timestamp};
 use chrono::{DateTime, Local};
+use walkdir::WalkDir;
 
 pub const UNKNOWN_FAST_TIER: i8 = -1;
+
+/// Recursively collect files under `dir` whose path satisfies `matches`,
+/// keeping only files modified within the last `max_age_days` (with one day
+/// of slack; files whose mtime cannot be read are kept). Results are sorted.
+/// Shared by every vendor's usage-file collector; only the name predicate
+/// differs per vendor.
+pub(crate) fn collect_recent_files(
+    dir: &Path,
+    max_age_days: Option<i64>,
+    matches: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+
+    let cutoff = max_age_days
+        .map(|days| SystemTime::now() - std::time::Duration::from_secs((days as u64 + 1) * 86400));
+
+    let mut files: Vec<PathBuf> = WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            if !e.file_type().is_file() {
+                return false;
+            }
+            if !matches(e.path()) {
+                return false;
+            }
+            if let Some(cutoff_time) = cutoff
+                && let Ok(meta) = e.metadata()
+                && let Ok(mtime) = meta.modified()
+            {
+                return mtime >= cutoff_time;
+            }
+            true
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    files.sort();
+    files
+}
+
+/// Path predicate for the common `*.jsonl` session-log layout.
+pub(crate) fn has_jsonl_extension(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "jsonl")
+}
 
 /// Normalized usage entry shared across all vendors.
 /// All vendor-specific data is normalized into this common format.

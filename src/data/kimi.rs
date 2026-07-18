@@ -1,9 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
-use walkdir::WalkDir;
 
 use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
 use crate::model_id::normalize_reasoning_effort;
@@ -59,6 +57,12 @@ fn read_single_kimi_file(path: &Path) -> Vec<SourceUsageRecord> {
         if line.is_empty() {
             continue;
         }
+        // Wire files are dominated by multi-kilobyte context/content lines;
+        // skip them with a substring check before paying for a full JSON
+        // parse. False positives just fall through to the type match below.
+        if !line.contains("usage.record") && !line.contains("llm.request") {
+            continue;
+        }
 
         let data: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -66,17 +70,25 @@ fn read_single_kimi_file(path: &Path) -> Vec<SourceUsageRecord> {
         };
         match data.get("type").and_then(|v| v.as_str()) {
             Some("llm.request") => {
-                if let Some(effort) = data
+                // Reassign unconditionally: a request without a recognized
+                // thinkingEffort must not inherit the previous request's.
+                current_effort = data
                     .get("thinkingEffort")
                     .and_then(|v| v.as_str())
-                    .and_then(normalize_reasoning_effort)
-                {
-                    current_effort = Some(effort);
-                }
+                    .and_then(normalize_reasoning_effort);
                 continue;
             }
             Some("usage.record") => {}
             _ => continue,
+        }
+        // Only per-request deltas are safe to sum; skip any future aggregate
+        // scope so the same tokens are never counted twice.
+        if data
+            .get("usageScope")
+            .and_then(|v| v.as_str())
+            .is_some_and(|scope| scope != "turn")
+        {
+            continue;
         }
 
         let usage = match data.get("usage") {
@@ -138,35 +150,9 @@ fn read_single_kimi_file(path: &Path) -> Vec<SourceUsageRecord> {
 }
 
 pub fn collect_usage_files(sessions_dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
-    if !sessions_dir.exists() {
-        return Vec::new();
-    }
-
-    let cutoff = max_age_days
-        .map(|days| SystemTime::now() - std::time::Duration::from_secs((days as u64 + 1) * 86400));
-
-    let mut files: Vec<PathBuf> = WalkDir::new(sessions_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            if !e.file_type().is_file() {
-                return false;
-            }
-            if e.file_name() != "wire.jsonl" {
-                return false;
-            }
-            if let Some(cutoff_time) = cutoff
-                && let Ok(meta) = e.metadata()
-                && let Ok(mtime) = meta.modified()
-            {
-                return mtime >= cutoff_time;
-            }
-            true
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
-    files.sort();
-    files
+    crate::data::collect_recent_files(sessions_dir, max_age_days, |path| {
+        path.file_name().is_some_and(|name| name == "wire.jsonl")
+    })
 }
 
 pub fn read_kimi_file_records(path: &Path) -> Vec<SourceUsageRecord> {
@@ -253,6 +239,46 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].entry.usage.input_tokens, 5);
+    }
+
+    #[test]
+    fn effort_resets_when_a_later_request_has_no_thinking_effort() {
+        let root = unique_temp_dir("effort-reset");
+        let content = r#"{"type":"llm.request","thinkingEffort":"max","time":1784329646154}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":10,"output":1,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1784329646200}
+{"type":"llm.request","time":1784329646300}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":20,"output":2,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1784329646400}
+{"type":"llm.request","thinkingEffort":"off","time":1784329646500}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":30,"output":3,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1784329646600}
+"#;
+        let path = write_wire_file(&session_wire_path(&root), content);
+
+        let records = read_kimi_file_records(&path);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].entry.effort.as_deref(), Some("max"));
+        assert_eq!(records[1].entry.effort.as_deref(), None);
+        assert_eq!(records[2].entry.effort.as_deref(), None);
+    }
+
+    #[test]
+    fn non_turn_usage_scopes_are_skipped() {
+        let root = unique_temp_dir("scope");
+        let content = r#"{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":10,"output":1,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1784329646200}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":999,"output":999,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"session","time":1784329646300}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":20,"output":2,"inputCacheRead":0,"inputCacheCreation":0},"time":1784329646400}
+"#;
+        let path = write_wire_file(&session_wire_path(&root), content);
+
+        let records = read_kimi_file_records(&path);
+        fs::remove_dir_all(&root).ok();
+
+        // The "turn" record and the scope-less record count; the aggregate
+        // "session" scope is skipped to avoid double counting.
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].entry.usage.input_tokens, 10);
+        assert_eq!(records[1].entry.usage.input_tokens, 20);
     }
 
     #[test]

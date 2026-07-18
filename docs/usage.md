@@ -24,7 +24,7 @@ Default behavior (no flags) enters monitor mode showing all vendors for the last
 | `q` / `Esc` | Quit |
 | `n` | Cycle to next vendor |
 | `r` | Refresh now |
-| `v claude` / `v codex` / `v gemini` / `v kimi` / `v omp` / `v all` | Switch vendor |
+| `t claude` / `t codex` / `t gemini` / `t kimi` / `t omp` / `t all` | Switch tool (also `tool <name>`) |
 | `host all` / `host <HOST>` | Switch between all machines and one machine |
 | `d <N>` | Change days range |
 | `a` | Switch to all vendors |

@@ -17,6 +17,10 @@ use ai_usage_proto::{
 
 pub const SUPPORTED_PULL_VENDORS: [&str; 5] = ["claude", "codex", "gemini", "kimi", "omp"];
 const VENDORS: [&str; 5] = SUPPORTED_PULL_VENDORS;
+/// The previous release's vendor set, offered as a fallback when an older
+/// server rejects [`SUPPORTED_PULL_VENDORS`]. Keeps sync alive (minus the new
+/// vendor) while the client is upgraded before the server.
+const PREVIOUS_PULL_VENDORS: [&str; 4] = ["claude", "codex", "gemini", "omp"];
 const BATCH_SIZE: usize = 1000;
 const PULL_LIMIT: usize = 20_000;
 const SNAPSHOT_DIFF_TARGET_BYTES: usize = 900_000;
@@ -108,6 +112,7 @@ pub trait SyncTransport {
         after_seq: u64,
         exclude_host: &str,
         limit: usize,
+        supported_vendors: &[&str],
     ) -> Result<PullResponse, SyncError>;
     fn submit_integrity_report(
         &self,
@@ -235,10 +240,11 @@ where
                 .collect();
             let response = match transport.upload(&wire_records) {
                 Ok(response) => response,
-                Err(err)
-                    if wire_records.iter().all(|record| record.vendor == "omp")
-                        && is_unsupported_vendor_error(&err) =>
-                {
+                Err(err) if is_unsupported_vendor_error(&err) => {
+                    // An older server that does not know this batch's vendor
+                    // yet (batches are grouped per vendor). Leave the records
+                    // unlogged so they upload once the server is upgraded,
+                    // and keep the remaining vendors' batches going.
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -527,17 +533,39 @@ fn is_unsupported_vendor_error(err: &SyncError) -> bool {
     message.contains("invalid vendor") || message.contains("unsupported vendor")
 }
 
-fn current_pull_vendors() -> Vec<String> {
-    SUPPORTED_PULL_VENDORS
-        .iter()
-        .map(|vendor| (*vendor).to_string())
-        .collect()
-}
-
-fn current_pull_state_fingerprint() -> Vec<String> {
-    let mut fingerprint = current_pull_vendors();
+fn pull_state_fingerprint_for(vendors: &[&str]) -> Vec<String> {
+    let mut fingerprint: Vec<String> = vendors.iter().map(|vendor| (*vendor).to_string()).collect();
     fingerprint.push(PULL_SCOPE_ALL_HOSTS_MARKER.to_string());
     fingerprint
+}
+
+/// Fetch the first pull page, offering vendor sets newest-first. An older
+/// server rejects a vendor name it does not know ("invalid vendor");
+/// retrying with the previous release's set keeps pull alive until the
+/// server is upgraded. Returns the accepted set, its fingerprint, and the
+/// page fetched with it, so the caller can commit any cache migration only
+/// for a set the server actually serves.
+fn negotiate_first_pull_page(
+    transport: &impl SyncTransport,
+    sync_state: &state::SyncState,
+) -> Result<(&'static [&'static str], Vec<String>, PullResponse), SyncError> {
+    let vendor_sets: [&'static [&'static str]; 2] =
+        [&SUPPORTED_PULL_VENDORS, &PREVIOUS_PULL_VENDORS];
+    let last = vendor_sets.len() - 1;
+    for (index, vendors) in vendor_sets.into_iter().enumerate() {
+        let fingerprint = pull_state_fingerprint_for(vendors);
+        let start_seq = if sync_state.pull_vendors == fingerprint {
+            sync_state.last_seen_seq
+        } else {
+            0
+        };
+        match transport.pull(start_seq, "", PULL_LIMIT, vendors) {
+            Ok(response) => return Ok((vendors, fingerprint, response)),
+            Err(err) if index < last && is_unsupported_vendor_error(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("the final vendor set either succeeds or returns its error")
 }
 
 fn uploaded_with_omp_v220_key(
@@ -638,17 +666,20 @@ where
     F: FnMut(&SyncProgress),
 {
     let mut sync_state = state::load_sync_state(cache_root);
-    let pull_state_fingerprint = current_pull_state_fingerprint();
-    if sync_state.pull_vendors != pull_state_fingerprint {
+    let (vendors, fingerprint, mut response) = negotiate_first_pull_page(transport, &sync_state)?;
+
+    // Commit the vendor-set migration only after the server has accepted the
+    // set: an older server rejecting the new vendor must never wipe the
+    // existing remote cache.
+    if sync_state.pull_vendors != fingerprint {
         cache::clear_remote_cache(cache_root)?;
         sync_state.last_seen_seq = 0;
-        sync_state.pull_vendors = pull_state_fingerprint;
+        sync_state.pull_vendors = fingerprint;
     }
     let mut page_index = 0;
     let mut pulled_records = 0;
 
     loop {
-        let response = transport.pull(sync_state.last_seen_seq, "", PULL_LIMIT)?;
         page_index += 1;
         pulled_records += response.records.len();
         merge_pulled_records(cache_root, &response)?;
@@ -664,6 +695,7 @@ where
         if !response.truncated {
             break;
         }
+        response = transport.pull(sync_state.last_seen_seq, "", PULL_LIMIT, vendors)?;
     }
 
     sync_state.last_successful_sync = Some(Utc::now().to_rfc3339());
@@ -878,15 +910,22 @@ mod tests {
         PullResponse, RecordKey, SCHEMA_VERSION, SequencedWireRecord, UploadResponse, WireRecord,
     };
 
+    /// (after_seq, exclude_host, limit, supported_vendors) seen by pull().
+    type PullRequestLog = (u64, String, usize, Vec<String>);
+
     struct FakeTransport {
         uploads: RefCell<Vec<Vec<WireRecord>>>,
         pulls: RefCell<Vec<PullResponse>>,
-        pull_requests: RefCell<Vec<(u64, String, usize)>>,
+        pull_requests: RefCell<Vec<PullRequestLog>>,
         integrity_submissions: RefCell<Vec<IntegrityReport>>,
         integrity_reports: RefCell<Vec<IntegrityReport>>,
+        /// When set, pull() rejects any request whose vendor list contains
+        /// this vendor, imitating an older server's "invalid vendor" 400.
+        reject_pull_vendor: Option<&'static str>,
     }
 
-    struct RejectOmpTransport {
+    struct RejectVendorTransport {
+        rejected: &'static str,
         uploads: RefCell<Vec<Vec<WireRecord>>>,
     }
 
@@ -906,6 +945,14 @@ mod tests {
                 pull_requests: RefCell::new(Vec::new()),
                 integrity_submissions: RefCell::new(Vec::new()),
                 integrity_reports: RefCell::new(Vec::new()),
+                reject_pull_vendor: None,
+            }
+        }
+
+        fn new_rejecting_pull_vendor(pulls: Vec<PullResponse>, vendor: &'static str) -> Self {
+            Self {
+                reject_pull_vendor: Some(vendor),
+                ..Self::new(pulls)
             }
         }
 
@@ -932,10 +979,24 @@ mod tests {
             after_seq: u64,
             exclude_host: &str,
             limit: usize,
+            supported_vendors: &[&str],
         ) -> Result<PullResponse, SyncError> {
-            self.pull_requests
-                .borrow_mut()
-                .push((after_seq, exclude_host.to_string(), limit));
+            self.pull_requests.borrow_mut().push((
+                after_seq,
+                exclude_host.to_string(),
+                limit,
+                supported_vendors
+                    .iter()
+                    .map(|vendor| (*vendor).to_string())
+                    .collect(),
+            ));
+            if let Some(rejected) = self.reject_pull_vendor
+                && supported_vendors.contains(&rejected)
+            {
+                return Err(SyncError::new(
+                    "http status: 400: supported_vendors contains invalid vendor",
+                ));
+            }
             Ok(self.pulls.borrow_mut().remove(0))
         }
 
@@ -954,10 +1015,10 @@ mod tests {
         }
     }
 
-    impl SyncTransport for RejectOmpTransport {
+    impl SyncTransport for RejectVendorTransport {
         fn upload(&self, records: &[WireRecord]) -> Result<UploadResponse, SyncError> {
             self.uploads.borrow_mut().push(records.to_vec());
-            if records.iter().any(|record| record.vendor == "omp") {
+            if records.iter().any(|record| record.vendor == self.rejected) {
                 return Err(SyncError::new("http status: 400: invalid vendor"));
             }
             Ok(UploadResponse {
@@ -972,6 +1033,7 @@ mod tests {
             _after_seq: u64,
             _exclude_host: &str,
             _limit: usize,
+            _supported_vendors: &[&str],
         ) -> Result<PullResponse, SyncError> {
             Ok(PullResponse {
                 records: Vec::new(),
@@ -1008,6 +1070,7 @@ mod tests {
             _after_seq: u64,
             _exclude_host: &str,
             _limit: usize,
+            _supported_vendors: &[&str],
         ) -> Result<PullResponse, SyncError> {
             Ok(PullResponse {
                 records: Vec::new(),
@@ -1497,7 +1560,8 @@ mod tests {
             "omp",
             usage_record_with_costs("omp-a", "2026-05-18T12:00:00Z"),
         );
-        let transport = RejectOmpTransport {
+        let transport = RejectVendorTransport {
+            rejected: "omp",
             uploads: RefCell::new(Vec::new()),
         };
 
@@ -1516,6 +1580,146 @@ mod tests {
         let upload_log = crate::sync::state::load_upload_log(&cache_root);
         assert!(upload_log.contains(&("claude".to_string(), "claude-a".to_string())));
         assert!(!upload_log.contains(&("omp".to_string(), "omp-a".to_string())));
+    }
+
+    #[test]
+    fn upload_skips_any_vendor_batch_an_older_server_rejects() {
+        let cache_root = unique_temp_dir("upload-older-server-kimi");
+        populate_vendor_cache(&cache_root, "claude", "claude-a");
+        populate_vendor_cache(&cache_root, "kimi", "kimi-a");
+        populate_vendor_cache(&cache_root, "omp", "omp-a");
+        let transport = RejectVendorTransport {
+            rejected: "kimi",
+            uploads: RefCell::new(Vec::new()),
+        };
+
+        run_upload_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("upload should skip the rejected vendor and continue");
+
+        // The kimi batch was attempted and rejected, but claude before it and
+        // omp after it both uploaded.
+        let uploads = transport.uploads.borrow();
+        let vendors: Vec<&str> = uploads
+            .iter()
+            .map(|batch| batch[0].vendor.as_str())
+            .collect();
+        assert_eq!(vendors, ["claude", "kimi", "omp"]);
+        let upload_log = crate::sync::state::load_upload_log(&cache_root);
+        assert!(upload_log.contains(&("claude".to_string(), "claude-a".to_string())));
+        assert!(upload_log.contains(&("omp".to_string(), "omp-a".to_string())));
+        assert!(!upload_log.contains(&("kimi".to_string(), "kimi-a".to_string())));
+    }
+
+    #[test]
+    fn pull_preserves_cache_and_downgrades_when_older_server_rejects_new_vendor() {
+        let cache_root = unique_temp_dir("pull-older-server");
+        let existing =
+            remote_usage_record("laptop", "claude", "remote-a", "2026-05-18T12:00:00Z", 10);
+        crate::data::cache::merge_remote_records(&cache_root, "laptop", vec![existing])
+            .expect("seed remote cache");
+        crate::sync::state::save_sync_state(
+            &cache_root,
+            &crate::sync::state::SyncState {
+                schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
+                last_seen_seq: 10,
+                pull_vendors: pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS),
+                last_successful_sync: None,
+                last_error: None,
+            },
+        )
+        .expect("save pre-upgrade state");
+        let new_remote =
+            remote_usage_record("laptop", "claude", "remote-b", "2026-05-18T13:00:00Z", 20);
+        let transport = FakeTransport::new_rejecting_pull_vendor(
+            vec![PullResponse {
+                records: vec![sequenced_remote_record(11, new_remote)],
+                max_seq: 11,
+                truncated: false,
+            }],
+            "kimi",
+        );
+
+        run_pull_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("pull should fall back to the previous vendor set");
+
+        // Full set offered first, then the previous set from the stored cursor.
+        let requests = transport.pull_requests.borrow();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].3.contains(&"kimi".to_string()));
+        assert!(!requests[1].3.contains(&"kimi".to_string()));
+        assert_eq!(requests[1].0, 10);
+        // The pre-existing cached record survived and the new one merged in.
+        let mut remote_keys: Vec<String> =
+            crate::data::cache::load_remote_entries(&cache_root, None)
+                .iter()
+                .map(|record| record.dedup_key.clone())
+                .collect();
+        remote_keys.sort();
+        assert_eq!(remote_keys, ["remote-a", "remote-b"]);
+        // The fingerprint stays on the previous set so the migration retries
+        // once the server is upgraded.
+        let state = crate::sync::state::load_sync_state(&cache_root);
+        assert_eq!(
+            state.pull_vendors,
+            pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS)
+        );
+    }
+
+    #[test]
+    fn pull_migrates_vendor_fingerprint_once_server_accepts_new_vendor() {
+        let cache_root = unique_temp_dir("pull-migrate");
+        let stale = remote_usage_record("laptop", "claude", "stale-a", "2026-05-18T12:00:00Z", 10);
+        crate::data::cache::merge_remote_records(&cache_root, "laptop", vec![stale])
+            .expect("seed remote cache");
+        crate::sync::state::save_sync_state(
+            &cache_root,
+            &crate::sync::state::SyncState {
+                schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
+                last_seen_seq: 10,
+                pull_vendors: pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS),
+                last_successful_sync: None,
+                last_error: None,
+            },
+        )
+        .expect("save pre-upgrade state");
+        let refetched =
+            remote_usage_record("laptop", "kimi", "remote-kimi", "2026-05-18T13:00:00Z", 20);
+        let transport = FakeTransport::new(vec![PullResponse {
+            records: vec![sequenced_remote_record(12, refetched)],
+            max_seq: 12,
+            truncated: false,
+        }]);
+
+        run_pull_once_with_progress(
+            &cache_root,
+            &enabled_config("workstation"),
+            &transport,
+            |_| {},
+        )
+        .expect("pull should migrate to the full vendor set");
+
+        // Migration refetches from the beginning and replaces the cache.
+        let requests = transport.pull_requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, 0);
+        let remote = crate::data::cache::load_remote_entries(&cache_root, None);
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].dedup_key, "remote-kimi");
+        let state = crate::sync::state::load_sync_state(&cache_root);
+        assert_eq!(
+            state.pull_vendors,
+            pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS)
+        );
     }
 
     #[test]
@@ -1742,7 +1946,7 @@ mod tests {
             &crate::sync::state::SyncState {
                 schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
                 last_seen_seq: 0,
-                pull_vendors: current_pull_state_fingerprint(),
+                pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS),
                 last_successful_sync: None,
                 last_error: None,
             },
@@ -1820,7 +2024,7 @@ mod tests {
             &crate::sync::state::SyncState {
                 schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
                 last_seen_seq: 10,
-                pull_vendors: current_pull_state_fingerprint(),
+                pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS),
                 last_successful_sync: None,
                 last_error: None,
             },
@@ -1860,13 +2064,13 @@ mod tests {
         )
         .expect("pull integrity");
 
-        assert_eq!(
-            transport.pull_requests.borrow().as_slice(),
-            &[
-                (10, String::new(), PULL_LIMIT),
-                (0, String::new(), PULL_LIMIT)
-            ]
-        );
+        let pull_seqs: Vec<u64> = transport
+            .pull_requests
+            .borrow()
+            .iter()
+            .map(|request| request.0)
+            .collect();
+        assert_eq!(pull_seqs, vec![10, 0]);
         let integrity_events = events
             .iter()
             .filter_map(|event| match event {
@@ -2073,8 +2277,9 @@ mod tests {
         )
         .expect("pull");
 
+        let (after_seq, exclude_host, limit, _) = transport.pull_requests.borrow()[0].clone();
         assert_eq!(
-            transport.pull_requests.borrow()[0],
+            (after_seq, exclude_host, limit),
             (0, String::new(), PULL_LIMIT)
         );
         assert_eq!(

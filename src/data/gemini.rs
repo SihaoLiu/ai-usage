@@ -1,8 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-
-use walkdir::WalkDir;
 
 use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
 use crate::time_utils::parse_timestamp;
@@ -127,46 +124,15 @@ fn build_dedup_key(
 }
 
 pub fn collect_usage_files(tmp_dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
-    if !tmp_dir.exists() {
-        return Vec::new();
-    }
-
-    let cutoff = max_age_days
-        .map(|days| SystemTime::now() - std::time::Duration::from_secs((days as u64 + 1) * 86400));
-
-    let mut files: Vec<PathBuf> = WalkDir::new(tmp_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            if !e.file_type().is_file() {
-                return false;
-            }
-            let path = e.path();
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let parent_name = path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            if !(parent_name == "chats"
-                && file_name.starts_with("session-")
-                && file_name.ends_with(".json"))
-            {
-                return false;
-            }
-            if let Some(cutoff_time) = cutoff
-                && let Ok(meta) = e.metadata()
-                && let Ok(mtime) = meta.modified()
-            {
-                return mtime >= cutoff_time;
-            }
-            true
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
-
-    files.sort();
-    files
+    crate::data::collect_recent_files(tmp_dir, max_age_days, |path| {
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let parent_name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        parent_name == "chats" && file_name.starts_with("session-") && file_name.ends_with(".json")
+    })
 }
 
 pub fn read_gemini_file_records(path: &Path) -> Vec<SourceUsageRecord> {

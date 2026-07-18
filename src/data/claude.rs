@@ -1,8 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-
-use walkdir::WalkDir;
 
 use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
 use crate::time_utils::parse_timestamp;
@@ -47,29 +44,7 @@ fn dirs_home() -> PathBuf {
 /// Collect all JSONL file paths under the given directory,
 /// optionally filtering by mtime (files modified within `max_age_days`).
 fn collect_jsonl_files(dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
-    let cutoff = max_age_days
-        .map(|days| SystemTime::now() - std::time::Duration::from_secs((days as u64 + 1) * 86400));
-
-    WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(move |e| {
-            if !e.file_type().is_file() {
-                return false;
-            }
-            if e.path().extension().is_none_or(|ext| ext != "jsonl") {
-                return false;
-            }
-            if let Some(cutoff_time) = cutoff
-                && let Ok(meta) = e.metadata()
-                && let Ok(mtime) = meta.modified()
-            {
-                return mtime >= cutoff_time;
-            }
-            true
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect()
+    crate::data::collect_recent_files(dir, max_age_days, crate::data::has_jsonl_extension)
 }
 
 pub fn collect_usage_files(max_age_days: Option<i64>) -> Vec<PathBuf> {

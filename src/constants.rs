@@ -420,8 +420,11 @@ pub fn fee_env_path() -> PathBuf {
 /// interactive prompt, exactly as before newer vendors existed.
 const LEGACY_FEE_VENDORS: [&str; 3] = ["claude", "codex", "gemini"];
 
-fn parse_fee_lines(content: &str) -> HashMap<String, f64> {
-    let mut fees: HashMap<String, f64> = HashMap::new();
+/// Parse fee lines into vendor -> value. A recognized key whose value fails
+/// to parse maps to `None` (present but malformed), which is distinct from
+/// the key being absent from the file entirely.
+fn parse_fee_lines(content: &str) -> HashMap<String, Option<f64>> {
+    let mut fees: HashMap<String, Option<f64>> = HashMap::new();
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -431,10 +434,8 @@ fn parse_fee_lines(content: &str) -> HashMap<String, f64> {
             let key = key.trim();
             let value = value.trim();
             for &(fee_key, vendor) in FEE_KEYS {
-                if key == fee_key
-                    && let Ok(v) = value.parse::<f64>()
-                {
-                    fees.insert(vendor.to_string(), v);
+                if key == fee_key {
+                    fees.insert(vendor.to_string(), value.parse::<f64>().ok());
                 }
             }
         }
@@ -442,19 +443,24 @@ fn parse_fee_lines(content: &str) -> HashMap<String, f64> {
     fees
 }
 
-/// Interpret the parsed fee keys. `None` defers to the interactive prompt
-/// (a legacy key is absent, so the file is incomplete user input); otherwise
-/// returns the fees plus the env keys of newer vendors the file does not
-/// name yet, which default to 0 until the user sets them.
+/// Interpret the parsed fee keys. `None` defers to the interactive prompt:
+/// either a legacy key is absent (incomplete user input) or any recognized
+/// key has a malformed value (silently zeroing it would discard the user's
+/// intent). Otherwise returns the fees plus the env keys of newer vendors
+/// the file does not name yet, which default to 0 until the user sets them.
 fn interpret_fee_keys(
-    fees: &HashMap<String, f64>,
+    fees: &HashMap<String, Option<f64>>,
 ) -> Option<(SubscriptionFees, Vec<&'static str>)> {
+    if fees.values().any(|value| value.is_none()) {
+        return None;
+    }
     if LEGACY_FEE_VENDORS
         .iter()
         .any(|vendor| !fees.contains_key(*vendor))
     {
         return None;
     }
+    let get = |vendor: &str| fees.get(vendor).copied().flatten().unwrap_or(0.0);
     let missing: Vec<&'static str> = FEE_KEYS
         .iter()
         .filter(|(_, vendor)| !fees.contains_key(*vendor))
@@ -462,10 +468,10 @@ fn interpret_fee_keys(
         .collect();
     Some((
         SubscriptionFees {
-            claude: fees["claude"],
-            codex: fees["codex"],
-            gemini: fees["gemini"],
-            kimi: fees.get("kimi").copied().unwrap_or(0.0),
+            claude: get("claude"),
+            codex: get("codex"),
+            gemini: get("gemini"),
+            kimi: get("kimi"),
         },
         missing,
     ))
@@ -727,38 +733,50 @@ mod tests {
     }
 
     #[test]
-    fn fee_lines_parse_ignores_comments_and_bad_values() {
+    fn fee_lines_parse_keeps_malformed_values_distinct_from_absent_keys() {
         let parsed = parse_fee_lines(
             "# switched to Max plan in June\nCLAUDE_MONTHLY_FEE=$200\nCODEX_MONTHLY_FEE=200\nGEMINI_MONTHLY_FEE=19.99\nUNRELATED=5\n",
         );
-        assert_eq!(parsed.len(), 2);
-        assert!(!parsed.contains_key("claude"));
-        assert!((parsed["codex"] - 200.0).abs() < f64::EPSILON);
-        assert!((parsed["gemini"] - 19.99).abs() < f64::EPSILON);
+        assert_eq!(parsed.len(), 3);
+        // A recognized key with an unparsable value is present-but-malformed,
+        // not absent: it must never be treated as a missing newer vendor.
+        assert_eq!(parsed["claude"], None);
+        assert_eq!(parsed["codex"], Some(200.0));
+        assert_eq!(parsed["gemini"], Some(19.99));
+        assert!(!parsed.contains_key("kimi"));
     }
 
     #[test]
-    fn fee_keys_missing_a_legacy_vendor_defer_to_the_prompt() {
+    fn fee_keys_missing_a_legacy_vendor_or_malformed_defer_to_the_prompt() {
         let mut fees = HashMap::new();
-        fees.insert("codex".to_string(), 200.0);
-        fees.insert("gemini".to_string(), 19.99);
+        fees.insert("codex".to_string(), Some(200.0));
+        fees.insert("gemini".to_string(), Some(19.99));
         assert!(interpret_fee_keys(&fees).is_none());
         assert!(interpret_fee_keys(&HashMap::new()).is_none());
+
+        // Any malformed value defers to the prompt, kimi included: silently
+        // pinning it to 0 would discard the user's intended fee.
+        let mut malformed_kimi = HashMap::new();
+        malformed_kimi.insert("claude".to_string(), Some(100.0));
+        malformed_kimi.insert("codex".to_string(), Some(200.0));
+        malformed_kimi.insert("gemini".to_string(), Some(19.99));
+        malformed_kimi.insert("kimi".to_string(), None);
+        assert!(interpret_fee_keys(&malformed_kimi).is_none());
     }
 
     #[test]
     fn fee_keys_missing_only_newer_vendors_load_with_zero() {
         let mut fees = HashMap::new();
-        fees.insert("claude".to_string(), 100.0);
-        fees.insert("codex".to_string(), 200.0);
-        fees.insert("gemini".to_string(), 19.99);
+        fees.insert("claude".to_string(), Some(100.0));
+        fees.insert("codex".to_string(), Some(200.0));
+        fees.insert("gemini".to_string(), Some(19.99));
 
         let (loaded, missing) = interpret_fee_keys(&fees).expect("legacy-complete file loads");
         assert!((loaded.claude - 100.0).abs() < f64::EPSILON);
         assert!((loaded.kimi - 0.0).abs() < f64::EPSILON);
         assert_eq!(missing, vec!["KIMI_MONTHLY_FEE"]);
 
-        fees.insert("kimi".to_string(), 40.0);
+        fees.insert("kimi".to_string(), Some(40.0));
         let (loaded, missing) = interpret_fee_keys(&fees).expect("complete file loads");
         assert!((loaded.kimi - 40.0).abs() < f64::EPSILON);
         assert!(missing.is_empty());

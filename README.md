@@ -14,19 +14,19 @@ A fast terminal dashboard for tracking token usage and costs across **Claude Cod
 
 ## Install
 
-### Option 1: Download binary
+### Option 1: Install and start
 
-Download the pre-built binary for your platform from [Releases](https://github.com/SihaoLiu/ai-usage/releases):
+```bash
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/SihaoLiu/ai-usage/main/scripts/install.sh)"
+```
 
-| Platform | Asset |
-|----------|-------|
-| Linux x86_64 (musl, fully static) | `ai-usage-x86_64-linux-musl` |
-| Linux aarch64 (musl, fully static) | `ai-usage-aarch64-linux-musl` |
-| Linux x86_64 (glibc) | `ai-usage-x86_64-linux-gnu` |
-| Linux aarch64 (glibc) | `ai-usage-aarch64-linux-gnu` |
-| macOS Apple Silicon | `ai-usage-aarch64-apple-darwin` |
+The installer detects Linux x86_64, Linux aarch64, or Apple Silicon; downloads
+the matching latest release; installs it to `~/.local/bin/ai-usage`; and
+starts the dashboard immediately. It prints a PATH reminder when needed.
 
-Place it anywhere in your `$PATH` and `chmod +x` it. Once installed, you can keep it up to date by typing `update` in monitor mode, or by starting monitor mode with `--auto-update` for periodic checks.
+Set `AI_USAGE_INSTALL_DIR` to install elsewhere, or `AI_USAGE_VERSION` to a
+specific tag such as `v3.0.0`. Once installed, type `update` in monitor mode
+or use `--auto-update` for periodic self-updates.
 
 ### Option 2: Build from source
 

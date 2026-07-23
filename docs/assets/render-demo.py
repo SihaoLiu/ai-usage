@@ -31,6 +31,7 @@ KEY_PAGE_UP = "\x1b[5~"
 KEY_PAGE_DOWN = "\x1b[6~"
 KEY_PLUS = "+"
 KEY_MINUS = "-"
+KEY_HELP = "h\r"
 KEY_CTRL_C = "\x03"
 
 
@@ -418,17 +419,14 @@ def build_demo_events(duration=5.0, step_interval=0.1):
     at = 0.8
 
     for key, count in [
-        (KEY_RIGHT, 10),
-        (KEY_LEFT, 5),
-        (KEY_PAGE_UP, 10),
-        (KEY_PAGE_DOWN, 5),
-        (KEY_PLUS, 3),
-        (KEY_MINUS, 3),
+        (KEY_RIGHT, 15),
+        (KEY_LEFT, 15),
     ]:
         for _ in range(count):
             events.append(InputEvent(round(at, 3), key))
             at += step_interval
 
+    events.append(InputEvent(round(at, 3), KEY_HELP))
     events.append(InputEvent(duration, KEY_CTRL_C))
     return sorted(events, key=lambda event: event.at)
 
@@ -444,6 +442,19 @@ def termios_tiocswinsz():
     return termios.TIOCSWINSZ
 
 
+def monitor_environment(columns, rows):
+    env = os.environ.copy()
+    env.pop("NO_COLOR", None)
+    env.update(
+        {
+            "COLUMNS": str(columns),
+            "LINES": str(rows),
+            "TERM": "xterm-256color",
+        }
+    )
+    return env
+
+
 def spawn_monitor(repo_root, columns, rows, vendor, days):
     binary = repo_root / "target" / "release" / "ai-usage"
     if not binary.exists():
@@ -451,14 +462,7 @@ def spawn_monitor(repo_root, columns, rows, vendor, days):
 
     pid, master_fd = pty.fork()
     if pid == 0:
-        env = os.environ.copy()
-        env.update(
-            {
-                "COLUMNS": str(columns),
-                "LINES": str(rows),
-                "TERM": "xterm-256color",
-            }
-        )
+        env = monitor_environment(columns, rows)
         os.chdir(repo_root)
         cmd = [str(binary), "--tool", vendor, "--days", str(days)]
         try:

@@ -51,18 +51,22 @@ class RenderDemoTests(unittest.TestCase):
         events = self.render_demo.build_demo_events(duration=5.0, step_interval=0.1)
 
         expected_sequence = (
-            [self.render_demo.KEY_RIGHT] * 10
-            + [self.render_demo.KEY_LEFT] * 5
-            + [self.render_demo.KEY_PAGE_UP] * 10
-            + [self.render_demo.KEY_PAGE_DOWN] * 5
-            + [self.render_demo.KEY_PLUS] * 3
-            + [self.render_demo.KEY_MINUS] * 3
+            [self.render_demo.KEY_RIGHT] * 15
+            + [self.render_demo.KEY_LEFT] * 15
+            + [self.render_demo.KEY_HELP]
             + [self.render_demo.KEY_CTRL_C]
         )
 
         self.assertEqual([event.data for event in events], expected_sequence)
+        self.assertEqual(self.render_demo.KEY_HELP, "h\r")
         self.assertEqual(events[-1].data, self.render_demo.KEY_CTRL_C)
         self.assertAlmostEqual(events[-1].at, 5.0)
+
+    def test_recording_environment_enables_terminal_colors(self):
+        environment = self.render_demo.monitor_environment(columns=196, rows=54)
+
+        self.assertEqual(environment["TERM"], "xterm-256color")
+        self.assertNotIn("NO_COLOR", environment)
 
     def test_terminal_screen_handles_clear_line_and_cursor_home(self):
         screen = self.render_demo.TerminalScreen(columns=10, rows=3)

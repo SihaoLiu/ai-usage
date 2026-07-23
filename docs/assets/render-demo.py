@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import codecs
 import errno
 import fcntl
 import os
@@ -101,6 +102,7 @@ class TerminalScreen:
         self.bold = False
         self.pending = ""
         self.pending_wrap = False
+        self.utf8_decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.cells = [[self.blank_cell() for _ in range(columns)] for _ in range(rows)]
 
     def blank_cell(self):
@@ -108,7 +110,7 @@ class TerminalScreen:
 
     def feed(self, data):
         if isinstance(data, bytes):
-            text = data.decode("utf-8", errors="replace")
+            text = self.utf8_decoder.decode(data)
         else:
             text = data
 

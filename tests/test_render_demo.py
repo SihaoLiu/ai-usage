@@ -89,6 +89,17 @@ class RenderDemoTests(unittest.TestCase):
         self.assertEqual(line.cells[1].fg, self.render_demo.PALETTE[1])
         self.assertEqual(line.cells[2].fg, self.render_demo.DEFAULT_FG)
 
+    def test_terminal_screen_keeps_a_split_braille_utf8_sequence_intact(self):
+        screen = self.render_demo.TerminalScreen(columns=5, rows=1)
+        encoded = "⣿".encode("utf-8")
+
+        screen.feed(encoded[:1])
+        screen.feed(encoded[1:])
+
+        line = screen.render_lines()[0]
+        self.assertEqual(line.text[0], "⣿")
+        self.assertNotIn("\ufffd", line.text)
+
 
 if __name__ == "__main__":
     unittest.main()

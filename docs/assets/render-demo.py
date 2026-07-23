@@ -319,6 +319,19 @@ def find_font(repo_root, name):
     raise SystemExit("No monospace font found; pass --font PATH")
 
 
+def load_braille_font(font_size):
+    path = Path("/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf")
+    if not path.exists():
+        raise SystemExit("No font with Braille glyphs found for chart rendering")
+    return ImageFont.truetype(str(path), max(1, round(font_size * 10 / 12)))
+
+
+def font_for_cell(char, normal, bold_font, braille, *, bold):
+    if "\u2800" <= char <= "\u28ff":
+        return braille
+    return bold_font if bold else normal
+
+
 def parse_sgr(params, fg, bold):
     if not params:
         return DEFAULT_FG, False
@@ -377,6 +390,7 @@ def font_metrics(normal):
 
 def render_screen_image(screen, font_path, font_size, padding):
     normal, bold = load_fonts(font_path, font_size)
+    braille = load_braille_font(font_size)
     char_width, line_height = font_metrics(normal)
     width = padding * 2 + screen.columns * char_width
     height = padding * 2 + screen.rows * line_height
@@ -388,7 +402,7 @@ def render_screen_image(screen, font_path, font_size, padding):
         for col_index, cell in enumerate(line.cells):
             if cell.char == " ":
                 continue
-            font = bold if cell.bold else normal
+            font = font_for_cell(cell.char, normal, bold, braille, bold=cell.bold)
             draw.text(
                 (padding + col_index * char_width, y),
                 cell.char,

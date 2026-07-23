@@ -28,6 +28,25 @@ class RenderDemoTests(unittest.TestCase):
     def test_frame_duration_uses_playback_speed(self):
         self.assertEqual(self.render_demo.frame_duration_ms(fps=8.0, speed=3.0), 42)
 
+    def test_braille_cells_use_the_dedicated_symbol_font(self):
+        normal, bold = self.render_demo.load_fonts(
+            self.render_demo.find_font(Path.cwd(), None), 12
+        )
+        braille = self.render_demo.load_braille_font(12)
+
+        self.assertIs(
+            self.render_demo.font_for_cell("⣿", normal, bold, braille, bold=False),
+            braille,
+        )
+        self.assertIs(
+            self.render_demo.font_for_cell("A", normal, bold, braille, bold=False),
+            normal,
+        )
+        self.assertNotEqual(
+            bytes(braille.getmask("⣿")),
+            bytes(braille.getmask("\ufffd")),
+        )
+
     def test_demo_events_match_viewport_navigation_sequence(self):
         events = self.render_demo.build_demo_events(duration=5.0, step_interval=0.1)
 

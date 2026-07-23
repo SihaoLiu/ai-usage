@@ -1,41 +1,8 @@
 use crate::constants::SubscriptionFees;
-use crate::model_id::{parse_model_identity, short_label};
-use crate::model_overrides;
 use crate::stats::ModelBreakdownRow;
-use crate::tool::Tool;
-
-/// Get short display name for a model.
-///
-/// Resolution order: user override file (`models.toml`) wins, otherwise the
-/// label is derived algorithmically from the id. The `_tool` hint is unused
-/// on purpose -- the parser infers the provider from the id itself, which is
-/// this lets tool logs that carry a real `provider/` prefix and freshly
-/// released models render correctly with no code change.
-pub fn get_short_model_name(model: &str, _tool: &str) -> String {
-    if let Some(label) = model_overrides::load().display.get(model) {
-        return label.clone();
-    }
-    short_label(&parse_model_identity(model))
-}
-
-fn format_model_name_with_tool_prefix(
-    model: &str,
-    tool: &str,
-    show_tool_prefix: bool,
-    use_short_name: bool,
-    prefix_width: usize,
-) -> String {
-    let name = if use_short_name {
-        get_short_model_name(model, tool)
-    } else {
-        model.to_string()
-    };
-    if !show_tool_prefix {
-        return name;
-    }
-    let display_tool = Tool::from_key(tool).map(Tool::display_name).unwrap_or(tool);
-    format!("{:<width$}: {}", display_tool, name, width = prefix_width)
-}
+use crate::table_view::{
+    DataRow, DisplayRow, RowMetrics, TableView, build_table, table_totals,
+};
 
 fn fit_text_to_width(text: &str, width: usize) -> String {
     if text.len() <= width {
@@ -155,10 +122,6 @@ pub fn format_cost_per_mtok(value: f64) -> String {
 // ROW_PCT_COLOR: token type's share within a single model/row (row direction, marked with ←).
 const COL_PCT_COLOR: &str = "\x1b[36m"; // cyan
 const ROW_PCT_COLOR: &str = "\x1b[33m"; // yellow
-const WATERMARK_COLOR: &str = "\x1b[38;5;240m"; // muted gray for background watermark
-const INTEGRITY_CHECKING_COLOR: &str = "\x1b[38;5;143m"; // muted yellow
-const INTEGRITY_CHECKED_COLOR: &str = "\x1b[38;5;108m"; // muted green
-const INTEGRITY_FAILED_COLOR: &str = "\x1b[38;5;203m"; // muted red
 const COLOR_RESET: &str = "\x1b[0m";
 
 /// Format a remaining duration as a zero-padded `HH:MM:SS` countdown string.
@@ -168,51 +131,6 @@ pub fn format_countdown(remaining: std::time::Duration) -> String {
     let minutes = (total % 3600) / 60;
     let seconds = total % 60;
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-}
-
-/// Watermark text shown as a dimmed placeholder in the monitor-mode prompt.
-/// Returns `(colored_string, visible_width)`. The visible width is needed by
-/// callers so they can move the cursor back over the watermark after rendering it.
-/// When `refresh_in` is `Some`, a `refresh in HH:MM:SS` countdown is woven into
-/// the text so the user can see how long until the next auto-refresh.
-pub fn prompt_watermark(refresh_in: Option<std::time::Duration>) -> (String, usize) {
-    let text = match refresh_in {
-        Some(remaining) => format!(
-            "ai-usage by SihaoLiu, v{}, refresh in {}, enter h or help for usage",
-            env!("CARGO_PKG_VERSION"),
-            format_countdown(remaining)
-        ),
-        None => format!(
-            "ai-usage by SihaoLiu, v{}, enter h or help for usage",
-            env!("CARGO_PKG_VERSION")
-        ),
-    };
-    prompt_placeholder(&text)
-}
-
-pub fn prompt_placeholder(text: &str) -> (String, usize) {
-    colored_prompt_placeholder(text, WATERMARK_COLOR)
-}
-
-pub fn integrity_checking_marker() -> (String, usize) {
-    colored_prompt_placeholder("Integrity Checking", INTEGRITY_CHECKING_COLOR)
-}
-
-pub fn integrity_checked_marker(duration: &str) -> (String, usize) {
-    colored_prompt_placeholder(
-        &format!("Integrity Checked in {duration}"),
-        INTEGRITY_CHECKED_COLOR,
-    )
-}
-
-pub fn integrity_failed_marker() -> (String, usize) {
-    colored_prompt_placeholder("Integrity Failed", INTEGRITY_FAILED_COLOR)
-}
-
-fn colored_prompt_placeholder(text: &str, color: &str) -> (String, usize) {
-    let visible = text.chars().count();
-    let colored = format!("{}{}{}", color, text, COLOR_RESET);
-    (colored, visible)
 }
 
 fn pad_left(visible_len: usize, width: usize) -> String {
@@ -396,20 +314,6 @@ fn format_cost_with_row_pct(cost: f64, row_total: f64, width: usize) -> String {
     format_cost_for_width(cost, width)
 }
 
-fn model_api_cost(stats: &ModelBreakdownRow) -> f64 {
-    stats.input_cost + stats.output_cost + stats.cache_read_cost + stats.cache_creation_cost
-}
-
-fn model_cost_per_mtok(stats: &ModelBreakdownRow) -> f64 {
-    let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
-    let total_tokens = cache_hit + prefill + decoding;
-    if total_tokens > 0 {
-        model_api_cost(stats) / (total_tokens as f64 / 1_000_000.0)
-    } else {
-        0.0
-    }
-}
-
 fn format_model_cost_with_col_pct(cost: f64, total_cost: f64, width: usize) -> String {
     let col_pct = if total_cost > 0.0 {
         cost / total_cost * 100.0
@@ -480,61 +384,90 @@ pub fn get_table_display_mode(
 pub fn get_table_width(mode: &str) -> usize {
     match mode {
         "full" => 198,
-        "medium" => 126,
+        "medium" => 128,
         "compact" => 72,
         "minimal" => 54,
         _ => 0,
     }
 }
 
-/// Get strategy totals for a model breakdown row.
-fn get_strategy_totals(stats: &ModelBreakdownRow) -> (i64, i64, i64) {
-    let cache_hit = stats.cache_read;
-    match stats.tool.as_str() {
-        "claude" | "kimi" | "omp" => {
-            let prefill = stats.input + stats.cache_creation;
-            let decoding = stats.output;
-            (cache_hit, prefill, decoding)
-        }
-        "codex" => {
-            let prefill = stats.input;
-            let decoding = stats.output + stats.reasoning;
-            (cache_hit, prefill, decoding)
-        }
-        "gemini" => {
-            let prefill = stats.input;
-            let decoding = stats.output + stats.thinking;
-            (cache_hit, prefill, decoding)
-        }
-        _ => (cache_hit, stats.input, stats.output),
+/// Sub-column widths inside the leading name area of a table row. The name
+/// area always renders to `total` visible characters; `vendor`/`harness` are
+/// zero when that sub-column is hidden for the current mode.
+struct NameLayout {
+    vendor: usize,
+    model: usize,
+    harness: usize,
+    total: usize,
+}
+
+fn name_layout(mode: &str, show_harness: bool) -> NameLayout {
+    match (mode, show_harness) {
+        ("full", true) => NameLayout {
+            vendor: 9,
+            model: 27,
+            harness: 12,
+            total: 50,
+        },
+        ("full", false) => NameLayout {
+            vendor: 9,
+            model: 40,
+            harness: 0,
+            total: 50,
+        },
+        ("medium", true) => NameLayout {
+            vendor: 9,
+            model: 14,
+            harness: 6,
+            total: 31,
+        },
+        ("medium", false) => NameLayout {
+            vendor: 9,
+            model: 21,
+            harness: 0,
+            total: 31,
+        },
+        _ => NameLayout {
+            vendor: 0,
+            model: 12,
+            harness: 0,
+            total: 12,
+        },
     }
 }
 
-/// Get strategy costs grouped by buckets for display.
-fn get_strategy_costs(
-    input_cost: f64,
-    output_cost: f64,
-    cache_output_cost: f64,
-    cache_input_cost: f64,
-    tool: &str,
-) -> (f64, f64, f64) {
-    let cache_hit_cost = cache_input_cost;
-    match tool {
-        "claude" | "kimi" | "omp" => {
-            let prefill_cost = input_cost + cache_output_cost;
-            let decoding_cost = output_cost;
-            (cache_hit_cost, prefill_cost, decoding_cost)
-        }
-        _ => {
-            let prefill_cost = input_cost;
-            let decoding_cost = output_cost + cache_output_cost;
-            (cache_hit_cost, prefill_cost, decoding_cost)
-        }
+fn cell(text: &str, width: usize) -> String {
+    format!("{:<w$}", fit_text_to_width(text, width), w = width)
+}
+
+/// Compose the vendor / model / harness sub-columns into one fixed-width
+/// name-area string.
+fn compose_name(l: &NameLayout, vendor: &str, model: &str, harness: &str) -> String {
+    let mut s = String::with_capacity(l.total);
+    if l.vendor > 0 {
+        s.push_str(&cell(vendor, l.vendor));
+        s.push(' ');
+    }
+    s.push_str(&cell(model, l.model));
+    if l.harness > 0 {
+        s.push(' ');
+        s.push_str(&cell(harness, l.harness));
+    }
+    s
+}
+
+/// Single-column row label for the narrow (compact/minimal) layouts: the
+/// harness tag is folded into the label because there is no room for columns.
+fn narrow_name(row: &DataRow, show_harness: bool, view: TableView) -> String {
+    if show_harness && view != TableView::Model {
+        format!("{}:{}", row.harness_short, row.model_label)
+    } else {
+        row.model_label.clone()
     }
 }
 
-/// Print model breakdown table with responsive formatting.
-/// Returns true if table was printed, false if hidden.
+/// Print the usage breakdown table with responsive formatting.
+/// Returns true if the table was printed, false if hidden.
 pub fn print_model_breakdown(
     model_stats: &[ModelBreakdownRow],
     days_in_data: f64,
@@ -542,170 +475,52 @@ pub fn print_model_breakdown(
     terminal_height: Option<u16>,
     tool: &str,
     subscription_fees: &SubscriptionFees,
+    view: TableView,
 ) -> bool {
-    // Calculate sums
-    let mut sum_messages: i64 = 0;
-    let mut sum_cache_hit: i64 = 0;
-    let mut sum_prefill: i64 = 0;
-    let mut sum_decoding: i64 = 0;
-    let mut sum_total_with_cache: i64 = 0;
+    let show_harness = tool == "all";
+    let rows = build_table(model_stats, view);
+    let totals = table_totals(model_stats);
 
-    for stats in model_stats {
-        sum_messages += stats.count;
-        let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
-        sum_cache_hit += cache_hit;
-        sum_prefill += prefill;
-        sum_decoding += decoding;
-        sum_total_with_cache += cache_hit + prefill + decoding;
-    }
-
-    // Display every model row; the sums above already cover the full data set.
-    let display_stats: Vec<&ModelBreakdownRow> = model_stats.iter().collect();
-
-    // Determine display mode
     let mode = match (terminal_width, terminal_height) {
-        (Some(w), Some(h)) => get_table_display_mode(w, h, display_stats.len()),
+        (Some(w), Some(h)) => get_table_display_mode(w, h, rows.len()),
         _ => "full",
     };
-
     if mode == "hidden" {
         return false;
     }
 
-    // Calculate costs from ALL rows (not just displayed ones)
-    let mut cache_hit_cost: f64 = 0.0;
-    let mut prefill_cost: f64 = 0.0;
-    let mut decoding_cost: f64 = 0.0;
-
     let subscription_price = subscription_fees.get(tool);
-
-    for stats in model_stats {
-        // Costs are pre-computed per-entry during aggregation (so tiered
-        // pricing for Claude 1M-context models is correct), so we just
-        // re-bucket the four components into the display strategy.
-        let (row_ch, row_pf, row_dc) = get_strategy_costs(
-            stats.input_cost,
-            stats.output_cost,
-            stats.cache_creation_cost,
-            stats.cache_read_cost,
-            &stats.tool,
-        );
-        cache_hit_cost += row_ch;
-        prefill_cost += row_pf;
-        decoding_cost += row_dc;
-    }
-
-    let total_cost = cache_hit_cost + prefill_cost + decoding_cost;
-
-    let show_tool_prefix = tool == "all";
-
     let tw = terminal_width.unwrap_or(200) as usize;
 
-    // Print table based on mode (display rows only, sums include all data)
     match mode {
-        "full" => print_table_full(
-            &display_stats,
-            sum_messages,
-            sum_cache_hit,
-            sum_prefill,
-            sum_decoding,
-            sum_total_with_cache,
-            total_cost,
-            cache_hit_cost,
-            prefill_cost,
-            decoding_cost,
-            tool,
-            show_tool_prefix,
-            tw,
-        ),
-        "medium" => print_table_medium(
-            &display_stats,
-            sum_messages,
-            sum_cache_hit,
-            sum_prefill,
-            sum_decoding,
-            sum_total_with_cache,
-            total_cost,
-            cache_hit_cost,
-            prefill_cost,
-            decoding_cost,
-            tool,
-            show_tool_prefix,
-            tw,
-        ),
-        "compact" => print_table_compact(
-            &display_stats,
-            sum_messages,
-            sum_cache_hit,
-            sum_prefill,
-            sum_decoding,
-            sum_total_with_cache,
-            total_cost,
-            cache_hit_cost,
-            prefill_cost,
-            decoding_cost,
-            tool,
-            show_tool_prefix,
-            tw,
-        ),
-        "minimal" => print_table_minimal(
-            &display_stats,
-            sum_messages,
-            sum_cache_hit,
-            sum_prefill,
-            sum_decoding,
-            sum_total_with_cache,
-            total_cost,
-            cache_hit_cost,
-            prefill_cost,
-            decoding_cost,
-            tool,
-            show_tool_prefix,
-            tw,
-        ),
+        "full" | "medium" => print_table_rich(mode, &rows, &totals, show_harness, view, tw),
+        "compact" => print_table_compact(&rows, &totals, show_harness, view, tw),
+        "minimal" => print_table_minimal(&rows, &totals, show_harness, view, tw),
         _ => {}
     }
 
     // Print cost summary
-    let daily_cost = if days_in_data > 0.0 {
-        total_cost / days_in_data
-    } else {
-        0.0
-    };
-    let weekly_cost = daily_cost * 7.0;
-    let monthly_cost = daily_cost * 30.0;
-    let savings = monthly_cost - subscription_price;
-    let monthly_tokens = if days_in_data > 0.0 {
-        (sum_total_with_cache as f64 / days_in_data) * 30.0
-    } else {
-        0.0
-    };
-    let cost_per_mtok = if monthly_tokens > 0.0 {
-        subscription_price / (monthly_tokens / 1_000_000.0)
-    } else {
-        0.0
-    };
-
+    let summary = crate::table_view::cost_summary(&totals, days_in_data, subscription_price);
     let table_width = get_table_width(mode);
     let cost_pad = center_pad(tw, table_width);
 
     if mode == "full" || mode == "medium" {
         let line = format!(
             "Daily: ${:.2}, Weekly: ${:.2}, Monthly(30d): ${:.2}, Monthly Saving ${:.2}, {} / MTok",
-            daily_cost,
-            weekly_cost,
-            monthly_cost,
-            savings,
-            format_cost_per_mtok(cost_per_mtok)
+            summary.daily,
+            summary.weekly,
+            summary.monthly,
+            summary.savings,
+            format_cost_per_mtok(summary.subscription_rate)
         );
         println!("{}{}", cost_pad, line);
-        if let Some(line) = top_model_insight_line(&display_stats, total_cost, show_tool_prefix) {
+        if let Some(line) = top_model_insight_line(&rows, summary.total_cost, show_harness) {
             println!("{}{}", cost_pad, fit_text_to_width(&line, table_width));
         }
     } else {
         let line = format!(
             "Daily: ${:.2}, Monthly: ${:.2}, Saving: ${:.2}",
-            daily_cost, monthly_cost, savings
+            summary.daily, summary.monthly, summary.savings
         );
         println!("{}{}", cost_pad, line);
     }
@@ -713,45 +528,35 @@ pub fn print_model_breakdown(
     true
 }
 
-fn top_model_insight_line(
-    model_stats: &[&ModelBreakdownRow],
-    total_cost: f64,
-    show_tool_prefix: bool,
-) -> Option<String> {
-    let top_spend = model_stats
-        .iter()
-        .copied()
-        .max_by(|a, b| model_api_cost(a).total_cmp(&model_api_cost(b)))?;
-    let highest_rate = model_stats
-        .iter()
-        .copied()
-        .filter(|row| {
-            let (cache_hit, prefill, decoding) = get_strategy_totals(row);
-            cache_hit + prefill + decoding > 0
-        })
-        .max_by(|a, b| model_cost_per_mtok(a).total_cmp(&model_cost_per_mtok(b)))?;
+fn data_rows(rows: &[DisplayRow]) -> impl Iterator<Item = &DataRow> {
+    rows.iter().filter_map(|row| match row {
+        DisplayRow::Data(d) => Some(d.as_ref()),
+        _ => None,
+    })
+}
 
-    let spend_name = fit_text_to_width(
-        &format_model_name_with_tool_prefix(
-            &top_spend.model,
-            &top_spend.tool,
-            show_tool_prefix,
-            true,
-            0,
-        ),
-        28,
-    );
-    let rate_name = fit_text_to_width(
-        &format_model_name_with_tool_prefix(
-            &highest_rate.model,
-            &highest_rate.tool,
-            show_tool_prefix,
-            true,
-            0,
-        ),
-        28,
-    );
-    let spend = model_api_cost(top_spend);
+pub(crate) fn top_model_insight_line(
+    rows: &[DisplayRow],
+    total_cost: f64,
+    show_harness: bool,
+) -> Option<String> {
+    let top_spend = data_rows(rows).max_by(|a, b| a.metrics.cost().total_cmp(&b.metrics.cost()))?;
+    let highest_rate = data_rows(rows)
+        .filter(|d| d.metrics.tokens() > 0)
+        .max_by(|a, b| {
+            a.metrics
+                .cost_per_mtok()
+                .total_cmp(&b.metrics.cost_per_mtok())
+        })?;
+
+    let name = |d: &DataRow| {
+        if show_harness {
+            format!("{} ({})", d.model_label, d.harness_short)
+        } else {
+            d.model_label.clone()
+        }
+    };
+    let spend = top_spend.metrics.cost();
     let spend_pct = if total_cost > 0.0 {
         spend / total_cost * 100.0
     } else {
@@ -760,11 +565,11 @@ fn top_model_insight_line(
 
     Some(format!(
         "Top spend: {} {} ({:.0}%) | Highest rate: {} {} / MTok",
-        spend_name,
+        fit_text_to_width(&name(top_spend), 28),
         format_cost_compact(spend),
         spend_pct,
-        rate_name,
-        format_cost_per_mtok(model_cost_per_mtok(highest_rate))
+        fit_text_to_width(&name(highest_rate), 28),
+        format_cost_per_mtok(highest_rate.metrics.cost_per_mtok())
     ))
 }
 
@@ -777,308 +582,227 @@ pub fn center_pad(terminal_width: usize, content_width: usize) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn print_table_full(
-    model_stats: &[&ModelBreakdownRow],
-    sum_messages: i64,
-    sum_cache_hit: i64,
-    sum_prefill: i64,
-    sum_decoding: i64,
-    sum_total_with_cache: i64,
-    total_cost: f64,
-    cache_hit_cost: f64,
-    prefill_cost: f64,
-    decoding_cost: f64,
-    _tool: &str,
-    show_tool_prefix: bool,
-    terminal_width: usize,
-) {
-    let w_model = 35;
-    let w_msgs = 18;
-    let w_cache = 26;
-    let w_cost = 16;
-    let w_rate = 12;
-    let table_width = get_table_width("full");
-    let p = center_pad(terminal_width, table_width);
-    println!();
-    println!(
-        "{}{:^width$}",
-        p,
-        "Usage / API Cost by Model",
-        width = table_width
-    );
-    println!("{}{}", p, "=".repeat(table_width));
-    println!("{}{}", p, dual_pct_legend(table_width));
-
-    println!(
-        "{}| {:<wm$} {:>wn$} | {:>wc$} {:>wc$} {:>wc$} {:>wc$} {:>wcost$} {:>wrate$} |",
-        p,
-        "Model",
-        "Messages",
-        "Cache Hit",
-        "Prefill",
-        "Decoding",
-        "Total",
-        "Cost",
-        "$/MTok",
-        wm = w_model,
-        wn = w_msgs,
-        wc = w_cache,
-        wcost = w_cost,
-        wrate = w_rate,
-    );
-    println!("{}|{}|", p, "-".repeat(table_width - 2));
-
-    for stats in model_stats {
-        let effective_tool = &stats.tool;
-        let model_name = fit_text_to_width(
-            &format_model_name_with_tool_prefix(
-                &stats.model,
-                effective_tool,
-                show_tool_prefix,
-                false,
-                0,
-            ),
-            w_model,
-        );
-        let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
-        let row_total = cache_hit + prefill + decoding;
-        let row_cost = model_api_cost(stats);
-        println!(
-            "{}| {:<wm$} {} | {} {} {} {} {} {} |",
-            p,
-            model_name,
-            format_with_col_pct(stats.count, sum_messages, w_msgs),
-            format_with_dual_pct(cache_hit, sum_cache_hit, row_total, w_cache, false),
-            format_with_dual_pct(prefill, sum_prefill, row_total, w_cache, false),
-            format_with_dual_pct(decoding, sum_decoding, row_total, w_cache, false),
-            format_with_dual_pct(row_total, sum_total_with_cache, row_total, w_cache, false),
-            format_model_cost_with_col_pct(row_cost, total_cost, w_cost),
-            format_rate_for_width(model_cost_per_mtok(stats), w_rate),
-            wm = w_model,
-        );
-    }
-
-    println!("{}|{}|", p, "-".repeat(table_width - 2));
-    println!(
-        "{}| {:<wm$} {} | {} {} {} {} {} {} |",
-        p,
-        "TOTAL",
-        format_with_col_pct(sum_messages, sum_messages, w_msgs),
-        format_with_dual_pct(
-            sum_cache_hit,
-            sum_cache_hit,
-            sum_total_with_cache,
-            w_cache,
-            false
-        ),
-        format_with_dual_pct(
-            sum_prefill,
-            sum_prefill,
-            sum_total_with_cache,
-            w_cache,
-            false
-        ),
-        format_with_dual_pct(
-            sum_decoding,
-            sum_decoding,
-            sum_total_with_cache,
-            w_cache,
-            false
-        ),
-        format_with_dual_pct(
-            sum_total_with_cache,
-            sum_total_with_cache,
-            sum_total_with_cache,
-            w_cache,
-            false
-        ),
-        format_model_cost_with_col_pct(total_cost, total_cost, w_cost),
-        format_rate_for_width(
-            if sum_total_with_cache > 0 {
-                total_cost / (sum_total_with_cache as f64 / 1_000_000.0)
-            } else {
-                0.0
-            },
-            w_rate
-        ),
-        wm = w_model,
-    );
-
-    println!(
-        "{}| {:<wm$} {:>wn$} | {} {} {} {} {} {} |",
-        p,
-        "Cost(API)",
-        "",
-        format_cost_with_row_pct(cache_hit_cost, total_cost, w_cache),
-        format_cost_with_row_pct(prefill_cost, total_cost, w_cache),
-        format_cost_with_row_pct(decoding_cost, total_cost, w_cache),
-        format_cost_with_row_pct(total_cost, total_cost, w_cache),
-        format_cost_with_row_pct(total_cost, total_cost, w_cost),
-        format_rate_for_width(
-            if sum_total_with_cache > 0 {
-                total_cost / (sum_total_with_cache as f64 / 1_000_000.0)
-            } else {
-                0.0
-            },
-            w_rate
-        ),
-        wm = w_model,
-        wn = w_msgs,
-    );
-    println!("{}{}", p, "=".repeat(table_width));
+/// Column widths for the two wide (percent-annotated) table modes.
+struct RichLayout {
+    table_width: usize,
+    name: NameLayout,
+    w_msgs: usize,
+    w_cache: usize,
+    w_cost: usize,
+    /// Zero hides the $/MTok column (medium mode).
+    w_rate: usize,
+    compact_cells: bool,
+    raw_model: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn print_table_medium(
-    model_stats: &[&ModelBreakdownRow],
-    sum_messages: i64,
-    sum_cache_hit: i64,
-    sum_prefill: i64,
-    sum_decoding: i64,
-    sum_total_with_cache: i64,
-    total_cost: f64,
-    cache_hit_cost: f64,
-    prefill_cost: f64,
-    decoding_cost: f64,
-    _tool: &str,
-    show_tool_prefix: bool,
+fn rich_layout(mode: &str, show_harness: bool) -> RichLayout {
+    if mode == "full" {
+        RichLayout {
+            table_width: get_table_width("full"),
+            name: name_layout("full", show_harness),
+            w_msgs: 14,
+            w_cache: 24,
+            w_cost: 15,
+            w_rate: 10,
+            compact_cells: false,
+            raw_model: true,
+        }
+    } else {
+        RichLayout {
+            table_width: get_table_width("medium"),
+            name: name_layout("medium", show_harness),
+            w_msgs: 13,
+            w_cache: 15,
+            w_cost: 12,
+            w_rate: 0,
+            compact_cells: true,
+            raw_model: false,
+        }
+    }
+}
+
+fn print_table_rich(
+    mode: &str,
+    rows: &[DisplayRow],
+    totals: &RowMetrics,
+    show_harness: bool,
+    view: TableView,
     terminal_width: usize,
 ) {
-    let w_model = 22;
-    let w_msgs = 15;
-    let w_cache = 16;
-    let w_cost = 13;
-    let table_width = get_table_width("medium");
-    let p = center_pad(terminal_width, table_width);
+    let l = rich_layout(mode, show_harness);
+    let p = center_pad(terminal_width, l.table_width);
+    let total_cost = totals.cost();
+
+    let metric_cells = |m: &RowMetrics| -> (String, String, String, String, String, String) {
+        let row_total = m.tokens();
+        (
+            format_with_col_pct(m.count, totals.count, l.w_msgs),
+            format_with_dual_pct(
+                m.cache_hit,
+                totals.cache_hit,
+                row_total,
+                l.w_cache,
+                l.compact_cells,
+            ),
+            format_with_dual_pct(
+                m.prefill,
+                totals.prefill,
+                row_total,
+                l.w_cache,
+                l.compact_cells,
+            ),
+            format_with_dual_pct(
+                m.decoding,
+                totals.decoding,
+                row_total,
+                l.w_cache,
+                l.compact_cells,
+            ),
+            format_with_dual_pct(
+                row_total,
+                totals.tokens(),
+                row_total,
+                l.w_cache,
+                l.compact_cells,
+            ),
+            format_model_cost_with_col_pct(m.cost(), total_cost, l.w_cost),
+        )
+    };
+    let rate_cell = |m: &RowMetrics| {
+        if l.w_rate > 0 {
+            format!(" {}", format_rate_for_width(m.cost_per_mtok(), l.w_rate))
+        } else {
+            String::new()
+        }
+    };
 
     println!();
     println!(
         "{}{:^width$}",
         p,
-        "Usage / API Cost by Model",
-        width = table_width
+        format!("Usage / API Cost ({})", view.description()),
+        width = l.table_width
     );
-    println!("{}{}", p, "=".repeat(table_width));
-    println!("{}{}", p, dual_pct_legend(table_width));
+    println!("{}{}", p, "=".repeat(l.table_width));
+    println!("{}{}", p, dual_pct_legend(l.table_width));
 
+    let (h_msgs, h_cache, h_prefill, h_decode) = if mode == "full" {
+        ("Messages", "Cache Hit", "Prefill", "Decoding")
+    } else {
+        ("Msgs", "CacheHit", "Prefill", "Decode")
+    };
+    let rate_hdr = if l.w_rate > 0 {
+        format!(" {:>w$}", "$/MTok", w = l.w_rate)
+    } else {
+        String::new()
+    };
+    let harness_hdr = if l.name.harness >= 7 { "Harness" } else { "Via" };
     println!(
-        "{}| {:<w_model$} {:>w_msgs$} | {:>w_cache$} {:>w_cache$} {:>w_cache$} {:>w_cache$} {:>w_cost$} |",
+        "{}| {} {:>wn$} | {:>wc$} {:>wc$} {:>wc$} {:>wc$} {:>wcost$}{} |",
         p,
-        "Model",
-        "Msgs",
-        "CacheHit",
-        "Prefill",
-        "Decode",
+        compose_name(&l.name, "Vendor", "Model", harness_hdr),
+        h_msgs,
+        h_cache,
+        h_prefill,
+        h_decode,
         "Total",
         "Cost",
-        w_model = w_model,
-        w_msgs = w_msgs,
-        w_cache = w_cache,
-        w_cost = w_cost,
+        rate_hdr,
+        wn = l.w_msgs,
+        wc = l.w_cache,
+        wcost = l.w_cost,
     );
-    println!("{}|{}|", p, "-".repeat(table_width - 2));
+    println!("{}|{}|", p, "-".repeat(l.table_width - 2));
 
-    for stats in model_stats {
-        let effective_tool = &stats.tool;
-        let model_name = fit_text_to_width(
-            &format_model_name_with_tool_prefix(
-                &stats.model,
-                effective_tool,
-                show_tool_prefix,
-                true,
-                0,
-            ),
-            w_model,
-        );
-        let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
-        let row_total = cache_hit + prefill + decoding;
-        let row_cost = model_api_cost(stats);
-        println!(
-            "{}| {:<w_model$} {} | {} {} {} {} {} |",
-            p,
-            model_name,
-            format_with_col_pct(stats.count, sum_messages, w_msgs),
-            format_with_dual_pct(cache_hit, sum_cache_hit, row_total, w_cache, true),
-            format_with_dual_pct(prefill, sum_prefill, row_total, w_cache, true),
-            format_with_dual_pct(decoding, sum_decoding, row_total, w_cache, true),
-            format_with_dual_pct(row_total, sum_total_with_cache, row_total, w_cache, true),
-            format_model_cost_with_col_pct(row_cost, total_cost, w_cost),
-            w_model = w_model,
-        );
+    for row in rows {
+        match row {
+            DisplayRow::GroupHeader { vendor } => {
+                println!("{}| {:<w$} |", p, vendor, w = l.table_width - 4);
+            }
+            DisplayRow::Data(d) => {
+                let model = if l.raw_model {
+                    d.model_raw.as_str()
+                } else {
+                    d.model_label.as_str()
+                };
+                let harness = if mode == "full" {
+                    d.harness_label.as_str()
+                } else {
+                    d.harness_short.as_str()
+                };
+                let name = compose_name(&l.name, &d.vendor_label, model, harness);
+                let (msgs, ch, pf, dc, tot, cost) = metric_cells(&d.metrics);
+                println!(
+                    "{}| {} {} | {} {} {} {} {}{} |",
+                    p,
+                    name,
+                    msgs,
+                    ch,
+                    pf,
+                    dc,
+                    tot,
+                    cost,
+                    rate_cell(&d.metrics)
+                );
+            }
+            DisplayRow::Subtotal { vendor, metrics } => {
+                let name = compose_name(&l.name, vendor, "total", "");
+                let (msgs, ch, pf, dc, tot, cost) = metric_cells(metrics);
+                println!(
+                    "{}| {} {} | {} {} {} {} {}{} |",
+                    p,
+                    name,
+                    msgs,
+                    ch,
+                    pf,
+                    dc,
+                    tot,
+                    cost,
+                    rate_cell(metrics)
+                );
+            }
+        }
     }
 
-    println!("{}|{}|", p, "-".repeat(table_width - 2));
+    println!("{}|{}|", p, "-".repeat(l.table_width - 2));
+    let (msgs, ch, pf, dc, tot, cost) = metric_cells(totals);
     println!(
-        "{}| {:<w_model$} {} | {} {} {} {} {} |",
+        "{}| {} {} | {} {} {} {} {}{} |",
         p,
-        "TOTAL",
-        format_with_col_pct(sum_messages, sum_messages, w_msgs),
-        format_with_dual_pct(
-            sum_cache_hit,
-            sum_cache_hit,
-            sum_total_with_cache,
-            w_cache,
-            true
-        ),
-        format_with_dual_pct(
-            sum_prefill,
-            sum_prefill,
-            sum_total_with_cache,
-            w_cache,
-            true
-        ),
-        format_with_dual_pct(
-            sum_decoding,
-            sum_decoding,
-            sum_total_with_cache,
-            w_cache,
-            true
-        ),
-        format_with_dual_pct(
-            sum_total_with_cache,
-            sum_total_with_cache,
-            sum_total_with_cache,
-            w_cache,
-            true
-        ),
-        format_model_cost_with_col_pct(total_cost, total_cost, w_cost),
-        w_model = w_model,
+        compose_name(&l.name, "TOTAL", "", ""),
+        msgs,
+        ch,
+        pf,
+        dc,
+        tot,
+        cost,
+        rate_cell(totals)
     );
 
     println!(
-        "{}| {:<w_model$} {:>w_msgs$} | {} {} {} {} {} |",
+        "{}| {} {:>wn$} | {} {} {} {} {}{} |",
         p,
-        "Cost(API)",
+        compose_name(&l.name, "Cost(API)", "", ""),
         "",
-        format_cost_with_row_pct(cache_hit_cost, total_cost, w_cache),
-        format_cost_with_row_pct(prefill_cost, total_cost, w_cache),
-        format_cost_with_row_pct(decoding_cost, total_cost, w_cache),
-        format_cost_with_row_pct(total_cost, total_cost, w_cache),
-        format_cost_with_row_pct(total_cost, total_cost, w_cost),
-        w_model = w_model,
-        w_msgs = w_msgs,
+        format_cost_with_row_pct(totals.cache_hit_cost, total_cost, l.w_cache),
+        format_cost_with_row_pct(totals.prefill_cost, total_cost, l.w_cache),
+        format_cost_with_row_pct(totals.decoding_cost, total_cost, l.w_cache),
+        format_cost_with_row_pct(total_cost, total_cost, l.w_cache),
+        format_cost_with_row_pct(total_cost, total_cost, l.w_cost),
+        rate_cell(totals),
+        wn = l.w_msgs,
     );
-    println!("{}{}", p, "=".repeat(table_width));
+    println!("{}{}", p, "=".repeat(l.table_width));
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_table_compact(
-    model_stats: &[&ModelBreakdownRow],
-    sum_messages: i64,
-    sum_cache_hit: i64,
-    sum_prefill: i64,
-    sum_decoding: i64,
-    sum_total_with_cache: i64,
-    total_cost: f64,
-    cache_hit_cost: f64,
-    prefill_cost: f64,
-    decoding_cost: f64,
-    _tool: &str,
-    show_tool_prefix: bool,
+    rows: &[DisplayRow],
+    totals: &RowMetrics,
+    show_harness: bool,
+    view: TableView,
     terminal_width: usize,
 ) {
-    let w_model = 12;
+    let w_name = 12;
     let w_msgs = 7;
     let w_val = 8;
     let w_cost = 9;
@@ -1090,7 +814,7 @@ fn print_table_compact(
     println!("{}{}", p, "=".repeat(table_width));
 
     println!(
-        "{}| {:<w_model$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} {:>w_cost$} |",
+        "{}| {:<w_name$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} {:>w_cost$} |",
         p,
         "Model",
         "Msgs",
@@ -1099,91 +823,73 @@ fn print_table_compact(
         "Decode",
         "Total",
         "Cost",
-        w_model = w_model,
+        w_name = w_name,
         w_msgs = w_msgs,
         w_val = w_val,
         w_cost = w_cost,
     );
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
-    for stats in model_stats {
-        let effective_tool = &stats.tool;
-        let model_name = fit_text_to_width(
-            &format_model_name_with_tool_prefix(
-                &stats.model,
-                effective_tool,
-                show_tool_prefix,
-                true,
-                0,
-            ),
-            w_model,
-        );
-        let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
+    let metric_row = |name: String, m: &RowMetrics| {
         println!(
-            "{}| {:<w_model$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} {} |",
+            "{}| {:<w_name$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} {} |",
             p,
-            model_name,
-            format_number_compact(stats.count),
-            format_number_compact(cache_hit),
-            format_number_compact(prefill),
-            format_number_compact(decoding),
-            format_number_compact(cache_hit + prefill + decoding),
-            format_cost_for_width(model_api_cost(stats), w_cost),
-            w_model = w_model,
+            name,
+            format_number_compact(m.count),
+            format_number_compact(m.cache_hit),
+            format_number_compact(m.prefill),
+            format_number_compact(m.decoding),
+            format_number_compact(m.tokens()),
+            format_cost_for_width(m.cost(), w_cost),
+            w_name = w_name,
             w_msgs = w_msgs,
             w_val = w_val,
         );
+    };
+
+    for row in rows {
+        match row {
+            DisplayRow::GroupHeader { vendor } => {
+                println!("{}| {:<w$} |", p, vendor, w = table_width - 4);
+            }
+            DisplayRow::Data(d) => {
+                let name = fit_text_to_width(&narrow_name(d, show_harness, view), w_name);
+                metric_row(name, &d.metrics);
+            }
+            DisplayRow::Subtotal { vendor, metrics } => {
+                let name = fit_text_to_width(&format!("= {}", vendor), w_name);
+                metric_row(name, metrics);
+            }
+        }
     }
 
     println!("{}|{}|", p, "-".repeat(table_width - 2));
-    println!(
-        "{}| {:<w_model$} {:>w_msgs$} | {:>w_val$} {:>w_val$} {:>w_val$} {:>w_val$} {} |",
-        p,
-        "TOTAL",
-        format_number_compact(sum_messages),
-        format_number_compact(sum_cache_hit),
-        format_number_compact(sum_prefill),
-        format_number_compact(sum_decoding),
-        format_number_compact(sum_total_with_cache),
-        format_cost_for_width(total_cost, w_cost),
-        w_model = w_model,
-        w_msgs = w_msgs,
-        w_val = w_val,
-    );
+    metric_row("TOTAL".to_string(), totals);
 
     println!(
-        "{}| {:<w_model$} {:>w_msgs$} | {} {} {} {} {} |",
+        "{}| {:<w_name$} {:>w_msgs$} | {} {} {} {} {} |",
         p,
         "Cost",
         "",
-        format_cost_for_width(cache_hit_cost, w_val),
-        format_cost_for_width(prefill_cost, w_val),
-        format_cost_for_width(decoding_cost, w_val),
-        format_cost_for_width(total_cost, w_val),
-        format_cost_for_width(total_cost, w_cost),
-        w_model = w_model,
+        format_cost_for_width(totals.cache_hit_cost, w_val),
+        format_cost_for_width(totals.prefill_cost, w_val),
+        format_cost_for_width(totals.decoding_cost, w_val),
+        format_cost_for_width(totals.cost(), w_val),
+        format_cost_for_width(totals.cost(), w_cost),
+        w_name = w_name,
         w_msgs = w_msgs,
     );
     println!("{}{}", p, "=".repeat(table_width));
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_table_minimal(
-    model_stats: &[&ModelBreakdownRow],
-    sum_messages: i64,
-    _sum_cache_hit: i64,
-    _sum_prefill: i64,
-    _sum_decoding: i64,
-    sum_total_with_cache: i64,
-    total_cost: f64,
-    _cache_hit_cost: f64,
-    _prefill_cost: f64,
-    _decoding_cost: f64,
-    _tool: &str,
-    show_tool_prefix: bool,
+    rows: &[DisplayRow],
+    totals: &RowMetrics,
+    show_harness: bool,
+    view: TableView,
     terminal_width: usize,
 ) {
-    let w_model = 12;
+    let w_name = 12;
     let w_msgs = 6;
     let w_tokens = 9;
     let w_cost = 9;
@@ -1196,14 +902,14 @@ fn print_table_minimal(
     println!("{}{}", p, "=".repeat(table_width));
 
     println!(
-        "{}| {:<w_model$} {:>w_msgs$} | {:>w_tokens$} {:>w_cost$} {:>w_rate$} |",
+        "{}| {:<w_name$} {:>w_msgs$} | {:>w_tokens$} {:>w_cost$} {:>w_rate$} |",
         p,
         "Model",
         "Msgs",
         "Tokens",
         "Cost",
         "$/MTok",
-        w_model = w_model,
+        w_name = w_name,
         w_msgs = w_msgs,
         w_tokens = w_tokens,
         w_cost = w_cost,
@@ -1211,71 +917,49 @@ fn print_table_minimal(
     );
     println!("{}|{}|", p, "-".repeat(table_width - 2));
 
-    for stats in model_stats {
-        let effective_tool = &stats.tool;
-        let model_name = fit_text_to_width(
-            &format_model_name_with_tool_prefix(
-                &stats.model,
-                effective_tool,
-                show_tool_prefix,
-                true,
-                0,
-            ),
-            w_model,
-        );
-        let (cache_hit, prefill, decoding) = get_strategy_totals(stats);
-        let row_tokens = cache_hit + prefill + decoding;
+    let metric_row = |name: String, m: &RowMetrics| {
         println!(
-            "{}| {:<w_model$} {:>w_msgs$} | {:>w_tokens$} {} {} |",
+            "{}| {:<w_name$} {:>w_msgs$} | {:>w_tokens$} {} {} |",
             p,
-            model_name,
-            format_number_compact(stats.count),
-            format_number_compact(row_tokens),
-            format_cost_for_width(model_api_cost(stats), w_cost),
-            format_rate_for_width(model_cost_per_mtok(stats), w_rate),
-            w_model = w_model,
+            name,
+            format_number_compact(m.count),
+            format_number_compact(m.tokens()),
+            format_cost_for_width(m.cost(), w_cost),
+            format_rate_for_width(m.cost_per_mtok(), w_rate),
+            w_name = w_name,
             w_msgs = w_msgs,
             w_tokens = w_tokens,
         );
+    };
+
+    for row in rows {
+        match row {
+            DisplayRow::GroupHeader { vendor } => {
+                println!("{}| {:<w$} |", p, vendor, w = table_width - 4);
+            }
+            DisplayRow::Data(d) => {
+                let name = fit_text_to_width(&narrow_name(d, show_harness, view), w_name);
+                metric_row(name, &d.metrics);
+            }
+            DisplayRow::Subtotal { vendor, metrics } => {
+                let name = fit_text_to_width(&format!("= {}", vendor), w_name);
+                metric_row(name, metrics);
+            }
+        }
     }
 
     println!("{}|{}|", p, "-".repeat(table_width - 2));
-    println!(
-        "{}| {:<w_model$} {:>w_msgs$} | {:>w_tokens$} {} {} |",
-        p,
-        "TOTAL",
-        format_number_compact(sum_messages),
-        format_number_compact(sum_total_with_cache),
-        format_cost_for_width(total_cost, w_cost),
-        format_rate_for_width(
-            if sum_total_with_cache > 0 {
-                total_cost / (sum_total_with_cache as f64 / 1_000_000.0)
-            } else {
-                0.0
-            },
-            w_rate
-        ),
-        w_model = w_model,
-        w_msgs = w_msgs,
-        w_tokens = w_tokens,
-    );
+    metric_row("TOTAL".to_string(), totals);
 
     println!(
-        "{}| {:<w_model$} {:>w_msgs$} | {:>w_tokens$} {} {} |",
+        "{}| {:<w_name$} {:>w_msgs$} | {:>w_tokens$} {} {} |",
         p,
         "Cost",
         "",
         "",
-        format_cost_for_width(total_cost, w_cost),
-        format_rate_for_width(
-            if sum_total_with_cache > 0 {
-                total_cost / (sum_total_with_cache as f64 / 1_000_000.0)
-            } else {
-                0.0
-            },
-            w_rate
-        ),
-        w_model = w_model,
+        format_cost_for_width(totals.cost(), w_cost),
+        format_rate_for_width(totals.cost_per_mtok(), w_rate),
+        w_name = w_name,
         w_msgs = w_msgs,
         w_tokens = w_tokens,
     );
@@ -1285,6 +969,7 @@ fn print_table_minimal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table_view::display_model_name;
     use std::time::Duration;
 
     fn visible_len(text: &str) -> usize {
@@ -1318,60 +1003,65 @@ mod tests {
     fn short_model_name_renders_new_models_without_a_table() {
         // The reported regression: an unmapped model truncated to "claude-opus-".
         assert_eq!(
-            get_short_model_name("claude-opus-4-8", "claude"),
+            display_model_name("claude-opus-4-8"),
             "Opus 4.8"
         );
         assert_eq!(
-            get_short_model_name("claude-opus-4-7", "claude"),
+            display_model_name("claude-opus-4-7"),
             "Opus 4.7"
         );
-        assert_eq!(get_short_model_name("opus", "claude"), "Opus");
-        assert_eq!(get_short_model_name("<synthetic>", "claude"), "synthetic");
-        assert_eq!(get_short_model_name("gpt-5.5", "codex"), "GPT-5.5");
+        assert_eq!(display_model_name("opus"), "Opus");
+        assert_eq!(display_model_name("<synthetic>"), "synthetic");
+        assert_eq!(display_model_name("gpt-5.5"), "GPT-5.5");
         assert_eq!(
-            get_short_model_name("gpt-5.5 (high)", "codex"),
+            display_model_name("gpt-5.5 (high)"),
             "GPT-5.5(H)"
         );
         assert_eq!(
-            get_short_model_name("gpt-5.5:xhigh", "codex"),
+            display_model_name("gpt-5.5:xhigh"),
             "GPT-5.5(XH)"
         );
         assert_eq!(
-            get_short_model_name("gemini-3.2-pro-preview", "gemini"),
+            display_model_name("gemini-3.2-pro-preview"),
             "Gem 3.2 Pro"
         );
         // Meta-tool `omp`: family inferred from the id's real provider prefix.
         assert_eq!(
-            get_short_model_name("anthropic/claude-opus-4-8", "omp"),
+            display_model_name("anthropic/claude-opus-4-8"),
             "Opus 4.8"
         );
     }
 
     #[test]
-    fn all_mode_prefixes_model_rows_with_tool_names() {
-        assert_eq!(
-            format_model_name_with_tool_prefix("gpt-5.5", "codex", true, true, 0),
-            "Codex: GPT-5.5"
-        );
-        assert_eq!(
-            format_model_name_with_tool_prefix("gemini-3.2-pro-preview", "gemini", true, true, 0),
-            "Gemini CLI: Gem 3.2 Pro"
-        );
-        assert_eq!(
-            format_model_name_with_tool_prefix("claude-opus-4-8", "claude", true, true, 0),
-            "Claude Code: Opus 4.8"
-        );
+    fn name_area_renders_to_fixed_width_in_every_layout() {
+        for (mode, show_harness) in [
+            ("full", true),
+            ("full", false),
+            ("medium", true),
+            ("medium", false),
+        ] {
+            let l = name_layout(mode, show_harness);
+            let composed = compose_name(&l, "Anthropic", "claude-opus-4-8", "Claude Code");
+            assert_eq!(composed.chars().count(), l.total, "{mode}/{show_harness}");
+            let header = compose_name(&l, "Vendor", "Model", "Harness");
+            assert_eq!(header.chars().count(), l.total, "{mode}/{show_harness}");
+        }
     }
 
     #[test]
-    fn watermark_weaves_countdown_when_present() {
-        let (text, _) = prompt_watermark(Some(Duration::from_secs(3661)));
-        assert!(text.contains("refresh in 01:01:01"));
-        assert!(text.contains("enter h or help for usage"));
-
-        let (plain, _) = prompt_watermark(None);
-        assert!(!plain.contains("refresh in"));
-        assert!(plain.contains("enter h or help for usage"));
+    fn narrow_name_folds_harness_tag_only_outside_model_view() {
+        let row = DataRow {
+            vendor: crate::model_id::Vendor::OpenAI,
+            vendor_label: "OpenAI".to_string(),
+            model_label: "GPT-5.5".to_string(),
+            model_raw: "gpt-5.5".to_string(),
+            harness_label: "Codex".to_string(),
+            harness_short: "Cdx".to_string(),
+            metrics: RowMetrics::default(),
+        };
+        assert_eq!(narrow_name(&row, true, TableView::Flat), "Cdx:GPT-5.5");
+        assert_eq!(narrow_name(&row, true, TableView::Model), "GPT-5.5");
+        assert_eq!(narrow_name(&row, false, TableView::Flat), "GPT-5.5");
     }
 
     #[test]
@@ -1386,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn model_cost_helpers_report_total_cost_and_rate() {
+    fn metrics_drive_cost_cells_and_rates() {
         let row = ModelBreakdownRow {
             model: "gpt-5.5".to_string(),
             tool: "codex".to_string(),
@@ -1404,11 +1094,12 @@ mod tests {
             cache_read_cost: 1.0,
             cache_creation_cost: 2.0,
         };
+        let metrics = RowMetrics::from_breakdown(&row);
 
-        assert_eq!(model_api_cost(&row), 10.0);
-        assert_eq!(model_cost_per_mtok(&row), 5.0);
+        assert_eq!(metrics.cost(), 10.0);
+        assert_eq!(metrics.cost_per_mtok(), 5.0);
 
-        let cell = format_model_cost_with_col_pct(model_api_cost(&row), 20.0, 16);
+        let cell = format_model_cost_with_col_pct(metrics.cost(), 20.0, 16);
         assert_eq!(visible_len(&cell), 16);
     }
 }

@@ -96,6 +96,7 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
     };
 
     let fork_boundary_ms = detect_fork_boundary(&content);
+    let session_id = session_id_from_content(&content);
 
     let mut current_model = "unknown".to_string();
     let mut current_effort = "unknown".to_string();
@@ -212,6 +213,7 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                         results.push(RawEntry {
                             entry: UsageEntry {
                                 host_id: None,
+                                session_id: session_id.clone(),
                                 timestamp: ts_owned.clone(),
                                 parsed_timestamp: parsed_ts,
                                 session_start_time: ts_owned.clone(),
@@ -239,6 +241,20 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
     }
 
     results
+}
+
+/// The first metadata event records the stable conversation id for a rollout.
+fn session_id_from_content(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let data: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+        (data.get("type").and_then(|v| v.as_str()) == Some("session_meta"))
+            .then(|| data.get("payload"))
+            .flatten()
+            .and_then(|payload| payload.get("id"))
+            .and_then(|id| id.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// If the first session_meta line carries `forked_from_id`, return the fork-creation
@@ -317,6 +333,7 @@ mod tests {
     fn non_fork_session_has_no_boundary() {
         let content = r#"{"timestamp":"2026-04-22T01:04:48.994Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-04-22T01:04:46.000Z"}}"#;
         assert_eq!(detect_fork_boundary(content), None);
+        assert_eq!(session_id_from_content(content).as_deref(), Some("abc"));
     }
 
     #[test]

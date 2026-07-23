@@ -69,6 +69,11 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
         Err(_) => return Vec::new(),
     };
 
+    let fallback_session_id = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
     let mut entries = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -113,11 +118,19 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
         };
 
         let parsed_ts = parse_timestamp(&timestamp);
+        let session_id = data
+            .get("sessionId")
+            .or_else(|| data.get("session_id"))
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or_else(|| fallback_session_id.clone());
 
         entries.push(SourceUsageRecord {
             dedup_key,
             entry: UsageEntry {
                 host_id: None,
+                session_id,
                 timestamp: timestamp.clone(),
                 parsed_timestamp: parsed_ts,
                 session_start_time: timestamp.clone(),
@@ -150,4 +163,25 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
     }
 
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_records_keep_the_claude_session_id() {
+        let path = std::env::temp_dir().join("ai-usage-claude-session-test.jsonl");
+        fs::write(
+            &path,
+            r#"{"sessionId":"claude-session","timestamp":"2026-07-23T00:00:00Z","requestId":"request","message":{"id":"message","model":"claude-test","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        )
+        .expect("write fixture");
+
+        let records = read_jsonl_file_records(&path);
+        fs::remove_file(&path).ok();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry.session_id.as_deref(), Some("claude-session"));
+    }
 }

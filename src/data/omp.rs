@@ -46,6 +46,12 @@ fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
         Err(_) => return Vec::new(),
     };
 
+    let session_id = session_id_from_content(&content).or_else(|| {
+        path.file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    });
     let mut records = Vec::new();
     let mut message_index = 0usize;
     for line in content.lines() {
@@ -123,6 +129,7 @@ fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
             dedup_key,
             entry: UsageEntry {
                 host_id: None,
+                session_id: session_id.clone(),
                 timestamp: timestamp.clone(),
                 parsed_timestamp,
                 session_start_time: timestamp.clone(),
@@ -143,6 +150,23 @@ fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
     }
 
     records
+}
+
+fn session_id_from_content(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let data: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+        (data.get("type").and_then(|value| value.as_str()) == Some("session"))
+            .then_some(&data)
+            .and_then(|session| {
+                session
+                    .get("id")
+                    .or_else(|| session.get("sessionId"))
+                    .or_else(|| session.get("session_id"))
+            })
+            .and_then(|id| id.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn build_dedup_key(
@@ -211,6 +235,13 @@ mod tests {
         assert!((costs.output - 0.00081).abs() < f64::EPSILON);
         assert!((costs.cache_read - 0.010112).abs() < f64::EPSILON);
         assert!((costs.cache_creation - 0.000001).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn session_metadata_id_is_used_for_usage_records() {
+        let content = r#"{"type":"session","id":"omp-session"}
+{"type":"message","timestamp":"2026-05-27T08:34:02.431Z","message":{"role":"assistant","model":"gpt-test","usage":{"input":1,"output":2}}}"#;
+        assert_eq!(session_id_from_content(content).as_deref(), Some("omp-session"));
     }
 
     #[test]

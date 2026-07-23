@@ -27,6 +27,11 @@ cargo build --release
 ./target/release/ai-usage --tool gemini
 ./target/release/ai-usage --tool kimi
 ./target/release/ai-usage --tool omp
+
+# Breakdown table shape (also cycled with `v` in monitor mode)
+./target/release/ai-usage --view flat    # Vendor / Model / Harness columns
+./target/release/ai-usage --view vendor  # grouped by vendor with subtotals
+./target/release/ai-usage --view model   # one row per model, harnesses merged
 ```
 
 ## Data Sources
@@ -50,16 +55,28 @@ Environment variables can override default paths:
 
 ```
 src/
-  main.rs            # Entry point, CLI args, monitor loop, vendor aggregation
-  tool.rs            # Tool enum (vendor keys, display names, rotation order)
+  main.rs            # Entry point, CLI args, once-mode printing, AppState
+  tool.rs            # Tool enum = the Harness axis (keys, names, rotation)
+  model_id.rs        # Algorithmic model-id parser; Vendor enum = model maker
+                     # (Anthropic/OpenAI/Google/Moonshot/Zhipu) inferred from id
+  table_view.rs      # Renderer-agnostic breakdown table views: flat / vendor /
+                     # model (three shapes over the Vendor x Harness x Model axes)
+  raw_data.rs        # Raw entry cache, host filtering, cross-tool aggregation
+  window_nav.rs      # Time-window navigation and chart interval sizing
+  sync_status.rs     # Sync worker polling and status-line formatting
   constants.rs       # Pricing tables, class-aware lookup (pricing.json + .fee.env)
   pricing.rs         # Layered pricing loader (embedded -> cache -> LiteLLM)
-  model_id.rs        # Algorithmic model-id parser (display label, sort, color)
   model_overrides.rs # User overrides loader (~/.config/ai-usage/models.toml)
-  formatting.rs      # Output formatting and responsive tables
-  charts.rs          # ASCII chart visualization
+  formatting.rs      # Plain-text tables for --once output
+  charts.rs          # Plain ASCII charts for --once output + shared series specs
   time_utils.rs      # Timezone and time formatting utilities
   updater.rs         # Self-update from GitHub releases
+  tui/
+    mod.rs           # Ratatui monitor mode: terminal lifecycle + event loop
+    commands.rs      # Prompt command parsing/execution (testable, no terminal)
+    data.rs          # Dashboard assembly (table rows, cost summary, chart series)
+    input.rs         # Prompt input line and command history
+    render.rs        # Frame rendering: header tabs, table, charts, footer, help
   data/
     mod.rs           # Common types (UsageEntry, TokenUsage)
     cache.rs         # Normalized per-vendor record cache
@@ -89,8 +106,14 @@ pricing.json         # API pricing data for all vendors
 - Time series data is bucketed into 8-hour intervals for trend analysis
 - All times are displayed in the system's local timezone
 - Display adapts to terminal width (Full/Medium/Compact/Minimal modes)
-- Monitor mode uses crossterm raw mode; disable before printing, re-enable after
-- Adding a vendor touches: `data/<vendor>.rs`, `stats/<vendor>.rs`, `tool.rs`, `main.rs` wiring, `pricing.json` + `constants.rs`/`pricing.rs`, `formatting.rs`, `charts.rs`, `sync/engine/mod.rs`, and `ai-usage-proto::is_valid_vendor`
+- The display model has three axes: Vendor (model maker, derived from the model
+  id by `model_id::Vendor`), Harness (the CLI tool, `tool::Tool`), and Model.
+  `table_view.rs` is the single source of truth for grouping/merging them.
+  Note: the data/sync layer historically says "vendor" where it means harness
+  (`data/<vendor>.rs`, `is_valid_vendor`); do not confuse the two.
+- Monitor mode is a ratatui alternate-screen app (`src/tui/`); `--once` prints
+  plain text via `formatting.rs`/`charts.rs` and stays pipe-friendly
+- Adding a harness touches: `data/<vendor>.rs`, `stats/<vendor>.rs`, `tool.rs`, `main.rs` wiring, `pricing.json` + `constants.rs`/`pricing.rs`, `sync/engine/mod.rs`, and `ai-usage-proto::is_valid_vendor`
 
 ## Testing
 

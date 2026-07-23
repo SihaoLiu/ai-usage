@@ -842,43 +842,48 @@ mod tests {
     }
 }
 
-// Line color configuration (ANSI 256-color)
-fn line_color(key: &str) -> &'static str {
+// Line color configuration (ANSI 256-color). The numeric indices are the
+// single source for both the plain ANSI renderer and the ratatui monitor UI.
+pub(crate) fn line_color_index(key: &str) -> Option<u8> {
     match key {
-        "fable_input" => "\x1b[38;5;129m",
-        "fable_output" => "\x1b[38;5;183m",
-        "opus_input" => "\x1b[38;5;196m",
-        "opus_output" => "\x1b[38;5;203m",
-        "sonnet_input" => "\x1b[38;5;33m",
-        "sonnet_output" => "\x1b[38;5;75m",
-        "haiku_input" => "\x1b[38;5;40m",
-        "haiku_output" => "\x1b[38;5;120m",
-        "model0_input" => "\x1b[38;5;208m",
-        "model0_output" => "\x1b[38;5;215m",
-        "model1_input" => "\x1b[38;5;135m",
-        "model1_output" => "\x1b[38;5;177m",
-        "model2_input" => "\x1b[38;5;37m",
-        "model2_output" => "\x1b[38;5;80m",
-        "model3_input" => "\x1b[38;5;197m",
-        "model3_output" => "\x1b[38;5;218m",
-        "model4_input" => "\x1b[38;5;226m",
-        "model4_output" => "\x1b[38;5;228m",
-        "model5_input" => "\x1b[38;5;51m",
-        "model5_output" => "\x1b[38;5;87m",
-        _ => "",
+        "fable_input" => Some(129),
+        "fable_output" => Some(183),
+        "opus_input" => Some(196),
+        "opus_output" => Some(203),
+        "sonnet_input" => Some(33),
+        "sonnet_output" => Some(75),
+        "haiku_input" => Some(40),
+        "haiku_output" => Some(120),
+        "model0_input" => Some(208),
+        "model0_output" => Some(215),
+        "model1_input" => Some(135),
+        "model1_output" => Some(177),
+        "model2_input" => Some(37),
+        "model2_output" => Some(80),
+        "model3_input" => Some(197),
+        "model3_output" => Some(218),
+        "model4_input" => Some(226),
+        "model4_output" => Some(228),
+        "model5_input" => Some(51),
+        "model5_output" => Some(87),
+        _ => None,
     }
 }
 
-fn tool_color(tool: &str) -> &'static str {
+pub(crate) fn tool_color_index(tool: &str) -> u8 {
     match tool {
-        "Claude Code" => "\x1b[38;5;173m",
-        "Codex" => "\x1b[38;5;255m",
-        "Gemini CLI" => "\x1b[38;5;33m",
-        "Kimi Code" => "\x1b[38;5;49m",
-        "Oh My Pi" => "\x1b[38;5;141m",
-        "All" => "\x1b[38;5;226m",
-        _ => "\x1b[38;5;135m",
+        "Claude Code" => 173,
+        "Codex" => 255,
+        "Gemini CLI" => 33,
+        "Kimi Code" => 49,
+        "Oh My Pi" => 141,
+        "All" => 226,
+        _ => 135,
     }
+}
+
+fn tool_color(tool: &str) -> String {
+    format!("\x1b[38;5;{}m", tool_color_index(tool))
 }
 
 fn round_to_nice(value: f64, round_up: bool) -> i64 {
@@ -1040,7 +1045,9 @@ fn print_segment_header(
     }
 }
 
-fn segment_label(
+/// Header labels for one chart segment: `(head, date)` like
+/// `("Wed : 5.45B", " 07 / 22")`. Shared by the plain and ratatui charts.
+pub(crate) fn segment_label(
     anchor: &DateTime<Local>,
     granularity: ChartGranularity,
     total: f64,
@@ -1410,17 +1417,14 @@ fn month_axis_ticks(
     ticks
 }
 
-fn print_x_axis_labels(
-    layout: &ChartLayout,
-    _interval_minutes: i64,
+/// Tick times and the chosen wall-clock interval (minutes) for an x axis
+/// spanning `first..=last`. Shared by the plain and ratatui charts.
+pub(crate) fn axis_tick_times(
+    first: &DateTime<Local>,
+    last: &DateTime<Local>,
     granularity: ChartGranularity,
-    pad: &str,
-) {
-    println!();
-
-    let first_time = layout.sorted_times.last().unwrap(); // oldest (reversed)
-    let last_time = *layout.sorted_times.first().unwrap();
-    let time_span_minutes = (last_time - *first_time).num_seconds() as f64 / 60.0;
+) -> (Vec<DateTime<Local>>, i64) {
+    let time_span_minutes = (*last - *first).num_seconds() as f64 / 60.0;
     let target_tick = time_span_minutes * 0.05;
 
     // Intervals span minutes up to multi-week so very wide windows still get
@@ -1436,16 +1440,48 @@ fn print_x_axis_labels(
     // Month ticks fall on fixed days within each labelled month; all other
     // granularities step by the chosen wall-clock interval.
     let tick_times: Vec<DateTime<Local>> = if granularity == ChartGranularity::Month {
-        month_axis_ticks(first_time, &last_time)
+        month_axis_ticks(first, last)
     } else {
         let mut times = Vec::new();
-        let mut current_tick = first_x_axis_tick(first_time, granularity, tick_interval);
-        while current_tick <= last_time {
+        let mut current_tick = first_x_axis_tick(first, granularity, tick_interval);
+        while current_tick <= *last {
             times.push(current_tick);
             current_tick = add_wall_clock_minutes(current_tick, tick_interval);
         }
         times
     };
+    (tick_times, tick_interval)
+}
+
+/// Render one x-axis tick label per the granularity/tick-density conventions.
+pub(crate) fn x_tick_label(
+    tick: &DateTime<Local>,
+    granularity: ChartGranularity,
+    tick_interval: i64,
+) -> String {
+    if granularity == ChartGranularity::Month {
+        // The header already carries the month, so only the day is shown.
+        tick.format("%d").to_string()
+    } else if tick_interval < 60 {
+        tick.format("%H:%M").to_string()
+    } else if tick_interval < 1440 {
+        tick.format("%H").to_string()
+    } else {
+        tick.format("%m/%d").to_string()
+    }
+}
+
+fn print_x_axis_labels(
+    layout: &ChartLayout,
+    _interval_minutes: i64,
+    granularity: ChartGranularity,
+    pad: &str,
+) {
+    println!();
+
+    let first_time = layout.sorted_times.last().unwrap(); // oldest (reversed)
+    let last_time = *layout.sorted_times.first().unwrap();
+    let (tick_times, tick_interval) = axis_tick_times(first_time, &last_time, granularity);
 
     let mut labels: Vec<String> = Vec::new();
     let mut positions: Vec<usize> = Vec::new();
@@ -1467,17 +1503,7 @@ fn print_x_axis_labels(
             && let Some(&pos) = layout.data_to_col.get(&idx)
             && !used_positions.contains(&pos)
         {
-            let label = if granularity == ChartGranularity::Month {
-                // The header already carries the month, so only the day is shown.
-                current_tick.format("%d").to_string()
-            } else if tick_interval < 60 {
-                current_tick.format("%H:%M").to_string()
-            } else if tick_interval < 1440 {
-                current_tick.format("%H").to_string()
-            } else {
-                current_tick.format("%m/%d").to_string()
-            };
-            labels.push(label);
+            labels.push(x_tick_label(&current_tick, granularity, tick_interval));
             positions.push(pos);
             used_positions.insert(pos);
         }
@@ -1663,6 +1689,138 @@ struct LineConfig {
     label: String,
 }
 
+/// One chart line: a (model, token type) pair with its display label and
+/// 256-color palette index. Shared by the plain ANSI charts and the ratatui
+/// monitor charts so series ordering and colors stay identical.
+pub(crate) struct ModelSeriesSpec {
+    pub model: String,
+    pub token_type: &'static str,
+    pub label: String,
+    pub color_index: u8,
+}
+
+/// Chart title for a model chart of the given type, per harness semantics.
+pub(crate) fn model_chart_title(chart_type: &str, tool: &str) -> &'static str {
+    if chart_type == "io" {
+        "Models Input / Output Token Consumption"
+    } else {
+        match tool {
+            "codex" => "Models Cache Read Input / Reasoning Output Token Consumption",
+            "gemini" => "Models Cache Read Input / Thinking Output Token Consumption",
+            _ => "Models Cache Read Input / Cache Creation Input Token Consumption",
+        }
+    }
+}
+
+/// Build the ordered line specs for a model chart: Claude sub-families lead
+/// with their dedicated palette entries (newest version first), everything
+/// else cycles through the indexed palette sorted by name.
+pub(crate) fn model_series_specs(
+    all_models: &HashSet<String>,
+    chart_type: &str,
+    tool: &str,
+) -> Vec<ModelSeriesSpec> {
+    use crate::model_id::{color_family, parse_model_identity, short_label, sort_key};
+
+    let (token_types, type_labels): (Vec<&'static str>, HashMap<&str, &str>) = if chart_type == "io"
+    {
+        (
+            vec!["input", "output"],
+            HashMap::from([("input", "Input"), ("output", "Output")]),
+        )
+    } else {
+        let labels = match tool {
+            "codex" => HashMap::from([
+                ("cache_read", "Cache Read In"),
+                ("cache_creation", "Reasoning Out"),
+            ]),
+            "gemini" => HashMap::from([
+                ("cache_read", "Cache Read In"),
+                ("cache_creation", "Thinking Out"),
+            ]),
+            _ => HashMap::from([
+                ("cache_read", "Cache Read In"),
+                ("cache_creation", "Cache Create In"),
+            ]),
+        };
+        (vec!["cache_read", "cache_creation"], labels)
+    };
+
+    let mut named_models: Vec<String> = all_models
+        .iter()
+        .filter(|m| color_family(&parse_model_identity(m)).is_some())
+        .cloned()
+        .collect();
+    let mut other_models: Vec<String> = all_models
+        .iter()
+        .filter(|m| color_family(&parse_model_identity(m)).is_none())
+        .cloned()
+        .collect();
+    named_models.sort_by(|a, b| {
+        sort_key(&parse_model_identity(a)).cmp(&sort_key(&parse_model_identity(b)))
+    });
+    other_models.sort();
+
+    let mut specs = Vec::new();
+    let mut other_color_idx = 0usize;
+    for model in named_models.into_iter().chain(other_models) {
+        let identity = parse_model_identity(&model);
+        let label = short_label(&identity);
+        let color_prefix = match color_family(&identity) {
+            Some(family) => family.to_string(),
+            None => {
+                let prefix = format!("model{}", other_color_idx % 6);
+                other_color_idx += 1;
+                prefix
+            }
+        };
+        for token_type in &token_types {
+            let color_suffix = if *token_type == "input" || *token_type == "cache_read" {
+                "input"
+            } else {
+                "output"
+            };
+            let color_key = format!("{}_{}", color_prefix, color_suffix);
+            specs.push(ModelSeriesSpec {
+                model: model.clone(),
+                token_type,
+                label: format!("{} {}", label, type_labels[token_type]),
+                color_index: line_color_index(&color_key).unwrap_or(250),
+            });
+        }
+    }
+    specs
+}
+
+/// Ordered tool lines for the comparison chart: known harnesses first, any
+/// unknown labels after (sorted), and an aggregate `All` line last.
+pub(crate) fn comparison_tool_order(all_tools: &HashSet<String>) -> Vec<String> {
+    let tool_order = [
+        "Claude Code",
+        "Codex",
+        "Gemini CLI",
+        "Kimi Code",
+        "Oh My Pi",
+    ];
+    let mut tools_sorted: Vec<String> = tool_order
+        .iter()
+        .filter(|v| all_tools.contains(**v))
+        .map(|v| v.to_string())
+        .collect();
+    let mut remaining: Vec<&String> = all_tools
+        .iter()
+        .filter(|v| !tool_order.contains(&v.as_str()))
+        .collect();
+    remaining.sort_unstable();
+    for v in remaining {
+        tools_sorted.push(v.clone());
+    }
+    if !tools_sorted.is_empty() {
+        tools_sorted.push("All".to_string());
+    }
+    tools_sorted
+}
+
 /// Print a multi-line chart with multiple lines (models x token types).
 #[allow(clippy::too_many_arguments)]
 pub fn print_multi_line_chart(
@@ -1693,38 +1851,7 @@ pub fn print_multi_line_chart(
         return;
     }
 
-    let (token_types, type_labels, chart_title) = if chart_type == "io" {
-        (
-            vec!["input", "output"],
-            HashMap::from([("input", "Input"), ("output", "Output")]),
-            "Models Input / Output Token Consumption".to_string(),
-        )
-    } else {
-        let labels = match tool {
-            "codex" => HashMap::from([
-                ("cache_read", "Cache Read In"),
-                ("cache_creation", "Reasoning Out"),
-            ]),
-            "gemini" => HashMap::from([
-                ("cache_read", "Cache Read In"),
-                ("cache_creation", "Thinking Out"),
-            ]),
-            _ => HashMap::from([
-                ("cache_read", "Cache Read In"),
-                ("cache_creation", "Cache Create In"),
-            ]),
-        };
-        let title = match tool {
-            "codex" => "Models Cache Read Input / Reasoning Output Token Consumption",
-            "gemini" => "Models Cache Read Input / Thinking Output Token Consumption",
-            _ => "Models Cache Read Input / Cache Creation Input Token Consumption",
-        };
-        (
-            vec!["cache_read", "cache_creation"],
-            labels,
-            title.to_string(),
-        )
-    };
+    let chart_title = model_chart_title(chart_type, tool).to_string();
 
     // Collect all models
     let mut all_models: HashSet<String> = HashSet::new();
@@ -1737,59 +1864,15 @@ pub fn print_multi_line_chart(
         all_models.retain(|m| included.contains(m));
     }
 
-    // Group by chart color family: Claude's opus/sonnet/haiku get dedicated
-    // palette entries and lead the chart ordered by family then newest version;
-    // everything else gets cycled through the indexed palette, sorted by name.
-    use crate::model_id::{color_family, parse_model_identity, short_label, sort_key};
-
-    let mut named_models: Vec<String> = all_models
-        .iter()
-        .filter(|m| color_family(&parse_model_identity(m)).is_some())
-        .cloned()
+    let lines: Vec<LineConfig> = model_series_specs(&all_models, chart_type, tool)
+        .into_iter()
+        .map(|spec| LineConfig {
+            model: spec.model,
+            token_type: spec.token_type.to_string(),
+            color: format!("\x1b[38;5;{}m", spec.color_index),
+            label: spec.label,
+        })
         .collect();
-    let mut other_models: Vec<String> = all_models
-        .iter()
-        .filter(|m| color_family(&parse_model_identity(m)).is_none())
-        .cloned()
-        .collect();
-
-    named_models.sort_by(|a, b| {
-        sort_key(&parse_model_identity(a)).cmp(&sort_key(&parse_model_identity(b)))
-    });
-    other_models.sort();
-
-    let all_models_sorted: Vec<String> = named_models.into_iter().chain(other_models).collect();
-
-    // Build line configurations
-    let mut lines: Vec<LineConfig> = Vec::new();
-    let mut other_color_idx = 0usize;
-    for model in all_models_sorted.iter() {
-        let identity = parse_model_identity(model);
-        let label = short_label(&identity);
-        let color_prefix = match color_family(&identity) {
-            Some(family) => family.to_string(),
-            None => {
-                let prefix = format!("model{}", other_color_idx % 6);
-                other_color_idx += 1;
-                prefix
-            }
-        };
-
-        for token_type in &token_types {
-            let color_suffix = if *token_type == "input" || *token_type == "cache_read" {
-                "input"
-            } else {
-                "output"
-            };
-            let color_key = format!("{}_{}", color_prefix, color_suffix);
-            lines.push(LineConfig {
-                model: model.clone(),
-                token_type: token_type.to_string(),
-                color: line_color(&color_key).to_string(),
-                label: format!("{} {}", label, type_labels[token_type]),
-            });
-        }
-    }
 
     // Calculate values for each line
     let mut line_values: HashMap<usize, Vec<f64>> = HashMap::new();
@@ -1914,31 +1997,7 @@ pub fn print_tool_comparison_chart(
         }
     }
 
-    let tool_order = [
-        "Claude Code",
-        "Codex",
-        "Gemini CLI",
-        "Kimi Code",
-        "Oh My Pi",
-    ];
-    let mut tools_sorted: Vec<String> = tool_order
-        .iter()
-        .filter(|v| all_tools.contains(**v))
-        .map(|v| v.to_string())
-        .collect();
-    let mut remaining: Vec<&String> = all_tools
-        .iter()
-        .filter(|v| !tool_order.contains(&v.as_str()))
-        .collect();
-    remaining.sort_unstable();
-    for v in remaining {
-        tools_sorted.push(v.clone());
-    }
-
-    // Add "All" as last entry
-    if !tools_sorted.is_empty() {
-        tools_sorted.push("All".to_string());
-    }
+    let tools_sorted = comparison_tool_order(&all_tools);
 
     // Build tool data.
     let mut tool_data: HashMap<String, Vec<f64>> = HashMap::new();

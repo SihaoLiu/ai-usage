@@ -10,6 +10,8 @@ use std::time::SystemTime;
 
 use crate::time_utils::{TimeWindow, parse_timestamp};
 use chrono::{DateTime, Local};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 pub const UNKNOWN_FAST_TIER: i8 = -1;
@@ -79,9 +81,12 @@ pub(crate) fn as_i64(value: &serde_json::Value, key: &str) -> i64 {
 
 /// Normalized usage entry shared across all vendors.
 /// All vendor-specific data is normalized into this common format.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageEntry {
     pub host_id: Option<String>,
+    /// Stable identifier of the source conversation when the harness exposes one.
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub timestamp: String,
     pub parsed_timestamp: Option<DateTime<Local>>,
     pub session_start_time: String,
@@ -94,7 +99,7 @@ pub struct UsageEntry {
 }
 
 /// Token usage counts for a single entry.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -103,7 +108,7 @@ pub struct TokenUsage {
     pub reasoning_output_tokens: i64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct UsageCost {
     pub input: f64,
     pub output: f64,
@@ -124,18 +129,32 @@ pub fn filter_usage_data_by_window(
     window: &TimeWindow,
     now: DateTime<Local>,
 ) -> Vec<UsageEntry> {
+    filter_usage_data_by_window_and_session(usage_data, window, None, now)
+}
+
+/// Filter usage data to a time window and, when selected, one conversation.
+pub fn filter_usage_data_by_window_and_session(
+    usage_data: &[UsageEntry],
+    window: &TimeWindow,
+    session_id: Option<&str>,
+    now: DateTime<Local>,
+) -> Vec<UsageEntry> {
     if usage_data.is_empty() {
         return Vec::new();
     }
 
     let (start, end) = window.bounds(now);
     usage_data
-        .iter()
+        .par_iter()
+        .with_min_len(4096)
         .filter_map(|entry| {
             let ts = entry
                 .parsed_timestamp
                 .or_else(|| parse_timestamp(&entry.timestamp))?;
-            (ts >= start && ts <= end).then(|| entry.clone())
+            (ts >= start
+                && ts <= end
+                && session_id.is_none_or(|selected| entry.session_id.as_deref() == Some(selected)))
+                .then(|| entry.clone())
         })
         .collect()
 }
@@ -149,6 +168,7 @@ mod tests {
         let timestamp = timestamp.to_rfc3339();
         UsageEntry {
             host_id: None,
+            session_id: None,
             timestamp: timestamp.clone(),
             parsed_timestamp: parse_timestamp(&timestamp),
             session_start_time: timestamp.clone(),
@@ -185,5 +205,25 @@ mod tests {
             .collect();
 
         assert_eq!(tokens, vec![20, 30]);
+    }
+
+    #[test]
+    fn session_filter_keeps_only_the_requested_session_inside_the_window() {
+        let window = TimeWindow::from_range("2026-05-01", "2026-05-07").expect("valid range");
+        let (start, _) = window.bounds(Local::now());
+        let mut first = entry_at(start, 10);
+        first.session_id = Some("session-a".to_string());
+        let mut second = entry_at(start, 20);
+        second.session_id = Some("session-b".to_string());
+
+        let filtered = filter_usage_data_by_window_and_session(
+            &[first, second],
+            &window,
+            Some("session-b"),
+            Local::now(),
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].usage.input_tokens, 20);
     }
 }

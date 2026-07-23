@@ -256,6 +256,7 @@ fn usage_record(key: &str, timestamp: &str, input_tokens: i64) -> SourceUsageRec
         dedup_key: key.to_string(),
         entry: UsageEntry {
             host_id: None,
+            session_id: None,
             timestamp: timestamp.to_string(),
             parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
             session_start_time: timestamp.to_string(),
@@ -332,6 +333,7 @@ fn remote_usage_record(
         dedup_key: dedup_key.to_string(),
         entry: UsageEntry {
             host_id: Some(host_id.to_string()),
+            session_id: None,
             timestamp: timestamp.to_string(),
             parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
             session_start_time: timestamp.to_string(),

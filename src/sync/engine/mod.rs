@@ -953,6 +953,7 @@ fn wire_to_remote_record(record: WireRecord) -> RemoteUsageRecord {
         dedup_key: record.dedup_key,
         entry: UsageEntry {
             host_id: Some(record.host_id),
+            session_id: None,
             parsed_timestamp: parse_timestamp(&record.timestamp),
             timestamp: record.timestamp,
             session_start_time: record.session_start_time,

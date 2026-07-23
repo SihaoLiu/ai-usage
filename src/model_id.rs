@@ -9,15 +9,32 @@
 //! sensible label with zero code changes. Genuinely irregular cases are the
 //! job of the external user override file, not this parser.
 
-/// The upstream provider a model belongs to, inferred from the id itself
-/// (not from whichever vendor bucket the caller happened to read it from).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provider {
-    Claude,
-    Openai,
+/// The model maker (vendor) a model belongs to, inferred from the id itself
+/// (not from whichever harness happened to log it). This is the "Vendor" axis
+/// of the Vendor / Harness / Model display model: a model always belongs to
+/// exactly one vendor, while any harness can in principle drive any model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Vendor {
+    Anthropic,
+    OpenAI,
     Google,
-    Kimi,
+    Moonshot,
+    Zhipu,
     Unknown,
+}
+
+impl Vendor {
+    /// Human-readable vendor name for table columns and group headers.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Vendor::Anthropic => "Anthropic",
+            Vendor::OpenAI => "OpenAI",
+            Vendor::Google => "Google",
+            Vendor::Moonshot => "Moonshot",
+            Vendor::Zhipu => "Zhipu",
+            Vendor::Unknown => "Other",
+        }
+    }
 }
 
 /// Structured view of a model id. Parsing strips provider prefixes, date and
@@ -25,7 +42,7 @@ pub enum Provider {
 /// classifies the remainder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelIdentity {
-    pub provider: Provider,
+    pub vendor: Vendor,
     /// Sub-family used for grouping/pricing: `opus`/`sonnet`/`haiku` for
     /// Claude, `gpt`/`o`/`codex` for OpenAI, `gemini` for Google, otherwise the
     /// first token of the normalized id.
@@ -139,7 +156,7 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
 
     if base == "<synthetic>" {
         return ModelIdentity {
-            provider: Provider::Unknown,
+            vendor: Vendor::Unknown,
             family: "synthetic".to_string(),
             version: String::new(),
             version_key: (0, 0),
@@ -160,7 +177,7 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
         .first()
         .is_some_and(|t| t.starts_with('o') && t[1..].starts_with(|c: char| c.is_ascii_digit()));
 
-    let (provider, family, version, version_key, modifiers) =
+    let (vendor, family, version, version_key, modifiers) =
         if stripped.starts_with("claude") || has_claude_family {
             parse_claude(&tokens)
         } else if is_o_series {
@@ -169,26 +186,28 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
             let major = tokens[0][1..].parse::<u32>().unwrap_or(0);
             let modifiers = collect_modifiers(tokens.get(1..).unwrap_or(&[]), OPENAI_MODIFIERS);
             (
-                Provider::Openai,
+                Vendor::OpenAI,
                 "o".to_string(),
                 String::new(),
                 (major, 0),
                 modifiers,
             )
         } else if tokens.first().is_some_and(|t| t == "gpt") {
-            parse_versioned(Provider::Openai, "gpt", &tokens, OPENAI_MODIFIERS)
+            parse_versioned(Vendor::OpenAI, "gpt", &tokens, OPENAI_MODIFIERS)
         } else if tokens.first().is_some_and(|t| t == "codex") {
             // `codex-mini-latest` etc.: no numeric version, modifiers follow.
             let modifiers = collect_modifiers(&tokens[1..], OPENAI_MODIFIERS);
             (
-                Provider::Openai,
+                Vendor::OpenAI,
                 "codex".to_string(),
                 String::new(),
                 (0, 0),
                 modifiers,
             )
         } else if tokens.first().is_some_and(|t| t == "gemini") {
-            parse_versioned(Provider::Google, "gemini", &tokens, GEMINI_MODIFIERS)
+            parse_versioned(Vendor::Google, "gemini", &tokens, GEMINI_MODIFIERS)
+        } else if tokens.first().is_some_and(|t| t == "glm") {
+            parse_versioned(Vendor::Zhipu, "glm", &tokens, ZHIPU_MODIFIERS)
         } else if tokens
             .first()
             .is_some_and(|t| t == "kimi" || is_k_version_token(t))
@@ -196,11 +215,11 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
             parse_kimi(&tokens)
         } else {
             let family = tokens.first().cloned().unwrap_or_default();
-            (Provider::Unknown, family, String::new(), (0, 0), Vec::new())
+            (Vendor::Unknown, family, String::new(), (0, 0), Vec::new())
         };
 
     ModelIdentity {
-        provider,
+        vendor,
         family,
         version,
         version_key,
@@ -211,9 +230,10 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
     }
 }
 
-const OPENAI_MODIFIERS: &[&str] = &["mini", "nano", "max", "spark", "codex", "pro"];
+const OPENAI_MODIFIERS: &[&str] = &["mini", "nano", "max", "spark", "codex", "pro", "sol", "luna"];
 const GEMINI_MODIFIERS: &[&str] = &["pro", "flash", "lite", "image", "ultra"];
 const KIMI_MODIFIERS: &[&str] = &["coding", "highspeed", "turbo"];
+const ZHIPU_MODIFIERS: &[&str] = &["air", "airx", "x", "flash", "flashx"];
 
 /// A bare `k<version>` token like `k3` or `k2.5` (the Kimi flagship line).
 fn is_k_version_token(t: &str) -> bool {
@@ -225,7 +245,7 @@ fn is_k_version_token(t: &str) -> bool {
 
 /// Parse Kimi ids: `k3`, `kimi-k2.5`, `kimi-for-coding`,
 /// `kimi-for-coding-highspeed`, `kimi-latest`.
-fn parse_kimi(tokens: &[String]) -> (Provider, String, String, (u32, u32), Vec<String>) {
+fn parse_kimi(tokens: &[String]) -> (Vendor, String, String, (u32, u32), Vec<String>) {
     let (version, version_key) =
         tokens
             .iter()
@@ -236,7 +256,7 @@ fn parse_kimi(tokens: &[String]) -> (Provider, String, String, (u32, u32), Vec<S
             });
     let modifiers = collect_modifiers(tokens, KIMI_MODIFIERS);
     (
-        Provider::Kimi,
+        Vendor::Moonshot,
         "kimi".to_string(),
         version,
         version_key,
@@ -254,7 +274,7 @@ fn collect_modifiers(tokens: &[String], recognized: &[&str]) -> Vec<String> {
 
 /// Parse Claude ids in either ordering: `claude-opus-4-8` (family first) or
 /// the older `claude-3-7-sonnet` (numbers first).
-fn parse_claude(tokens: &[String]) -> (Provider, String, String, (u32, u32), Vec<String>) {
+fn parse_claude(tokens: &[String]) -> (Vendor, String, String, (u32, u32), Vec<String>) {
     let family = tokens
         .iter()
         .find(|t| CLAUDE_FAMILIES.contains(&t.as_str()))
@@ -267,17 +287,17 @@ fn parse_claude(tokens: &[String]) -> (Provider, String, String, (u32, u32), Vec
         .filter_map(|t| t.parse::<u32>().ok())
         .collect();
     let (version, version_key) = format_version_from_parts(&nums);
-    (Provider::Claude, family, version, version_key, Vec::new())
+    (Vendor::Anthropic, family, version, version_key, Vec::new())
 }
 
 /// Parse a versioned id whose version is the first dotted/numeric token after
 /// the family (`gpt-5.5-codex`, `gemini-2.5-flash-lite`).
 fn parse_versioned(
-    provider: Provider,
+    vendor: Vendor,
     family: &str,
     tokens: &[String],
     recognized: &[&str],
-) -> (Provider, String, String, (u32, u32), Vec<String>) {
+) -> (Vendor, String, String, (u32, u32), Vec<String>) {
     let version_tok = tokens.get(1).cloned().unwrap_or_default();
     let (version, version_key) = if version_tok
         .chars()
@@ -291,13 +311,7 @@ fn parse_versioned(
     };
     let rest_start = if version.is_empty() { 1 } else { 2 };
     let modifiers = collect_modifiers(tokens.get(rest_start..).unwrap_or(&[]), recognized);
-    (
-        provider,
-        family.to_string(),
-        version,
-        version_key,
-        modifiers,
-    )
+    (vendor, family.to_string(), version, version_key, modifiers)
 }
 
 /// `5.5` -> `(5, 5)`, `2.0` -> `(2, 0)`, `3` -> `(3, 0)`.
@@ -337,12 +351,12 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
-/// Abbreviation for the single most salient modifier, by provider precedence.
-fn modifier_abbrev(provider: Provider, modifiers: &[String]) -> Option<&'static str> {
+/// Abbreviation for the single most salient modifier, by vendor precedence.
+fn modifier_abbrev(vendor: Vendor, modifiers: &[String]) -> Option<&'static str> {
     let has = |needle: &str| modifiers.iter().any(|m| m == needle);
-    match provider {
-        Provider::Openai => {
-            // Size/spark beat the bare `codex` marker.
+    match vendor {
+        Vendor::OpenAI => {
+            // Size/spark beat named variants, which beat the bare `codex` marker.
             if has("max") {
                 Some("Max")
             } else if has("mini") {
@@ -351,13 +365,17 @@ fn modifier_abbrev(provider: Provider, modifiers: &[String]) -> Option<&'static 
                 Some("Nano")
             } else if has("spark") {
                 Some("Sprk")
+            } else if has("sol") {
+                Some("Sol")
+            } else if has("luna") {
+                Some("Luna")
             } else if has("codex") {
                 Some("Cdx")
             } else {
                 None
             }
         }
-        Provider::Google => {
+        Vendor::Google => {
             // `image` wins; `flash-lite` reads as `Lt`, not `Fl`.
             if has("image") {
                 Some("Img")
@@ -373,7 +391,7 @@ fn modifier_abbrev(provider: Provider, modifiers: &[String]) -> Option<&'static 
                 None
             }
         }
-        Provider::Kimi => {
+        Vendor::Moonshot => {
             // Speed variants beat the bare `coding` marker.
             if has("highspeed") {
                 Some("HS")
@@ -381,6 +399,22 @@ fn modifier_abbrev(provider: Provider, modifiers: &[String]) -> Option<&'static 
                 Some("Tb")
             } else if has("coding") {
                 Some("Coding")
+            } else {
+                None
+            }
+        }
+        Vendor::Zhipu => {
+            // Combined `airx`/`flashx` beat their base tokens.
+            if has("airx") {
+                Some("AirX")
+            } else if has("flashx") {
+                Some("FlX")
+            } else if has("air") {
+                Some("Air")
+            } else if has("flash") {
+                Some("Fl")
+            } else if has("x") {
+                Some("X")
             } else {
                 None
             }
@@ -403,8 +437,8 @@ fn effort_abbrev(effort: &str) -> String {
 /// Render the compact display label for a model, e.g. `Opus 4.8`,
 /// `GPT-5.5 Cdx`, `Gem 3.2 Pro`.
 pub fn short_label(id: &ModelIdentity) -> String {
-    let mut base = match id.provider {
-        Provider::Claude => {
+    let mut base = match id.vendor {
+        Vendor::Anthropic => {
             let fam = capitalize(&id.family);
             if id.version.is_empty() {
                 fam
@@ -412,8 +446,8 @@ pub fn short_label(id: &ModelIdentity) -> String {
                 format!("{} {}", fam, id.version)
             }
         }
-        Provider::Openai if id.family == "o" => id.normalized_id.clone(),
-        Provider::Openai => {
+        Vendor::OpenAI if id.family == "o" => id.normalized_id.clone(),
+        Vendor::OpenAI => {
             let head = if id.family == "codex" {
                 "Codex".to_string()
             } else if id.version.is_empty() {
@@ -421,34 +455,45 @@ pub fn short_label(id: &ModelIdentity) -> String {
             } else {
                 format!("GPT-{}", id.version)
             };
-            match modifier_abbrev(id.provider, &id.modifiers) {
+            match modifier_abbrev(id.vendor, &id.modifiers) {
                 Some(abbr) => format!("{} {}", head, abbr),
                 None => head,
             }
         }
-        Provider::Google => {
+        Vendor::Google => {
             let head = if id.version.is_empty() {
                 "Gem".to_string()
             } else {
                 format!("Gem {}", id.version)
             };
-            match modifier_abbrev(id.provider, &id.modifiers) {
+            match modifier_abbrev(id.vendor, &id.modifiers) {
                 Some(abbr) => format!("{} {}", head, abbr),
                 None => head,
             }
         }
-        Provider::Kimi => {
+        Vendor::Moonshot => {
             let head = if id.version.is_empty() {
                 "Kimi".to_string()
             } else {
                 format!("K{}", id.version)
             };
-            match modifier_abbrev(id.provider, &id.modifiers) {
+            match modifier_abbrev(id.vendor, &id.modifiers) {
                 Some(abbr) => format!("{} {}", head, abbr),
                 None => head,
             }
         }
-        Provider::Unknown => {
+        Vendor::Zhipu => {
+            let head = if id.version.is_empty() {
+                "GLM".to_string()
+            } else {
+                format!("GLM-{}", id.version)
+            };
+            match modifier_abbrev(id.vendor, &id.modifiers) {
+                Some(abbr) => format!("{} {}", head, abbr),
+                None => head,
+            }
+        }
+        Vendor::Unknown => {
             if id.normalized_id == "<synthetic>" {
                 "synthetic".to_string()
             } else {
@@ -464,18 +509,19 @@ pub fn short_label(id: &ModelIdentity) -> String {
 }
 
 fn family_rank(id: &ModelIdentity) -> u32 {
-    match id.provider {
-        Provider::Claude => match id.family.as_str() {
+    match id.vendor {
+        Vendor::Anthropic => match id.family.as_str() {
             "fable" | "mythos" => 0,
             "opus" => 1,
             "sonnet" => 2,
             "haiku" => 3,
             _ => 4,
         },
-        Provider::Openai => 10,
-        Provider::Google => 20,
-        Provider::Kimi => 25,
-        Provider::Unknown => 30,
+        Vendor::OpenAI => 10,
+        Vendor::Google => 20,
+        Vendor::Moonshot => 25,
+        Vendor::Zhipu => 27,
+        Vendor::Unknown => 30,
     }
 }
 
@@ -493,7 +539,7 @@ pub fn sort_key(id: &ModelIdentity) -> (u32, std::cmp::Reverse<(u32, u32)>, Stri
 /// entries today; everything else falls back to the indexed palette. Fable and
 /// Mythos share one palette entry (same model behind two ids).
 pub fn color_family(id: &ModelIdentity) -> Option<&'static str> {
-    if id.provider == Provider::Claude {
+    if id.vendor == Vendor::Anthropic {
         match id.family.as_str() {
             "fable" | "mythos" => Some("fable"),
             "opus" => Some("opus"),
@@ -546,6 +592,8 @@ mod tests {
         assert_eq!(label("gpt-5.1-codex-max"), "GPT-5.1 Max");
         assert_eq!(label("gpt-5.1-codex-mini"), "GPT-5.1 Mini");
         assert_eq!(label("gpt-5.3-codex-spark"), "GPT-5.3 Sprk");
+        assert_eq!(label("gpt-5.6-sol"), "GPT-5.6 Sol");
+        assert_eq!(label("gpt-5.6-luna"), "GPT-5.6 Luna");
         assert_eq!(label("gpt-4.1-mini"), "GPT-4.1 Mini");
         assert_eq!(label("codex-mini-latest"), "Codex Mini");
         assert_eq!(label("o3"), "o3");
@@ -589,18 +637,18 @@ mod tests {
     #[test]
     fn kimi_parse_exposes_provider_family_version_modifiers() {
         let k = parse_model_identity("k3");
-        assert_eq!(k.provider, Provider::Kimi);
+        assert_eq!(k.vendor, Vendor::Moonshot);
         assert_eq!(k.family, "kimi");
         assert_eq!(k.version_key, (3, 0));
         assert!(k.modifiers.is_empty());
 
         let k25 = parse_model_identity("kimi-k2.5");
-        assert_eq!(k25.provider, Provider::Kimi);
+        assert_eq!(k25.vendor, Vendor::Moonshot);
         assert_eq!(k25.family, "kimi");
         assert_eq!(k25.version_key, (2, 5));
 
         let coding = parse_model_identity("kimi-for-coding");
-        assert_eq!(coding.provider, Provider::Kimi);
+        assert_eq!(coding.vendor, Vendor::Moonshot);
         assert_eq!(coding.version_key, (0, 0));
         assert_eq!(coding.modifiers, vec!["coding".to_string()]);
 
@@ -621,6 +669,67 @@ mod tests {
         assert!(gem < k3);
         assert!(k3 < k25);
         assert!(k25 < unknown);
+    }
+
+    #[test]
+    fn glm_labels_derive_version_and_modifiers() {
+        assert_eq!(label("glm-5.2"), "GLM-5.2");
+        assert_eq!(label("glm-4.6"), "GLM-4.6");
+        assert_eq!(label("glm-4.5-air"), "GLM-4.5 Air");
+        assert_eq!(label("glm-4.5-flash"), "GLM-4.5 Fl");
+        assert_eq!(label("glm-4.5-x"), "GLM-4.5 X");
+        assert_eq!(label("glm-4.5-airx"), "GLM-4.5 AirX");
+        assert_eq!(label("zai-org/GLM-5.2"), "GLM-5.2");
+        assert_eq!(label("glm-5.2:high"), "GLM-5.2(H)");
+    }
+
+    #[test]
+    fn glm_parse_exposes_vendor_family_version() {
+        let g = parse_model_identity("glm-5.2");
+        assert_eq!(g.vendor, Vendor::Zhipu);
+        assert_eq!(g.family, "glm");
+        assert_eq!(g.version_key, (5, 2));
+        assert!(g.modifiers.is_empty());
+
+        let air = parse_model_identity("glm-4.5-air");
+        assert_eq!(air.vendor, Vendor::Zhipu);
+        assert_eq!(air.modifiers, vec!["air".to_string()]);
+    }
+
+    #[test]
+    fn vendor_display_names_are_maker_names() {
+        assert_eq!(Vendor::Anthropic.display_name(), "Anthropic");
+        assert_eq!(Vendor::OpenAI.display_name(), "OpenAI");
+        assert_eq!(Vendor::Google.display_name(), "Google");
+        assert_eq!(Vendor::Moonshot.display_name(), "Moonshot");
+        assert_eq!(Vendor::Zhipu.display_name(), "Zhipu");
+        assert_eq!(Vendor::Unknown.display_name(), "Other");
+    }
+
+    #[test]
+    fn vendor_is_inferred_from_model_id() {
+        let vendor = |s: &str| parse_model_identity(s).vendor;
+        assert_eq!(vendor("claude-opus-4-8"), Vendor::Anthropic);
+        assert_eq!(vendor("anthropic/claude-opus-4-8"), Vendor::Anthropic);
+        assert_eq!(vendor("gpt-5.5-codex"), Vendor::OpenAI);
+        assert_eq!(vendor("o3-mini"), Vendor::OpenAI);
+        assert_eq!(vendor("gemini-2.5-pro"), Vendor::Google);
+        assert_eq!(vendor("kimi-k2.5"), Vendor::Moonshot);
+        assert_eq!(vendor("k3"), Vendor::Moonshot);
+        assert_eq!(vendor("glm-5.2"), Vendor::Zhipu);
+        assert_eq!(vendor("mystery-model"), Vendor::Unknown);
+    }
+
+    #[test]
+    fn glm_sorts_after_moonshot_before_unknown() {
+        let kimi = sort_key(&parse_model_identity("kimi-k2.5"));
+        let glm = sort_key(&parse_model_identity("glm-5.2"));
+        let glm_old = sort_key(&parse_model_identity("glm-4.6"));
+        let unknown = sort_key(&parse_model_identity("mystery-model"));
+
+        assert!(kimi < glm);
+        assert!(glm < glm_old);
+        assert!(glm_old < unknown);
     }
 
     #[test]
@@ -660,13 +769,13 @@ mod tests {
     #[test]
     fn parse_exposes_provider_family_version_modifiers() {
         let c = parse_model_identity("claude-opus-4-8");
-        assert_eq!(c.provider, Provider::Claude);
+        assert_eq!(c.vendor, Vendor::Anthropic);
         assert_eq!(c.family, "opus");
         assert_eq!(c.version_key, (4, 8));
         assert!(c.modifiers.is_empty());
 
         let g = parse_model_identity("gpt-5.5-codex");
-        assert_eq!(g.provider, Provider::Openai);
+        assert_eq!(g.vendor, Vendor::OpenAI);
         assert_eq!(g.family, "gpt");
         assert_eq!(g.version_key, (5, 5));
         assert_eq!(g.modifiers, vec!["codex".to_string()]);
@@ -675,7 +784,7 @@ mod tests {
         assert_eq!(m.modifiers, vec!["mini".to_string()]);
 
         let fl = parse_model_identity("gemini-2.5-flash-lite");
-        assert_eq!(fl.provider, Provider::Google);
+        assert_eq!(fl.vendor, Vendor::Google);
         assert_eq!(fl.family, "gemini");
         assert_eq!(fl.version_key, (2, 5));
         assert!(fl.modifiers.contains(&"lite".to_string()));

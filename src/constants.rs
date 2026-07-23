@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use crate::model_id::{Provider, parse_model_identity};
+use crate::model_id::{Vendor, parse_model_identity};
 
 /// Embedded pricing data from pricing.json
 const PRICING_JSON: &str = include_str!("../pricing.json");
@@ -296,7 +296,7 @@ fn same_class_fallback<'a>(
     model: &str,
 ) -> Option<&'a ModelPricing> {
     let target = parse_model_identity(model);
-    if target.provider == Provider::Unknown {
+    if target.vendor == Vendor::Unknown {
         return None;
     }
     table
@@ -313,7 +313,7 @@ fn same_class_fallback<'a>(
 /// the exact set of size/modifier tokens (so `gpt-5.5-mini` never matches the
 /// base `gpt-5.5`).
 fn same_class(a: &crate::model_id::ModelIdentity, b: &crate::model_id::ModelIdentity) -> bool {
-    if a.provider != b.provider || a.family != b.family {
+    if a.vendor != b.vendor || a.family != b.family {
         return false;
     }
     let mut am = a.modifiers.clone();

@@ -374,6 +374,7 @@ mod tests {
             dedup_key: dedup_key.to_string(),
             entry: UsageEntry {
                 host_id: None,
+                session_id: None,
                 timestamp: timestamp.to_string(),
                 parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
                 session_start_time: timestamp.to_string(),

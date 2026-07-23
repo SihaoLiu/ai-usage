@@ -7,10 +7,11 @@ pub mod omp;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Local};
+use rayon::prelude::*;
 
 use crate::constants::{AllPricing, ModelPricing};
 use crate::data::UsageEntry;
-use crate::model_id::{Provider, normalize_reasoning_effort, parse_model_identity};
+use crate::model_id::{Vendor, normalize_reasoning_effort, parse_model_identity};
 use crate::time_utils::{
     TokenFractions, distribute_tokens_to_intervals, parse_timestamp, to_interval,
 };
@@ -20,11 +21,13 @@ pub(crate) fn pricing_provider_for_entry<'a>(tool: &'a str, entry: &'a UsageEntr
         return tool;
     }
 
-    match parse_model_identity(&entry.model).provider {
-        Provider::Claude => "claude",
-        Provider::Google => "gemini",
-        Provider::Kimi => "kimi",
-        Provider::Openai | Provider::Unknown => "codex",
+    match parse_model_identity(&entry.model).vendor {
+        Vendor::Anthropic => "claude",
+        Vendor::Google => "gemini",
+        Vendor::Moonshot => "kimi",
+        // No dedicated pricing table for Zhipu yet; unknown-vendor entries
+        // have always priced through the codex defaults.
+        Vendor::OpenAI | Vendor::Zhipu | Vendor::Unknown => "codex",
     }
 }
 
@@ -80,104 +83,150 @@ pub type ModelTimeSeries = HashMap<DateTime<Local>, HashMap<String, IntervalToke
 /// Time series: interval -> tool -> total tokens
 pub type ToolTimeSeries = HashMap<DateTime<Local>, HashMap<String, f64>>;
 
+/// Chunk size for parallel aggregation over usage entries. Large enough that
+/// per-chunk HashMap merge cost is negligible, small enough to spread a
+/// million-entry scan across every core.
+pub(crate) const PAR_CHUNK: usize = 16_384;
+
+fn accumulate_breakdown_entry(
+    model_stats: &mut HashMap<String, ModelBreakdownRow>,
+    entry: &UsageEntry,
+    tool: &str,
+    combine_effort: bool,
+    pricing: &AllPricing,
+) {
+    let model_key = model_key_for_entry(entry, combine_effort);
+
+    let row = model_stats
+        .entry(model_key.clone())
+        .or_insert_with(|| ModelBreakdownRow {
+            model: model_key,
+            tool: tool.to_string(),
+            count: 0,
+            input: 0,
+            output: 0,
+            cache_creation: 0,
+            cache_read: 0,
+            reasoning: 0,
+            thinking: 0,
+            total: 0,
+            total_with_cache: 0,
+            input_cost: 0.0,
+            output_cost: 0.0,
+            cache_read_cost: 0.0,
+            cache_creation_cost: 0.0,
+        });
+
+    row.count += 1;
+    row.input += entry.usage.input_tokens;
+    row.output += entry.usage.output_tokens;
+    row.cache_read += entry.usage.cache_read_input_tokens;
+
+    match tool {
+        "codex" => {
+            row.reasoning += entry.usage.reasoning_output_tokens;
+        }
+        "gemini" => {
+            row.thinking += entry.usage.cache_creation_input_tokens;
+            row.cache_creation += entry.usage.cache_creation_input_tokens;
+        }
+        _ => {
+            row.cache_creation += entry.usage.cache_creation_input_tokens;
+        }
+    }
+    if tool != "omp"
+        && let Some(costs) = entry.costs
+    {
+        row.input_cost += costs.input;
+        row.output_cost += costs.output;
+        row.cache_read_cost += costs.cache_read;
+        row.cache_creation_cost += costs.cache_creation;
+        return;
+    }
+
+    let pricing_provider = pricing_provider_for_entry(tool, entry);
+    let p = pricing.pricing_for_entry(pricing_provider, &entry.model, entry.fast_tier);
+    row.input_cost += ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
+    row.output_cost +=
+        ModelPricing::tier_cost(entry.usage.output_tokens, p.output, p.output_above_200k);
+    row.cache_read_cost += ModelPricing::tier_cost(
+        entry.usage.cache_read_input_tokens,
+        p.cache_input,
+        p.cache_input_above_200k,
+    );
+    row.cache_creation_cost += match (tool, pricing_provider) {
+        ("omp", _) => ModelPricing::tier_cost(
+            entry.usage.cache_creation_input_tokens,
+            p.cache_output,
+            p.cache_output_above_200k,
+        ),
+        (_, "codex") => ModelPricing::tier_cost(
+            entry.usage.reasoning_output_tokens,
+            p.output,
+            p.output_above_200k,
+        ),
+        (_, "gemini") => ModelPricing::tier_cost(
+            entry.usage.cache_creation_input_tokens,
+            p.output,
+            p.output_above_200k,
+        ),
+        _ => ModelPricing::tier_cost(
+            entry.usage.cache_creation_input_tokens,
+            p.cache_output,
+            p.cache_output_above_200k,
+        ),
+    };
+}
+
+fn merge_breakdown_rows(a: &mut ModelBreakdownRow, b: ModelBreakdownRow) {
+    a.count += b.count;
+    a.input += b.input;
+    a.output += b.output;
+    a.cache_creation += b.cache_creation;
+    a.cache_read += b.cache_read;
+    a.reasoning += b.reasoning;
+    a.thinking += b.thinking;
+    a.input_cost += b.input_cost;
+    a.output_cost += b.output_cost;
+    a.cache_read_cost += b.cache_read_cost;
+    a.cache_creation_cost += b.cache_creation_cost;
+}
+
 /// Calculate the per-model breakdown across all entries.
 ///
 /// Rows are aggregated per model (optionally split by effort), `<synthetic>`
 /// models are dropped, and the result is sorted by message count descending.
 /// Cost is computed per-entry using `ModelPricing::tier_cost` so that the
 /// 200k-tier premium for Claude 1M-context models is applied correctly.
+/// The scan is chunk-parallel: each chunk folds into a local map, maps merge
+/// pairwise.
 pub(crate) fn calculate_model_breakdown_generic(
     usage_data: &[UsageEntry],
     tool: &str,
     combine_effort: bool,
     pricing: &AllPricing,
 ) -> Vec<ModelBreakdownRow> {
-    let mut model_stats: HashMap<String, ModelBreakdownRow> = HashMap::new();
-
-    for entry in usage_data {
-        let model_key = model_key_for_entry(entry, combine_effort);
-
-        let row = model_stats
-            .entry(model_key.clone())
-            .or_insert_with(|| ModelBreakdownRow {
-                model: model_key,
-                tool: tool.to_string(),
-                count: 0,
-                input: 0,
-                output: 0,
-                cache_creation: 0,
-                cache_read: 0,
-                reasoning: 0,
-                thinking: 0,
-                total: 0,
-                total_with_cache: 0,
-                input_cost: 0.0,
-                output_cost: 0.0,
-                cache_read_cost: 0.0,
-                cache_creation_cost: 0.0,
-            });
-
-        row.count += 1;
-        row.input += entry.usage.input_tokens;
-        row.output += entry.usage.output_tokens;
-        row.cache_read += entry.usage.cache_read_input_tokens;
-
-        match tool {
-            "codex" => {
-                row.reasoning += entry.usage.reasoning_output_tokens;
+    let model_stats: HashMap<String, ModelBreakdownRow> = usage_data
+        .par_chunks(PAR_CHUNK)
+        .fold(HashMap::new, |mut local, chunk| {
+            for entry in chunk {
+                accumulate_breakdown_entry(&mut local, entry, tool, combine_effort, pricing);
             }
-            "gemini" => {
-                row.thinking += entry.usage.cache_creation_input_tokens;
-                row.cache_creation += entry.usage.cache_creation_input_tokens;
+            local
+        })
+        .reduce(HashMap::new, |mut a, b| {
+            for (key, row) in b {
+                match a.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        merge_breakdown_rows(slot.get_mut(), row);
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(row);
+                    }
+                }
             }
-            _ => {
-                row.cache_creation += entry.usage.cache_creation_input_tokens;
-            }
-        }
-        if tool != "omp"
-            && let Some(costs) = entry.costs
-        {
-            row.input_cost += costs.input;
-            row.output_cost += costs.output;
-            row.cache_read_cost += costs.cache_read;
-            row.cache_creation_cost += costs.cache_creation;
-            continue;
-        }
-
-        let pricing_provider = pricing_provider_for_entry(tool, entry);
-        let p = pricing.pricing_for_entry(pricing_provider, &entry.model, entry.fast_tier);
-        row.input_cost +=
-            ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
-        row.output_cost +=
-            ModelPricing::tier_cost(entry.usage.output_tokens, p.output, p.output_above_200k);
-        row.cache_read_cost += ModelPricing::tier_cost(
-            entry.usage.cache_read_input_tokens,
-            p.cache_input,
-            p.cache_input_above_200k,
-        );
-        row.cache_creation_cost += match (tool, pricing_provider) {
-            ("omp", _) => ModelPricing::tier_cost(
-                entry.usage.cache_creation_input_tokens,
-                p.cache_output,
-                p.cache_output_above_200k,
-            ),
-            (_, "codex") => ModelPricing::tier_cost(
-                entry.usage.reasoning_output_tokens,
-                p.output,
-                p.output_above_200k,
-            ),
-            (_, "gemini") => ModelPricing::tier_cost(
-                entry.usage.cache_creation_input_tokens,
-                p.output,
-                p.output_above_200k,
-            ),
-            _ => ModelPricing::tier_cost(
-                entry.usage.cache_creation_input_tokens,
-                p.cache_output,
-                p.cache_output_above_200k,
-            ),
-        };
-    }
+            a
+        });
 
     let mut result: Vec<ModelBreakdownRow> = model_stats
         .into_values()
@@ -197,67 +246,100 @@ pub(crate) fn calculate_model_breakdown_generic(
     result
 }
 
+fn accumulate_time_series_entry(
+    time_series: &mut ModelTimeSeries,
+    entry: &UsageEntry,
+    interval_minutes: i64,
+    combine_effort: bool,
+    tool: &str,
+) {
+    if entry.timestamp.is_empty() {
+        return;
+    }
+
+    let model_key = model_key_for_entry(entry, combine_effort);
+
+    let tokens = TokenFractions {
+        input: entry.usage.input_tokens as f64,
+        output: entry.usage.output_tokens as f64,
+        cache_creation: match tool {
+            "codex" => entry.usage.reasoning_output_tokens as f64,
+            _ => entry.usage.cache_creation_input_tokens as f64,
+        },
+        cache_read: entry.usage.cache_read_input_tokens as f64,
+    };
+
+    let distributed = distribute_tokens_to_intervals(
+        &entry.session_start_time,
+        &entry.session_end_time,
+        &tokens,
+        interval_minutes,
+    );
+
+    if !distributed.is_empty() {
+        for (interval_time, fraction) in distributed {
+            let model_map = time_series.entry(interval_time).or_default();
+            let breakdown = model_map.entry(model_key.clone()).or_default();
+            breakdown.input += fraction.input;
+            breakdown.output += fraction.output;
+            breakdown.cache_creation += fraction.cache_creation;
+            breakdown.cache_read += fraction.cache_read;
+        }
+    } else {
+        // Fallback: use timestamp-based bucketing
+        let timestamp_local = entry
+            .parsed_timestamp
+            .or_else(|| parse_timestamp(&entry.timestamp));
+
+        if let Some(ts) = timestamp_local {
+            let interval_time = to_interval(&ts, interval_minutes);
+            let model_map = time_series.entry(interval_time).or_default();
+            let breakdown = model_map.entry(model_key.clone()).or_default();
+            breakdown.input += tokens.input;
+            breakdown.output += tokens.output;
+            breakdown.cache_creation += tokens.cache_creation;
+            breakdown.cache_read += tokens.cache_read;
+        }
+    }
+}
+
+fn merge_time_series(mut a: ModelTimeSeries, b: ModelTimeSeries) -> ModelTimeSeries {
+    for (interval_time, models) in b {
+        let target = a.entry(interval_time).or_default();
+        for (model, breakdown) in models {
+            let slot = target.entry(model).or_default();
+            slot.input += breakdown.input;
+            slot.output += breakdown.output;
+            slot.cache_creation += breakdown.cache_creation;
+            slot.cache_read += breakdown.cache_read;
+        }
+    }
+    a
+}
+
 /// Calculate model token breakdown time series with interval distribution.
+/// Chunk-parallel: the per-entry session-time parsing dominates this scan.
 pub(crate) fn calculate_model_token_breakdown_time_series_generic(
     usage_data: &[UsageEntry],
     interval_minutes: i64,
     combine_effort: bool,
     tool: &str,
 ) -> ModelTimeSeries {
-    let mut time_series: ModelTimeSeries = HashMap::new();
-
-    for entry in usage_data {
-        if entry.timestamp.is_empty() {
-            continue;
-        }
-
-        let model_key = model_key_for_entry(entry, combine_effort);
-
-        let tokens = TokenFractions {
-            input: entry.usage.input_tokens as f64,
-            output: entry.usage.output_tokens as f64,
-            cache_creation: match tool {
-                "codex" => entry.usage.reasoning_output_tokens as f64,
-                _ => entry.usage.cache_creation_input_tokens as f64,
-            },
-            cache_read: entry.usage.cache_read_input_tokens as f64,
-        };
-
-        let distributed = distribute_tokens_to_intervals(
-            &entry.session_start_time,
-            &entry.session_end_time,
-            &tokens,
-            interval_minutes,
-        );
-
-        if !distributed.is_empty() {
-            for (interval_time, fraction) in distributed {
-                let model_map = time_series.entry(interval_time).or_default();
-                let breakdown = model_map.entry(model_key.clone()).or_default();
-                breakdown.input += fraction.input;
-                breakdown.output += fraction.output;
-                breakdown.cache_creation += fraction.cache_creation;
-                breakdown.cache_read += fraction.cache_read;
+    usage_data
+        .par_chunks(PAR_CHUNK)
+        .fold(HashMap::new, |mut local, chunk| {
+            for entry in chunk {
+                accumulate_time_series_entry(
+                    &mut local,
+                    entry,
+                    interval_minutes,
+                    combine_effort,
+                    tool,
+                );
             }
-        } else {
-            // Fallback: use timestamp-based bucketing
-            let timestamp_local = entry
-                .parsed_timestamp
-                .or_else(|| parse_timestamp(&entry.timestamp));
-
-            if let Some(ts) = timestamp_local {
-                let interval_time = to_interval(&ts, interval_minutes);
-                let model_map = time_series.entry(interval_time).or_default();
-                let breakdown = model_map.entry(model_key.clone()).or_default();
-                breakdown.input += tokens.input;
-                breakdown.output += tokens.output;
-                breakdown.cache_creation += tokens.cache_creation;
-                breakdown.cache_read += tokens.cache_read;
-            }
-        }
-    }
-
-    time_series
+            local
+        })
+        .reduce(HashMap::new, merge_time_series)
 }
 
 // Public wrappers for each tool
@@ -286,6 +368,7 @@ mod tests {
     fn usage_entry(model: &str, effort: Option<&str>, costs: Option<UsageCost>) -> UsageEntry {
         UsageEntry {
             host_id: None,
+            session_id: None,
             timestamp: "2026-06-15T12:00:00Z".to_string(),
             parsed_timestamp: None,
             session_start_time: String::new(),

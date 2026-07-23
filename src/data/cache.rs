@@ -7,19 +7,22 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageCost, UsageEntry};
-use crate::model_id::{Provider, is_reasoning_effort, parse_model_identity};
+use crate::model_id::{Vendor, is_reasoning_effort, parse_model_identity};
 use crate::time_utils::parse_timestamp;
 
 const CACHE_VERSION: u32 = 1;
 const ENTRY_FILE_MAGIC: &[u8; 8] = b"AIUCACH1";
 const REMOTE_FILE_MAGIC: &[u8; 8] = b"AIUREMT1";
+const HOT_SNAPSHOT_FILE: &str = "hot-snapshot.bin";
+const HOT_SNAPSHOT_MAGIC: &[u8; 8] = b"AIUHOT01";
 const MANIFEST_FILE: &str = "manifest.json";
 const ENTRIES_DIR: &str = "entries";
 const REMOTE_DIR: &str = "remote";
-const OMP_PARSER_REVISION: u32 = 2;
+const SESSION_ID_PARSER_REVISION: u32 = 1;
+const OMP_PARSER_REVISION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheManifest {
@@ -39,6 +42,11 @@ impl Default for CacheManifest {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct VendorManifest {
     files: BTreeMap<String, SourceFileMeta>,
+    /// Revision of session metadata after the current active source set was
+    /// parsed. Retained inactive records are intentionally excluded: their
+    /// source files no longer exist and cannot be refreshed.
+    #[serde(default)]
+    session_metadata_revision: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,8 +94,27 @@ impl SourceFileMeta {
 fn parser_revision(vendor: &str) -> u32 {
     match vendor {
         "omp" => OMP_PARSER_REVISION,
+        "claude" | "codex" | "gemini" | "kimi" => SESSION_ID_PARSER_REVISION,
         _ => 0,
     }
+}
+
+/// Whether a nonempty active-source manifest for a vendor was parsed by the
+/// current session-id-aware parser. This is intentionally manifest-based: an
+/// absent conversation is a valid query result and must not force a source
+/// rescan.
+pub(crate) fn vendor_session_metadata_is_current(cache_root: &Path, vendor: &str) -> bool {
+    let required_revision = parser_revision(vendor);
+    if required_revision == 0 {
+        return true;
+    }
+    let manifest = read_manifest(&cache_root.join(MANIFEST_FILE));
+    manifest
+        .vendors
+        .get(vendor)
+        .is_some_and(|vendor_manifest| {
+            vendor_manifest.session_metadata_revision == required_revision
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,12 +165,48 @@ struct PersistedSourceRecord {
     cost_cache_read: Option<f64>,
     #[serde(default)]
     cost_cache_creation: Option<f64>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedVendorRecords {
     format_version: u32,
     records: Vec<PersistedSourceRecord>,
+}
+
+/// Cache record layout before conversation ids were retained. Kept only for
+/// an in-place migration of existing binary caches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedVendorRecordsBeforeSession {
+    format_version: u32,
+    records: Vec<PersistedSourceRecordBeforeSession>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSourceRecordBeforeSession {
+    source_path: String,
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
+    effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+    #[serde(default = "default_fast_tier")]
+    fast_tier: i8,
+    #[serde(default)]
+    cost_input: Option<f64>,
+    #[serde(default)]
+    cost_output: Option<f64>,
+    #[serde(default)]
+    cost_cache_read: Option<f64>,
+    #[serde(default)]
+    cost_cache_creation: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +442,7 @@ impl From<PersistedSourceRecordV1> for PersistedSourceRecord {
             cost_output: None,
             cost_cache_read: None,
             cost_cache_creation: None,
+            session_id: None,
         }
     }
 }
@@ -403,6 +467,32 @@ impl From<PersistedSourceRecordWithFastTier> for PersistedSourceRecord {
             cost_output: None,
             cost_cache_read: None,
             cost_cache_creation: None,
+            session_id: None,
+        }
+    }
+}
+
+impl From<PersistedSourceRecordBeforeSession> for PersistedSourceRecord {
+    fn from(record: PersistedSourceRecordBeforeSession) -> Self {
+        Self {
+            source_path: record.source_path,
+            dedup_key: record.dedup_key,
+            timestamp: record.timestamp,
+            session_start_time: record.session_start_time,
+            session_end_time: record.session_end_time,
+            model: record.model,
+            effort: record.effort,
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            cache_read_input_tokens: record.cache_read_input_tokens,
+            cache_creation_input_tokens: record.cache_creation_input_tokens,
+            reasoning_output_tokens: record.reasoning_output_tokens,
+            fast_tier: record.fast_tier,
+            cost_input: record.cost_input,
+            cost_output: record.cost_output,
+            cost_cache_read: record.cost_cache_read,
+            cost_cache_creation: record.cost_cache_creation,
+            session_id: None,
         }
     }
 }
@@ -475,12 +565,14 @@ impl PersistedSourceRecord {
             cost_output: record.entry.costs.map(|costs| costs.output),
             cost_cache_read: record.entry.costs.map(|costs| costs.cache_read),
             cost_cache_creation: record.entry.costs.map(|costs| costs.cache_creation),
+            session_id: record.entry.session_id,
         }
     }
 
     fn to_usage_entry(&self) -> UsageEntry {
         UsageEntry {
             host_id: None,
+            session_id: self.session_id.clone(),
             timestamp: self.timestamp.clone(),
             parsed_timestamp: parse_timestamp(&self.timestamp),
             session_start_time: self.session_start_time.clone(),
@@ -544,6 +636,7 @@ impl PersistedRemoteRecord {
             dedup_key: self.dedup_key.clone(),
             entry: UsageEntry {
                 host_id: Some(host_id.to_string()),
+                session_id: None,
                 timestamp: self.timestamp.clone(),
                 parsed_timestamp: parse_timestamp(&self.timestamp),
                 session_start_time: self.session_start_time.clone(),
@@ -596,6 +689,55 @@ pub fn default_cache_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".cache").join("ai-usage"))
 }
 
+/// Read the compact, derived raw-data snapshot without touching source logs.
+/// Its payload is versioned by the caller's type and protected by the same
+/// checksum and atomic-write protocol as the authoritative record caches.
+pub(crate) fn load_hot_snapshot<T: DeserializeOwned>(cache_root: &Path) -> io::Result<Option<T>> {
+    let path = cache_root.join(HOT_SNAPSHOT_FILE);
+    let content = match fs::read(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if content.len() < HOT_SNAPSHOT_MAGIC.len() + 8
+        || &content[..HOT_SNAPSHOT_MAGIC.len()] != HOT_SNAPSHOT_MAGIC
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid hot snapshot header",
+        ));
+    }
+    let checksum_start = HOT_SNAPSHOT_MAGIC.len();
+    let payload_start = checksum_start + 8;
+    let stored_checksum = u64::from_le_bytes(
+        content[checksum_start..payload_start]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid checksum"))?,
+    );
+    let payload = &content[payload_start..];
+    if stored_checksum != fnv1a_bytes(0, payload) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hot snapshot checksum mismatch",
+        ));
+    }
+    bincode::deserialize(payload)
+        .map(Some)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// Persist a compact derived snapshot. The canonical per-source cache files
+/// remain the source of truth and can always rebuild this file.
+pub(crate) fn write_hot_snapshot<T: Serialize>(cache_root: &Path, snapshot: &T) -> io::Result<()> {
+    let payload = bincode::serialize(snapshot).map_err(io::Error::other)?;
+    let checksum = fnv1a_bytes(0, &payload);
+    let mut content = Vec::with_capacity(HOT_SNAPSHOT_MAGIC.len() + 8 + payload.len());
+    content.extend_from_slice(HOT_SNAPSHOT_MAGIC);
+    content.extend_from_slice(&checksum.to_le_bytes());
+    content.extend_from_slice(&payload);
+    atomic_write(&cache_root.join(HOT_SNAPSHOT_FILE), &content)
+}
+
 /// Load cached entries for one vendor without touching source files.
 #[cfg(test)]
 pub fn load_vendor_cached_snapshot(cache_root: &Path, vendor: &str) -> Vec<UsageEntry> {
@@ -609,16 +751,17 @@ pub fn load_vendor_cached_records(cache_root: &Path, vendor: &str) -> Vec<Cached
         .map(|records| {
             let mut seen = HashSet::new();
             records
-                .iter()
+                .into_iter()
                 .filter_map(|record| {
                     if !record.dedup_key.is_empty() && !seen.insert(record.dedup_key.clone()) {
                         return None;
                     }
+                    let entry = record.to_usage_entry();
                     Some(CachedUsageRecord {
                         vendor: vendor.to_string(),
-                        source_path: record.source_path.clone(),
-                        dedup_key: record.dedup_key.clone(),
-                        entry: record.to_usage_entry(),
+                        source_path: record.source_path,
+                        dedup_key: record.dedup_key,
+                        entry,
                     })
                 })
                 .collect()
@@ -651,19 +794,22 @@ pub fn load_remote_entries(
         .collect();
     host_files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut records = Vec::new();
-    for (host_id, path) in host_files {
-        let Ok(host_records) = read_remote_records(&path) else {
-            continue;
-        };
-        let host_records = deduplicate_remote_omp_aliases(host_records);
-        records.extend(
+    // Per-host files decode in parallel; the indexed collect keeps the
+    // deterministic host order.
+    let per_host: Vec<Vec<RemoteUsageRecord>> = host_files
+        .par_iter()
+        .map(|(host_id, path)| {
+            let Ok(host_records) = read_remote_records(path) else {
+                return Vec::new();
+            };
+            let host_records = deduplicate_remote_omp_aliases(host_records);
             host_records
                 .iter()
-                .map(|record| record.to_remote_usage_record(&host_id)),
-        );
-    }
-    records
+                .map(|record| record.to_remote_usage_record(host_id))
+                .collect()
+        })
+        .collect();
+    per_host.into_iter().flatten().collect()
 }
 
 /// Remove every per-host file in the remote cache directory and report
@@ -817,21 +963,21 @@ fn remote_omp_file_alias_from_key(key: &OmpV220Key) -> OmpRemoteFileAlias {
 
 fn omp_model_candidates_for(model: &str, effort: Option<&str>) -> Vec<String> {
     let mut models = vec![model.to_string()];
-    match parse_model_identity(model).provider {
-        Provider::Claude => {
+    match parse_model_identity(model).vendor {
+        Vendor::Anthropic => {
             models.push(format!("anthropic/{model}"));
             models.push(format!("claude/{model}"));
         }
-        Provider::Google => {
+        Vendor::Google => {
             models.push(format!("gemini/{model}"));
             models.push(format!("google/{model}"));
             models.push(format!("vertex/{model}"));
         }
-        Provider::Openai => {
+        Vendor::OpenAI => {
             models.push(format!("openai/{model}"));
             models.push(format!("openai-codex/{model}"));
         }
-        Provider::Kimi | Provider::Unknown => {}
+        Vendor::Moonshot | Vendor::Zhipu | Vendor::Unknown => {}
     }
     if let Some(provider) = effort.filter(|value| !value.is_empty() && !is_reasoning_effort(value))
     {
@@ -957,6 +1103,11 @@ where
     let mut active_keys = HashSet::new();
     let mut cache_changed = false;
     let parser_revision = parser_revision(vendor);
+    if parser_revision != 0
+        && next_vendor_manifest.session_metadata_revision != parser_revision
+    {
+        cache_changed = true;
+    }
 
     for source in &active_sources {
         active_keys.insert(source.key.clone());
@@ -1042,6 +1193,9 @@ where
     };
 
     if cache_changed {
+        if parser_revision != 0 {
+            next_vendor_manifest.session_metadata_revision = parser_revision;
+        }
         if !retain_inactive_sources {
             next_vendor_manifest
                 .files
@@ -1078,7 +1232,10 @@ where
     F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
 {
     let active_records = parse_active_sources(&active_sources, current_fast_tier, parse_file);
-    let mut vendor_manifest = VendorManifest::default();
+    let mut vendor_manifest = VendorManifest {
+        session_metadata_revision: parser_revision(vendor),
+        ..Default::default()
+    };
     let stats = record_stats_by_path(&active_records);
 
     for source in &active_sources {
@@ -1269,6 +1426,27 @@ fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
             ));
         }
         return Ok(decoded.records);
+    }
+
+    if let Ok(decoded) = bincode::deserialize::<PersistedVendorRecordsBeforeSession>(payload) {
+        if decoded.format_version != CACHE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported cache entry version",
+            ));
+        }
+        let records: Vec<PersistedSourceRecord> =
+            decoded.records.into_iter().map(Into::into).collect();
+        if records
+            .iter()
+            .any(|record| !record.has_non_negative_token_usage())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache entry has negative token count",
+            ));
+        }
+        return Ok(records);
     }
 
     if let Ok(decoded) = bincode::deserialize::<PersistedVendorRecordsWithFastTier>(payload) {
@@ -1713,6 +1891,7 @@ mod tests {
             dedup_key: key.to_string(),
             entry: UsageEntry {
                 host_id: None,
+                session_id: None,
                 timestamp: timestamp.to_string(),
                 parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
                 session_start_time: timestamp.to_string(),
@@ -1750,6 +1929,7 @@ mod tests {
             dedup_key: dedup_key.to_string(),
             entry: UsageEntry {
                 host_id: None,
+                session_id: None,
                 timestamp: timestamp.to_string(),
                 parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
                 session_start_time: timestamp.to_string(),
@@ -1878,6 +2058,155 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].host_id, None);
+    }
+
+    #[test]
+    fn local_cache_round_trips_session_ids() {
+        let cache_root = unique_temp_dir("session-id");
+        let source = cache_root.join("source.jsonl");
+        write_source(&source, "first");
+
+        let _ = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
+            let mut record = usage_record("stable-key", "2026-05-01T00:00:00Z", 42);
+            record.entry.session_id = Some("conversation-42".to_string());
+            vec![record]
+        });
+        let records = super::load_vendor_cached_records(&cache_root, "test");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].entry.session_id.as_deref(),
+            Some("conversation-42")
+        );
+    }
+
+    #[test]
+    fn cache_before_session_ids_remains_readable() {
+        let cache_root = unique_temp_dir("before-session-id");
+        let entries_dir = cache_root.join(super::ENTRIES_DIR);
+        fs::create_dir_all(&entries_dir).expect("create entries directory");
+
+        let legacy = super::PersistedVendorRecordsBeforeSession {
+            format_version: super::CACHE_VERSION,
+            records: vec![super::PersistedSourceRecordBeforeSession {
+                source_path: "source.jsonl".to_string(),
+                dedup_key: "stable-key".to_string(),
+                timestamp: "2026-05-01T00:00:00Z".to_string(),
+                session_start_time: "2026-05-01T00:00:00Z".to_string(),
+                session_end_time: "2026-05-01T00:00:00Z".to_string(),
+                model: "test-model".to_string(),
+                effort: None,
+                input_tokens: 42,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                fast_tier: UNKNOWN_FAST_TIER,
+                cost_input: None,
+                cost_output: None,
+                cost_cache_read: None,
+                cost_cache_creation: None,
+            }],
+        };
+        let payload = bincode::serialize(&legacy).expect("serialize legacy cache");
+        let mut content = Vec::new();
+        content.extend_from_slice(super::ENTRY_FILE_MAGIC);
+        content.extend_from_slice(&super::fnv1a_bytes(0, &payload).to_le_bytes());
+        content.extend_from_slice(&payload);
+        fs::write(entries_dir.join("claude.bin"), content).expect("write legacy cache");
+
+        let records = super::load_vendor_cached_records(&cache_root, "claude");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry.session_id, None);
+        assert_eq!(records[0].entry.usage.input_tokens, 42);
+    }
+
+    #[test]
+    fn manifest_marks_session_metadata_stale_until_current_parser_revision() {
+        let cache_root = unique_temp_dir("session-metadata-revision");
+        let source = cache_root.join("source.jsonl");
+        write_source(&source, "first");
+
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "claude",
+            vec![source],
+            -1,
+            |_| vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)],
+        );
+        assert!(super::vendor_session_metadata_is_current(&cache_root, "claude"));
+
+        let manifest_path = cache_root.join(super::MANIFEST_FILE);
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&manifest_path).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        manifest["vendors"]["claude"]["session_metadata_revision"] = serde_json::json!(0);
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write stale manifest");
+
+        assert!(!super::vendor_session_metadata_is_current(&cache_root, "claude"));
+
+        manifest["vendors"]["claude"]["files"] = serde_json::json!({});
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("serialize empty manifest"),
+        )
+        .expect("write empty manifest");
+
+        assert!(!super::vendor_session_metadata_is_current(&cache_root, "claude"));
+    }
+
+    #[test]
+    fn retained_inactive_sources_do_not_keep_session_metadata_stale() {
+        let cache_root = unique_temp_dir("inactive-session-metadata");
+        let active = cache_root.join("active.jsonl");
+        let retired = cache_root.join("retired.jsonl");
+        write_source(&active, "active");
+        write_source(&retired, "retired");
+
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "claude",
+            vec![active.clone(), retired.clone()],
+            -1,
+            |_| vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)],
+        );
+
+        let manifest_path = cache_root.join(super::MANIFEST_FILE);
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&manifest_path).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        let retired_key = fs::canonicalize(&retired)
+            .expect("canonical retired path")
+            .to_string_lossy()
+            .into_owned();
+        manifest["vendors"]["claude"]["files"][&retired_key]["parser_revision"] =
+            serde_json::json!(0);
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write stale manifest");
+        fs::remove_file(&retired).expect("remove retired source");
+
+        let _ = super::refresh_retaining_vendor_cache(
+            &cache_root,
+            "claude",
+            vec![active],
+            -1,
+            |_| vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)],
+        );
+
+        assert!(super::vendor_session_metadata_is_current(
+            &cache_root,
+            "claude"
+        ));
     }
 
     #[test]

@@ -125,6 +125,7 @@ fn read_single_kimi_file(path: &Path) -> Vec<SourceUsageRecord> {
             dedup_key,
             entry: UsageEntry {
                 host_id: None,
+                session_id: session_agent.as_ref().map(|(session, _)| session.clone()),
                 timestamp: timestamp.clone(),
                 parsed_timestamp,
                 session_start_time: timestamp.clone(),
@@ -202,6 +203,7 @@ mod tests {
         fs::remove_dir_all(&root).ok();
 
         assert_eq!(records.len(), 2);
+        assert_eq!(records[0].entry.session_id.as_deref(), Some("session_abc"));
 
         let first = &records[0].entry;
         assert_eq!(first.model, "k3");

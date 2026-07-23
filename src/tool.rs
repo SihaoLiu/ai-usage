@@ -51,6 +51,18 @@ impl Tool {
         }
     }
 
+    /// Compact harness tag for narrow table cells and merged harness lists.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Tool::Claude => "CC",
+            Tool::Codex => "Cdx",
+            Tool::Gemini => "GCli",
+            Tool::Kimi => "KC",
+            Tool::Omp => "OMP",
+            Tool::All => "All",
+        }
+    }
+
     pub fn from_key(value: &str) -> Option<Self> {
         match value {
             "claude" => Some(Tool::Claude),

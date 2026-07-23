@@ -74,6 +74,7 @@ fn read_single_gemini_file(path: &Path) -> Vec<SourceUsageRecord> {
             dedup_key,
             entry: UsageEntry {
                 host_id: None,
+                session_id: (!session_id.is_empty()).then(|| session_id.clone()),
                 timestamp: timestamp.clone(),
                 parsed_timestamp: parsed_ts,
                 session_start_time: timestamp.clone(),
@@ -176,6 +177,7 @@ mod tests {
 
         let keys: Vec<&str> = records.iter().map(|r| r.dedup_key.as_str()).collect();
         assert_eq!(keys, ["gemini:sess-uuid-1:m1", "gemini:sess-uuid-1:m2"]);
+        assert_eq!(records[0].entry.session_id.as_deref(), Some("sess-uuid-1"));
     }
 
     #[test]

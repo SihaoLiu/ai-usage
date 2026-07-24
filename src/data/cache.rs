@@ -109,12 +109,9 @@ pub(crate) fn vendor_session_metadata_is_current(cache_root: &Path, vendor: &str
         return true;
     }
     let manifest = read_manifest(&cache_root.join(MANIFEST_FILE));
-    manifest
-        .vendors
-        .get(vendor)
-        .is_some_and(|vendor_manifest| {
-            vendor_manifest.session_metadata_revision == required_revision
-        })
+    manifest.vendors.get(vendor).is_some_and(|vendor_manifest| {
+        vendor_manifest.session_metadata_revision == required_revision
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1103,9 +1100,7 @@ where
     let mut active_keys = HashSet::new();
     let mut cache_changed = false;
     let parser_revision = parser_revision(vendor);
-    if parser_revision != 0
-        && next_vendor_manifest.session_metadata_revision != parser_revision
-    {
+    if parser_revision != 0 && next_vendor_manifest.session_metadata_revision != parser_revision {
         cache_changed = true;
     }
 
@@ -2128,20 +2123,18 @@ mod tests {
         let source = cache_root.join("source.jsonl");
         write_source(&source, "first");
 
-        let _ = super::load_or_update_vendor_cache(
+        let _ = super::load_or_update_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
+            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
+        });
+        assert!(super::vendor_session_metadata_is_current(
             &cache_root,
-            "claude",
-            vec![source],
-            -1,
-            |_| vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)],
-        );
-        assert!(super::vendor_session_metadata_is_current(&cache_root, "claude"));
+            "claude"
+        ));
 
         let manifest_path = cache_root.join(super::MANIFEST_FILE);
-        let mut manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&manifest_path).expect("read manifest"),
-        )
-        .expect("parse manifest");
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
         manifest["vendors"]["claude"]["session_metadata_revision"] = serde_json::json!(0);
         fs::write(
             &manifest_path,
@@ -2149,7 +2142,10 @@ mod tests {
         )
         .expect("write stale manifest");
 
-        assert!(!super::vendor_session_metadata_is_current(&cache_root, "claude"));
+        assert!(!super::vendor_session_metadata_is_current(
+            &cache_root,
+            "claude"
+        ));
 
         manifest["vendors"]["claude"]["files"] = serde_json::json!({});
         fs::write(
@@ -2158,7 +2154,10 @@ mod tests {
         )
         .expect("write empty manifest");
 
-        assert!(!super::vendor_session_metadata_is_current(&cache_root, "claude"));
+        assert!(!super::vendor_session_metadata_is_current(
+            &cache_root,
+            "claude"
+        ));
     }
 
     #[test]
@@ -2178,10 +2177,9 @@ mod tests {
         );
 
         let manifest_path = cache_root.join(super::MANIFEST_FILE);
-        let mut manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&manifest_path).expect("read manifest"),
-        )
-        .expect("parse manifest");
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
         let retired_key = fs::canonicalize(&retired)
             .expect("canonical retired path")
             .to_string_lossy()
@@ -2195,13 +2193,10 @@ mod tests {
         .expect("write stale manifest");
         fs::remove_file(&retired).expect("remove retired source");
 
-        let _ = super::refresh_retaining_vendor_cache(
-            &cache_root,
-            "claude",
-            vec![active],
-            -1,
-            |_| vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)],
-        );
+        let _ =
+            super::refresh_retaining_vendor_cache(&cache_root, "claude", vec![active], -1, |_| {
+                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
+            });
 
         assert!(super::vendor_session_metadata_is_current(
             &cache_root,

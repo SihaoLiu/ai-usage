@@ -241,7 +241,10 @@ mod tests {
     fn session_metadata_id_is_used_for_usage_records() {
         let content = r#"{"type":"session","id":"omp-session"}
 {"type":"message","timestamp":"2026-05-27T08:34:02.431Z","message":{"role":"assistant","model":"gpt-test","usage":{"input":1,"output":2}}}"#;
-        assert_eq!(session_id_from_content(content).as_deref(), Some("omp-session"));
+        assert_eq!(
+            session_id_from_content(content).as_deref(),
+            Some("omp-session")
+        );
     }
 
     #[test]

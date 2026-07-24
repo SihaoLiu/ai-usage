@@ -170,7 +170,8 @@ fn accumulate_breakdown_entry(
     }
 
     let p = &entry_pricing[entry.model.as_str()][&entry.fast_tier];
-    row.input_cost += ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
+    row.input_cost +=
+        ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
     row.output_cost +=
         ModelPricing::tier_cost(entry.usage.output_tokens, p.output, p.output_above_200k);
     row.cache_read_cost += ModelPricing::tier_cost(
@@ -235,13 +236,7 @@ pub(crate) fn calculate_model_breakdown_generic(
         .par_chunks(PAR_CHUNK)
         .fold(HashMap::new, |mut local, chunk| {
             for entry in chunk {
-                accumulate_breakdown_entry(
-                    &mut local,
-                    entry,
-                    tool,
-                    combine_effort,
-                    &entry_pricing,
-                );
+                accumulate_breakdown_entry(&mut local, entry, tool, combine_effort, &entry_pricing);
             }
             local
         })

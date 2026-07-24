@@ -22,9 +22,9 @@ use crate::data::kimi::get_kimi_dir;
 use crate::data::omp::get_omp_dir;
 use crate::data::{self, UsageEntry};
 use crate::stats::{self, ModelBreakdownRow, ToolTimeSeries};
+use crate::sync_status::IntegrityStatus;
 use crate::time_utils::{self, TimeWindow};
 use crate::tool::Tool;
-use crate::sync_status::IntegrityStatus;
 use crate::{AppState, FULL_CACHE_HORIZON};
 
 /// Short rolling windows are common enough to keep a compact derived snapshot
@@ -114,7 +114,8 @@ fn load_hot_raw_snapshot(
     now: DateTime<Local>,
 ) -> Option<RawDataCache> {
     let snapshot: HotRawSnapshot = data::cache::load_hot_snapshot(cache_root).ok().flatten()?;
-    let captured_at = DateTime::from_timestamp(snapshot.captured_at_seconds, 0)?.with_timezone(&Local);
+    let captured_at =
+        DateTime::from_timestamp(snapshot.captured_at_seconds, 0)?.with_timezone(&Local);
     (snapshot.cache.local_host_id.as_deref() == local_host_id
         && snapshot.cache.horizon_days == HOT_CACHE_HORIZON_DAYS
         && hot_snapshot_covers(
@@ -156,7 +157,10 @@ pub(crate) fn compute_required_horizon(window: &TimeWindow, now: DateTime<Local>
     days.max(1)
 }
 
-pub(crate) fn include_local_for_host_filter(host_filter: Option<&str>, local_host_id: Option<&str>) -> bool {
+pub(crate) fn include_local_for_host_filter(
+    host_filter: Option<&str>,
+    local_host_id: Option<&str>,
+) -> bool {
     match host_filter {
         None => true,
         Some(host) => local_host_id == Some(host),
@@ -194,8 +198,8 @@ type LoadedVendorCache = (Vec<UsageEntry>, HashSet<(String, String)>, bool);
 
 pub(crate) fn load_local_tool_cached_records(cache_root: &Path, tool: &str) -> LoadedVendorCache {
     let records = data::cache::load_vendor_cached_records(cache_root, tool);
-    let session_metadata_current = records.is_empty()
-        || data::cache::vendor_session_metadata_is_current(cache_root, tool);
+    let session_metadata_current =
+        records.is_empty() || data::cache::vendor_session_metadata_is_current(cache_root, tool);
     let mut entries = Vec::with_capacity(records.len());
     let mut keys = HashSet::with_capacity(records.len());
     for record in records {
@@ -300,12 +304,8 @@ pub(crate) fn read_cached_raw_data_for_window(
 ) -> RawDataCache {
     let cache_root = data::cache::default_cache_dir();
     if host_filter.is_none()
-        && let Some(cache) = load_hot_raw_snapshot(
-            &cache_root,
-            local_host_id,
-            required_horizon,
-            now,
-        )
+        && let Some(cache) =
+            load_hot_raw_snapshot(&cache_root, local_host_id, required_horizon, now)
     {
         return cache;
     }
@@ -449,7 +449,10 @@ pub(crate) enum WindowDataState {
     Populated,
 }
 
-pub(crate) fn classify_window_data(has_source_data: bool, has_window_data: bool) -> WindowDataState {
+pub(crate) fn classify_window_data(
+    has_source_data: bool,
+    has_window_data: bool,
+) -> WindowDataState {
     match (has_source_data, has_window_data) {
         (false, _) => WindowDataState::NoSourceData,
         (true, false) => WindowDataState::EmptyWindow,
@@ -632,10 +635,8 @@ pub(crate) fn calculate_weighted_cost_per_mtok(
     for row in model_stats {
         let totals = by_tool.entry(row.tool.as_str()).or_default();
         totals.0 += row.total_with_cache;
-        totals.1 += row.input_cost
-            + row.output_cost
-            + row.cache_read_cost
-            + row.cache_creation_cost;
+        totals.1 +=
+            row.input_cost + row.output_cost + row.cache_read_cost + row.cache_creation_cost;
     }
 
     let grand_total: i64 = by_tool.values().map(|(tokens, _)| tokens).sum();
@@ -697,7 +698,10 @@ mod tests {
             cache_read_cost: 0.0,
             cache_creation_cost: 0.0,
         };
-        let rows = [row("claude", 1_000_000, 10.0), row("codex", 3_000_000, 30.0)];
+        let rows = [
+            row("claude", 1_000_000, 10.0),
+            row("codex", 3_000_000, 30.0),
+        ];
         let fees = SubscriptionFees {
             claude: 20.0,
             codex: 40.0,
@@ -718,8 +722,18 @@ mod tests {
             .expect("fixed now");
         let captured_at = now - Duration::days(2);
 
-        assert!(hot_snapshot_covers(HOT_CACHE_HORIZON_DAYS, captured_at, 3, now));
-        assert!(!hot_snapshot_covers(HOT_CACHE_HORIZON_DAYS, captured_at, 7, now));
+        assert!(hot_snapshot_covers(
+            HOT_CACHE_HORIZON_DAYS,
+            captured_at,
+            3,
+            now
+        ));
+        assert!(!hot_snapshot_covers(
+            HOT_CACHE_HORIZON_DAYS,
+            captured_at,
+            7,
+            now
+        ));
     }
 
     #[test]
@@ -784,187 +798,187 @@ mod tests {
         fs::remove_dir_all(cache_root).expect("remove cache root");
     }
 
-        #[test]
-        fn horizon_covers_the_current_window() {
-            let now = Local
-                .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
-                .single()
-                .expect("fixed now");
-            let window = TimeWindow::rolling_days(3);
+    #[test]
+    fn horizon_covers_the_current_window() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
 
-            assert_eq!(compute_required_horizon(&window, now), 5);
-        }
+        assert_eq!(compute_required_horizon(&window, now), 5);
+    }
 
-        #[test]
-        fn window_data_state_distinguishes_empty_window_from_missing_source_data() {
-            assert_eq!(
-                classify_window_data(false, false),
-                WindowDataState::NoSourceData
-            );
-            assert_eq!(
-                classify_window_data(true, false),
-                WindowDataState::EmptyWindow
-            );
-            assert_eq!(classify_window_data(true, true), WindowDataState::Populated);
-        }
+    #[test]
+    fn window_data_state_distinguishes_empty_window_from_missing_source_data() {
+        assert_eq!(
+            classify_window_data(false, false),
+            WindowDataState::NoSourceData
+        );
+        assert_eq!(
+            classify_window_data(true, false),
+            WindowDataState::EmptyWindow
+        );
+        assert_eq!(classify_window_data(true, true), WindowDataState::Populated);
+    }
 
-        #[test]
-        fn host_filter_includes_local_only_when_machine_matches() {
-            assert!(include_local_for_host_filter(None, None));
-            assert!(include_local_for_host_filter(
-                Some("workstation"),
-                Some("workstation")
-            ));
-            assert!(!include_local_for_host_filter(
-                Some("laptop"),
-                Some("workstation")
-            ));
-            assert!(!include_local_for_host_filter(Some("laptop"), None));
-        }
+    #[test]
+    fn host_filter_includes_local_only_when_machine_matches() {
+        assert!(include_local_for_host_filter(None, None));
+        assert!(include_local_for_host_filter(
+            Some("workstation"),
+            Some("workstation")
+        ));
+        assert!(!include_local_for_host_filter(
+            Some("laptop"),
+            Some("workstation")
+        ));
+        assert!(!include_local_for_host_filter(Some("laptop"), None));
+    }
 
-        #[test]
-        fn remote_records_merge_into_tool_buckets() {
-            let timestamp = "2026-05-18T12:00:00Z";
-            let mut cache = RawDataCache {
-                claude: Vec::new(),
-                codex: Vec::new(),
-                gemini: Vec::new(),
-                kimi: Vec::new(),
-                omp: Vec::new(),
-                horizon_days: FULL_CACHE_HORIZON,
-                local_host_id: None,
-                local_record_keys: HashSet::new(),
-                local_session_metadata_current: true,
-            };
-            merge_remote_records_into_raw_cache(
-                &mut cache,
-                vec![
-                    data::cache::RemoteUsageRecord {
-                        vendor: "claude".to_string(),
-                        dedup_key: "a".to_string(),
-                        entry: UsageEntry {
-                            host_id: Some("laptop".to_string()),
-                            session_id: None,
-                            timestamp: timestamp.to_string(),
-                            parsed_timestamp: time_utils::parse_timestamp(timestamp),
-                            session_start_time: timestamp.to_string(),
-                            session_end_time: timestamp.to_string(),
-                            model: "model-a".to_string(),
-                            effort: None,
-                            fast_tier: -1,
-                            usage: data::TokenUsage::default(),
-                            costs: None,
-                        },
+    #[test]
+    fn remote_records_merge_into_tool_buckets() {
+        let timestamp = "2026-05-18T12:00:00Z";
+        let mut cache = RawDataCache {
+            claude: Vec::new(),
+            codex: Vec::new(),
+            gemini: Vec::new(),
+            kimi: Vec::new(),
+            omp: Vec::new(),
+            horizon_days: FULL_CACHE_HORIZON,
+            local_host_id: None,
+            local_record_keys: HashSet::new(),
+            local_session_metadata_current: true,
+        };
+        merge_remote_records_into_raw_cache(
+            &mut cache,
+            vec![
+                data::cache::RemoteUsageRecord {
+                    vendor: "claude".to_string(),
+                    dedup_key: "a".to_string(),
+                    entry: UsageEntry {
+                        host_id: Some("laptop".to_string()),
+                        session_id: None,
+                        timestamp: timestamp.to_string(),
+                        parsed_timestamp: time_utils::parse_timestamp(timestamp),
+                        session_start_time: timestamp.to_string(),
+                        session_end_time: timestamp.to_string(),
+                        model: "model-a".to_string(),
+                        effort: None,
+                        fast_tier: -1,
+                        usage: data::TokenUsage::default(),
+                        costs: None,
                     },
-                    data::cache::RemoteUsageRecord {
-                        vendor: "codex".to_string(),
-                        dedup_key: "b".to_string(),
-                        entry: UsageEntry {
-                            host_id: Some("laptop".to_string()),
-                            session_id: None,
-                            timestamp: timestamp.to_string(),
-                            parsed_timestamp: time_utils::parse_timestamp(timestamp),
-                            session_start_time: timestamp.to_string(),
-                            session_end_time: timestamp.to_string(),
-                            model: "model-b".to_string(),
-                            effort: None,
-                            fast_tier: -1,
-                            usage: data::TokenUsage::default(),
-                            costs: None,
-                        },
+                },
+                data::cache::RemoteUsageRecord {
+                    vendor: "codex".to_string(),
+                    dedup_key: "b".to_string(),
+                    entry: UsageEntry {
+                        host_id: Some("laptop".to_string()),
+                        session_id: None,
+                        timestamp: timestamp.to_string(),
+                        parsed_timestamp: time_utils::parse_timestamp(timestamp),
+                        session_start_time: timestamp.to_string(),
+                        session_end_time: timestamp.to_string(),
+                        model: "model-b".to_string(),
+                        effort: None,
+                        fast_tier: -1,
+                        usage: data::TokenUsage::default(),
+                        costs: None,
                     },
-                ],
-            );
+                },
+            ],
+        );
 
-            assert_eq!(cache.claude.len(), 1);
-            assert_eq!(cache.codex.len(), 1);
-            assert!(cache.gemini.is_empty());
-        }
+        assert_eq!(cache.claude.len(), 1);
+        assert_eq!(cache.codex.len(), 1);
+        assert!(cache.gemini.is_empty());
+    }
 
-        #[test]
-        fn remote_records_from_local_host_fill_missing_keys_without_duplicates() {
-            let timestamp = "2026-05-18T12:00:00Z";
-            let mut cache = RawDataCache {
-                claude: vec![UsageEntry {
-                    host_id: None,
-                    session_id: None,
-                    timestamp: timestamp.to_string(),
-                    parsed_timestamp: time_utils::parse_timestamp(timestamp),
-                    session_start_time: timestamp.to_string(),
-                    session_end_time: timestamp.to_string(),
-                    model: "local-model".to_string(),
-                    effort: None,
-                    fast_tier: -1,
-                    usage: data::TokenUsage::default(),
-                    costs: None,
-                }],
-                codex: Vec::new(),
-                gemini: Vec::new(),
-                kimi: Vec::new(),
-                omp: Vec::new(),
-                horizon_days: FULL_CACHE_HORIZON,
-                local_host_id: Some("laptop".to_string()),
-                local_record_keys: HashSet::from([("claude".to_string(), "a".to_string())]),
-                local_session_metadata_current: true,
-            };
-            merge_remote_records_into_raw_cache(
-                &mut cache,
-                vec![
-                    data::cache::RemoteUsageRecord {
-                        vendor: "claude".to_string(),
-                        dedup_key: "a".to_string(),
-                        entry: UsageEntry {
-                            host_id: Some("laptop".to_string()),
-                            session_id: None,
-                            timestamp: timestamp.to_string(),
-                            parsed_timestamp: time_utils::parse_timestamp(timestamp),
-                            session_start_time: timestamp.to_string(),
-                            session_end_time: timestamp.to_string(),
-                            model: "duplicate-model".to_string(),
-                            effort: None,
-                            fast_tier: -1,
-                            usage: data::TokenUsage::default(),
-                            costs: None,
-                        },
+    #[test]
+    fn remote_records_from_local_host_fill_missing_keys_without_duplicates() {
+        let timestamp = "2026-05-18T12:00:00Z";
+        let mut cache = RawDataCache {
+            claude: vec![UsageEntry {
+                host_id: None,
+                session_id: None,
+                timestamp: timestamp.to_string(),
+                parsed_timestamp: time_utils::parse_timestamp(timestamp),
+                session_start_time: timestamp.to_string(),
+                session_end_time: timestamp.to_string(),
+                model: "local-model".to_string(),
+                effort: None,
+                fast_tier: -1,
+                usage: data::TokenUsage::default(),
+                costs: None,
+            }],
+            codex: Vec::new(),
+            gemini: Vec::new(),
+            kimi: Vec::new(),
+            omp: Vec::new(),
+            horizon_days: FULL_CACHE_HORIZON,
+            local_host_id: Some("laptop".to_string()),
+            local_record_keys: HashSet::from([("claude".to_string(), "a".to_string())]),
+            local_session_metadata_current: true,
+        };
+        merge_remote_records_into_raw_cache(
+            &mut cache,
+            vec![
+                data::cache::RemoteUsageRecord {
+                    vendor: "claude".to_string(),
+                    dedup_key: "a".to_string(),
+                    entry: UsageEntry {
+                        host_id: Some("laptop".to_string()),
+                        session_id: None,
+                        timestamp: timestamp.to_string(),
+                        parsed_timestamp: time_utils::parse_timestamp(timestamp),
+                        session_start_time: timestamp.to_string(),
+                        session_end_time: timestamp.to_string(),
+                        model: "duplicate-model".to_string(),
+                        effort: None,
+                        fast_tier: -1,
+                        usage: data::TokenUsage::default(),
+                        costs: None,
                     },
-                    data::cache::RemoteUsageRecord {
-                        vendor: "claude".to_string(),
-                        dedup_key: "b".to_string(),
-                        entry: UsageEntry {
-                            host_id: Some("laptop".to_string()),
-                            session_id: None,
-                            timestamp: timestamp.to_string(),
-                            parsed_timestamp: time_utils::parse_timestamp(timestamp),
-                            session_start_time: timestamp.to_string(),
-                            session_end_time: timestamp.to_string(),
-                            model: "missing-model".to_string(),
-                            effort: None,
-                            fast_tier: -1,
-                            usage: data::TokenUsage::default(),
-                            costs: None,
-                        },
+                },
+                data::cache::RemoteUsageRecord {
+                    vendor: "claude".to_string(),
+                    dedup_key: "b".to_string(),
+                    entry: UsageEntry {
+                        host_id: Some("laptop".to_string()),
+                        session_id: None,
+                        timestamp: timestamp.to_string(),
+                        parsed_timestamp: time_utils::parse_timestamp(timestamp),
+                        session_start_time: timestamp.to_string(),
+                        session_end_time: timestamp.to_string(),
+                        model: "missing-model".to_string(),
+                        effort: None,
+                        fast_tier: -1,
+                        usage: data::TokenUsage::default(),
+                        costs: None,
                     },
-                ],
-            );
+                },
+            ],
+        );
 
-            assert_eq!(cache.claude.len(), 2);
-            assert!(
-                cache
-                    .claude
-                    .iter()
-                    .any(|entry| entry.model == "local-model")
-            );
-            assert!(
-                cache
-                    .claude
-                    .iter()
-                    .any(|entry| entry.model == "missing-model")
-            );
-            assert!(
-                !cache
-                    .claude
-                    .iter()
-                    .any(|entry| entry.model == "duplicate-model")
-            );
-        }
+        assert_eq!(cache.claude.len(), 2);
+        assert!(
+            cache
+                .claude
+                .iter()
+                .any(|entry| entry.model == "local-model")
+        );
+        assert!(
+            cache
+                .claude
+                .iter()
+                .any(|entry| entry.model == "missing-model")
+        );
+        assert!(
+            !cache
+                .claude
+                .iter()
+                .any(|entry| entry.model == "duplicate-model")
+        );
+    }
 }

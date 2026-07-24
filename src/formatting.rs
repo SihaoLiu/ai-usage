@@ -1,8 +1,6 @@
 use crate::constants::SubscriptionFees;
 use crate::stats::ModelBreakdownRow;
-use crate::table_view::{
-    DataRow, DisplayRow, RowMetrics, TableView, build_table, table_totals,
-};
+use crate::table_view::{DataRow, DisplayRow, RowMetrics, TableView, build_table, table_totals};
 
 fn fit_text_to_width(text: &str, width: usize) -> String {
     if text.len() <= width {
@@ -696,7 +694,11 @@ fn print_table_rich(
     } else {
         String::new()
     };
-    let harness_hdr = if l.name.harness >= 7 { "Harness" } else { "Via" };
+    let harness_hdr = if l.name.harness >= 7 {
+        "Harness"
+    } else {
+        "Via"
+    };
     println!(
         "{}| {} {:>wn$} | {:>wc$} {:>wc$} {:>wc$} {:>wc$} {:>wcost$}{} |",
         p,
@@ -1002,34 +1004,16 @@ mod tests {
     #[test]
     fn short_model_name_renders_new_models_without_a_table() {
         // The reported regression: an unmapped model truncated to "claude-opus-".
-        assert_eq!(
-            display_model_name("claude-opus-4-8"),
-            "Opus 4.8"
-        );
-        assert_eq!(
-            display_model_name("claude-opus-4-7"),
-            "Opus 4.7"
-        );
+        assert_eq!(display_model_name("claude-opus-4-8"), "Opus 4.8");
+        assert_eq!(display_model_name("claude-opus-4-7"), "Opus 4.7");
         assert_eq!(display_model_name("opus"), "Opus");
         assert_eq!(display_model_name("<synthetic>"), "synthetic");
         assert_eq!(display_model_name("gpt-5.5"), "GPT-5.5");
-        assert_eq!(
-            display_model_name("gpt-5.5 (high)"),
-            "GPT-5.5(H)"
-        );
-        assert_eq!(
-            display_model_name("gpt-5.5:xhigh"),
-            "GPT-5.5(XH)"
-        );
-        assert_eq!(
-            display_model_name("gemini-3.2-pro-preview"),
-            "Gem 3.2 Pro"
-        );
+        assert_eq!(display_model_name("gpt-5.5 (high)"), "GPT-5.5(H)");
+        assert_eq!(display_model_name("gpt-5.5:xhigh"), "GPT-5.5(XH)");
+        assert_eq!(display_model_name("gemini-3.2-pro-preview"), "Gem 3.2 Pro");
         // Meta-tool `omp`: family inferred from the id's real provider prefix.
-        assert_eq!(
-            display_model_name("anthropic/claude-opus-4-8"),
-            "Opus 4.8"
-        );
+        assert_eq!(display_model_name("anthropic/claude-opus-4-8"), "Opus 4.8");
     }
 
     #[test]

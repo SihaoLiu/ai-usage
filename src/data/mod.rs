@@ -154,7 +154,7 @@ pub fn filter_usage_data_by_window_and_session(
             (ts >= start
                 && ts <= end
                 && session_id.is_none_or(|selected| entry.session_id.as_deref() == Some(selected)))
-                .then(|| entry.clone())
+            .then(|| entry.clone())
         })
         .collect()
 }

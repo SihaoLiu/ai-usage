@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use ai_usage_server::{AppState, ServerConfig, build_app, spawn_auto_update_worker};
+use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

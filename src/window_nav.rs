@@ -5,8 +5,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 use std::collections::VecDeque;
 
 use crate::charts;
-use crate::time_utils::TimeWindow;
 use crate::get_terminal_size;
+use crate::time_utils::TimeWindow;
 
 /// Calculate chart height(s) that fit within the terminal.
 /// For one tool: returns per-chart height (2 charts displayed).
@@ -247,223 +247,223 @@ mod tests {
     #[allow(unused_imports)]
     use chrono::TimeZone;
 
-        #[test]
-        fn date_command_selects_single_inclusive_day() {
-            let command = parse_time_window_command("date 2026-05-07", 3)
-                .expect("recognized command")
-                .expect("valid date");
-            let TimeWindow::ExplicitRange {
-                start,
-                end,
-                projection_days,
-                ..
-            } = command
-            else {
-                panic!("date command should create an explicit window");
-            };
+    #[test]
+    fn date_command_selects_single_inclusive_day() {
+        let command = parse_time_window_command("date 2026-05-07", 3)
+            .expect("recognized command")
+            .expect("valid date");
+        let TimeWindow::ExplicitRange {
+            start,
+            end,
+            projection_days,
+            ..
+        } = command
+        else {
+            panic!("date command should create an explicit window");
+        };
 
-            assert_eq!(
-                start.format("%Y-%m-%d %H:%M:%S").to_string(),
-                "2026-05-07 00:00:00"
-            );
-            assert_eq!(
-                end.format("%Y-%m-%d %H:%M:%S").to_string(),
-                "2026-05-07 23:59:59"
-            );
-            assert_eq!(projection_days, 1.0);
-        }
+        assert_eq!(
+            start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-07 00:00:00"
+        );
+        assert_eq!(
+            end.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-07 23:59:59"
+        );
+        assert_eq!(projection_days, 1.0);
+    }
 
-        #[test]
-        fn range_command_selects_inclusive_date_span() {
-            let command = parse_time_window_command("range 2026-05-01 2026-05-07", 3)
-                .expect("recognized command")
-                .expect("valid range");
+    #[test]
+    fn range_command_selects_inclusive_date_span() {
+        let command = parse_time_window_command("range 2026-05-01 2026-05-07", 3)
+            .expect("recognized command")
+            .expect("valid range");
 
-            assert_eq!(command.projection_days(Local::now()), 7.0);
-        }
+        assert_eq!(command.projection_days(Local::now()), 7.0);
+    }
 
-        #[test]
-        fn interval_slide_older_moves_rolling_window_by_display_interval() {
-            let now = Local
-                .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
-                .single()
-                .expect("fixed now");
-            let window = TimeWindow::rolling_days(3);
+    #[test]
+    fn interval_slide_older_moves_rolling_window_by_display_interval() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
 
-            let slid =
-                slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Older)
-                    .expect("slide older");
-            let (start, end) = slid.bounds(now);
+        let slid =
+            slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Older)
+                .expect("slide older");
+        let (start, end) = slid.bounds(now);
 
-            assert_eq!(end, now - chrono::Duration::hours(1));
-            assert_eq!(
-                start,
-                now - chrono::Duration::days(3) - chrono::Duration::hours(1)
-            );
-            assert_eq!(slid.page_step(), chrono::Duration::days(3));
-        }
+        assert_eq!(end, now - chrono::Duration::hours(1));
+        assert_eq!(
+            start,
+            now - chrono::Duration::days(3) - chrono::Duration::hours(1)
+        );
+        assert_eq!(slid.page_step(), chrono::Duration::days(3));
+    }
 
-        #[test]
-        fn interval_slide_newer_clamps_to_present() {
-            let now = Local
-                .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
-                .single()
-                .expect("fixed now");
-            let window = TimeWindow::rolling_days(3);
-            let older =
-                slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Older)
-                    .expect("slide older");
+    #[test]
+    fn interval_slide_newer_clamps_to_present() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+        let older =
+            slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Older)
+                .expect("slide older");
 
-            let newer =
-                slide_window_by_display_interval(&older, now, 160, IntervalSlideDirection::Newer)
-                    .expect("slide newer");
-            let (start, end) = newer.bounds(now);
+        let newer =
+            slide_window_by_display_interval(&older, now, 160, IntervalSlideDirection::Newer)
+                .expect("slide newer");
+        let (start, end) = newer.bounds(now);
 
-            assert_eq!(end, now);
-            assert_eq!(start, now - chrono::Duration::days(3));
-        }
+        assert_eq!(end, now);
+        assert_eq!(start, now - chrono::Duration::days(3));
+    }
 
-        #[test]
-        fn interval_slide_newer_on_current_window_is_noop() {
-            let now = Local
-                .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
-                .single()
-                .expect("fixed now");
-            let window = TimeWindow::rolling_days(3);
+    #[test]
+    fn interval_slide_newer_on_current_window_is_noop() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
 
-            assert!(
-                slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Newer)
-                    .is_none()
-            );
-        }
+        assert!(
+            slide_window_by_display_interval(&window, now, 160, IntervalSlideDirection::Newer)
+                .is_none()
+        );
+    }
 
-        #[test]
-        fn batched_interval_slide_matches_repeated_right_arrow_slides() {
-            let now = Local
-                .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
-                .single()
-                .expect("fixed now");
-            let window = TimeWindow::rolling_days(3);
-            let target_width = 160;
-            let directions = [IntervalSlideDirection::Older; 5];
+    #[test]
+    fn batched_interval_slide_matches_repeated_right_arrow_slides() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+        let target_width = 160;
+        let directions = [IntervalSlideDirection::Older; 5];
 
-            let batched = apply_interval_slide_directions(&window, now, target_width, directions)
-                .expect("batched slide");
-            let mut sequential = window.clone();
-            for _ in 0..directions.len() {
-                sequential = slide_window_by_display_interval(
-                    &sequential,
-                    now,
-                    target_width,
-                    IntervalSlideDirection::Older,
-                )
-                .expect("sequential slide");
-            }
-
-            assert_eq!(batched.bounds(now), sequential.bounds(now));
-            assert_eq!(batched.page_step(), sequential.page_step());
-        }
-
-        #[test]
-        fn batched_interval_slide_preserves_noop_then_right_arrow_slide() {
-            let now = Local
-                .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
-                .single()
-                .expect("fixed now");
-            let window = TimeWindow::rolling_days(3);
-            let target_width = 160;
-            let directions = [IntervalSlideDirection::Newer, IntervalSlideDirection::Older];
-
-            let batched = apply_interval_slide_directions(&window, now, target_width, directions)
-                .expect("batched slide");
-            let expected = slide_window_by_display_interval(
-                &window,
+        let batched = apply_interval_slide_directions(&window, now, target_width, directions)
+            .expect("batched slide");
+        let mut sequential = window.clone();
+        for _ in 0..directions.len() {
+            sequential = slide_window_by_display_interval(
+                &sequential,
                 now,
                 target_width,
                 IntervalSlideDirection::Older,
             )
-            .expect("right arrow slide");
-
-            assert_eq!(batched.bounds(now), expected.bounds(now));
-            assert_eq!(batched.page_step(), expected.page_step());
+            .expect("sequential slide");
         }
 
-        #[test]
-        fn display_interval_scales_past_daily_for_multi_month_windows() {
-            let now = Local
-                .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
-                .single()
-                .expect("fixed now");
-            let window = TimeWindow::from_range("2025-11-03", "2026-05-14").expect("range");
+        assert_eq!(batched.bounds(now), sequential.bounds(now));
+        assert_eq!(batched.page_step(), sequential.page_step());
+    }
 
-            let interval = display_interval_minutes_for_window(&window, now, 160);
+    #[test]
+    fn batched_interval_slide_preserves_noop_then_right_arrow_slide() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::rolling_days(3);
+        let target_width = 160;
+        let directions = [IntervalSlideDirection::Newer, IntervalSlideDirection::Older];
 
-            assert!(interval > 1440);
-            assert_eq!(interval, 2880);
-        }
+        let batched = apply_interval_slide_directions(&window, now, target_width, directions)
+            .expect("batched slide");
+        let expected = slide_window_by_display_interval(
+            &window,
+            now,
+            target_width,
+            IntervalSlideDirection::Older,
+        )
+        .expect("right arrow slide");
 
-        #[test]
-        fn display_interval_uses_month_granularity_for_quarter_windows() {
-            let now = Local
-                .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
-                .single()
-                .expect("fixed now");
-            let window = TimeWindow::from_range("2026-02-14", "2026-05-14").expect("range");
-            let (range_start, range_end) = window.bounds(now);
+        assert_eq!(batched.bounds(now), expected.bounds(now));
+        assert_eq!(batched.page_step(), expected.page_step());
+    }
 
-            let granularity = display_chart_granularity(&range_start, &range_end);
-            let interval = display_interval_minutes_for_window(&window, now, 160);
+    #[test]
+    fn display_interval_scales_past_daily_for_multi_month_windows() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::from_range("2025-11-03", "2026-05-14").expect("range");
 
-            assert_eq!(granularity, charts::ChartGranularity::Month);
-            assert_eq!(interval, 1440);
-        }
+        let interval = display_interval_minutes_for_window(&window, now, 160);
 
-        #[test]
-        fn display_interval_scales_past_daily_for_year_granularity_windows() {
-            let now = Local
-                .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
-                .single()
-                .expect("fixed now");
-            let window = TimeWindow::from_range("2024-01-01", "2026-05-14").expect("range");
+        assert!(interval > 1440);
+        assert_eq!(interval, 2880);
+    }
 
-            let interval = display_interval_minutes_for_window(&window, now, 160);
+    #[test]
+    fn display_interval_uses_month_granularity_for_quarter_windows() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::from_range("2026-02-14", "2026-05-14").expect("range");
+        let (range_start, range_end) = window.bounds(now);
 
-            assert!(interval > 1440);
-            assert_eq!(interval, 20160);
-        }
+        let granularity = display_chart_granularity(&range_start, &range_end);
+        let interval = display_interval_minutes_for_window(&window, now, 160);
 
-        #[test]
-        fn latest_command_returns_to_rolling_days() {
-            let command = parse_time_window_command("latest", 5)
-                .expect("recognized command")
-                .expect("valid latest command");
-            let TimeWindow::RollingDays { days } = command else {
-                panic!("latest should create a rolling window");
-            };
+        assert_eq!(granularity, charts::ChartGranularity::Month);
+        assert_eq!(interval, 1440);
+    }
 
-            assert_eq!(days, 5);
-        }
+    #[test]
+    fn display_interval_scales_past_daily_for_year_granularity_windows() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 14, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let window = TimeWindow::from_range("2024-01-01", "2026-05-14").expect("range");
 
-        #[test]
-        fn rolling_days_preset_is_current_only_for_matching_rolling_window() {
-            assert!(is_current_rolling_days_preset(
-                &TimeWindow::rolling_days(30),
-                30
-            ));
-            assert!(!is_current_rolling_days_preset(
-                &TimeWindow::rolling_days(7),
-                30
-            ));
-        }
+        let interval = display_interval_minutes_for_window(&window, now, 160);
 
-        #[test]
-        fn zoomed_rolling_days_window_is_not_current_preset() {
-            let now = Local
-                .with_ymd_and_hms(2026, 6, 15, 12, 0, 0)
-                .single()
-                .expect("fixed now");
-            let zoomed = TimeWindow::rolling_days(30).zoom_in(now).expect("zoom in");
+        assert!(interval > 1440);
+        assert_eq!(interval, 20160);
+    }
 
-            assert!(!is_current_rolling_days_preset(&zoomed, 30));
-        }
+    #[test]
+    fn latest_command_returns_to_rolling_days() {
+        let command = parse_time_window_command("latest", 5)
+            .expect("recognized command")
+            .expect("valid latest command");
+        let TimeWindow::RollingDays { days } = command else {
+            panic!("latest should create a rolling window");
+        };
+
+        assert_eq!(days, 5);
+    }
+
+    #[test]
+    fn rolling_days_preset_is_current_only_for_matching_rolling_window() {
+        assert!(is_current_rolling_days_preset(
+            &TimeWindow::rolling_days(30),
+            30
+        ));
+        assert!(!is_current_rolling_days_preset(
+            &TimeWindow::rolling_days(7),
+            30
+        ));
+    }
+
+    #[test]
+    fn zoomed_rolling_days_window_is_not_current_preset() {
+        let now = Local
+            .with_ymd_and_hms(2026, 6, 15, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let zoomed = TimeWindow::rolling_days(30).zoom_in(now).expect("zoom in");
+
+        assert!(!is_current_rolling_days_preset(&zoomed, 30));
+    }
 }

@@ -146,7 +146,11 @@ pub struct CostSummary {
     pub subscription_rate: f64,
 }
 
-pub fn cost_summary(totals: &RowMetrics, days_in_data: f64, subscription_price: f64) -> CostSummary {
+pub fn cost_summary(
+    totals: &RowMetrics,
+    days_in_data: f64,
+    subscription_price: f64,
+) -> CostSummary {
     let total_cost = totals.cost();
     let daily = if days_in_data > 0.0 {
         total_cost / days_in_data
@@ -197,10 +201,15 @@ pub struct DataRow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DisplayRow {
     /// Vendor group heading (vendor view only).
-    GroupHeader { vendor: String },
+    GroupHeader {
+        vendor: String,
+    },
     Data(Box<DataRow>),
     /// Per-vendor subtotal (vendor view, groups with at least two rows).
-    Subtotal { vendor: String, metrics: RowMetrics },
+    Subtotal {
+        vendor: String,
+        metrics: RowMetrics,
+    },
 }
 
 /// Resolve the short display name for a model id: the user override file wins,
@@ -232,7 +241,10 @@ fn harness_rank(key: &str) -> usize {
 fn entry_for(row: &ModelBreakdownRow) -> Entry {
     let identity = parse_model_identity(&row.model);
     let (harness_name, harness_tag) = match Tool::from_key(&row.tool) {
-        Some(tool) => (tool.display_name().to_string(), tool.short_label().to_string()),
+        Some(tool) => (
+            tool.display_name().to_string(),
+            tool.short_label().to_string(),
+        ),
         None => (row.tool.clone(), row.tool.clone()),
     };
     Entry {
@@ -505,7 +517,11 @@ mod tests {
                     "Opus 4.8".to_string(),
                     "Claude Code".to_string()
                 ),
-                (String::new(), "Opus 4.8".to_string(), "Oh My Pi".to_string()),
+                (
+                    String::new(),
+                    "Opus 4.8".to_string(),
+                    "Oh My Pi".to_string()
+                ),
                 (
                     "OpenAI".to_string(),
                     "GPT-5.5".to_string(),

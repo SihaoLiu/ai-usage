@@ -230,7 +230,9 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
     }
 }
 
-const OPENAI_MODIFIERS: &[&str] = &["mini", "nano", "max", "spark", "codex", "pro", "sol", "luna"];
+const OPENAI_MODIFIERS: &[&str] = &[
+    "mini", "nano", "max", "spark", "codex", "pro", "sol", "luna",
+];
 const GEMINI_MODIFIERS: &[&str] = &["pro", "flash", "lite", "image", "ultra"];
 const KIMI_MODIFIERS: &[&str] = &["coding", "highspeed", "turbo"];
 const ZHIPU_MODIFIERS: &[&str] = &["air", "airx", "x", "flash", "flashx"];

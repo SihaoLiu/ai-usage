@@ -84,7 +84,11 @@ fn switch_days_preset(state: &mut AppState, days: i64) -> Outcome {
     state.time_window = TimeWindow::rolling_days(days);
     Outcome::message(
         Effect::Refresh,
-        format!("Changed to {} day{}", days, if days == 1 { "" } else { "s" }),
+        format!(
+            "Changed to {} day{}",
+            days,
+            if days == 1 { "" } else { "s" }
+        ),
     )
 }
 
@@ -106,7 +110,10 @@ pub fn rotate_tool(state: &mut AppState, step: isize) -> Outcome {
         if let Some(dir) = get_tool_data_dir(candidate.key())
             && !dir.exists()
         {
-            messages.push(format!("Skipping {} (no data dir)", candidate.display_name()));
+            messages.push(format!(
+                "Skipping {} (no data dir)",
+                candidate.display_name()
+            ));
             continue;
         }
         state.tool = candidate.key().to_string();
@@ -136,7 +143,10 @@ fn switch_tool(state: &mut AppState, requested: &str) -> Outcome {
                 format!("Switched to {}", new_tool.display_name()),
             )
         }
-        None => Outcome::message(Effect::None, "Usage: t, tool [claude|codex|gemini|kimi|omp|all]"),
+        None => Outcome::message(
+            Effect::None,
+            "Usage: t, tool [claude|codex|gemini|kimi|omp|all]",
+        ),
     }
 }
 
@@ -146,7 +156,10 @@ fn switch_host(state: &mut AppState, selection: &str) -> Outcome {
             if state.host == new_host {
                 return Outcome::message(
                     Effect::None,
-                    format!("Already showing host {}.", host_label(state.host.as_deref())),
+                    format!(
+                        "Already showing host {}.",
+                        host_label(state.host.as_deref())
+                    ),
                 );
             }
             state.host = new_host;
@@ -192,7 +205,10 @@ fn set_session(state: &mut AppState, session_id: Option<&str>) -> Outcome {
         return Outcome::message(Effect::None, "Usage: session <ID> | session clear");
     }
     if state.session_id.as_deref() == Some(session_id) {
-        return Outcome::message(Effect::None, format!("Already tracking session {session_id}."));
+        return Outcome::message(
+            Effect::None,
+            format!("Already tracking session {session_id}."),
+        );
     }
     state.session_id = Some(session_id.to_string());
     Outcome::message(

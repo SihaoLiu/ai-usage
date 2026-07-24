@@ -182,6 +182,9 @@ mod tests {
         fs::remove_file(&path).ok();
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].entry.session_id.as_deref(), Some("claude-session"));
+        assert_eq!(
+            records[0].entry.session_id.as_deref(),
+            Some("claude-session")
+        );
     }
 }

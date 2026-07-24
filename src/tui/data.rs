@@ -304,11 +304,8 @@ fn comparison_chart(
 pub fn rebuild_view(dash: &mut Dashboard, view: TableView) {
     dash.view = view;
     dash.rows = build_table(&dash.model_stats, view);
-    dash.insight = formatting::top_model_insight_line(
-        &dash.rows,
-        dash.summary.total_cost,
-        dash.tool.is_all(),
-    );
+    dash.insight =
+        formatting::top_model_insight_line(&dash.rows, dash.summary.total_cost, dash.tool.is_all());
 }
 
 pub fn build(state: &mut AppState) -> Dashboard {
@@ -321,8 +318,12 @@ pub fn build(state: &mut AppState) -> Dashboard {
 
     let target_width = crate::get_chart_target_width();
     let granularity = crate::display_chart_granularity(&range_start, &range_end);
-    let optimal =
-        crate::calculate_optimal_interval_minutes(&range_start, &range_end, target_width, granularity);
+    let optimal = crate::calculate_optimal_interval_minutes(
+        &range_start,
+        &range_end,
+        target_width,
+        granularity,
+    );
     let interval_minutes = crate::round_to_nice_interval(optimal);
     let times = interval_times(&range_start, &range_end, interval_minutes);
 
@@ -488,7 +489,11 @@ mod tests {
         let times = interval_times(&start, &end, 60);
         let ticks = build_x_ticks(&times, 60, ChartGranularity::Day);
 
-        assert!(ticks.len() >= 4, "expected dense ticks, got {}", ticks.len());
+        assert!(
+            ticks.len() >= 4,
+            "expected dense ticks, got {}",
+            ticks.len()
+        );
         let mut seen = HashSet::new();
         for (idx, label) in &ticks {
             assert!(*idx < times.len());
@@ -512,8 +517,18 @@ mod tests {
             len: 10,
             granularity: ChartGranularity::Day,
             segments: vec![
-                Segment { start: 0, end: 4, total: 10.0, anchor: day(20) },
-                Segment { start: 5, end: 9, total: 35.0, anchor: day(21) },
+                Segment {
+                    start: 0,
+                    end: 4,
+                    total: 10.0,
+                    anchor: day(20),
+                },
+                Segment {
+                    start: 5,
+                    end: 9,
+                    total: 35.0,
+                    anchor: day(21),
+                },
             ],
             x_ticks: vec![(0, "20".to_string()), (9, "21".to_string())],
         };

@@ -2,20 +2,20 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::charts::{self, ChartGranularity};
-use crate::formatting::{format_cost_per_mtok, format_number_compact, format_y_axis_value};
-use crate::model_id::Vendor;
-use crate::table_view::{DataRow, DisplayRow, RowMetrics, TableView};
+use crate::formatting::format_y_axis_value;
 use crate::tool::Tool;
 use crate::tui::commands::{HelpView, help_topics};
 use crate::tui::data::{ChartData, Dashboard};
 use crate::tui::input::InputLine;
+use crate::tui::palette::{ACCENT, DIM};
+use crate::tui::table::draw_table;
 use crate::{AppState, IntegrityStatus};
 
 pub struct Ui<'a> {
@@ -31,22 +31,6 @@ pub struct Ui<'a> {
 const MIN_WIDTH: u16 = 68;
 const MIN_HEIGHT: u16 = 22;
 
-const DIM: Color = Color::Indexed(245);
-const ACCENT: Color = Color::Indexed(51);
-const COL_PCT: Color = Color::Indexed(36);
-const ROW_PCT: Color = Color::Indexed(179);
-
-fn vendor_color(vendor: Vendor) -> Color {
-    match vendor {
-        Vendor::Anthropic => Color::Indexed(208),
-        Vendor::OpenAI => Color::Indexed(255),
-        Vendor::Google => Color::Indexed(39),
-        Vendor::Moonshot => Color::Indexed(49),
-        Vendor::Zhipu => Color::Indexed(135),
-        Vendor::Unknown => Color::Indexed(245),
-    }
-}
-
 pub fn draw(frame: &mut Frame, ui: &Ui) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -54,9 +38,12 @@ pub fn draw(frame: &mut Frame, ui: &Ui) {
         return;
     }
 
-    let [header, body, footer] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(10), Constraint::Length(1)])
-            .areas(area);
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(10),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
     draw_header(frame, header, ui);
 
@@ -98,10 +85,7 @@ fn draw_too_small(frame: &mut Frame, area: Rect) {
             area.width, area.height, MIN_WIDTH, MIN_HEIGHT
         )),
     ];
-    frame.render_widget(
-        Paragraph::new(text).alignment(Alignment::Center),
-        area,
-    );
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), area);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
@@ -110,7 +94,10 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
 
     let mut spans: Vec<Span> = vec![
         Span::styled(" ai-usage ", Style::default().fg(ACCENT).bold()),
-        Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), Style::default().fg(DIM)),
+        Span::styled(
+            format!("v{} ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(DIM),
+        ),
     ];
     for tool in Tool::ROTATION {
         let label = format!(" {} ", tool.display_name());
@@ -152,7 +139,10 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
     // Leading spacer keeps a visible gap when the left side is truncated.
     let mut right_spans: Vec<Span> = vec![Span::raw("  ")];
     if let Some(sync) = ui.sync_status {
-        right_spans.push(Span::styled(format!("{}  |  ", sync), Style::default().fg(DIM)));
+        right_spans.push(Span::styled(
+            format!("{}  |  ", sync),
+            Style::default().fg(DIM),
+        ));
     }
     let (integrity_text, integrity_color) = match ui.state.integrity_status {
         IntegrityStatus::Checking => ("integrity: checking".to_string(), Color::Indexed(143)),
@@ -162,7 +152,10 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
         ),
         IntegrityStatus::Failed => ("integrity: FAILED".to_string(), Color::Indexed(203)),
     };
-    right_spans.push(Span::styled(integrity_text, Style::default().fg(integrity_color)));
+    right_spans.push(Span::styled(
+        integrity_text,
+        Style::default().fg(integrity_color),
+    ));
     right_spans.push(Span::styled(
         format!(
             "  |  refresh in {} ",
@@ -186,386 +179,6 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
         Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
         right_area,
     );
-}
-
-struct Cols {
-    vendor: bool,
-    /// Raw model id column (the full snapshot id), shown when very wide.
-    raw: bool,
-    harness: bool,
-    harness_full: bool,
-    strategy: bool,
-    rate: bool,
-}
-
-fn visible_cols(width: u16, show_harness: bool) -> Cols {
-    if width >= 150 {
-        Cols {
-            vendor: true,
-            // The full layout needs 169 inner cells: 159 fixed/minimum
-            // column cells plus ten one-cell gaps. Account for the border
-            // around the table as well.
-            raw: width >= 171,
-            harness: show_harness,
-            harness_full: show_harness,
-            strategy: true,
-            rate: true,
-        }
-    } else if width >= 138 {
-        Cols {
-            vendor: true,
-            raw: false,
-            harness: show_harness,
-            harness_full: false,
-            strategy: true,
-            rate: false,
-        }
-    } else {
-        Cols {
-            vendor: false,
-            raw: false,
-            harness: false,
-            harness_full: false,
-            strategy: false,
-            rate: false,
-        }
-    }
-}
-
-/// Reserve only the width a readable model label needs so the descriptive
-/// columns cannot crowd the numeric metrics on wide terminals.
-fn model_column_width(longest_label: usize) -> u16 {
-    (longest_label.saturating_add(2) as u16).clamp(14, 26)
-}
-
-fn dashboard_model_column_width(rows: &[DisplayRow]) -> u16 {
-    let longest = rows
-        .iter()
-        .filter_map(|row| match row {
-            DisplayRow::Data(data) => Some(data.model_label.chars().count()),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0);
-    model_column_width(longest)
-}
-
-/// Keep descriptive columns content-bound and share surplus width across the
-/// numeric metrics, which are the cells that benefit from extra reading room.
-fn table_column_widths(area_width: u16, rows: &[DisplayRow], cols: &Cols) -> Vec<u16> {
-    let mut descriptive = Vec::new();
-    if cols.vendor {
-        descriptive.push(9);
-    }
-    descriptive.push(dashboard_model_column_width(rows));
-
-    let raw_index = if cols.raw {
-        let index = descriptive.len();
-        descriptive.push(20);
-        Some(index)
-    } else {
-        None
-    };
-    if cols.harness {
-        descriptive.push(if cols.harness_full { 14 } else { 11 });
-    }
-
-    let mut metrics = vec![11];
-    if cols.strategy {
-        metrics.extend([16, 16, 16]);
-    }
-    metrics.extend([11, 12]);
-    if cols.rate {
-        metrics.push(8);
-    }
-
-    let column_count = descriptive.len() + metrics.len();
-    let cell_budget = area_width
-        .saturating_sub(2)
-        .saturating_sub(column_count.saturating_sub(1) as u16);
-
-    if let Some(index) = raw_index {
-        let longest = rows
-            .iter()
-            .filter_map(|row| match row {
-                DisplayRow::Data(data) => Some(data.model_raw.chars().count()),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
-        let desired = longest.saturating_add(2).clamp(20, 36) as u16;
-        let other_width = descriptive
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != index)
-            .map(|(_, width)| *width)
-            .chain(metrics.iter().copied())
-            .sum::<u16>();
-        descriptive[index] = desired.min(cell_budget.saturating_sub(other_width));
-    }
-
-    let used = descriptive.iter().chain(&metrics).copied().sum::<u16>();
-    let surplus = cell_budget.saturating_sub(used);
-    if !metrics.is_empty() {
-        let each = surplus / metrics.len() as u16;
-        let remainder = surplus % metrics.len() as u16;
-        for (index, width) in metrics.iter_mut().enumerate() {
-            *width += each + u16::from((index as u16) < remainder);
-        }
-    }
-
-    descriptive.extend(metrics);
-    descriptive
-}
-
-fn right(spans: Vec<Span<'static>>) -> Cell<'static> {
-    Cell::from(Line::from(spans).alignment(Alignment::Right))
-}
-
-fn qty_cell(value: i64, col_total: i64, row_total: Option<i64>) -> Cell<'static> {
-    let mut spans = vec![Span::raw(format_number_compact(value))];
-    if col_total > 0 {
-        let pct = value as f64 / col_total as f64 * 100.0;
-        spans.push(Span::styled(
-            format!(" \u{2191}{:.0}%", pct),
-            Style::default().fg(COL_PCT),
-        ));
-    }
-    if let Some(total) = row_total
-        && total > 0
-    {
-        let pct = value as f64 / total as f64 * 100.0;
-        spans.push(Span::styled(
-            format!("\u{00B7}\u{2190}{:.0}%", pct),
-            Style::default().fg(ROW_PCT),
-        ));
-    }
-    right(spans)
-}
-
-fn cost_text(value: f64) -> String {
-    if value.abs() >= 1_000.0 {
-        format!("${:.1}K", value / 1_000.0)
-    } else {
-        format!("${:.2}", value)
-    }
-}
-
-fn cost_cell(value: f64, total: f64) -> Cell<'static> {
-    let mut spans = vec![Span::raw(cost_text(value))];
-    if total > 0.0 {
-        spans.push(Span::styled(
-            format!(" \u{2191}{:.0}%", value / total * 100.0),
-            Style::default().fg(COL_PCT),
-        ));
-    }
-    right(spans)
-}
-
-/// Build the numeric cells for one row. `col_pct` adds the cyan share-of-
-/// column percentages; the TOTAL row passes false since they are always 100%.
-fn metric_cells(
-    m: &RowMetrics,
-    totals: &RowMetrics,
-    cols: &Cols,
-    col_pct: bool,
-    cells: &mut Vec<Cell<'static>>,
-) {
-    let row_total = m.tokens();
-    let col = |total: i64| if col_pct { total } else { 0 };
-    cells.push(qty_cell(m.count, col(totals.count), None));
-    if cols.strategy {
-        cells.push(qty_cell(m.cache_hit, col(totals.cache_hit), Some(row_total)));
-        cells.push(qty_cell(m.prefill, col(totals.prefill), Some(row_total)));
-        cells.push(qty_cell(m.decoding, col(totals.decoding), Some(row_total)));
-    }
-    cells.push(qty_cell(row_total, col(totals.tokens()), None));
-    cells.push(cost_cell(m.cost(), if col_pct { totals.cost() } else { 0.0 }));
-    if cols.rate {
-        cells.push(right(vec![Span::styled(
-            format_cost_per_mtok(m.cost_per_mtok()),
-            Style::default().fg(DIM),
-        )]));
-    }
-}
-
-fn model_cell_text(d: &DataRow, cols: &Cols, show_harness: bool, view: TableView) -> String {
-    if !cols.vendor && show_harness && view != TableView::Model {
-        format!("{}:{}", d.harness_short, d.model_label)
-    } else {
-        d.model_label.clone()
-    }
-}
-
-fn harness_cell_text(d: &DataRow, cols: &Cols) -> String {
-    if cols.harness_full {
-        d.harness_label.clone()
-    } else {
-        d.harness_short.clone()
-    }
-}
-
-fn draw_table(frame: &mut Frame, area: Rect, dash: &Dashboard) {
-    let show_harness = dash.tool.is_all();
-    let cols = visible_cols(area.width, show_harness);
-    let totals = &dash.totals;
-
-    let mut header_cells: Vec<Cell> = Vec::new();
-    if cols.vendor {
-        header_cells.push(Cell::from("Vendor"));
-    }
-    header_cells.push(Cell::from("Model"));
-    if cols.raw {
-        header_cells.push(Cell::from("Model Id"));
-    }
-    if cols.harness {
-        header_cells.push(Cell::from("Harness"));
-    }
-    header_cells.push(right(vec![Span::raw("Msgs")]));
-    if cols.strategy {
-        for label in ["Cache Hit", "Prefill", "Decode"] {
-            header_cells.push(right(vec![Span::raw(label)]));
-        }
-    }
-    header_cells.push(right(vec![Span::raw("Total")]));
-    header_cells.push(right(vec![Span::raw("Cost")]));
-    if cols.rate {
-        header_cells.push(right(vec![Span::raw("$/MTok")]));
-    }
-    let widths = table_column_widths(area.width, &dash.rows, &cols)
-        .into_iter()
-        .map(Constraint::Length)
-        .collect::<Vec<_>>();
-    let n_cols = header_cells.len();
-    let header = Row::new(header_cells).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD));
-
-    let mut rows: Vec<Row> = Vec::new();
-    for display_row in &dash.rows {
-        match display_row {
-            DisplayRow::GroupHeader { vendor } => {
-                let color = vendor_color(vendor_by_name(vendor));
-                let mut cells = vec![Cell::from(Span::styled(
-                    vendor.clone(),
-                    Style::default().fg(color).bold(),
-                ))];
-                cells.resize_with(n_cols, || Cell::from(""));
-                rows.push(Row::new(cells));
-            }
-            DisplayRow::Data(d) => {
-                let mut cells: Vec<Cell> = Vec::new();
-                if cols.vendor {
-                    cells.push(Cell::from(Span::styled(
-                        d.vendor_label.clone(),
-                        Style::default().fg(vendor_color(d.vendor)).bold(),
-                    )));
-                }
-                cells.push(Cell::from(model_cell_text(d, &cols, show_harness, dash.view)));
-                if cols.raw {
-                    cells.push(Cell::from(Span::styled(
-                        d.model_raw.clone(),
-                        Style::default().fg(DIM),
-                    )));
-                }
-                if cols.harness {
-                    cells.push(Cell::from(Span::styled(
-                        harness_cell_text(d, &cols),
-                        Style::default().fg(DIM),
-                    )));
-                }
-                metric_cells(&d.metrics, totals, &cols, true, &mut cells);
-                rows.push(Row::new(cells));
-            }
-            DisplayRow::Subtotal { vendor, metrics } => {
-                let mut cells: Vec<Cell> = Vec::new();
-                let label = format!("{} total", vendor);
-                if cols.vendor {
-                    cells.push(Cell::from(""));
-                    cells.push(Cell::from(Span::styled(label, Style::default().fg(DIM))));
-                } else {
-                    cells.push(Cell::from(Span::styled(label, Style::default().fg(DIM))));
-                }
-                if cols.raw {
-                    cells.push(Cell::from(""));
-                }
-                if cols.harness {
-                    cells.push(Cell::from(""));
-                }
-                metric_cells(metrics, totals, &cols, true, &mut cells);
-                rows.push(Row::new(cells).style(Style::default().add_modifier(Modifier::DIM)));
-            }
-        }
-    }
-
-    let mut total_cells: Vec<Cell> = vec![Cell::from(Span::styled(
-        "TOTAL",
-        Style::default().bold(),
-    ))];
-    if cols.vendor {
-        total_cells.push(Cell::from(""));
-    }
-    if cols.raw {
-        total_cells.push(Cell::from(""));
-    }
-    if cols.harness {
-        total_cells.push(Cell::from(""));
-    }
-    metric_cells(totals, totals, &cols, false, &mut total_cells);
-    rows.push(Row::new(total_cells).style(Style::default().add_modifier(Modifier::BOLD)));
-
-    let title = format!(
-        " Usage / API Cost ({}) ",
-        dash.view.description()
-    );
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM))
-        .title(Span::styled(title, Style::default().fg(ACCENT).bold()))
-        .title_top(
-            Line::from(vec![
-                Span::styled(" \u{2191} share of column ", Style::default().fg(COL_PCT)),
-                Span::styled("\u{00B7}", Style::default().fg(DIM)),
-                Span::styled(" \u{2190} share of row ", Style::default().fg(ROW_PCT)),
-            ])
-            .alignment(Alignment::Right),
-        );
-    let summary = &dash.summary;
-    let summary_line = format!(
-        " Daily ${:.2} | Weekly ${:.2} | Monthly ${:.2} | Saving ${:.2} | {} / MTok ",
-        summary.daily,
-        summary.weekly,
-        summary.monthly,
-        summary.savings,
-        format_cost_per_mtok(summary.subscription_rate),
-    );
-    let summary_len = summary_line.chars().count();
-    block = block.title_bottom(Line::from(Span::styled(summary_line, Style::default().fg(DIM))));
-    if let Some(insight) = &dash.insight {
-        // Only when there is room next to the summary title.
-        let insight_line = format!(" {} ", insight);
-        if (area.width as usize) >= summary_len + insight_line.chars().count() + 4 {
-            block = block.title_bottom(
-                Line::from(Span::styled(insight_line, Style::default().fg(DIM)))
-                    .alignment(Alignment::Right),
-            );
-        }
-    }
-
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(block)
-        .column_spacing(1);
-    frame.render_widget(table, area);
-}
-
-fn vendor_by_name(name: &str) -> Vendor {
-    match name {
-        "Anthropic" => Vendor::Anthropic,
-        "OpenAI" => Vendor::OpenAI,
-        "Google" => Vendor::Google,
-        "Moonshot" => Vendor::Moonshot,
-        "Zhipu" => Vendor::Zhipu,
-        _ => Vendor::Unknown,
-    }
 }
 
 fn draw_charts(frame: &mut Frame, area: Rect, ui: &Ui) {
@@ -601,7 +214,10 @@ fn smoothed_points(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
         return points.to_vec();
     }
 
-    let slopes: Vec<f64> = points.windows(2).map(|pair| pair[1].1 - pair[0].1).collect();
+    let slopes: Vec<f64> = points
+        .windows(2)
+        .map(|pair| pair[1].1 - pair[0].1)
+        .collect();
     let mut tangents = Vec::with_capacity(points.len());
     tangents.push(slopes[0]);
     for pair in slopes.windows(2) {
@@ -808,8 +424,9 @@ fn draw_chart(frame: &mut Frame, area: Rect, chart: &ChartData, bottom_label: Op
     // Segment header: "Wed : 5.45B" over " 07 / 22", centered per segment.
     // The compact/skip decision looks at inner segments only, so a narrow
     // partial segment at either window edge never suppresses the whole row.
-    let seg_cells =
-        |s: &crate::tui::data::Segment| ((s.end - s.start + 1) as f64 / len as f64 * width as f64) as usize;
+    let seg_cells = |s: &crate::tui::data::Segment| {
+        ((s.end - s.start + 1) as f64 / len as f64 * width as f64) as usize
+    };
     let inner_min = if chart.segments.len() > 2 {
         chart.segments[1..chart.segments.len() - 1]
             .iter()
@@ -829,8 +446,7 @@ fn draw_chart(frame: &mut Frame, area: Rect, chart: &ChartData, bottom_label: Op
         order.sort_by_key(|&i| std::cmp::Reverse(seg_cells(&chart.segments[i])));
         for &i in &order {
             let seg = &chart.segments[i];
-            let (h, d) =
-                charts::segment_label(&seg.anchor, chart.granularity, seg.total, compact);
+            let (h, d) = charts::segment_label(&seg.anchor, chart.granularity, seg.total, compact);
             let mid = col_of((seg.start + seg.end) as f64 / 2.0);
             place_segment_pair(&mut head, &mut date, mid, h.trim(), d.trim());
         }
@@ -966,9 +582,12 @@ fn draw_help(frame: &mut Frame, area: Rect, view: HelpView) {
                 ]),
                 Line::from(""),
             ];
-            lines.extend(topic.detail.iter().map(|text| {
-                Line::from(vec![Span::raw("  "), Span::raw(*text)])
-            }));
+            lines.extend(
+                topic
+                    .detail
+                    .iter()
+                    .map(|text| Line::from(vec![Span::raw("  "), Span::raw(*text)])),
+            );
             (
                 format!(" help: {} ", topic.name),
                 lines,
@@ -998,10 +617,7 @@ fn draw_help(frame: &mut Frame, area: Rect, view: HelpView) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(title, Style::default().fg(ACCENT).bold()))
-                .title_bottom(Line::from(Span::styled(
-                    footer,
-                    Style::default().fg(DIM),
-                ))),
+                .title_bottom(Line::from(Span::styled(footer, Style::default().fg(DIM)))),
         ),
         popup,
     );
@@ -1010,6 +626,8 @@ fn draw_help(frame: &mut Frame, area: Rect, view: HelpView) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_id::Vendor;
+    use crate::table_view::{DataRow, DisplayRow, RowMetrics, TableView};
     use crate::tui::data::{ChartData, Segment, Series};
     use chrono::TimeZone;
     use ratatui::Terminal;
@@ -1026,6 +644,277 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn row_metrics(cache_hit: i64) -> RowMetrics {
+        RowMetrics {
+            count: 1,
+            cache_hit,
+            prefill: 1_390_000,
+            decoding: 480_000,
+            cache_hit_cost: 10.0,
+            prefill_cost: 2.0,
+            decoding_cost: 3.0,
+        }
+    }
+
+    fn data_row(
+        label: &str,
+        vendor: Vendor,
+        vendor_label: &str,
+        metrics: RowMetrics,
+    ) -> DisplayRow {
+        DisplayRow::Data(Box::new(DataRow {
+            vendor,
+            vendor_label: vendor_label.to_string(),
+            model_label: label.to_string(),
+            model_raw: label.to_ascii_lowercase().replace(' ', "-"),
+            harness_label: "Claude Code".to_string(),
+            harness_short: "CC".to_string(),
+            metrics,
+        }))
+    }
+
+    fn dashboard(view: TableView, rows: Vec<DisplayRow>, totals: RowMetrics) -> Dashboard {
+        Dashboard {
+            tool: Tool::All,
+            view,
+            window_label: String::new(),
+            has_source_data: true,
+            has_visible_data: true,
+            session_id: None,
+            model_stats: Vec::new(),
+            rows,
+            totals,
+            summary: Default::default(),
+            insight: None,
+            headline: None,
+            span_label: String::new(),
+            charts: Vec::new(),
+        }
+    }
+
+    fn render_table(width: u16, height: u16, dash: &Dashboard) -> Terminal<TestBackend> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_table(frame, frame.area(), dash))
+            .expect("draw");
+        terminal
+    }
+
+    fn line_containing(text: &str, needle: &str) -> String {
+        text.lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in:\n{text}"))
+            .to_string()
+    }
+
+    fn line_index_containing(text: &str, needle: &str) -> u16 {
+        text.lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in:\n{text}")) as u16
+    }
+
+    fn char_index(text: &str, needle: &str) -> usize {
+        let byte = text
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?} in {text:?}"));
+        text[..byte].chars().count()
+    }
+
+    fn char_positions(text: &str, needle: char) -> Vec<usize> {
+        text.chars()
+            .enumerate()
+            .filter_map(|(index, ch)| (ch == needle).then_some(index))
+            .collect()
+    }
+
+    #[test]
+    fn wide_table_uses_exact_values_and_fixed_percentage_slots() {
+        let alpha = RowMetrics {
+            count: 418,
+            cache_hit: 9_730_000_000,
+            prefill: 1_390_000,
+            decoding: 480_000,
+            cache_hit_cost: 156.94,
+            prefill_cost: 4.25,
+            decoding_cost: 1.75,
+        };
+        let beta = RowMetrics {
+            count: 1_540,
+            cache_hit: 385_000_000,
+            prefill: 11_600_000,
+            decoding: 1_680_000,
+            cache_hit_cost: 921.89,
+            prefill_cost: 12.0,
+            decoding_cost: 8.0,
+        };
+        let mut totals = alpha;
+        totals.add(&beta);
+        let dash = dashboard(
+            TableView::Flat,
+            vec![
+                data_row("Alpha", Vendor::Anthropic, "Anthropic", alpha),
+                data_row("Beta", Vendor::Anthropic, "", beta),
+            ],
+            totals,
+        );
+
+        let terminal = render_table(360, 8, &dash);
+        let text = buffer_text(&terminal);
+        let alpha_line = line_containing(&text, "Alpha");
+        let beta_line = line_containing(&text, "Beta");
+        let total_line = line_containing(&text, "TOTAL");
+
+        assert!(alpha_line.contains("9,730,000,000"), "{alpha_line}");
+        assert!(beta_line.contains("385,000,000"), "{beta_line}");
+        assert_eq!(
+            char_positions(&alpha_line, '↑'),
+            char_positions(&beta_line, '↑')
+        );
+        assert_eq!(
+            char_positions(&alpha_line, '%'),
+            char_positions(&beta_line, '%')
+        );
+
+        let cache_arrow = char_positions(&alpha_line, '↑')[1];
+        let total_value = "10,115,000,000";
+        let total_value_end = char_index(&total_line, total_value) + total_value.len() - 1;
+        assert_eq!(
+            total_value_end + 2,
+            cache_arrow,
+            "{total_line}\n{alpha_line}"
+        );
+    }
+
+    #[test]
+    fn compact_units_share_one_column_and_have_scale_colors() {
+        let cases = [
+            ("Scale T", 1_234_000_000_000, 'T', Color::Indexed(177)),
+            ("Scale B", 9_730_000_000, 'B', Color::Indexed(214)),
+            ("Scale M", 385_000_000, 'M', Color::Indexed(81)),
+            ("Scale K", 752_000, 'K', Color::Indexed(108)),
+        ];
+        let mut totals = RowMetrics::default();
+        let rows = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (label, value, _, _))| {
+                let metrics = row_metrics(*value);
+                totals.add(&metrics);
+                data_row(
+                    label,
+                    Vendor::Anthropic,
+                    if index == 0 { "Anthropic" } else { "" },
+                    metrics,
+                )
+            })
+            .collect();
+        let dash = dashboard(TableView::Flat, rows, totals);
+
+        let terminal = render_table(170, 9, &dash);
+        let text = buffer_text(&terminal);
+        let buffer = terminal.backend().buffer();
+        let mut unit_column = None;
+
+        for (label, _, unit, color) in cases {
+            let line = line_containing(&text, label);
+            let y = line_index_containing(&text, label);
+            let cache_arrow = char_positions(&line, '↑')[1];
+            let unit_x = cache_arrow - 2;
+            assert_eq!(line.chars().nth(unit_x), Some(unit), "{line}");
+            assert_eq!(buffer[(unit_x as u16, y)].fg, color, "{line}");
+            assert_eq!(*unit_column.get_or_insert(unit_x), unit_x, "{line}");
+        }
+    }
+
+    #[test]
+    fn table_rows_have_distinct_visual_hierarchy() {
+        let alpha = row_metrics(9_730_000_000);
+        let beta = row_metrics(385_000_000);
+        let gamma = row_metrics(752_000);
+        let mut anthropic_total = alpha;
+        anthropic_total.add(&beta);
+        let mut totals = anthropic_total;
+        totals.add(&gamma);
+        let dash = dashboard(
+            TableView::Vendor,
+            vec![
+                DisplayRow::GroupHeader {
+                    vendor: "Anthropic".to_string(),
+                },
+                data_row("Alpha", Vendor::Anthropic, "", alpha),
+                data_row("Beta", Vendor::Anthropic, "", beta),
+                DisplayRow::Subtotal {
+                    vendor: "Anthropic".to_string(),
+                    metrics: anthropic_total,
+                },
+                DisplayRow::GroupHeader {
+                    vendor: "OpenAI".to_string(),
+                },
+                data_row("Gamma", Vendor::OpenAI, "", gamma),
+            ],
+            totals,
+        );
+
+        let terminal = render_table(180, 12, &dash);
+        let text = buffer_text(&terminal);
+        let buffer = terminal.backend().buffer();
+        let background_at = |needle: &str| {
+            let line = line_containing(&text, needle);
+            let x = char_index(&line, needle) as u16;
+            let y = line_index_containing(&text, needle);
+            buffer[(x, y)].bg
+        };
+        let header_line = text
+            .lines()
+            .find(|line| line.contains("Vendor") && line.contains("Cache Hit"))
+            .expect("table header");
+        let header_x = char_index(header_line, "Vendor") as u16;
+        let header_y = text
+            .lines()
+            .position(|line| line == header_line)
+            .expect("table header index") as u16;
+
+        assert_eq!(buffer[(header_x, header_y)].bg, Color::Indexed(236));
+        assert_eq!(background_at("Anthropic"), Color::Indexed(235));
+        assert_eq!(background_at("Beta"), Color::Indexed(233));
+        let subtotal_y = line_index_containing(&text, "Beta") + 1;
+        assert_eq!(buffer[(1, subtotal_y)].bg, Color::Indexed(234));
+        assert_eq!(background_at("OpenAI"), Color::Indexed(235));
+        assert_eq!(background_at("TOTAL"), Color::Indexed(237));
+    }
+
+    #[test]
+    fn narrow_table_titles_and_summary_use_complete_fields() {
+        let metrics = row_metrics(9_730_000_000);
+        let mut dash = dashboard(
+            TableView::Flat,
+            vec![data_row("Alpha", Vendor::Anthropic, "Anthropic", metrics)],
+            metrics,
+        );
+        dash.summary.daily = 3_430.09;
+        dash.summary.weekly = 24_010.63;
+        dash.summary.monthly = 102_902.70;
+        dash.summary.savings = 102_502.70;
+        dash.summary.subscription_rate = 0.003;
+
+        for width in [68, 72, 80] {
+            let terminal = render_table(width, 7, &dash);
+            let text = buffer_text(&terminal);
+            let top = text.lines().next().expect("top border");
+            let bottom = line_containing(&text, "Daily");
+
+            assert!(top.contains("Usage / API Cost"), "{width}: {top}");
+            assert!(top.contains("↑ share of column"), "{width}: {top}");
+            assert!(!top.contains("share of row"), "{width}: {top}");
+            assert!(bottom.contains("Daily $3.43K"), "{width}: {bottom}");
+            assert!(bottom.contains("Weekly $24.01K"), "{width}: {bottom}");
+            assert!(bottom.contains("Monthly $102.9K"), "{width}: {bottom}");
+            assert!(bottom.contains("Saving $102.5K"), "{width}: {bottom}");
+            assert!(!bottom.contains("/ MTok"), "{width}: {bottom}");
+        }
     }
 
     #[test]
@@ -1103,12 +992,37 @@ mod tests {
             len,
             granularity: ChartGranularity::Week,
             segments: vec![
-                Segment { start: 0, end: 8, total: 9.0, anchor: monday(1) },
-                Segment { start: 9, end: 29, total: 21.0, anchor: monday(8) },
-                Segment { start: 30, end: 50, total: 21.0, anchor: monday(15) },
-                Segment { start: 51, end: 71, total: 21.0, anchor: monday(22) },
+                Segment {
+                    start: 0,
+                    end: 8,
+                    total: 9.0,
+                    anchor: monday(1),
+                },
+                Segment {
+                    start: 9,
+                    end: 29,
+                    total: 21.0,
+                    anchor: monday(8),
+                },
+                Segment {
+                    start: 30,
+                    end: 50,
+                    total: 21.0,
+                    anchor: monday(15),
+                },
+                Segment {
+                    start: 51,
+                    end: 71,
+                    total: 21.0,
+                    anchor: monday(22),
+                },
                 // The one-bucket partial Monday at the window's right edge.
-                Segment { start: 72, end: 72, total: 1.0, anchor: monday(29) },
+                Segment {
+                    start: 72,
+                    end: 72,
+                    total: 1.0,
+                    anchor: monday(29),
+                },
             ],
             x_ticks: vec![(0, "06/05".to_string()), (36, "06/17".to_string())],
         };
@@ -1127,7 +1041,11 @@ mod tests {
         // Separator ticks under each week boundary on the axis rule.
         assert!(text.contains('\u{2534}'), "missing axis tick:\n{}", text);
         // Dense y labels: one tick mark per plot row.
-        assert!(text.matches('\u{2524}').count() >= 10, "sparse y ticks:\n{}", text);
+        assert!(
+            text.matches('\u{2524}').count() >= 10,
+            "sparse y ticks:\n{}",
+            text
+        );
     }
 
     #[test]
@@ -1140,24 +1058,5 @@ mod tests {
         assert_eq!(smoothed.last(), points.last());
         assert!(smoothed.iter().all(|(_, y)| (0.0..=10.0).contains(y)));
         assert!(smoothed.iter().any(|(_, y)| *y > 0.0 && *y < 10.0));
-    }
-
-    #[test]
-    fn model_column_width_is_bounded_for_wide_table_layout() {
-        assert_eq!(model_column_width(5), 14);
-        assert_eq!(model_column_width(15), 17);
-        assert_eq!(model_column_width(80), 26);
-    }
-
-    #[test]
-    fn column_breakpoints_do_not_clip_metrics_or_the_raw_id() {
-        // The table has a border, one-cell gaps, and fixed metric columns.
-        // A 108-column terminal cannot fit the three cache-strategy columns
-        // in addition to vendor, model, harness, and totals.
-        assert!(!visible_cols(108, true).strategy);
-        // The wide layout with the raw id needs one more column than 170
-        // once the table border and inter-column gaps are included.
-        assert!(!visible_cols(170, true).raw);
-        assert!(visible_cols(171, true).raw);
     }
 }

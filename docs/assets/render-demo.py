@@ -82,6 +82,7 @@ class InputEvent:
 class Cell:
     char: str = " "
     fg: tuple[int, int, int] = DEFAULT_FG
+    bg: tuple[int, int, int] = BG
     bold: bool = False
 
 
@@ -99,6 +100,7 @@ class TerminalScreen:
         self.cursor_row = 0
         self.saved_cursor = (0, 0)
         self.fg = DEFAULT_FG
+        self.bg = BG
         self.bold = False
         self.pending = ""
         self.pending_wrap = False
@@ -106,7 +108,7 @@ class TerminalScreen:
         self.cells = [[self.blank_cell() for _ in range(columns)] for _ in range(rows)]
 
     def blank_cell(self):
-        return Cell()
+        return Cell(" ", self.fg, self.bg, self.bold)
 
     def feed(self, data):
         if isinstance(data, bytes):
@@ -168,7 +170,7 @@ class TerminalScreen:
 
     def handle_csi(self, body, final):
         if final == "m":
-            self.fg, self.bold = parse_sgr(body, self.fg, self.bold)
+            self.fg, self.bg, self.bold = parse_sgr(body, self.fg, self.bg, self.bold)
             return
         if final in "hl":
             return
@@ -262,9 +264,9 @@ class TerminalScreen:
         if self.cursor_col + width > self.columns:
             self.newline()
 
-        self.cells[self.cursor_row][self.cursor_col] = Cell(char, self.fg, self.bold)
+        self.cells[self.cursor_row][self.cursor_col] = Cell(char, self.fg, self.bg, self.bold)
         for col in range(self.cursor_col + 1, min(self.columns, self.cursor_col + width)):
-            self.cells[self.cursor_row][col] = Cell(" ", self.fg, self.bold)
+            self.cells[self.cursor_row][col] = Cell(" ", self.fg, self.bg, self.bold)
 
         if self.cursor_col + width >= self.columns:
             self.cursor_col = self.columns - 1
@@ -335,9 +337,9 @@ def font_for_cell(char, normal, bold_font, braille, *, bold):
     return bold_font if bold else normal
 
 
-def parse_sgr(params, fg, bold):
+def parse_sgr(params, fg, bg, bold):
     if not params:
-        return DEFAULT_FG, False
+        return DEFAULT_FG, BG, False
 
     values = [0 if part == "" else int(part) for part in params.split(";")]
     i = 0
@@ -345,6 +347,7 @@ def parse_sgr(params, fg, bold):
         code = values[i]
         if code == 0:
             fg = DEFAULT_FG
+            bg = BG
             bold = False
         elif code == 1:
             bold = True
@@ -352,18 +355,29 @@ def parse_sgr(params, fg, bold):
             bold = False
         elif code == 39:
             fg = DEFAULT_FG
+        elif code == 49:
+            bg = BG
         elif 30 <= code <= 37:
             fg = PALETTE[code - 30]
         elif 90 <= code <= 97:
             fg = PALETTE[8 + code - 90]
+        elif 40 <= code <= 47:
+            bg = PALETTE[code - 40]
+        elif 100 <= code <= 107:
+            bg = PALETTE[8 + code - 100]
         elif code == 38 and i + 2 < len(values) and values[i + 1] == 5:
             color_idx = values[i + 2]
             if 0 <= color_idx < len(PALETTE):
                 fg = PALETTE[color_idx]
             i += 2
+        elif code == 48 and i + 2 < len(values) and values[i + 1] == 5:
+            color_idx = values[i + 2]
+            if 0 <= color_idx < len(PALETTE):
+                bg = PALETTE[color_idx]
+            i += 2
         i += 1
 
-    return fg, bold
+    return fg, bg, bold
 
 
 def char_cell_width(char):
@@ -403,11 +417,17 @@ def render_screen_image(screen, font_path, font_size, padding):
     for row_index, line in enumerate(screen.render_lines()):
         y = padding + row_index * line_height
         for col_index, cell in enumerate(line.cells):
+            x = padding + col_index * char_width
+            if cell.bg != BG:
+                draw.rectangle(
+                    (x, y, x + char_width - 1, y + line_height - 1),
+                    fill=cell.bg,
+                )
             if cell.char == " ":
                 continue
             font = font_for_cell(cell.char, normal, bold, braille, bold=cell.bold)
             draw.text(
-                (padding + col_index * char_width, y),
+                (x, y),
                 cell.char,
                 font=font,
                 fill=cell.fg,
@@ -578,7 +598,7 @@ def save_gif(frames, output, fps, speed):
 def build_parser():
     parser = argparse.ArgumentParser(description="Record the monitor dashboard to docs/assets/ai-usage.gif")
     parser.add_argument("--output", default="docs/assets/ai-usage.gif")
-    parser.add_argument("--columns", type=int, default=160)
+    parser.add_argument("--columns", type=int, default=240)
     parser.add_argument("--lines", type=int, default=54)
     parser.add_argument("--vendor", default="all")
     parser.add_argument("--days", type=int, default=3)

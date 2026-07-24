@@ -4,7 +4,9 @@
 pub mod commands;
 pub mod data;
 pub mod input;
+mod palette;
 pub mod render;
+mod table;
 
 use std::collections::VecDeque;
 use std::io;

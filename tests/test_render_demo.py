@@ -24,6 +24,7 @@ class RenderDemoTests(unittest.TestCase):
         self.assertEqual(args.duration, 5.0)
         self.assertEqual(args.speed, 1.0)
         self.assertEqual(args.key_interval, 0.1)
+        self.assertEqual(args.columns, 240)
 
     def test_frame_duration_uses_playback_speed(self):
         self.assertEqual(self.render_demo.frame_duration_ms(fps=8.0, speed=3.0), 42)
@@ -88,6 +89,30 @@ class RenderDemoTests(unittest.TestCase):
         self.assertEqual(line.cells[0].fg, self.render_demo.DEFAULT_FG)
         self.assertEqual(line.cells[1].fg, self.render_demo.PALETTE[1])
         self.assertEqual(line.cells[2].fg, self.render_demo.DEFAULT_FG)
+
+    def test_terminal_screen_keeps_sgr_background_state(self):
+        screen = self.render_demo.TerminalScreen(columns=5, rows=1)
+
+        screen.feed("a\x1b[48;5;233m \x1b[49mc")
+        line = screen.render_lines()[0]
+
+        self.assertEqual(line.cells[0].bg, self.render_demo.BG)
+        self.assertEqual(line.cells[1].bg, self.render_demo.PALETTE[233])
+        self.assertEqual(line.cells[2].bg, self.render_demo.BG)
+
+    def test_render_screen_image_paints_blank_cell_background(self):
+        screen = self.render_demo.TerminalScreen(columns=1, rows=1)
+        screen.feed("\x1b[48;5;233m ")
+        font_path = self.render_demo.find_font(Path.cwd(), None)
+
+        image = self.render_demo.render_screen_image(
+            screen,
+            font_path,
+            font_size=12,
+            padding=2,
+        )
+
+        self.assertEqual(image.getpixel((2, 2)), self.render_demo.PALETTE[233])
 
     def test_terminal_screen_keeps_a_split_braille_utf8_sequence_intact(self):
         screen = self.render_demo.TerminalScreen(columns=5, rows=1)

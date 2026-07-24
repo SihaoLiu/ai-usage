@@ -79,7 +79,7 @@ pub fn draw(frame: &mut Frame, ui: &Ui) {
         let table_height = table_want.min(body.height.saturating_sub(min_charts).max(8));
         let [table_area, charts_area] =
             Layout::vertical([Constraint::Length(table_height), Constraint::Min(6)]).areas(body);
-        draw_table(frame, table_area, ui);
+        draw_table(frame, table_area, ui.dash);
         draw_charts(frame, charts_area, ui);
     }
 
@@ -232,9 +232,8 @@ fn visible_cols(width: u16, show_harness: bool) -> Cols {
     }
 }
 
-/// Reserve only the width a readable model label needs. The raw model id is
-/// the flexible column, preventing an oversized Model column from crowding
-/// the descriptive columns and numeric metrics on wide terminals.
+/// Reserve only the width a readable model label needs so the descriptive
+/// columns cannot crowd the numeric metrics on wide terminals.
 fn model_column_width(longest_label: usize) -> u16 {
     (longest_label.saturating_add(2) as u16).clamp(14, 26)
 }
@@ -249,6 +248,74 @@ fn dashboard_model_column_width(rows: &[DisplayRow]) -> u16 {
         .max()
         .unwrap_or(0);
     model_column_width(longest)
+}
+
+/// Keep descriptive columns content-bound and share surplus width across the
+/// numeric metrics, which are the cells that benefit from extra reading room.
+fn table_column_widths(area_width: u16, rows: &[DisplayRow], cols: &Cols) -> Vec<u16> {
+    let mut descriptive = Vec::new();
+    if cols.vendor {
+        descriptive.push(9);
+    }
+    descriptive.push(dashboard_model_column_width(rows));
+
+    let raw_index = if cols.raw {
+        let index = descriptive.len();
+        descriptive.push(20);
+        Some(index)
+    } else {
+        None
+    };
+    if cols.harness {
+        descriptive.push(if cols.harness_full { 14 } else { 11 });
+    }
+
+    let mut metrics = vec![11];
+    if cols.strategy {
+        metrics.extend([16, 16, 16]);
+    }
+    metrics.extend([11, 12]);
+    if cols.rate {
+        metrics.push(8);
+    }
+
+    let column_count = descriptive.len() + metrics.len();
+    let cell_budget = area_width
+        .saturating_sub(2)
+        .saturating_sub(column_count.saturating_sub(1) as u16);
+
+    if let Some(index) = raw_index {
+        let longest = rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Data(data) => Some(data.model_raw.chars().count()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let desired = longest.saturating_add(2).clamp(20, 36) as u16;
+        let other_width = descriptive
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, width)| *width)
+            .chain(metrics.iter().copied())
+            .sum::<u16>();
+        descriptive[index] = desired.min(cell_budget.saturating_sub(other_width));
+    }
+
+    let used = descriptive.iter().chain(&metrics).copied().sum::<u16>();
+    let surplus = cell_budget.saturating_sub(used);
+    if !metrics.is_empty() {
+        let each = surplus / metrics.len() as u16;
+        let remainder = surplus % metrics.len() as u16;
+        for (index, width) in metrics.iter_mut().enumerate() {
+            *width += each + u16::from((index as u16) < remainder);
+        }
+    }
+
+    descriptive.extend(metrics);
+    descriptive
 }
 
 fn right(spans: Vec<Span<'static>>) -> Cell<'static> {
@@ -338,45 +405,37 @@ fn harness_cell_text(d: &DataRow, cols: &Cols) -> String {
     }
 }
 
-fn draw_table(frame: &mut Frame, area: Rect, ui: &Ui) {
-    let dash = ui.dash;
+fn draw_table(frame: &mut Frame, area: Rect, dash: &Dashboard) {
     let show_harness = dash.tool.is_all();
     let cols = visible_cols(area.width, show_harness);
     let totals = &dash.totals;
-    let model_width = dashboard_model_column_width(&dash.rows);
 
     let mut header_cells: Vec<Cell> = Vec::new();
-    let mut widths: Vec<Constraint> = Vec::new();
     if cols.vendor {
         header_cells.push(Cell::from("Vendor"));
-        widths.push(Constraint::Length(9));
     }
     header_cells.push(Cell::from("Model"));
-    widths.push(Constraint::Length(model_width));
     if cols.raw {
         header_cells.push(Cell::from("Model Id"));
-        widths.push(Constraint::Min(20));
     }
     if cols.harness {
         header_cells.push(Cell::from("Harness"));
-        widths.push(Constraint::Length(if cols.harness_full { 14 } else { 11 }));
     }
     header_cells.push(right(vec![Span::raw("Msgs")]));
-    widths.push(Constraint::Length(11));
     if cols.strategy {
         for label in ["Cache Hit", "Prefill", "Decode"] {
             header_cells.push(right(vec![Span::raw(label)]));
-            widths.push(Constraint::Length(16));
         }
     }
     header_cells.push(right(vec![Span::raw("Total")]));
-    widths.push(Constraint::Length(11));
     header_cells.push(right(vec![Span::raw("Cost")]));
-    widths.push(Constraint::Length(12));
     if cols.rate {
         header_cells.push(right(vec![Span::raw("$/MTok")]));
-        widths.push(Constraint::Length(8));
     }
+    let widths = table_column_widths(area.width, &dash.rows, &cols)
+        .into_iter()
+        .map(Constraint::Length)
+        .collect::<Vec<_>>();
     let n_cols = header_cells.len();
     let header = Row::new(header_cells).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD));
 
@@ -969,6 +1028,57 @@ mod tests {
         out
     }
 
+    #[test]
+    fn wide_table_bounds_model_id_and_expands_metric_columns() {
+        let dash = Dashboard {
+            tool: Tool::All,
+            view: TableView::Flat,
+            window_label: String::new(),
+            has_source_data: true,
+            has_visible_data: true,
+            session_id: None,
+            model_stats: Vec::new(),
+            rows: vec![DisplayRow::Data(Box::new(DataRow {
+                vendor: Vendor::Anthropic,
+                vendor_label: "Anthropic".to_string(),
+                model_label: "Opus 4.8".to_string(),
+                model_raw: "claude-opus-4-8".to_string(),
+                harness_label: "Claude Code".to_string(),
+                harness_short: "CC".to_string(),
+                metrics: RowMetrics::default(),
+            }))],
+            totals: RowMetrics::default(),
+            summary: Default::default(),
+            insight: None,
+            headline: None,
+            span_label: String::new(),
+            charts: Vec::new(),
+        };
+        let backend = TestBackend::new(240, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_table(frame, frame.area(), &dash))
+            .expect("draw");
+        let text = buffer_text(&terminal);
+        let header = text
+            .lines()
+            .find(|line| line.contains("Model Id") && line.contains("Cache Hit"))
+            .expect("table header");
+        let model_id = header.find("Model Id").expect("Model Id column");
+        let harness = header.find("Harness").expect("Harness column");
+        let messages = header.find("Msgs").expect("Msgs column");
+        let cache_hit = header.find("Cache Hit").expect("Cache Hit column");
+
+        assert!(
+            harness - model_id <= 24,
+            "Model Id absorbed the wide-table surplus:\n{header}"
+        );
+        assert!(
+            cache_hit - messages >= 18,
+            "metric columns did not receive the wide-table surplus:\n{header}"
+        );
+    }
+
     /// Regression: a 24-day window at Week granularity ends mid-window with a
     /// one-bucket Monday segment. The narrow edge segment must not suppress
     /// the whole segment-header row.
@@ -1033,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn model_column_width_is_bounded_so_the_raw_id_gets_remaining_space() {
+    fn model_column_width_is_bounded_for_wide_table_layout() {
         assert_eq!(model_column_width(5), 14);
         assert_eq!(model_column_width(15), 17);
         assert_eq!(model_column_width(80), 26);

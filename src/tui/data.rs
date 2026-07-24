@@ -7,14 +7,14 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Duration, Local};
+use chrono::{DateTime, Local};
 
 use crate::charts::{self, ChartGranularity};
 use crate::stats;
 use crate::table_view::{
     CostSummary, DisplayRow, RowMetrics, TableView, build_table, cost_summary, table_totals,
 };
-use crate::time_utils::to_interval;
+use crate::time_utils::{generate_interval_times, to_interval};
 use crate::tool::Tool;
 use crate::{AppState, formatting};
 
@@ -72,13 +72,8 @@ fn interval_times(
     range_end: &DateTime<Local>,
     interval_minutes: i64,
 ) -> Vec<DateTime<Local>> {
-    let mut times = Vec::new();
-    let mut t = to_interval(range_start, interval_minutes);
-    while t <= *range_end {
-        times.push(t);
-        t += Duration::minutes(interval_minutes);
-    }
-    times
+    let start = to_interval(range_start, interval_minutes);
+    generate_interval_times(&start, range_end, interval_minutes)
 }
 
 /// Group chronological, uniformly-bucketed times into granularity segments.
@@ -459,6 +454,46 @@ mod tests {
         for pair in times.windows(2) {
             assert_eq!((pair[1] - pair[0]).num_minutes(), 60);
         }
+    }
+
+    #[test]
+    fn multi_day_chart_times_include_post_dst_usage_buckets() {
+        const DST_TEST_CHILD: &str = "AI_USAGE_DST_TEST_CHILD";
+        if std::env::var_os(DST_TEST_CHILD).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args([
+                "--exact",
+                "tui::data::tests::multi_day_chart_times_include_post_dst_usage_buckets",
+                "--nocapture",
+            ])
+            .env("TZ", "America/Los_Angeles")
+            .env(DST_TEST_CHILD, "1")
+            .output()
+            .expect("run DST regression test in an isolated process");
+
+            assert!(
+                output.status.success(),
+                "DST regression subprocess failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let start = Local.with_ymd_and_hms(2026, 1, 13, 15, 17, 0).unwrap();
+        let end = Local.with_ymd_and_hms(2026, 7, 24, 16, 7, 0).unwrap();
+        let interval_minutes = 2 * 24 * 60;
+        let times = interval_times(&start, &end, interval_minutes);
+        let post_dst_usage = Local.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+        let usage_bucket = to_interval(&post_dst_usage, interval_minutes);
+
+        assert!(
+            times.contains(&usage_bucket),
+            "chart buckets must include the same {:?} key used by aggregation",
+            usage_bucket
+        );
     }
 
     #[test]

@@ -44,6 +44,31 @@ fn model_key_for_entry(entry: &UsageEntry, combine_effort: bool) -> String {
         .unwrap_or_else(|| entry.model.clone())
 }
 
+type EntryPricing<'a> = HashMap<&'a str, HashMap<i8, ModelPricing>>;
+
+fn resolve_entry_pricing<'a>(
+    usage_data: &'a [UsageEntry],
+    tool: &str,
+    pricing: &AllPricing,
+) -> EntryPricing<'a> {
+    let mut resolved = HashMap::new();
+    for entry in usage_data
+        .iter()
+        .filter(|entry| tool == "omp" || entry.costs.is_none())
+    {
+        let tiers = resolved
+            .entry(entry.model.as_str())
+            .or_insert_with(HashMap::new);
+        tiers.entry(entry.fast_tier).or_insert_with(|| {
+            let provider = pricing_provider_for_entry(tool, entry);
+            pricing
+                .pricing_for_entry(provider, &entry.model, entry.fast_tier)
+                .into_owned()
+        });
+    }
+    resolved
+}
+
 /// Model breakdown row (shared across all tools).
 /// Cost component fields are populated during aggregation by applying tiered
 /// pricing on each individual entry, then summing. This is the only correct
@@ -93,7 +118,7 @@ fn accumulate_breakdown_entry(
     entry: &UsageEntry,
     tool: &str,
     combine_effort: bool,
-    pricing: &AllPricing,
+    entry_pricing: &EntryPricing<'_>,
 ) {
     let model_key = model_key_for_entry(entry, combine_effort);
 
@@ -144,8 +169,7 @@ fn accumulate_breakdown_entry(
         return;
     }
 
-    let pricing_provider = pricing_provider_for_entry(tool, entry);
-    let p = pricing.pricing_for_entry(pricing_provider, &entry.model, entry.fast_tier);
+    let p = &entry_pricing[entry.model.as_str()][&entry.fast_tier];
     row.input_cost += ModelPricing::tier_cost(entry.usage.input_tokens, p.input, p.input_above_200k);
     row.output_cost +=
         ModelPricing::tier_cost(entry.usage.output_tokens, p.output, p.output_above_200k);
@@ -154,18 +178,18 @@ fn accumulate_breakdown_entry(
         p.cache_input,
         p.cache_input_above_200k,
     );
-    row.cache_creation_cost += match (tool, pricing_provider) {
-        ("omp", _) => ModelPricing::tier_cost(
+    row.cache_creation_cost += match tool {
+        "omp" => ModelPricing::tier_cost(
             entry.usage.cache_creation_input_tokens,
             p.cache_output,
             p.cache_output_above_200k,
         ),
-        (_, "codex") => ModelPricing::tier_cost(
+        "codex" => ModelPricing::tier_cost(
             entry.usage.reasoning_output_tokens,
             p.output,
             p.output_above_200k,
         ),
-        (_, "gemini") => ModelPricing::tier_cost(
+        "gemini" => ModelPricing::tier_cost(
             entry.usage.cache_creation_input_tokens,
             p.output,
             p.output_above_200k,
@@ -206,11 +230,18 @@ pub(crate) fn calculate_model_breakdown_generic(
     combine_effort: bool,
     pricing: &AllPricing,
 ) -> Vec<ModelBreakdownRow> {
+    let entry_pricing = resolve_entry_pricing(usage_data, tool, pricing);
     let model_stats: HashMap<String, ModelBreakdownRow> = usage_data
         .par_chunks(PAR_CHUNK)
         .fold(HashMap::new, |mut local, chunk| {
             for entry in chunk {
-                accumulate_breakdown_entry(&mut local, entry, tool, combine_effort, pricing);
+                accumulate_breakdown_entry(
+                    &mut local,
+                    entry,
+                    tool,
+                    combine_effort,
+                    &entry_pricing,
+                );
             }
             local
         })
@@ -450,5 +481,22 @@ mod tests {
         assert_eq!(pricing_provider_for_entry("omp", &google), "gemini");
         assert_eq!(pricing_provider_for_entry("omp", &open), "codex");
         assert_eq!(pricing_provider_for_entry("omp", &kimi), "kimi");
+    }
+
+    #[test]
+    fn entry_pricing_is_resolved_once_per_model_tier() {
+        let pricing = AllPricing::load_raw().finalize();
+        let standard = usage_entry("gpt-5", None, None);
+        let repeated = usage_entry("gpt-5", Some("high"), None);
+        let mut fast = usage_entry("gpt-5", None, None);
+        fast.fast_tier = 1;
+        let persisted = usage_entry("cached-model", None, Some(UsageCost::default()));
+        let entries = [standard, repeated, fast, persisted];
+
+        let resolved = resolve_entry_pricing(&entries, "codex", &pricing);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved["gpt-5"].len(), 2);
+        assert!(!resolved.contains_key("cached-model"));
     }
 }

@@ -337,9 +337,8 @@ pub fn build(state: &mut AppState) -> Dashboard {
         let model_stats = crate::calculate_all_model_breakdown(&all_data, &state.pricing);
         let tool_ts = crate::calculate_tool_aggregate_time_series(&all_data, interval_minutes);
         let (weighted_cost, total_savings) = crate::calculate_weighted_cost_per_mtok(
-            &all_data,
+            &model_stats,
             projection_days,
-            &state.pricing,
             &state.subscription_fees,
         );
         let headline = (weighted_cost > 0.0).then(|| {

@@ -543,11 +543,12 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         return Some(false);
     }
 
+    let all_model_stats = calculate_all_model_breakdown(&all_data, &state.pricing);
+
     // Compute and cache the weighted cost prompt for show_prompt reuse
     let (weighted_cost, total_savings) = calculate_weighted_cost_per_mtok(
-        &all_data,
+        &all_model_stats,
         projection_days,
-        &state.pricing,
         &state.subscription_fees,
     );
     state.all_tool_prompt = if weighted_cost > 0.0 {
@@ -561,7 +562,6 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     };
 
     let tool_time_series = calculate_tool_aggregate_time_series(&all_data, interval_minutes);
-    let all_model_stats = calculate_all_model_breakdown(&all_data, &state.pricing);
     let has_source_data = state
         .raw_cache
         .as_ref()

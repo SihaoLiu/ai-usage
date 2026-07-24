@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use std::path::Path;
 
-use crate::constants::{AllPricing, ModelPricing, SubscriptionFees};
+use crate::constants::{AllPricing, SubscriptionFees};
 use crate::data::claude::detect_fast_tier_snapshot as detect_claude_fast_tier_snapshot;
 use crate::data::codex::{
     detect_fast_tier_snapshot as detect_codex_fast_tier_snapshot, get_codex_dir,
@@ -624,107 +624,21 @@ pub(crate) fn calculate_all_model_breakdown(
 /// Calculate weighted average cost per MTok and total monthly savings across all tools.
 /// Returns (weighted_cost_per_mtok, total_monthly_savings).
 pub(crate) fn calculate_weighted_cost_per_mtok(
-    all_data: &AllToolData,
+    model_stats: &[ModelBreakdownRow],
     days: f64,
-    pricing: &AllPricing,
     subscription_fees: &SubscriptionFees,
 ) -> (f64, f64) {
-    let tool_configs: &[(&str, &[UsageEntry], f64)] = &[
-        ("claude", &all_data.claude, subscription_fees.claude),
-        ("codex", &all_data.codex, subscription_fees.codex),
-        ("gemini", &all_data.gemini, subscription_fees.gemini),
-        ("kimi", &all_data.kimi, subscription_fees.kimi),
-        ("omp", &all_data.omp, 0.0),
-    ];
-
-    let mut tool_data: Vec<(i64, f64, f64)> = Vec::new();
-
-    for &(tool, entries, sub_price) in tool_configs {
-        if entries.is_empty() {
-            continue;
-        }
-
-        // Compute cost per-entry so tiered pricing (Claude 1M-context >200k
-        // premium) is applied correctly. Aggregating tokens first and then
-        // multiplying by the tier rate would overstate cost when many entries
-        // are individually below 200k. The scan is chunk-parallel.
-        let (total_tokens, api_cost) = entries
-            .par_chunks(stats::PAR_CHUNK)
-            .map(|chunk| {
-                let mut tokens: i64 = 0;
-                let mut cost: f64 = 0.0;
-                for entry in chunk {
-                    if entry.model.contains("<synthetic>") {
-                        continue;
-                    }
-
-                    let extra = match tool {
-                        "codex" => entry.usage.reasoning_output_tokens,
-                        _ => entry.usage.cache_creation_input_tokens,
-                    };
-                    tokens += entry.usage.input_tokens
-                        + entry.usage.output_tokens
-                        + entry.usage.cache_read_input_tokens
-                        + extra;
-
-                    if let Some(costs) = entry.costs {
-                        cost += costs.input + costs.output + costs.cache_read + costs.cache_creation;
-                        continue;
-                    }
-
-                    let pricing_provider = stats::pricing_provider_for_entry(tool, entry);
-                    let p =
-                        pricing.pricing_for_entry(pricing_provider, &entry.model, entry.fast_tier);
-                    cost += ModelPricing::tier_cost(
-                        entry.usage.input_tokens,
-                        p.input,
-                        p.input_above_200k,
-                    );
-                    cost += ModelPricing::tier_cost(
-                        entry.usage.output_tokens,
-                        p.output,
-                        p.output_above_200k,
-                    );
-                    cost += ModelPricing::tier_cost(
-                        entry.usage.cache_read_input_tokens,
-                        p.cache_input,
-                        p.cache_input_above_200k,
-                    );
-                    cost += match (tool, pricing_provider) {
-                        ("omp", _) => ModelPricing::tier_cost(
-                            entry.usage.cache_creation_input_tokens,
-                            p.cache_output,
-                            p.cache_output_above_200k,
-                        ),
-                        (_, "codex") => ModelPricing::tier_cost(
-                            entry.usage.reasoning_output_tokens,
-                            p.output,
-                            p.output_above_200k,
-                        ),
-                        (_, "gemini") => ModelPricing::tier_cost(
-                            entry.usage.cache_creation_input_tokens,
-                            p.output,
-                            p.output_above_200k,
-                        ),
-                        _ => ModelPricing::tier_cost(
-                            entry.usage.cache_creation_input_tokens,
-                            p.cache_output,
-                            p.cache_output_above_200k,
-                        ),
-                    };
-                }
-                (tokens, cost)
-            })
-            .reduce(|| (0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
-
-        if total_tokens == 0 {
-            continue;
-        }
-
-        tool_data.push((total_tokens, api_cost, sub_price));
+    let mut by_tool: HashMap<&str, (i64, f64)> = HashMap::new();
+    for row in model_stats {
+        let totals = by_tool.entry(row.tool.as_str()).or_default();
+        totals.0 += row.total_with_cache;
+        totals.1 += row.input_cost
+            + row.output_cost
+            + row.cache_read_cost
+            + row.cache_creation_cost;
     }
 
-    let grand_total: i64 = tool_data.iter().map(|(t, _, _)| t).sum();
+    let grand_total: i64 = by_tool.values().map(|(tokens, _)| tokens).sum();
     if grand_total == 0 || days <= 0.0 {
         return (0.0, 0.0);
     }
@@ -732,9 +646,16 @@ pub(crate) fn calculate_weighted_cost_per_mtok(
     let mut weighted_cost = 0.0;
     let mut total_savings = 0.0;
 
-    for (tokens, api_cost, sub_price) in &tool_data {
-        let percentage = *tokens as f64 / grand_total as f64;
-        let monthly_tokens = (*tokens as f64 / days) * 30.0;
+    for tool in ["claude", "codex", "gemini", "kimi", "omp"] {
+        let Some(&(tokens, api_cost)) = by_tool.get(tool) else {
+            continue;
+        };
+        if tokens == 0 {
+            continue;
+        }
+        let sub_price = subscription_fees.get(tool);
+        let percentage = tokens as f64 / grand_total as f64;
+        let monthly_tokens = (tokens as f64 / days) * 30.0;
         let cost_per_mtok = if monthly_tokens > 0.0 {
             sub_price / (monthly_tokens / 1_000_000.0)
         } else {
@@ -756,6 +677,38 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use chrono::{Duration, TimeZone};
+
+    #[test]
+    fn weighted_cost_reuses_model_breakdown_totals() {
+        let row = |tool: &str, tokens: i64, cost: f64| ModelBreakdownRow {
+            model: format!("{tool}-model"),
+            tool: tool.to_string(),
+            count: 1,
+            input: tokens,
+            output: 0,
+            cache_creation: 0,
+            cache_read: 0,
+            reasoning: 0,
+            thinking: 0,
+            total: tokens,
+            total_with_cache: tokens,
+            input_cost: cost,
+            output_cost: 0.0,
+            cache_read_cost: 0.0,
+            cache_creation_cost: 0.0,
+        };
+        let rows = [row("claude", 1_000_000, 10.0), row("codex", 3_000_000, 30.0)];
+        let fees = SubscriptionFees {
+            claude: 20.0,
+            codex: 40.0,
+            ..Default::default()
+        };
+
+        let (weighted_cost, savings) = calculate_weighted_cost_per_mtok(&rows, 10.0, &fees);
+
+        assert!((weighted_cost - 5.0).abs() < 1e-9);
+        assert!((savings - 60.0).abs() < 1e-9);
+    }
 
     #[test]
     fn hot_snapshot_only_covers_windows_inside_its_recent_history() {

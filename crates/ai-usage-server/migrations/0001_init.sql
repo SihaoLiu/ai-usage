@@ -47,3 +47,8 @@ CREATE TABLE IF NOT EXISTS integrity_reports (
 );
 
 CREATE INDEX IF NOT EXISTS idx_integrity_reports_host ON integrity_reports(host_id);
+
+CREATE TABLE IF NOT EXISTS server_metadata (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);

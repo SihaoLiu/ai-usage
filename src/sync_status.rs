@@ -44,14 +44,45 @@ pub(crate) fn monitor_sync_interval(monitor_interval: std::time::Duration) -> st
     (monitor_interval / 3).max(std::time::Duration::from_secs(60))
 }
 
+pub(crate) fn monitor_sync_stagger(
+    sync_interval: std::time::Duration,
+    machine_id: &str,
+) -> std::time::Duration {
+    let window = (sync_interval / 4).min(std::time::Duration::from_secs(60));
+    let window_millis = window.as_millis().min(u64::MAX as u128) as u64;
+    let millis =
+        sync::timing::stable_hash(machine_id, 0x7379_6e63) % window_millis.saturating_add(1);
+    std::time::Duration::from_millis(millis)
+}
+
+pub(crate) fn monitor_sync_delay(
+    monitor_interval: std::time::Duration,
+    machine_id: &str,
+) -> std::time::Duration {
+    let sync_interval = monitor_sync_interval(monitor_interval);
+    sync_interval.saturating_add(monitor_sync_stagger(sync_interval, machine_id))
+}
+
+pub(crate) fn monitor_sync_deadline_after_refresh(
+    now: std::time::Instant,
+    current_deadline: std::time::Instant,
+    monitor_interval: std::time::Duration,
+    machine_id: &str,
+) -> std::time::Instant {
+    let triggered_deadline =
+        now + monitor_sync_stagger(monitor_sync_interval(monitor_interval), machine_id);
+    current_deadline.min(triggered_deadline)
+}
+
 pub(crate) fn monitor_deadlines_after_interval_change(
     now: std::time::Instant,
     monitor_interval_seconds: u64,
+    machine_id: &str,
 ) -> (std::time::Instant, std::time::Instant) {
     let monitor_interval = std::time::Duration::from_secs(monitor_interval_seconds);
     (
         now + monitor_interval,
-        now + monitor_sync_interval(monitor_interval),
+        now + monitor_sync_delay(monitor_interval, machine_id),
     )
 }
 
@@ -133,6 +164,9 @@ pub(crate) fn format_manual_sync_progress(event: &sync::engine::SyncProgress) ->
             "sync integrity: {}",
             format_integrity_verification(verification)
         )),
+        sync::engine::SyncProgress::IntegrityCheckReused { checked_hosts } => Some(format!(
+            "sync integrity: reused recent check for {checked_hosts} hosts"
+        )),
     }
 }
 
@@ -185,7 +219,9 @@ pub(crate) fn format_monitor_sync_status_at(
     None
 }
 
-pub(crate) fn format_monitor_worker_progress(progress: &sync::worker::SyncWorkerProgress) -> String {
+pub(crate) fn format_monitor_worker_progress(
+    progress: &sync::worker::SyncWorkerProgress,
+) -> String {
     match progress {
         sync::worker::SyncWorkerProgress::Sync(event) => match event {
             sync::engine::SyncProgress::UploadPlanned {
@@ -239,6 +275,9 @@ pub(crate) fn format_monitor_worker_progress(progress: &sync::worker::SyncWorker
             sync::engine::SyncProgress::IntegrityCheckFinished { verification } => {
                 format!("integrity {}", format_integrity_verification(verification))
             }
+            sync::engine::SyncProgress::IntegrityCheckReused { checked_hosts } => {
+                format!("integrity reused recent check for {checked_hosts} hosts")
+            }
         },
         sync::worker::SyncWorkerProgress::Http(event) => match event {
             sync::client::HttpProgress::RateLimited {
@@ -252,7 +291,9 @@ pub(crate) fn format_monitor_worker_progress(progress: &sync::worker::SyncWorker
     }
 }
 
-pub(crate) fn format_integrity_verification(verification: &sync::integrity::IntegrityVerification) -> String {
+pub(crate) fn format_integrity_verification(
+    verification: &sync::integrity::IntegrityVerification,
+) -> String {
     match verification {
         sync::integrity::IntegrityVerification::Checked { checked_hosts } => {
             format!("checked {checked_hosts} hosts")
@@ -302,72 +343,102 @@ mod tests {
     #[allow(unused_imports)]
     use chrono::TimeZone;
 
-        #[test]
-        fn sync_integrity_verification_maps_to_prompt_status() {
-            let duration = std::time::Duration::from_millis(12);
-            assert_eq!(
-                integrity_status_from_verification(
-                    &sync::integrity::IntegrityVerification::Checked { checked_hosts: 2 },
-                    duration,
-                ),
-                IntegrityStatus::Checked { duration }
-            );
+    #[test]
+    fn sync_integrity_verification_maps_to_prompt_status() {
+        let duration = std::time::Duration::from_millis(12);
+        assert_eq!(
+            integrity_status_from_verification(
+                &sync::integrity::IntegrityVerification::Checked { checked_hosts: 2 },
+                duration,
+            ),
+            IntegrityStatus::Checked { duration }
+        );
 
-            assert_eq!(
-                integrity_status_from_verification(
-                    &sync::integrity::IntegrityVerification::Failed {
-                        failures: vec![sync::integrity::IntegrityFailure {
-                            host_id: "laptop".to_string(),
-                            range_end_utc: "2026-06-01T00:00:00Z".to_string(),
-                            expected_record_count: 1,
-                            actual_record_count: 0,
-                            expected_digest_sha256: "a".repeat(64),
-                            actual_digest_sha256: "b".repeat(64),
-                        }],
-                    },
-                    duration,
-                ),
-                IntegrityStatus::Failed
-            );
-        }
+        assert_eq!(
+            integrity_status_from_verification(
+                &sync::integrity::IntegrityVerification::Failed {
+                    failures: vec![sync::integrity::IntegrityFailure {
+                        host_id: "laptop".to_string(),
+                        range_end_utc: "2026-06-01T00:00:00Z".to_string(),
+                        expected_record_count: 1,
+                        actual_record_count: 0,
+                        expected_digest_sha256: "a".repeat(64),
+                        actual_digest_sha256: "b".repeat(64),
+                    }],
+                },
+                duration,
+            ),
+            IntegrityStatus::Failed
+        );
+    }
 
-        #[test]
-        fn sync_interval_is_one_third_of_monitor_interval_with_minimum() {
-            assert_eq!(
-                monitor_sync_interval(std::time::Duration::from_secs(3600)),
-                std::time::Duration::from_secs(1200)
-            );
-            assert_eq!(
-                monitor_sync_interval(std::time::Duration::from_secs(180)),
-                std::time::Duration::from_secs(60)
-            );
-            assert_eq!(
-                monitor_sync_interval(std::time::Duration::from_secs(30)),
-                std::time::Duration::from_secs(60)
-            );
-        }
+    #[test]
+    fn sync_interval_is_one_third_of_monitor_interval_with_minimum() {
+        assert_eq!(
+            monitor_sync_interval(std::time::Duration::from_secs(3600)),
+            std::time::Duration::from_secs(1200)
+        );
+        assert_eq!(
+            monitor_sync_interval(std::time::Duration::from_secs(180)),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            monitor_sync_interval(std::time::Duration::from_secs(30)),
+            std::time::Duration::from_secs(60)
+        );
+    }
 
-        #[test]
-        fn interval_change_reschedules_refresh_and_sync_deadlines() {
-            let now = std::time::Instant::now();
+    #[test]
+    fn sync_stagger_is_stable_and_bounded() {
+        let interval = std::time::Duration::from_secs(1200);
+        let first = monitor_sync_stagger(interval, "workstation");
+        let second = monitor_sync_stagger(interval, "workstation");
 
-            let (next_refresh, next_sync) = monitor_deadlines_after_interval_change(now, 3600);
+        assert_eq!(first, second);
+        assert!(first <= std::time::Duration::from_secs(60));
+        assert!(first <= interval / 4);
+    }
 
-            assert_eq!(next_refresh, now + std::time::Duration::from_secs(3600));
-            assert_eq!(next_sync, now + std::time::Duration::from_secs(1200));
-        }
+    #[test]
+    fn interval_change_reschedules_refresh_and_sync_deadlines() {
+        let now = std::time::Instant::now();
 
-        #[test]
-        fn manual_sync_progress_formats_push_pull_and_retry_events() {
-            assert_eq!(
-                format_manual_sync_progress(&sync::engine::SyncProgress::UploadPlanned {
-                    total_records: 1001,
-                    total_batches: 2,
-                    skipped_records: 7,
-                }),
-                Some("sync push: 1001 records to upload in 2 batches, 7 already synced".to_string())
-            );
-            assert_eq!(
+        let (next_refresh, next_sync) =
+            monitor_deadlines_after_interval_change(now, 3600, "workstation");
+
+        assert_eq!(next_refresh, now + std::time::Duration::from_secs(3600));
+        assert_eq!(
+            next_sync,
+            now + monitor_sync_delay(std::time::Duration::from_secs(3600), "workstation")
+        );
+    }
+
+    #[test]
+    fn refresh_completion_does_not_postpone_a_pending_sync() {
+        let now = std::time::Instant::now();
+
+        assert_eq!(
+            monitor_sync_deadline_after_refresh(
+                now,
+                now,
+                std::time::Duration::from_secs(30),
+                "workstation",
+            ),
+            now
+        );
+    }
+
+    #[test]
+    fn manual_sync_progress_formats_push_pull_and_retry_events() {
+        assert_eq!(
+            format_manual_sync_progress(&sync::engine::SyncProgress::UploadPlanned {
+                total_records: 1001,
+                total_batches: 2,
+                skipped_records: 7,
+            }),
+            Some("sync push: 1001 records to upload in 2 batches, 7 already synced".to_string())
+        );
+        assert_eq!(
                 format_manual_sync_progress(&sync::engine::SyncProgress::UploadBatchFinished {
                     batch_index: 1,
                     total_batches: 2,
@@ -381,63 +452,63 @@ mod tests {
                         .to_string()
                 )
             );
-            assert_eq!(
-                format_manual_sync_progress(&sync::engine::SyncProgress::PullPageFinished {
+        assert_eq!(
+            format_manual_sync_progress(&sync::engine::SyncProgress::PullPageFinished {
+                page_index: 2,
+                page_records: 5000,
+                pulled_records: 10000,
+                max_seq: 123,
+                truncated: true,
+            }),
+            Some("sync pull: page 2, 10000 records pulled, latest seq 123".to_string())
+        );
+        assert_eq!(
+            format_http_progress(&sync::client::HttpProgress::RateLimited {
+                attempt: 2,
+                retry_after: std::time::Duration::from_millis(1100),
+            }),
+            "sync: rate limited, retrying in 1.1s (attempt 2)"
+        );
+    }
+
+    #[test]
+    fn monitor_sync_status_formats_running_progress_and_completion() {
+        let running = sync::worker::SyncStats {
+            running: true,
+            progress: Some(sync::worker::SyncWorkerProgress::Sync(
+                sync::engine::SyncProgress::PullPageFinished {
                     page_index: 2,
                     page_records: 5000,
                     pulled_records: 10000,
                     max_seq: 123,
                     truncated: true,
-                }),
-                Some("sync pull: page 2, 10000 records pulled, latest seq 123".to_string())
-            );
-            assert_eq!(
-                format_http_progress(&sync::client::HttpProgress::RateLimited {
-                    attempt: 2,
-                    retry_after: std::time::Duration::from_millis(1100),
-                }),
-                "sync: rate limited, retrying in 1.1s (attempt 2)"
-            );
-        }
+                },
+            )),
+            ..sync::worker::SyncStats::default()
+        };
+        assert_eq!(
+            format_monitor_sync_status_at(
+                &running,
+                chrono::DateTime::parse_from_rfc3339("2026-05-19T12:00:00Z")
+                    .expect("timestamp")
+                    .with_timezone(&chrono::Utc),
+            ),
+            Some("Sync: pull page 2, 10000 records pulled, latest seq 123".to_string())
+        );
 
-        #[test]
-        fn monitor_sync_status_formats_running_progress_and_completion() {
-            let running = sync::worker::SyncStats {
-                running: true,
-                progress: Some(sync::worker::SyncWorkerProgress::Sync(
-                    sync::engine::SyncProgress::PullPageFinished {
-                        page_index: 2,
-                        page_records: 5000,
-                        pulled_records: 10000,
-                        max_seq: 123,
-                        truncated: true,
-                    },
-                )),
-                ..sync::worker::SyncStats::default()
-            };
-            assert_eq!(
-                format_monitor_sync_status_at(
-                    &running,
-                    chrono::DateTime::parse_from_rfc3339("2026-05-19T12:00:00Z")
-                        .expect("timestamp")
-                        .with_timezone(&chrono::Utc),
-                ),
-                Some("Sync: pull page 2, 10000 records pulled, latest seq 123".to_string())
-            );
-
-            let completed = sync::worker::SyncStats {
-                success_count: 1,
-                last_finished_at: Some("2026-05-19T11:42:00Z".to_string()),
-                ..sync::worker::SyncStats::default()
-            };
-            assert_eq!(
-                format_monitor_sync_status_at(
-                    &completed,
-                    chrono::DateTime::parse_from_rfc3339("2026-05-19T12:00:00Z")
-                        .expect("timestamp")
-                        .with_timezone(&chrono::Utc),
-                ),
-                Some("Sync: checked 18 min ago".to_string())
-            );
-        }
+        let completed = sync::worker::SyncStats {
+            success_count: 1,
+            last_finished_at: Some("2026-05-19T11:42:00Z".to_string()),
+            ..sync::worker::SyncStats::default()
+        };
+        assert_eq!(
+            format_monitor_sync_status_at(
+                &completed,
+                chrono::DateTime::parse_from_rfc3339("2026-05-19T12:00:00Z")
+                    .expect("timestamp")
+                    .with_timezone(&chrono::Utc),
+            ),
+            Some("Sync: checked 18 min ago".to_string())
+        );
+    }
 }

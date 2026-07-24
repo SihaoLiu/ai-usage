@@ -11,6 +11,8 @@ pub const SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION: u32 = 2;
 const SYNC_STATE_FILE: &str = "sync_state.json";
 const SYNC_UPLOAD_LOG_FILE: &str = "sync_upload_log.bin";
 const SYNC_SNAPSHOT_STATE_FILE: &str = "sync_snapshot_state.bin";
+const SYNC_SNAPSHOT_MARKER_FILE: &str = "sync_snapshot_marker.json";
+const SNAPSHOT_MARKER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncState {
@@ -18,16 +20,51 @@ pub struct SyncState {
     pub last_seen_seq: u64,
     #[serde(default)]
     pub pull_vendors: Vec<String>,
+    #[serde(default)]
+    pub pull_scope: String,
+    #[serde(default)]
+    pub last_full_pull: Option<String>,
     pub last_successful_sync: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub integrity_check: Option<IntegrityCheckState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityCheckState {
+    pub checked_at: String,
+    pub range_end_utc: String,
+    pub checked_hosts: usize,
+    #[serde(default)]
+    pub sync_scope: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotUploadState {
     pub schema_version: u32,
     pub full_hash: String,
-    pub key_set_hash: String,
+    pub cache_generation: String,
     pub record_hashes: BTreeMap<(String, String), String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SnapshotCacheMarker {
+    schema_version: u32,
+    cache_generation: String,
+    sync_scope: String,
+    record_count: usize,
+    #[serde(default)]
+    content_revision: Option<u64>,
+    #[serde(default)]
+    verified_at_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotCacheReceipt {
+    pub cache_generation: String,
+    pub record_count: usize,
+    pub content_revision: Option<u64>,
+    pub verified_at_secs: u64,
 }
 
 impl Default for SyncState {
@@ -36,8 +73,11 @@ impl Default for SyncState {
             schema_version: SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 0,
             pull_vendors: Vec::new(),
+            pull_scope: String::new(),
+            last_full_pull: None,
             last_successful_sync: None,
             last_error: None,
+            integrity_check: None,
         }
     }
 }
@@ -98,10 +138,63 @@ pub fn load_snapshot_upload_state(cache_root: &Path) -> SnapshotUploadState {
 pub fn save_snapshot_upload_state(
     cache_root: &Path,
     state: &SnapshotUploadState,
+    sync_scope: &str,
+    content_revision: Option<u64>,
 ) -> io::Result<()> {
     let path = cache_root.join(SYNC_SNAPSHOT_STATE_FILE);
     let content = bincode::serialize(state).map_err(io::Error::other)?;
-    atomic_write(&path, &content)
+    atomic_write(&path, &content)?;
+    save_snapshot_cache_marker(cache_root, state, sync_scope, content_revision)
+}
+
+fn save_snapshot_cache_marker(
+    cache_root: &Path,
+    state: &SnapshotUploadState,
+    sync_scope: &str,
+    content_revision: Option<u64>,
+) -> io::Result<()> {
+    let marker_path = cache_root.join(SYNC_SNAPSHOT_MARKER_FILE);
+    if state.cache_generation.is_empty() || sync_scope.is_empty() {
+        match fs::remove_file(marker_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        return Ok(());
+    }
+    let marker = SnapshotCacheMarker {
+        schema_version: SNAPSHOT_MARKER_SCHEMA_VERSION,
+        cache_generation: state.cache_generation.clone(),
+        sync_scope: sync_scope.to_string(),
+        record_count: state.record_hashes.len(),
+        content_revision,
+        verified_at_secs: unix_time_secs(),
+    };
+    let marker_content = serde_json::to_vec(&marker)?;
+    atomic_write(&marker_path, &marker_content)
+}
+
+pub fn snapshot_cache_receipt(cache_root: &Path, sync_scope: &str) -> Option<SnapshotCacheReceipt> {
+    let marker = load_snapshot_cache_marker(cache_root)?;
+    (marker.sync_scope == sync_scope).then_some(SnapshotCacheReceipt {
+        cache_generation: marker.cache_generation,
+        record_count: marker.record_count,
+        content_revision: marker.content_revision,
+        verified_at_secs: marker.verified_at_secs,
+    })
+}
+
+fn load_snapshot_cache_marker(cache_root: &Path) -> Option<SnapshotCacheMarker> {
+    let content = fs::read(cache_root.join(SYNC_SNAPSHOT_MARKER_FILE)).ok()?;
+    let marker = serde_json::from_slice::<SnapshotCacheMarker>(&content).ok()?;
+    (marker.schema_version == SNAPSHOT_MARKER_SCHEMA_VERSION).then_some(marker)
+}
+
+fn unix_time_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -156,8 +249,11 @@ mod tests {
                 schema_version: SYNC_STATE_SCHEMA_VERSION,
                 last_seen_seq: 0,
                 pull_vendors: Vec::new(),
+                pull_scope: String::new(),
+                last_full_pull: None,
                 last_successful_sync: None,
                 last_error: None,
+                integrity_check: None,
             }
         );
     }
@@ -169,8 +265,11 @@ mod tests {
             schema_version: SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 42,
             pull_vendors: vec!["claude".to_string(), "codex".to_string()],
+            pull_scope: "server-a".to_string(),
+            last_full_pull: Some("2026-05-18T12:00:00Z".to_string()),
             last_successful_sync: Some("2026-05-18T12:34:56Z".to_string()),
             last_error: Some("temporary network error".to_string()),
+            integrity_check: None,
         };
 
         save_sync_state(&cache_root, &state).expect("save state");
@@ -178,6 +277,55 @@ mod tests {
         assert_eq!(load_sync_state(&cache_root), state);
         let raw = fs::read_to_string(cache_root.join("sync_state.json")).expect("read json");
         assert!(raw.contains("\"last_seen_seq\": 42"));
+    }
+
+    #[test]
+    fn integrity_check_state_round_trips_with_sync_state() {
+        let cache_root = unique_temp_dir("integrity-check-state");
+        let state = SyncState {
+            integrity_check: Some(IntegrityCheckState {
+                checked_at: "2026-07-23T18:00:00Z".to_string(),
+                range_end_utc: "2026-07-23T00:00:00Z".to_string(),
+                checked_hosts: 5,
+                sync_scope: "scope-a".to_string(),
+            }),
+            ..SyncState::default()
+        };
+
+        save_sync_state(&cache_root, &state).expect("save state");
+
+        assert_eq!(load_sync_state(&cache_root), state);
+    }
+
+    #[test]
+    fn legacy_integrity_check_without_sync_scope_stays_readable() {
+        let cache_root = unique_temp_dir("legacy-integrity-check");
+        fs::write(
+            cache_root.join(SYNC_STATE_FILE),
+            br#"{
+                "schema_version": 1,
+                "last_seen_seq": 42,
+                "pull_vendors": ["claude", "codex", "gemini"],
+                "last_successful_sync": null,
+                "last_error": null,
+                "integrity_check": {
+                    "checked_at": "2026-07-23T18:00:00Z",
+                    "range_end_utc": "2026-07-23T00:00:00Z",
+                    "checked_hosts": 5
+                }
+            }"#,
+        )
+        .expect("write legacy state");
+
+        let state = load_sync_state(&cache_root);
+
+        assert_eq!(
+            state
+                .integrity_check
+                .expect("legacy integrity check")
+                .sync_scope,
+            ""
+        );
     }
 
     #[test]
@@ -215,6 +363,75 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_state_keeps_the_previous_binary_layout() {
+        #[derive(Serialize, Deserialize)]
+        struct PreviousSnapshotUploadState {
+            schema_version: u32,
+            full_hash: String,
+            key_set_hash: String,
+            record_hashes: BTreeMap<(String, String), String>,
+        }
+
+        let previous = PreviousSnapshotUploadState {
+            schema_version: SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION,
+            full_hash: "full".to_string(),
+            key_set_hash: "legacy-key-set".to_string(),
+            record_hashes: BTreeMap::from([(
+                ("claude".to_string(), "dedup".to_string()),
+                "record".to_string(),
+            )]),
+        };
+        let encoded = bincode::serialize(&previous).expect("serialize previous state");
+        let current: SnapshotUploadState =
+            bincode::deserialize(&encoded).expect("deserialize current state");
+
+        assert_eq!(current.schema_version, SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION);
+        assert_eq!(current.full_hash, "full");
+        assert_eq!(current.cache_generation, "legacy-key-set");
+        assert_eq!(
+            current
+                .record_hashes
+                .get(&("claude".to_string(), "dedup".to_string())),
+            Some(&"record".to_string())
+        );
+
+        let current_encoded = bincode::serialize(&current).expect("serialize current state");
+        let previous_again: PreviousSnapshotUploadState =
+            bincode::deserialize(&current_encoded).expect("deserialize previous state");
+        assert_eq!(previous_again.key_set_hash, "legacy-key-set");
+    }
+
+    #[test]
+    fn snapshot_cache_marker_is_a_scoped_upload_receipt() {
+        let cache_root = unique_temp_dir("snapshot-cache-marker");
+        let snapshot = SnapshotUploadState {
+            schema_version: SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION,
+            full_hash: "full".to_string(),
+            cache_generation: "generation-a".to_string(),
+            record_hashes: BTreeMap::new(),
+        };
+        save_snapshot_upload_state(&cache_root, &snapshot, "scope-a", Some(42))
+            .expect("save snapshot state");
+
+        let receipt =
+            snapshot_cache_receipt(&cache_root, "scope-a").expect("matching snapshot receipt");
+        assert_eq!(receipt.cache_generation, "generation-a");
+        assert_eq!(receipt.record_count, 0);
+        assert_eq!(receipt.content_revision, Some(42));
+        assert!(receipt.verified_at_secs > 0);
+        assert_eq!(snapshot_cache_receipt(&cache_root, "scope-b"), None);
+
+        fs::write(cache_root.join(SYNC_SNAPSHOT_STATE_FILE), b"corrupt state")
+            .expect("replace snapshot state");
+        assert_eq!(
+            snapshot_cache_receipt(&cache_root, "scope-a")
+                .expect("receipt remains independent")
+                .record_count,
+            0
+        );
+    }
+
+    #[test]
     fn clear_sync_state_removes_existing_file_and_is_idempotent() {
         let cache_root = unique_temp_dir("clear-state");
         save_sync_state(
@@ -223,8 +440,11 @@ mod tests {
                 schema_version: SYNC_STATE_SCHEMA_VERSION,
                 last_seen_seq: 99,
                 pull_vendors: Vec::new(),
+                pull_scope: String::new(),
+                last_full_pull: None,
                 last_successful_sync: Some("2026-05-20T00:00:00Z".to_string()),
                 last_error: None,
+                integrity_check: None,
             },
         )
         .expect("save state");
@@ -243,8 +463,11 @@ mod tests {
             schema_version: SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 7,
             pull_vendors: Vec::new(),
+            pull_scope: String::new(),
+            last_full_pull: None,
             last_successful_sync: None,
             last_error: None,
+            integrity_check: None,
         };
         let mut keys = BTreeSet::new();
         keys.insert(("gemini".to_string(), "dedup".to_string()));

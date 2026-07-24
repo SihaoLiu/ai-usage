@@ -3,6 +3,7 @@ use crate::data::cache::{self, CachedUsageRecord, RemoteUsageRecord};
 use crate::sync::config::EnabledSyncConfig;
 use crate::sync::engine::{SUPPORTED_PULL_VENDORS, SyncError};
 use crate::sync::keys::assign_sync_dedup_keys;
+use ai_usage_proto::{INTEGRITY_ALGORITHM, IntegrityReport};
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 use serde::Serialize;
 use serde_json::json;
@@ -11,9 +12,8 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use ai_usage_proto::{INTEGRITY_ALGORITHM, IntegrityReport};
 
-const TRANSCRIPT_FORMAT: &str = "integrity-transcript-v1";
+const TRANSCRIPT_FORMAT: &str = "integrity-summary-v1";
 const TRANSCRIPT_DIR: &str = "integrity";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,17 +57,9 @@ struct CanonicalIntegrityRecord {
 impl Eq for CanonicalIntegrityRecord {}
 
 #[derive(Debug, Clone)]
-struct DigestedIntegrityRecord {
-    canonical: CanonicalIntegrityRecord,
-    canonical_json_len: usize,
-    record_sha256: String,
-}
-
-#[derive(Debug, Clone)]
 struct DigestResult {
     record_count: u64,
     digest_sha256: String,
-    stable_records: Vec<DigestedIntegrityRecord>,
 }
 
 impl PartialOrd for CanonicalIntegrityRecord {
@@ -124,9 +116,9 @@ pub fn build_local_report_for_range(
             ));
         }
     }
-    let (report, digest) =
+    let (report, _digest) =
         build_report_from_records(&config.machine_id, records, range_end_utc, computed_at)?;
-    let _ = write_local_transcript(cache_root, &config.machine_id, &report, &digest);
+    let _ = write_local_transcript(cache_root, &config.machine_id, &report);
     Ok(report)
 }
 
@@ -174,19 +166,12 @@ pub fn verify_remote_reports_at(
         let range_end_utc = DateTime::parse_from_rfc3339(&report.range_end_utc)
             .map_err(|err| SyncError::new(format!("invalid integrity range end: {err}")))?
             .with_timezone(&Utc);
-        let (actual, digest) =
+        let (actual, _digest) =
             build_remote_report_digest_at(cache_root, &report.host_id, range_end_utc, computed_at)?;
         checked_hosts += 1;
         let matches_report = actual.digest_sha256 == report.digest_sha256
             && actual.record_count == report.record_count;
-        let _ = write_remote_transcript(
-            cache_root,
-            local_host_id,
-            report,
-            &actual,
-            &digest,
-            matches_report,
-        );
+        let _ = write_remote_transcript(cache_root, local_host_id, report, &actual, matches_report);
         if !matches_report {
             failures.push(IntegrityFailure {
                 host_id: report.host_id.clone(),
@@ -246,24 +231,17 @@ fn digest_records(
     stable_records.sort();
 
     let mut hasher = Sha256::new();
-    let mut digested_records = Vec::with_capacity(stable_records.len());
+    let record_count = stable_records.len() as u64;
     for record in stable_records {
         let bytes = serde_json::to_vec(&record)
             .map_err(|err| SyncError::new(format!("serialize integrity record: {err}")))?;
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(&bytes);
-        let record_sha256 = sha256_hex(&bytes);
-        digested_records.push(DigestedIntegrityRecord {
-            canonical: record,
-            canonical_json_len: bytes.len(),
-            record_sha256,
-        });
     }
     let digest = hasher.finalize();
     Ok(DigestResult {
-        record_count: digested_records.len() as u64,
+        record_count,
         digest_sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
-        stable_records: digested_records,
     })
 }
 
@@ -271,7 +249,6 @@ fn write_local_transcript(
     cache_root: &Path,
     local_host_id: &str,
     report: &IntegrityReport,
-    digest: &DigestResult,
 ) -> std::io::Result<()> {
     let summary = json!({
         "line": "summary",
@@ -285,7 +262,7 @@ fn write_local_transcript(
         "record_count": report.record_count,
         "digest_sha256": report.digest_sha256,
     });
-    write_transcript(cache_root, "local", &report.host_id, summary, digest)
+    write_transcript(cache_root, "local", &report.host_id, summary)
 }
 
 fn write_remote_transcript(
@@ -293,7 +270,6 @@ fn write_remote_transcript(
     local_host_id: &str,
     expected: &IntegrityReport,
     actual: &IntegrityReport,
-    digest: &DigestResult,
     matches_report: bool,
 ) -> std::io::Result<()> {
     let summary = json!({
@@ -313,7 +289,7 @@ fn write_remote_transcript(
         "server_digest_sha256": expected.digest_sha256,
         "actual_digest_sha256": actual.digest_sha256,
     });
-    write_transcript(cache_root, "remote", &expected.host_id, summary, digest)
+    write_transcript(cache_root, "remote", &expected.host_id, summary)
 }
 
 fn write_transcript(
@@ -321,7 +297,6 @@ fn write_transcript(
     view: &str,
     subject_host_id: &str,
     summary: serde_json::Value,
-    digest: &DigestResult,
 ) -> std::io::Result<()> {
     let path = transcript_path(cache_root, view, subject_host_id);
     if let Some(parent) = path.parent() {
@@ -333,10 +308,6 @@ fn write_transcript(
         let mut writer = BufWriter::new(file);
         serde_json::to_writer(&mut writer, &summary)?;
         writer.write_all(b"\n")?;
-        for (index, record) in digest.stable_records.iter().enumerate() {
-            serde_json::to_writer(&mut writer, &transcript_record_line(index, record))?;
-            writer.write_all(b"\n")?;
-        }
         writer.flush()?;
     }
     fs::rename(tmp_path, path)
@@ -348,34 +319,6 @@ fn transcript_path(cache_root: &Path, view: &str, subject_host_id: &str) -> Path
         safe_file_stem(view),
         safe_file_stem(subject_host_id)
     ))
-}
-
-fn transcript_record_line(index: usize, record: &DigestedIntegrityRecord) -> serde_json::Value {
-    let canonical = &record.canonical;
-    json!({
-        "line": "record",
-        "index": index,
-        "host_id": canonical.host_id,
-        "vendor": canonical.vendor,
-        "dedup_key_sha256": sha256_hex(canonical.dedup_key.as_bytes()),
-        "timestamp": canonical.timestamp,
-        "session_start_time": canonical.session_start_time,
-        "session_end_time": canonical.session_end_time,
-        "model": canonical.model,
-        "effort": canonical.effort,
-        "fast_tier": canonical.fast_tier,
-        "input_tokens": canonical.input_tokens,
-        "output_tokens": canonical.output_tokens,
-        "cache_read_input_tokens": canonical.cache_read_input_tokens,
-        "cache_creation_input_tokens": canonical.cache_creation_input_tokens,
-        "reasoning_output_tokens": canonical.reasoning_output_tokens,
-        "cost_input": canonical.cost_input,
-        "cost_output": canonical.cost_output,
-        "cost_cache_read": canonical.cost_cache_read,
-        "cost_cache_creation": canonical.cost_cache_creation,
-        "canonical_json_len": record.canonical_json_len,
-        "record_sha256": record.record_sha256,
-    })
 }
 
 fn safe_file_stem(value: &str) -> String {
@@ -394,11 +337,6 @@ fn safe_file_stem(value: &str) -> String {
     } else {
         stem
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn local_canonical_record(
@@ -618,33 +556,15 @@ mod tests {
 
         let path = cache_root.join("integrity").join("local-host-a.jsonl");
         let lines = read_jsonl(&path);
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["line"], "summary");
+        assert_eq!(lines[0]["format"], "integrity-summary-v1");
         assert_eq!(lines[0]["view"], "local");
         assert_eq!(lines[0]["observer_host_id"], "host-a");
         assert_eq!(lines[0]["subject_host_id"], "host-a");
         assert_eq!(lines[0]["record_count"], 1);
         assert_eq!(lines[0]["digest_sha256"], report.digest_sha256);
         assert_eq!(lines[0]["range_end_utc"], "2026-06-01T00:00:00Z");
-        assert_eq!(lines[1]["line"], "record");
-        assert_eq!(lines[1]["index"], 0);
-        assert_eq!(lines[1]["vendor"], "claude");
-        assert_eq!(lines[1]["timestamp"], "2026-05-31T23:59:59Z");
-        assert_eq!(lines[1]["input_tokens"], 10);
-        assert_eq!(
-            lines[1]["record_sha256"]
-                .as_str()
-                .expect("record hash string")
-                .len(),
-            64
-        );
-        assert_eq!(
-            lines[1]["dedup_key_sha256"]
-                .as_str()
-                .expect("dedup key hash string")
-                .len(),
-            64
-        );
         let text = std::fs::read_to_string(path).expect("read transcript text");
         assert!(!text.contains("stable-a"));
         assert!(!text.contains("current"));
@@ -676,22 +596,9 @@ mod tests {
         let path = cache_root.join("integrity").join("local-host-a.jsonl");
         let lines = read_jsonl(&path);
         assert_eq!(report.record_count, 2);
-        assert_eq!(lines.len(), 3);
-        let first = lines[1]["dedup_key_sha256"]
-            .as_str()
-            .expect("first dedup hash");
-        let second = lines[2]["dedup_key_sha256"]
-            .as_str()
-            .expect("second dedup hash");
-        assert_ne!(
-            first,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_ne!(
-            second,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_ne!(first, second);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["record_count"], 2);
+        assert_eq!(lines[0]["digest_sha256"], report.digest_sha256);
     }
 
     #[test]
@@ -837,7 +744,7 @@ mod tests {
         ));
         let path = viewer_cache.join("integrity").join("remote-host-a.jsonl");
         let lines = read_jsonl(&path);
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["line"], "summary");
         assert_eq!(lines[0]["view"], "remote");
         assert_eq!(lines[0]["observer_host_id"], "host-b");
@@ -853,7 +760,5 @@ mod tests {
             lines[0]["expected_digest_sha256"],
             lines[0]["actual_digest_sha256"]
         );
-        assert_eq!(lines[1]["line"], "record");
-        assert_eq!(lines[1]["input_tokens"], 99);
     }
 }

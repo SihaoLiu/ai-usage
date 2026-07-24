@@ -1,18 +1,19 @@
 use crate::sync::config::EnabledSyncConfig;
-use crate::sync::engine::{SyncError, SyncTransport};
+use crate::sync::engine::{RemoteSnapshotState, SyncError, SyncTransport};
+use ai_usage_proto::{
+    HealthResponse, IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineList,
+    PullResponse, SnapshotDiffRequest, SnapshotDiffResponse, SnapshotFinalizeRequest,
+    SnapshotFinalizeResponse, SnapshotRecordBatch, UploadResponse, WireRecord,
+};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
-use ai_usage_proto::{
-    IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineList, PullResponse,
-    SnapshotDiffRequest, SnapshotDiffResponse, SnapshotFinalizeRequest, SnapshotFinalizeResponse,
-    SnapshotRecordBatch, UploadResponse, WireRecord,
-};
 
-const MAX_RATE_LIMIT_RETRIES: usize = 5;
-const DEFAULT_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_millis(1100);
-const MAX_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_REQUEST_RETRIES: usize = 5;
+const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(1100);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_JSON_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+const CLIENT_ID_HEADER: &str = "x-ai-usage-client";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpProgress {
@@ -29,6 +30,7 @@ pub struct SyncHttpClient {
     agent: ureq::Agent,
     server_url: String,
     token: String,
+    machine_id: String,
     progress: Option<HttpProgressCallback>,
 }
 
@@ -55,6 +57,7 @@ impl SyncHttpClient {
             agent,
             server_url: config.server_url.trim_end_matches('/').to_string(),
             token: config.token,
+            machine_id: config.machine_id,
             progress,
         }
     }
@@ -67,11 +70,18 @@ impl SyncHttpClient {
         format!("Bearer {}", self.token)
     }
 
+    pub fn health(&self) -> Result<HealthResponse, SyncError> {
+        let response =
+            self.call_with_retry(|| self.agent.get(&self.endpoint("/v1/health")).call())?;
+        read_json_response(response)
+    }
+
     pub fn machines(&self) -> Result<MachineList, SyncError> {
-        let response = self.call_with_rate_limit_retry(|| {
+        let response = self.call_with_retry(|| {
             self.agent
                 .get(&self.endpoint("/v1/machines"))
                 .header("Authorization", self.auth_header())
+                .header(CLIENT_ID_HEADER, &self.machine_id)
                 .call()
         })?;
         read_json_response(response)
@@ -82,10 +92,11 @@ impl SyncHttpClient {
         report: &IntegrityReport,
     ) -> Result<IntegritySubmitResponse, SyncError> {
         let body = serde_json::to_string(report).map_err(|err| SyncError::new(err.to_string()))?;
-        let response = self.call_with_rate_limit_retry(|| {
+        let response = self.call_with_retry(|| {
             self.agent
                 .post(&self.endpoint("/v1/integrity/report"))
                 .header("Authorization", self.auth_header())
+                .header(CLIENT_ID_HEADER, &self.machine_id)
                 .header("Content-Type", "application/json")
                 .send(body.clone())
         })?;
@@ -93,10 +104,11 @@ impl SyncHttpClient {
     }
 
     pub fn integrity_reports(&self) -> Result<IntegrityReportList, SyncError> {
-        let response = self.call_with_rate_limit_retry(|| {
+        let response = self.call_with_retry(|| {
             self.agent
                 .get(&self.endpoint("/v1/integrity/reports"))
                 .header("Authorization", self.auth_header())
+                .header(CLIENT_ID_HEADER, &self.machine_id)
                 .call()
         })?;
         read_json_response(response)
@@ -107,10 +119,11 @@ impl SyncHttpClient {
         request: &SnapshotDiffRequest,
     ) -> Result<SnapshotDiffResponse, SyncError> {
         let body = serde_json::to_string(request).map_err(|err| SyncError::new(err.to_string()))?;
-        let response = self.call_with_rate_limit_retry(|| {
+        let response = self.call_with_retry(|| {
             self.agent
                 .post(&self.endpoint("/v1/snapshot/diff"))
                 .header("Authorization", self.auth_header())
+                .header(CLIENT_ID_HEADER, &self.machine_id)
                 .header("Content-Type", "application/json")
                 .send(body.clone())
         })?;
@@ -122,10 +135,11 @@ impl SyncHttpClient {
         batch: &SnapshotRecordBatch,
     ) -> Result<UploadResponse, SyncError> {
         let body = serde_json::to_string(batch).map_err(|err| SyncError::new(err.to_string()))?;
-        let response = self.call_with_rate_limit_retry(|| {
+        let response = self.call_with_retry(|| {
             self.agent
                 .post(&self.endpoint("/v1/snapshot/records"))
                 .header("Authorization", self.auth_header())
+                .header(CLIENT_ID_HEADER, &self.machine_id)
                 .header("Content-Type", "application/json")
                 .send(body.clone())
         })?;
@@ -137,31 +151,40 @@ impl SyncHttpClient {
         request: &SnapshotFinalizeRequest,
     ) -> Result<SnapshotFinalizeResponse, SyncError> {
         let body = serde_json::to_string(request).map_err(|err| SyncError::new(err.to_string()))?;
-        let response = self.call_with_rate_limit_retry(|| {
+        let response = self.call_with_retry(|| {
             self.agent
                 .post(&self.endpoint("/v1/snapshot/finalize"))
                 .header("Authorization", self.auth_header())
+                .header(CLIENT_ID_HEADER, &self.machine_id)
                 .header("Content-Type", "application/json")
                 .send(body.clone())
         })?;
         read_json_response(response)
     }
 
-    fn call_with_rate_limit_retry<F>(
-        &self,
-        mut send: F,
-    ) -> Result<ureq::http::Response<ureq::Body>, SyncError>
+    fn call_with_retry<F>(&self, mut send: F) -> Result<ureq::http::Response<ureq::Body>, SyncError>
     where
         F: FnMut() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     {
-        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
-            let response = send().map_err(transport_error)?;
-            if response.status().as_u16() == 429 && attempt < MAX_RATE_LIMIT_RETRIES {
-                let retry_after = rate_limit_retry_delay(&response);
-                self.emit_progress(HttpProgress::RateLimited {
-                    attempt: attempt + 1,
-                    retry_after,
-                });
+        for attempt in 0..=MAX_REQUEST_RETRIES {
+            let response = match send() {
+                Ok(response) => response,
+                Err(err) if is_retryable_transport_error(&err) && attempt < MAX_REQUEST_RETRIES => {
+                    std::thread::sleep(retry_delay(&self.machine_id, attempt + 1, None));
+                    continue;
+                }
+                Err(err) => return Err(transport_error(err)),
+            };
+            let status = response.status().as_u16();
+            if is_retryable_status(status) && attempt < MAX_REQUEST_RETRIES {
+                let retry_after =
+                    retry_delay(&self.machine_id, attempt + 1, server_retry_after(&response));
+                if status == 429 {
+                    self.emit_progress(HttpProgress::RateLimited {
+                        attempt: attempt + 1,
+                        retry_after,
+                    });
+                }
                 std::thread::sleep(retry_after);
                 continue;
             }
@@ -186,10 +209,11 @@ impl SyncTransport for SyncHttpClient {
             })
             .collect::<Result<Vec<_>, _>>()?
             .join("\n");
-        let response = self.call_with_rate_limit_retry(|| {
+        let response = self.call_with_retry(|| {
             self.agent
                 .post(&self.endpoint("/v1/upload"))
                 .header("Authorization", self.auth_header())
+                .header(CLIENT_ID_HEADER, &self.machine_id)
                 .header("Content-Type", "application/x-ndjson")
                 .send(body.clone())
         })?;
@@ -207,10 +231,11 @@ impl SyncTransport for SyncHttpClient {
         let path = format!(
             "/v1/pull?after_seq={after_seq}&exclude_host={exclude_host}&limit={limit}&supported_vendors={supported_vendors}"
         );
-        let response = self.call_with_rate_limit_retry(|| {
+        let response = self.call_with_retry(|| {
             self.agent
                 .get(&self.endpoint(&path))
                 .header("Authorization", self.auth_header())
+                .header(CLIENT_ID_HEADER, &self.machine_id)
                 .call()
         })?;
         read_json_response(response)
@@ -244,6 +269,39 @@ impl SyncTransport for SyncHttpClient {
     ) -> Result<SnapshotFinalizeResponse, SyncError> {
         SyncHttpClient::snapshot_finalize(self, request)
     }
+
+    fn server_instance_id(&self) -> Result<Option<String>, SyncError> {
+        Ok(self.health()?.instance_id)
+    }
+
+    fn remote_snapshot_state(&self, host_id: &str) -> Result<RemoteSnapshotState, SyncError> {
+        Ok(self
+            .machines()?
+            .machines
+            .into_iter()
+            .find(|machine| machine.host_id == host_id)
+            .map_or(RemoteSnapshotState::Missing, |machine| {
+                RemoteSnapshotState::Present {
+                    record_count: machine.record_count,
+                    content_revision: machine.content_revision,
+                }
+            }))
+    }
+}
+
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn is_retryable_transport_error(err: &ureq::Error) -> bool {
+    matches!(
+        err,
+        ureq::Error::Protocol(_)
+            | ureq::Error::Io(_)
+            | ureq::Error::Timeout(_)
+            | ureq::Error::HostNotFound
+            | ureq::Error::ConnectionFailed
+    )
 }
 
 fn read_json_response<T: DeserializeOwned>(
@@ -267,15 +325,28 @@ fn read_json_response<T: DeserializeOwned>(
     serde_json::from_str(&body).map_err(|err| SyncError::new(err.to_string()))
 }
 
-fn rate_limit_retry_delay(response: &ureq::http::Response<ureq::Body>) -> Duration {
+fn server_retry_after(response: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
     response
         .headers()
         .get("Retry-After")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_RATE_LIMIT_RETRY_DELAY)
-        .min(MAX_RATE_LIMIT_RETRY_DELAY)
+}
+
+fn retry_delay(machine_id: &str, attempt: usize, server_retry_after: Option<Duration>) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(16) as u32;
+    let base = server_retry_after
+        .unwrap_or_else(|| DEFAULT_RETRY_DELAY.saturating_mul(1_u32 << exponent))
+        .min(MAX_RETRY_DELAY);
+    if base.is_zero() || base == MAX_RETRY_DELAY {
+        return base;
+    }
+    let jitter_window_ms = (base / 2).as_millis().min(u64::MAX as u128) as u64;
+    let jitter_ms =
+        crate::sync::timing::stable_hash(machine_id, attempt as u64) % (jitter_window_ms + 1);
+    base.saturating_add(Duration::from_millis(jitter_ms))
+        .min(MAX_RETRY_DELAY)
 }
 
 fn transport_error(err: ureq::Error) -> SyncError {
@@ -289,8 +360,13 @@ mod tests {
     use crate::sync::config::EnabledSyncConfig;
     use crate::sync::engine::{SUPPORTED_PULL_VENDORS, SyncTransport};
     use crate::sync::{engine, state};
+    use ai_usage_proto::{
+        INTEGRITY_ALGORITHM, IntegrityReport, PullResponse, SCHEMA_VERSION, SequencedWireRecord,
+        WireRecord,
+    };
+    use ai_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
     use axum::extract::State;
-    use axum::http::StatusCode;
+    use axum::http::{HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
     use axum::{Json, Router};
@@ -298,11 +374,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use ai_usage_proto::{
-        INTEGRITY_ALGORITHM, IntegrityReport, PullResponse, SCHEMA_VERSION, SequencedWireRecord,
-        WireRecord,
-    };
-    use ai_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -424,9 +495,13 @@ mod tests {
                 .await
                 .expect("server");
         });
-        let client = SyncHttpClient::new(client_config(format!("http://{addr}")));
+        let server_url = format!("http://{addr}");
+        let client = SyncHttpClient::new(client_config(server_url.clone()));
+        let mut uploader_config = client_config(server_url);
+        uploader_config.machine_id = "laptop".to_string();
+        let uploader = SyncHttpClient::new(uploader_config);
 
-        let upload_client = client.clone();
+        let upload_client = uploader;
         let upload = tokio::task::spawn_blocking(move || {
             upload_client.upload(&[record("laptop", "remote-a")])
         })
@@ -457,6 +532,31 @@ mod tests {
         assert_eq!(machines.machines.len(), 1);
         assert_eq!(machines.machines[0].host_id, "laptop");
         assert_eq!(machines.machines[0].record_count, 1);
+
+        let identity_client = client.clone();
+        let instance_id = tokio::task::spawn_blocking(move || {
+            SyncTransport::server_instance_id(&identity_client)
+        })
+        .await
+        .expect("instance identity join")
+        .expect("instance identity")
+        .expect("new server identity");
+        assert_eq!(instance_id.len(), 64);
+
+        let state_client = client.clone();
+        let remote_state = tokio::task::spawn_blocking(move || {
+            SyncTransport::remote_snapshot_state(&state_client, "laptop")
+        })
+        .await
+        .expect("remote state join")
+        .expect("remote state");
+        assert_eq!(
+            remote_state,
+            RemoteSnapshotState::Present {
+                record_count: 1,
+                content_revision: Some(1),
+            }
+        );
         server.abort();
     }
 
@@ -472,9 +572,13 @@ mod tests {
                 .await
                 .expect("server");
         });
-        let client = SyncHttpClient::new(client_config(format!("http://{addr}")));
+        let server_url = format!("http://{addr}");
+        let client = SyncHttpClient::new(client_config(server_url.clone()));
+        let mut uploader_config = client_config(server_url);
+        uploader_config.machine_id = "laptop".to_string();
+        let uploader = SyncHttpClient::new(uploader_config);
 
-        let upload_client = client.clone();
+        let upload_client = uploader;
         tokio::task::spawn_blocking(move || {
             upload_client.upload(&[record_with_vendor("laptop", "omp", "remote-omp-a")])
         })
@@ -576,6 +680,77 @@ mod tests {
             .expect("list join")
             .expect("list response");
         assert_eq!(reports.reports, vec![report]);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_identifies_its_machine() {
+        async fn machines(headers: HeaderMap) -> Json<MachineList> {
+            assert_eq!(
+                headers
+                    .get("x-ai-usage-client")
+                    .and_then(|value| value.to_str().ok()),
+                Some("workstation")
+            );
+            Json(MachineList {
+                machines: Vec::new(),
+            })
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let app = Router::new().route("/v1/machines", get(machines));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let client = SyncHttpClient::new(client_config(format!("http://{addr}")));
+
+        let machine_client = client.clone();
+        let machines = tokio::task::spawn_blocking(move || machine_client.machines())
+            .await
+            .expect("machines join")
+            .expect("machines response");
+
+        assert!(machines.machines.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_refreshes_the_server_instance_identity() {
+        async fn health(State(attempts): State<Arc<AtomicUsize>>) -> Json<HealthResponse> {
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+            Json(HealthResponse {
+                ok: true,
+                version: "3.0.1".to_string(),
+                schema_version: SCHEMA_VERSION,
+                uptime_seconds: attempt as u64,
+                instance_id: Some(format!("server-{attempt}")),
+            })
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let app = Router::new()
+            .route("/v1/health", get(health))
+            .with_state(attempts);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let client = SyncHttpClient::new(client_config(format!("http://{addr}")));
+
+        assert_eq!(
+            SyncTransport::server_instance_id(&client).expect("first identity"),
+            Some("server-0".to_string())
+        );
+        assert_eq!(
+            SyncTransport::server_instance_id(&client).expect("refreshed identity"),
+            Some("server-1".to_string())
+        );
         server.abort();
     }
 
@@ -814,6 +989,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_retries_transient_server_errors() {
+        async fn upload(State(attempts): State<Arc<AtomicUsize>>) -> Response {
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+            if attempt == 0 {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    [("Retry-After", "0")],
+                    "upstream unavailable",
+                )
+                    .into_response()
+            } else {
+                Json(UploadResponse {
+                    accepted: 1,
+                    ignored: 0,
+                    max_seq: 1,
+                })
+                .into_response()
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let app = Router::new()
+            .route("/v1/upload", post(upload))
+            .with_state(attempts.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let client = SyncHttpClient::new(client_config(format!("http://{addr}")));
+
+        let upload_client = client.clone();
+        let upload = tokio::task::spawn_blocking(move || {
+            upload_client.upload(&[record("laptop", "transient-error")])
+        })
+        .await
+        .expect("upload join")
+        .expect("upload response");
+
+        assert_eq!(upload.accepted, 1);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_reports_rate_limit_retry_progress() {
         async fn upload(State(attempts): State<Arc<AtomicUsize>>) -> Response {
             let attempt = attempts.fetch_add(1, Ordering::Relaxed);
@@ -872,5 +1094,54 @@ mod tests {
         assert_eq!(upload.accepted, 1);
         assert_eq!(retries.load(Ordering::Relaxed), 1);
         server.abort();
+    }
+
+    #[test]
+    fn retry_delay_grows_exponentially_without_server_guidance() {
+        let first = retry_delay("workstation", 1, None);
+        let second = retry_delay("workstation", 2, None);
+        let capped = retry_delay("workstation", 20, None);
+
+        assert!(second > first);
+        assert_eq!(capped, MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn retry_delay_staggers_different_machines() {
+        let server_delay = Some(Duration::from_secs(1));
+        let workstation = retry_delay("workstation", 2, server_delay);
+        let laptop = retry_delay("laptop", 2, server_delay);
+
+        assert_ne!(workstation, laptop);
+        assert!(workstation >= Duration::from_secs(1));
+        assert!(laptop >= Duration::from_secs(1));
+        assert!(workstation <= Duration::from_millis(1500));
+        assert!(laptop <= Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn request_retries_transient_transport_errors() {
+        let client = SyncHttpClient::new(client_config("http://127.0.0.1:1".to_string()));
+        let mut attempts = 0usize;
+
+        let response = client
+            .call_with_retry(|| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(ureq::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "connection reset",
+                    )))
+                } else {
+                    Ok(ureq::http::Response::builder()
+                        .status(200)
+                        .body(ureq::Body::builder().data("{}"))
+                        .expect("response"))
+                }
+            })
+            .expect("transient error should be retried");
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(attempts, 2);
     }
 }

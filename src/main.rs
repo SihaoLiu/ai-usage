@@ -18,7 +18,6 @@ mod window_nav;
 
 use std::collections::{HashMap, HashSet};
 
-
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
@@ -27,9 +26,7 @@ use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use crossterm::terminal;
 
-use constants::{
-    AllPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees,
-};
+use constants::{AllPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees};
 use data::UsageEntry;
 use formatting::print_model_breakdown;
 use table_view::TableView;
@@ -690,6 +687,17 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
                 return 1;
             };
             let cache_root = data::cache::default_cache_dir();
+            let _sync_lock = match sync::lock::SyncLock::try_acquire(&cache_root) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    eprintln!("ai-usage: another sync is already running");
+                    return 1;
+                }
+                Err(err) => {
+                    eprintln!("ai-usage: failed to acquire sync lock: {err}");
+                    return 1;
+                }
+            };
             let client = sync::client::SyncHttpClient::new_with_progress(config.clone(), |event| {
                 eprintln!("{}", format_http_progress(event));
             });
@@ -897,7 +905,8 @@ fn main() {
             needs_session_metadata(state.session_id.as_deref(), &refreshed);
         if !raw_cache_has_any_tool_data(&refreshed) || needs_session_metadata {
             refreshed = refresh_all_tool_raw_full(state.local_host_id.as_deref());
-            if !include_local_for_host_filter(state.host.as_deref(), state.local_host_id.as_deref()) {
+            if !include_local_for_host_filter(state.host.as_deref(), state.local_host_id.as_deref())
+            {
                 clear_local_raw_cache(&mut refreshed);
             }
             let cache_root = data::cache::default_cache_dir();
@@ -1036,7 +1045,10 @@ mod tests {
     fn session_query_does_not_refresh_a_cache_with_session_metadata() {
         let cache = cache_with_session(Some("another-conversation"));
 
-        assert!(!needs_session_metadata(Some("missing-conversation"), &cache));
+        assert!(!needs_session_metadata(
+            Some("missing-conversation"),
+            &cache
+        ));
     }
 
     #[test]
@@ -1105,5 +1117,4 @@ mod tests {
         );
         assert!(parse_host_selection("Workstation").is_err());
     }
-
 }

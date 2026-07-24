@@ -1,7 +1,10 @@
+pub(crate) mod cache_generation;
 pub mod client;
 pub mod config;
 pub mod engine;
 pub mod integrity;
 pub(crate) mod keys;
+pub mod lock;
 pub mod state;
+pub(crate) mod timing;
 pub mod worker;

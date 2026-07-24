@@ -119,6 +119,8 @@ pub struct MachineInfo {
     pub host_id: String,
     pub last_seen: String,
     pub record_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +134,8 @@ pub struct HealthResponse {
     pub version: String,
     pub schema_version: u32,
     pub uptime_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -638,5 +642,59 @@ mod tests {
             invalid_digest.validate(),
             Err(ValidationError::InvalidDigest)
         );
+    }
+
+    #[test]
+    fn health_response_accepts_legacy_payload_without_instance_id() {
+        let response: HealthResponse = serde_json::from_str(
+            r#"{
+                "ok": true,
+                "version": "3.0.0",
+                "schema_version": 1,
+                "uptime_seconds": 42
+            }"#,
+        )
+        .expect("deserialize legacy health response");
+
+        assert_eq!(response.instance_id, None);
+    }
+
+    #[test]
+    fn machine_info_accepts_legacy_payload_without_content_revision() {
+        let machine: MachineInfo = serde_json::from_str(
+            r#"{
+                "host_id": "workstation-home",
+                "last_seen": "2026-07-23T18:00:00Z",
+                "record_count": 42
+            }"#,
+        )
+        .expect("deserialize legacy machine info");
+
+        assert_eq!(machine.content_revision, None);
+    }
+
+    #[test]
+    fn legacy_machine_info_ignores_new_content_revision() {
+        #[derive(Deserialize)]
+        struct LegacyMachineInfo {
+            host_id: String,
+            last_seen: String,
+            record_count: u64,
+        }
+
+        let current = MachineInfo {
+            host_id: "workstation-home".to_string(),
+            last_seen: "2026-07-23T18:00:00Z".to_string(),
+            record_count: 42,
+            content_revision: Some(84),
+        };
+        let legacy: LegacyMachineInfo = serde_json::from_value(
+            serde_json::to_value(current).expect("serialize current machine info"),
+        )
+        .expect("deserialize with legacy machine info");
+
+        assert_eq!(legacy.host_id, "workstation-home");
+        assert_eq!(legacy.last_seen, "2026-07-23T18:00:00Z");
+        assert_eq!(legacy.record_count, 42);
     }
 }

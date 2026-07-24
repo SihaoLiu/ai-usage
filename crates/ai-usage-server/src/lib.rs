@@ -1,3 +1,9 @@
+use ai_usage_proto::{
+    HealthResponse, IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineInfo,
+    MachineList, PullResponse, RecordKey, SCHEMA_VERSION, SequencedWireRecord, SnapshotDiffRequest,
+    SnapshotDiffResponse, SnapshotRecordBatch, UploadResponse, WireRecord, is_valid_host_id,
+    is_valid_vendor,
+};
 use axum::extract::{DefaultBodyLimit, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -12,21 +18,25 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
-use ai_usage_proto::{
-    HealthResponse, IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineInfo,
-    MachineList, PullResponse, RecordKey, SCHEMA_VERSION, SequencedWireRecord, SnapshotDiffRequest,
-    SnapshotDiffResponse, SnapshotRecordBatch, UploadResponse, WireRecord, is_valid_host_id,
-    is_valid_vendor,
-};
+use tokio::sync::Mutex as AsyncMutex;
 
 type DbPool = Pool<SqliteConnectionManager>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const RATE_LIMIT_REFILL_PER_SECOND: f64 = 1.0;
 const RATE_LIMIT_BURST: f64 = 30.0;
+const GLOBAL_RATE_LIMIT_REFILL_PER_SECOND: f64 = 4.0;
+const GLOBAL_RATE_LIMIT_BURST: f64 = 60.0;
+const MAX_RATE_LIMIT_BUCKETS: usize = 256;
+const RATE_LIMIT_BUCKET_IDLE: Duration = Duration::from_secs(10 * 60);
+const CLIENT_ID_HEADER: &str = "x-ai-usage-client";
+const LEGACY_RATE_LIMIT_KEY: &str = "legacy";
 const LEGACY_PULL_VENDORS: [&str; 3] = ["claude", "codex", "gemini"];
+const MAX_PULL_RECORDS: usize = 5_000;
+static SERVER_INSTANCE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -93,7 +103,10 @@ pub struct AppState {
     config: Arc<ServerConfig>,
     pool: DbPool,
     started_at: Instant,
+    instance_id: Arc<str>,
     rate_limiter: Arc<Mutex<HashMap<String, BucketState>>>,
+    global_rate_limiter: Arc<Mutex<BucketState>>,
+    write_gate: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,19 +155,26 @@ impl AppState {
             .max_size(4)
             .connection_timeout(Duration::from_secs(5))
             .build(manager)?;
-        {
+        let instance_id = {
             let mut conn = pool.get()?;
             conn.execute_batch(include_str!("../migrations/0001_init.sql"))?;
             ensure_fast_tier_column(&conn)?;
             ensure_cost_columns(&conn)?;
             ensure_snapshot_id_column(&conn)?;
             cleanup_omp_alias_duplicates(&mut conn)?;
-        }
+            load_or_create_server_instance_id(&conn, &config.db_path)?
+        };
         Ok(Self {
             config: Arc::new(config),
             pool,
             started_at: Instant::now(),
+            instance_id: Arc::from(instance_id),
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            global_rate_limiter: Arc::new(Mutex::new(BucketState {
+                tokens: GLOBAL_RATE_LIMIT_BURST,
+                last_refill: Instant::now(),
+            })),
+            write_gate: Arc::new(AsyncMutex::new(())),
         })
     }
 }
@@ -219,6 +239,7 @@ fn run_server_auto_update_once() -> Result<ai_usage_updater::InstallOutcome, Str
 struct AppError {
     status: StatusCode,
     message: Option<String>,
+    retry_after_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +266,7 @@ impl AppError {
         Self {
             status,
             message: Some(message.into()),
+            retry_after_seconds: None,
         }
     }
 
@@ -252,16 +274,33 @@ impl AppError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: None,
+            retry_after_seconds: None,
+        }
+    }
+
+    fn rate_limited(retry_after_seconds: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: Some("rate limit exceeded".to_string()),
+            retry_after_seconds: Some(retry_after_seconds),
         }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        match self.message {
+        let mut response = match self.message {
             Some(message) => (self.status, message).into_response(),
             None => self.status.into_response(),
+        };
+        if let Some(seconds) = self.retry_after_seconds
+            && let Ok(value) = seconds.to_string().parse()
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
         }
+        response
     }
 }
 
@@ -283,7 +322,55 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         schema_version: SCHEMA_VERSION,
         uptime_seconds: state.started_at.elapsed().as_secs(),
+        instance_id: Some(state.instance_id.to_string()),
     })
+}
+
+fn load_or_create_server_instance_id(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+) -> rusqlite::Result<String> {
+    let existing = conn
+        .query_row(
+            "SELECT value FROM server_metadata WHERE key = 'instance_id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(instance_id) = existing {
+        return Ok(instance_id);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ai-usage-server-instance-v1");
+    hasher.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(
+        SERVER_INSTANCE_NONCE
+            .fetch_add(1, Ordering::Relaxed)
+            .to_le_bytes(),
+    );
+    hasher.update(db_path.to_string_lossy().as_bytes());
+    let candidate = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    conn.execute(
+        "INSERT OR IGNORE INTO server_metadata (key, value) VALUES ('instance_id', ?1)",
+        params![candidate],
+    )?;
+    conn.query_row(
+        "SELECT value FROM server_metadata WHERE key = 'instance_id'",
+        [],
+        |row| row.get(0),
+    )
 }
 
 async fn upload(
@@ -313,6 +400,7 @@ async fn upload(
         record.validate().map_err(|err| {
             AppError::new(StatusCode::BAD_REQUEST, format!("line {}: {err}", idx + 1))
         })?;
+        validate_client_host(&headers, &record.host_id)?;
         if state
             .config
             .allowed_hosts
@@ -327,6 +415,7 @@ async fn upload(
         records.push(record);
     }
 
+    let _write_guard = state.write_gate.lock().await;
     let mut conn = state.pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let uploaded_at = Utc::now().to_rfc3339();
@@ -382,6 +471,7 @@ async fn snapshot_keys(
     let batch: SnapshotKeyBatch = serde_json::from_str(&body)
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))?;
     validate_snapshot_host(&state, &batch.host_id)?;
+    validate_client_host(&headers, &batch.host_id)?;
     validate_snapshot_id(&batch.snapshot_id)?;
     if batch.keys.len() > state.config.max_batch_records {
         return Err(AppError::new(
@@ -390,6 +480,7 @@ async fn snapshot_keys(
         ));
     }
 
+    let _write_guard = state.write_gate.lock().await;
     let mut conn = state.pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut accepted = 0usize;
@@ -430,7 +521,9 @@ async fn snapshot_diff(
         .validate()
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
     validate_snapshot_host(&state, &request.host_id)?;
+    validate_client_host(&headers, &request.host_id)?;
 
+    let _write_guard = state.write_gate.lock().await;
     let mut conn = state.pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut needed = Vec::new();
@@ -480,6 +573,7 @@ async fn snapshot_records(
         .validate()
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
     validate_snapshot_host(&state, &batch.host_id)?;
+    validate_client_host(&headers, &batch.host_id)?;
     if batch.records.len() > state.config.max_batch_records {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
@@ -487,6 +581,7 @@ async fn snapshot_records(
         ));
     }
 
+    let _write_guard = state.write_gate.lock().await;
     let mut conn = state.pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let uploaded_at = Utc::now().to_rfc3339();
@@ -536,8 +631,10 @@ async fn snapshot_finalize(
     let request: SnapshotFinalizeRequest = serde_json::from_str(&body)
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))?;
     validate_snapshot_host(&state, &request.host_id)?;
+    validate_client_host(&headers, &request.host_id)?;
     validate_snapshot_id(&request.snapshot_id)?;
 
+    let _write_guard = state.write_gate.lock().await;
     let mut conn = state.pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let deleted = tx.execute(
@@ -787,7 +884,7 @@ async fn pull(
 ) -> Result<Json<PullResponse>, AppError> {
     authorize(&state, &headers)?;
     let query = parse_pull_query(raw_query.as_deref())?;
-    let limit = query.limit.unwrap_or(5000).clamp(1, 20_000);
+    let limit = normalized_pull_limit(query.limit);
     let fetch_limit = limit + 1;
     let mut conn = state.pool.get()?;
     // The page query and the global max_seq query must observe the same
@@ -848,6 +945,12 @@ async fn pull(
         max_seq: response_max_seq,
         truncated,
     }))
+}
+
+fn normalized_pull_limit(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(MAX_PULL_RECORDS)
+        .clamp(1, MAX_PULL_RECORDS)
 }
 
 fn parse_pull_query(raw_query: Option<&str>) -> Result<PullQuery, AppError> {
@@ -926,14 +1029,19 @@ async fn machines(
 ) -> Result<Json<MachineList>, AppError> {
     authorize(&state, &headers)?;
     let conn = state.pool.get()?;
-    let mut stmt =
-        conn.prepare("SELECT host_id, last_seen, record_count FROM machines ORDER BY host_id ASC")?;
+    let mut stmt = conn.prepare(
+        "SELECT host_id, last_seen, record_count,
+            COALESCE((SELECT MAX(seq) FROM records WHERE records.host_id = machines.host_id), 0)
+         FROM machines
+         ORDER BY host_id ASC",
+    )?;
     let machines = stmt
         .query_map([], |row| {
             Ok(MachineInfo {
                 host_id: row.get(0)?,
                 last_seen: row.get(1)?,
                 record_count: row.get::<_, i64>(2)? as u64,
+                content_revision: Some(row.get::<_, i64>(3)? as u64),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -952,6 +1060,7 @@ async fn submit_integrity_report(
     report
         .validate()
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    validate_client_host(&headers, &report.host_id)?;
     if state
         .config
         .allowed_hosts
@@ -964,6 +1073,7 @@ async fn submit_integrity_report(
         ));
     }
 
+    let _write_guard = state.write_gate.lock().await;
     let conn = state.pool.get()?;
     let updated_at = Utc::now().to_rfc3339();
     conn.execute(
@@ -1030,35 +1140,103 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let expected = state.config.shared_token.as_bytes();
     let provided = token.as_bytes();
     if provided.len() == expected.len() && provided.ct_eq(expected).into() {
-        check_rate_limit(state, token)
+        check_rate_limit(state, headers)
     } else {
         Err(AppError::unauthorized())
     }
 }
 
-fn check_rate_limit(state: &AppState, token: &str) -> Result<(), AppError> {
+fn check_rate_limit(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let now = Instant::now();
     let mut buckets = state
         .rate_limiter
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let bucket = buckets.entry(token.to_string()).or_insert(BucketState {
+    let requested_key = request_client_id(headers)?
+        .filter(|client_id| {
+            state
+                .config
+                .allowed_hosts
+                .as_ref()
+                .is_none_or(|hosts| hosts.contains(*client_id))
+        })
+        .unwrap_or(LEGACY_RATE_LIMIT_KEY);
+    let mut key = requested_key;
+    if !buckets.contains_key(key) && buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
+        buckets.retain(|_, bucket| now.duration_since(bucket.last_refill) < RATE_LIMIT_BUCKET_IDLE);
+        if buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
+            key = LEGACY_RATE_LIMIT_KEY;
+            if !buckets.contains_key(key)
+                && let Some(oldest) = buckets
+                    .iter()
+                    .min_by_key(|(_, bucket)| bucket.last_refill)
+                    .map(|(client_id, _)| client_id.clone())
+            {
+                buckets.remove(&oldest);
+            }
+        }
+    }
+    let bucket = buckets.entry(key.to_string()).or_insert(BucketState {
         tokens: RATE_LIMIT_BURST,
         last_refill: now,
     });
+    consume_rate_limit_token(bucket, now, RATE_LIMIT_REFILL_PER_SECOND, RATE_LIMIT_BURST)?;
+    drop(buckets);
 
+    let mut global = state
+        .global_rate_limiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    consume_rate_limit_token(
+        &mut global,
+        now,
+        GLOBAL_RATE_LIMIT_REFILL_PER_SECOND,
+        GLOBAL_RATE_LIMIT_BURST,
+    )
+}
+
+fn consume_rate_limit_token(
+    bucket: &mut BucketState,
+    now: Instant,
+    refill_per_second: f64,
+    burst: f64,
+) -> Result<(), AppError> {
     let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-    bucket.tokens = (bucket.tokens + elapsed * RATE_LIMIT_REFILL_PER_SECOND).min(RATE_LIMIT_BURST);
+    bucket.tokens = (bucket.tokens + elapsed * refill_per_second).min(burst);
     bucket.last_refill = now;
+    if bucket.tokens < 1.0 {
+        let retry_after = ((1.0 - bucket.tokens) / refill_per_second).ceil() as u64;
+        return Err(AppError::rate_limited(retry_after.max(1)));
+    }
+    bucket.tokens -= 1.0;
+    Ok(())
+}
 
-    if bucket.tokens >= 1.0 {
-        bucket.tokens -= 1.0;
-        Ok(())
+fn request_client_id(headers: &HeaderMap) -> Result<Option<&str>, AppError> {
+    let Some(value) = headers.get(CLIENT_ID_HEADER) else {
+        return Ok(None);
+    };
+    let client_id = value
+        .to_str()
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "invalid client identity"))?;
+    if is_valid_host_id(client_id) {
+        Ok(Some(client_id))
     } else {
         Err(AppError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate limit exceeded",
+            StatusCode::BAD_REQUEST,
+            "invalid client identity",
         ))
+    }
+}
+
+fn validate_client_host(headers: &HeaderMap, host_id: &str) -> Result<(), AppError> {
+    if request_client_id(headers)?.is_some_and(|client_id| client_id != host_id) {
+        Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "client identity does not match host_id",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1503,3 +1681,6 @@ fn omp_ids_from_dedup_key(dedup_key: &str) -> (String, String) {
     }
     (String::new(), String::new())
 }
+
+#[cfg(test)]
+mod tests;

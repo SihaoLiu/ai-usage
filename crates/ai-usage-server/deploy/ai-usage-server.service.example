@@ -1,5 +1,5 @@
 [Unit]
-Description=Vibe Usage sync server
+Description=AI Usage sync server
 After=network-online.target
 Wants=network-online.target
 

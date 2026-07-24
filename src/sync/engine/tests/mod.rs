@@ -8,6 +8,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod integrity_throttle;
+mod pull_compat;
+mod pull_scope;
+mod snapshot_cache;
+
 /// (after_seq, exclude_host, limit, supported_vendors) seen by pull().
 type PullRequestLog = (u64, String, usize, Vec<String>);
 
@@ -23,6 +28,7 @@ struct FakeTransport {
     /// When set, upload() rejects any batch containing this vendor,
     /// imitating an older server that predates it.
     reject_upload_vendor: Option<&'static str>,
+    server_instance_id: Option<String>,
 }
 
 struct RejectVendorTransport {
@@ -36,6 +42,8 @@ struct DiffSnapshotTransport {
     snapshot_record_batches: RefCell<Vec<SnapshotRecordBatch>>,
     snapshot_finalizations: RefCell<Vec<SnapshotFinalizeRequest>>,
     needed: Vec<RecordKey>,
+    server_instance_id: Option<String>,
+    remote_snapshot_state: RemoteSnapshotState,
 }
 
 impl FakeTransport {
@@ -48,6 +56,7 @@ impl FakeTransport {
             integrity_reports: RefCell::new(Vec::new()),
             reject_pull_vendor: None,
             reject_upload_vendor: None,
+            server_instance_id: None,
         }
     }
 
@@ -63,6 +72,11 @@ impl FakeTransport {
             integrity_reports: RefCell::new(reports),
             ..Self::new(pulls)
         }
+    }
+
+    fn with_server_instance(mut self, instance_id: &str) -> Self {
+        self.server_instance_id = Some(instance_id.to_string());
+        self
     }
 }
 
@@ -120,6 +134,10 @@ impl SyncTransport for FakeTransport {
             reports: self.integrity_reports.borrow().clone(),
         })
     }
+
+    fn server_instance_id(&self) -> Result<Option<String>, SyncError> {
+        Ok(self.server_instance_id.clone())
+    }
 }
 
 impl SyncTransport for RejectVendorTransport {
@@ -174,7 +192,19 @@ impl DiffSnapshotTransport {
             snapshot_record_batches: RefCell::new(Vec::new()),
             snapshot_finalizations: RefCell::new(Vec::new()),
             needed,
+            server_instance_id: None,
+            remote_snapshot_state: RemoteSnapshotState::Unavailable,
         }
+    }
+
+    fn with_server_instance(mut self, instance_id: &str) -> Self {
+        self.server_instance_id = Some(instance_id.to_string());
+        self
+    }
+
+    fn with_remote_snapshot_state(mut self, state: RemoteSnapshotState) -> Self {
+        self.remote_snapshot_state = state;
+        self
     }
 }
 
@@ -238,6 +268,14 @@ impl SyncTransport for DiffSnapshotTransport {
             deleted: 0,
             max_seq: 0,
         })
+    }
+
+    fn server_instance_id(&self) -> Result<Option<String>, SyncError> {
+        Ok(self.server_instance_id.clone())
+    }
+
+    fn remote_snapshot_state(&self, _host_id: &str) -> Result<RemoteSnapshotState, SyncError> {
+        Ok(self.remote_snapshot_state)
     }
 }
 
@@ -619,6 +657,54 @@ fn snapshot_upload_uses_server_diff_and_only_sends_needed_records() {
 }
 
 #[test]
+fn append_only_snapshot_sends_only_new_fingerprints_without_finalizing() {
+    let cache_root = unique_temp_dir("snapshot-append-only");
+    populate_vendor_cache(&cache_root, "claude", "claude-a");
+    let initial = DiffSnapshotTransport::new(Vec::new());
+
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &initial,
+        |_| {},
+    )
+    .expect("initial upload");
+
+    populate_vendor_cache_with_records(
+        &cache_root,
+        "claude",
+        vec![
+            usage_record("claude-a", "2026-05-18T12:00:00Z", 10),
+            usage_record("claude-b", "2026-05-18T12:01:00Z", 20),
+        ],
+    );
+    let incremental = DiffSnapshotTransport::new(vec![RecordKey {
+        vendor: "claude".to_string(),
+        dedup_key: "claude-b".to_string(),
+    }]);
+
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &incremental,
+        |_| {},
+    )
+    .expect("incremental upload");
+
+    let diffs = incremental.snapshot_diffs.borrow();
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(diffs[0].records.len(), 1);
+    assert_eq!(diffs[0].records[0].dedup_key, "claude-b");
+    drop(diffs);
+    let batches = incremental.snapshot_record_batches.borrow();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].records.len(), 1);
+    assert_eq!(batches[0].records[0].dedup_key, "claude-b");
+    drop(batches);
+    assert!(incremental.snapshot_finalizations.borrow().is_empty());
+}
+
+#[test]
 fn snapshot_upload_assigns_stable_keys_to_empty_dedup_records() {
     let cache_root = unique_temp_dir("snapshot-empty-dedup");
     populate_vendor_cache_with_records(
@@ -647,6 +733,87 @@ fn snapshot_upload_assigns_stable_keys_to_empty_dedup_records() {
     assert!(diffs[0].records[0].dedup_key.starts_with("fallback:v1:"));
     assert!(diffs[0].records[1].dedup_key.starts_with("fallback:v1:"));
     assert_ne!(diffs[0].records[0].dedup_key, diffs[0].records[1].dedup_key);
+}
+
+#[test]
+fn snapshot_fingerprint_requests_stay_below_the_wire_budget() {
+    let cache_root = unique_temp_dir("snapshot-fingerprint-budget");
+    let records = (0..3_000)
+        .map(|index| {
+            usage_record(
+                &format!("{index:04}-{}", "k".repeat(500)),
+                "2026-05-18T12:00:00Z",
+                10,
+            )
+        })
+        .collect();
+    populate_vendor_cache_with_records(&cache_root, "claude", records);
+    let snapshot =
+        collect_snapshot_records(&cache_root, &enabled_config("workstation")).expect("snapshot");
+    let records = snapshot.records.iter().collect::<Vec<_>>();
+
+    for chunk in snapshot_fingerprint_chunks(&records) {
+        let body = serde_json::to_vec(&SnapshotDiffRequest {
+            host_id: "workstation".to_string(),
+            snapshot_id: "workstation:20260723T120000Z".to_string(),
+            records: chunk,
+        })
+        .expect("serialize request");
+        assert!(
+            body.len() <= 750 * 1024,
+            "snapshot fingerprint body was {} bytes",
+            body.len()
+        );
+    }
+}
+
+#[test]
+fn snapshot_record_requests_stay_below_the_wire_budget() {
+    let cache_root = unique_temp_dir("snapshot-record-budget");
+    let records = (0..1_000)
+        .map(|index| {
+            usage_record(
+                &format!("{index:04}-{}", "k".repeat(500)),
+                "2026-05-18T12:00:00Z",
+                10,
+            )
+        })
+        .collect::<Vec<_>>();
+    let needed = records
+        .iter()
+        .map(|record| RecordKey {
+            vendor: "claude".to_string(),
+            dedup_key: record.dedup_key.clone(),
+        })
+        .collect();
+    populate_vendor_cache_with_records(&cache_root, "claude", records);
+    let transport = DiffSnapshotTransport::new(needed);
+
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &transport,
+        |_| {},
+    )
+    .expect("snapshot upload");
+
+    let batches = transport.snapshot_record_batches.borrow();
+    assert!(batches.len() > 1);
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.records.len())
+            .sum::<usize>(),
+        1_000
+    );
+    for batch in batches.iter() {
+        let body = serde_json::to_vec(batch).expect("serialize batch");
+        assert!(
+            body.len() <= 750 * 1024,
+            "snapshot record body was {} bytes",
+            body.len()
+        );
+    }
 }
 
 #[test]
@@ -834,171 +1001,6 @@ fn pull_and_integrity_skips_integrity_on_degraded_pull() {
 }
 
 #[test]
-fn pull_downgrade_after_rollback_keeps_cached_records_and_cursor() {
-    let cache_root = unique_temp_dir("pull-rollback");
-    // A kimi record already pulled while the server was new.
-    let cached_kimi =
-        remote_usage_record("laptop", "kimi", "remote-kimi", "2026-05-18T12:00:00Z", 10);
-    crate::data::cache::merge_remote_records(&cache_root, "laptop", vec![cached_kimi])
-        .expect("seed remote cache");
-    crate::sync::state::save_sync_state(
-        &cache_root,
-        &crate::sync::state::SyncState {
-            schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
-            last_seen_seq: 10,
-            pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS),
-            last_successful_sync: None,
-            last_error: None,
-        },
-    )
-    .expect("save migrated state");
-    let transport = FakeTransport::new_rejecting_pull_vendor(
-        vec![PullResponse {
-            records: Vec::new(),
-            max_seq: 12,
-            truncated: false,
-        }],
-        "kimi",
-    );
-
-    run_pull_once_with_progress(
-        &cache_root,
-        &enabled_config("workstation"),
-        &transport,
-        |_| {},
-    )
-    .expect("rollback pull should downgrade without wiping");
-
-    // The fallback pull stayed incremental (cursor kept) and the cached
-    // kimi record survived the downgrade.
-    let requests = transport.pull_requests.borrow();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1].0, 10);
-    let remote = crate::data::cache::load_remote_entries(&cache_root, None);
-    assert_eq!(remote.len(), 1);
-    assert_eq!(remote[0].dedup_key, "remote-kimi");
-    // The reduced fingerprint is adopted so a later server upgrade
-    // triggers the full backfill refetch.
-    let state = crate::sync::state::load_sync_state(&cache_root);
-    assert_eq!(
-        state.pull_vendors,
-        pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS)
-    );
-}
-
-#[test]
-fn pull_preserves_cache_and_downgrades_when_older_server_rejects_new_vendor() {
-    let cache_root = unique_temp_dir("pull-older-server");
-    let existing = remote_usage_record("laptop", "claude", "remote-a", "2026-05-18T12:00:00Z", 10);
-    crate::data::cache::merge_remote_records(&cache_root, "laptop", vec![existing])
-        .expect("seed remote cache");
-    crate::sync::state::save_sync_state(
-        &cache_root,
-        &crate::sync::state::SyncState {
-            schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
-            last_seen_seq: 10,
-            pull_vendors: pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS),
-            last_successful_sync: None,
-            last_error: None,
-        },
-    )
-    .expect("save pre-upgrade state");
-    let new_remote =
-        remote_usage_record("laptop", "claude", "remote-b", "2026-05-18T13:00:00Z", 20);
-    let transport = FakeTransport::new_rejecting_pull_vendor(
-        vec![PullResponse {
-            records: vec![sequenced_remote_record(11, new_remote)],
-            max_seq: 11,
-            truncated: false,
-        }],
-        "kimi",
-    );
-
-    let mut events = Vec::new();
-    run_pull_once_with_progress(
-        &cache_root,
-        &enabled_config("workstation"),
-        &transport,
-        |event| events.push(event.clone()),
-    )
-    .expect("pull should fall back to the previous vendor set");
-
-    // Full set offered first, then the previous set from the stored cursor.
-    let requests = transport.pull_requests.borrow();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[0].3.contains(&"kimi".to_string()));
-    assert!(!requests[1].3.contains(&"kimi".to_string()));
-    assert_eq!(requests[1].0, 10);
-    // The degraded pull names the vendors the server could not serve.
-    assert!(events.iter().any(|event| matches!(
-        event,
-        SyncProgress::PullVendorsUnavailable { vendors }
-            if vendors == &vec!["kimi".to_string()]
-    )));
-    // The pre-existing cached record survived and the new one merged in.
-    let mut remote_keys: Vec<String> = crate::data::cache::load_remote_entries(&cache_root, None)
-        .iter()
-        .map(|record| record.dedup_key.clone())
-        .collect();
-    remote_keys.sort();
-    assert_eq!(remote_keys, ["remote-a", "remote-b"]);
-    // The fingerprint stays on the previous set so the migration retries
-    // once the server is upgraded.
-    let state = crate::sync::state::load_sync_state(&cache_root);
-    assert_eq!(
-        state.pull_vendors,
-        pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS)
-    );
-}
-
-#[test]
-fn pull_migrates_vendor_fingerprint_once_server_accepts_new_vendor() {
-    let cache_root = unique_temp_dir("pull-migrate");
-    let stale = remote_usage_record("laptop", "claude", "stale-a", "2026-05-18T12:00:00Z", 10);
-    crate::data::cache::merge_remote_records(&cache_root, "laptop", vec![stale])
-        .expect("seed remote cache");
-    crate::sync::state::save_sync_state(
-        &cache_root,
-        &crate::sync::state::SyncState {
-            schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
-            last_seen_seq: 10,
-            pull_vendors: pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS),
-            last_successful_sync: None,
-            last_error: None,
-        },
-    )
-    .expect("save pre-upgrade state");
-    let refetched =
-        remote_usage_record("laptop", "kimi", "remote-kimi", "2026-05-18T13:00:00Z", 20);
-    let transport = FakeTransport::new(vec![PullResponse {
-        records: vec![sequenced_remote_record(12, refetched)],
-        max_seq: 12,
-        truncated: false,
-    }]);
-
-    run_pull_once_with_progress(
-        &cache_root,
-        &enabled_config("workstation"),
-        &transport,
-        |_| {},
-    )
-    .expect("pull should migrate to the full vendor set");
-
-    // Migration refetches from the beginning and replaces the cache.
-    let requests = transport.pull_requests.borrow();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].0, 0);
-    let remote = crate::data::cache::load_remote_entries(&cache_root, None);
-    assert_eq!(remote.len(), 1);
-    assert_eq!(remote[0].dedup_key, "remote-kimi");
-    let state = crate::sync::state::load_sync_state(&cache_root);
-    assert_eq!(
-        state.pull_vendors,
-        pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS)
-    );
-}
-
-#[test]
 fn upload_progress_reports_planned_and_finished_batches() {
     let cache_root = unique_temp_dir("upload-progress");
     populate_vendor_cache_with_count(&cache_root, "claude", BATCH_SIZE + 1);
@@ -1045,6 +1047,41 @@ fn upload_progress_reports_planned_and_finished_batches() {
             },
         ]
     );
+}
+
+#[test]
+fn legacy_upload_requests_stay_below_the_wire_budget() {
+    let cache_root = unique_temp_dir("legacy-upload-budget");
+    let records = (0..1_000)
+        .map(|index| {
+            usage_record(
+                &format!("{index:04}-{}", "k".repeat(500)),
+                "2026-05-18T12:00:00Z",
+                10,
+            )
+        })
+        .collect();
+    populate_vendor_cache_with_records(&cache_root, "claude", records);
+    let transport = FakeTransport::new(Vec::new());
+
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &transport,
+        |_| {},
+    )
+    .expect("legacy upload");
+
+    let uploads = transport.uploads.borrow();
+    assert!(uploads.len() > 1);
+    assert_eq!(uploads.iter().map(Vec::len).sum::<usize>(), 1_000);
+    for batch in uploads.iter() {
+        let bytes = batch
+            .iter()
+            .map(|record| serde_json::to_vec(record).expect("serialize record").len() + 1)
+            .sum::<usize>();
+        assert!(bytes <= 750 * 1024, "legacy upload body was {bytes} bytes");
+    }
 }
 
 #[test]
@@ -1222,8 +1259,14 @@ fn integrity_failure_clears_remote_cache_and_rechecks_after_repull() {
             schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 0,
             pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS),
+            pull_scope: crate::sync::cache_generation::server_scope_fingerprint(
+                &enabled_config("workstation"),
+                None,
+            ),
+            last_full_pull: Some(Utc::now().to_rfc3339()),
             last_successful_sync: None,
             last_error: None,
+            integrity_check: None,
         },
     )
     .expect("save current cursor");
@@ -1299,8 +1342,14 @@ fn pull_integrity_repair_clears_stale_cache_after_incremental_pull_failure() {
             schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 10,
             pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS),
+            pull_scope: crate::sync::cache_generation::server_scope_fingerprint(
+                &enabled_config("workstation"),
+                None,
+            ),
+            last_full_pull: Some(Utc::now().to_rfc3339()),
             last_successful_sync: None,
             last_error: None,
+            integrity_check: None,
         },
     )
     .expect("save current cursor");
@@ -1550,10 +1599,7 @@ fn sync_pull_resets_legacy_exclude_self_cursor_and_requests_all_hosts() {
     .expect("pull");
 
     let (after_seq, exclude_host, limit, _) = transport.pull_requests.borrow()[0].clone();
-    assert_eq!(
-        (after_seq, exclude_host, limit),
-        (0, String::new(), PULL_LIMIT)
-    );
+    assert_eq!((after_seq, exclude_host, limit), (0, String::new(), 5_000));
     assert_eq!(
         crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
         123

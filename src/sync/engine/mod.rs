@@ -9,10 +9,11 @@ use ai_usage_proto::{
     SnapshotDiffRequest, SnapshotDiffResponse, SnapshotFinalizeRequest, SnapshotFinalizeResponse,
     SnapshotRecordBatch, UploadResponse, WireRecord,
 };
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 
 pub const SUPPORTED_PULL_VENDORS: [&str; 5] = ["claude", "codex", "gemini", "kimi", "omp"];
@@ -26,8 +27,12 @@ const PREVIOUS_PULL_VENDORS: [&str; 4] = ["claude", "codex", "gemini", "omp"];
 /// version skew, and must fail the upload loudly instead of being held back.
 const CORE_VENDORS: [&str; 3] = ["claude", "codex", "gemini"];
 const BATCH_SIZE: usize = 1000;
-const PULL_LIMIT: usize = 20_000;
-const SNAPSHOT_DIFF_TARGET_BYTES: usize = 900_000;
+const PULL_LIMIT: usize = 5_000;
+const SNAPSHOT_DIFF_TARGET_BYTES: usize = 700_000;
+const UPLOAD_TARGET_BYTES: usize = 700_000;
+const INTEGRITY_RECHECK_INTERVAL: Duration = Duration::hours(6);
+const LEGACY_SNAPSHOT_RECEIPT_MAX_AGE_SECS: u64 = 6 * 60 * 60;
+const LEGACY_PULL_BACKFILL_INTERVAL: Duration = Duration::hours(6);
 const SNAPSHOT_UPLOAD_STATE_VERSION: u32 = state::SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION;
 const OMP_METADATA_REFRESH_LOG_VENDOR: &str = "omp-metadata-refresh";
 const PULL_SCOPE_ALL_HOSTS_MARKER: &str = "scope:all-hosts";
@@ -87,6 +92,9 @@ pub enum SyncProgress {
     IntegrityCheckFinished {
         verification: crate::sync::integrity::IntegrityVerification,
     },
+    IntegrityCheckReused {
+        checked_hosts: usize,
+    },
 }
 
 /// What an upload cycle actually managed to send.
@@ -95,6 +103,9 @@ pub struct UploadOutcome {
     /// Vendors whose records an older server rejected as unsupported; they
     /// stay local (and unlogged) until the server is upgraded.
     pub held_back_vendors: Vec<String>,
+    /// Whether the completed upload changed data covered by the integrity
+    /// range ending at the current UTC midnight.
+    pub stable_data_changed: bool,
 }
 
 /// What a pull cycle actually fetched.
@@ -103,6 +114,8 @@ pub struct PullOutcome {
     /// False when the server rejected the current vendor set and the pull
     /// ran with the previous release's set instead.
     pub used_full_vendor_set: bool,
+    /// Whether this pull changed data covered by the current integrity range.
+    pub stable_data_changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +178,28 @@ pub trait SyncTransport {
     ) -> Result<SnapshotFinalizeResponse, SyncError> {
         Err(SyncError::new("snapshot unsupported"))
     }
+    fn server_instance_id(&self) -> Result<Option<String>, SyncError> {
+        Ok(None)
+    }
+    fn remote_snapshot_state(&self, _host_id: &str) -> Result<RemoteSnapshotState, SyncError> {
+        Ok(RemoteSnapshotState::Unavailable)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteSnapshotState {
+    Unavailable,
+    Missing,
+    Present {
+        record_count: u64,
+        content_revision: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum RemoteSnapshotStatus {
+    Current { content_revision: Option<u64> },
+    Stale,
 }
 
 #[cfg(test)]
@@ -187,7 +222,24 @@ where
 {
     let upload = run_upload_once_with_progress(cache_root, config, transport, &mut on_progress)?;
     if upload.held_back_vendors.is_empty() {
-        run_pull_and_integrity_once_with_progress(cache_root, config, transport, on_progress)
+        let pull = run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+        if !pull.used_full_vendor_set {
+            return Ok(());
+        }
+        let now = Utc::now();
+        if !upload.stable_data_changed
+            && !pull.stable_data_changed
+            && let Some(checked_hosts) = reusable_integrity_check(
+                cache_root,
+                config,
+                transport.server_instance_id()?.as_deref(),
+                now,
+            )
+        {
+            on_progress(&SyncProgress::IntegrityCheckReused { checked_hosts });
+            return Ok(());
+        }
+        run_integrity_once_with_repair(cache_root, config, transport, on_progress)
     } else {
         // Degraded cycle (older server): integrity digests would count the
         // held-back records the server cannot distribute, tripping every
@@ -205,8 +257,10 @@ pub fn run_upload_once_with_progress<F>(
 where
     F: FnMut(&SyncProgress),
 {
-    if run_snapshot_upload_once_with_progress(cache_root, config, transport, &mut on_progress)? {
-        return Ok(UploadOutcome::default());
+    if let Some(outcome) =
+        run_snapshot_upload_once_with_progress(cache_root, config, transport, &mut on_progress)?
+    {
+        return Ok(outcome);
     }
 
     let mut upload_log = state::load_upload_log(cache_root);
@@ -254,7 +308,7 @@ where
     let mut total_records = upload_groups.iter().map(Vec::len).sum::<usize>();
     let mut total_batches = upload_groups
         .iter()
-        .map(|records| records.len().div_ceil(BATCH_SIZE))
+        .map(|records| upload_candidate_chunks(records).len())
         .sum::<usize>();
     on_progress(&SyncProgress::UploadPlanned {
         total_records,
@@ -267,9 +321,12 @@ where
     let mut ignored = 0;
     let mut batch_index = 0;
     let mut held_back_vendors: Vec<String> = Vec::new();
+    let integrity_range_end = crate::sync::integrity::integrity_range_end_utc(Utc::now());
+    let mut stable_data_changed = false;
     for group in upload_groups {
-        let group_batches = group.len().div_ceil(BATCH_SIZE);
-        for (group_batch_index, batch) in group.chunks(BATCH_SIZE).enumerate() {
+        let batches = upload_candidate_chunks(&group);
+        let group_batch_count = batches.len();
+        for (group_batch_index, batch) in batches.iter().copied().enumerate() {
             let wire_records: Vec<WireRecord> = batch
                 .iter()
                 .map(|candidate| candidate.wire.clone())
@@ -286,9 +343,12 @@ where
                     // progress totals reconcile, and leave its records
                     // unlogged so they upload once the server is upgraded.
                     let vendor = wire_records[0].vendor.clone();
-                    let remaining_records = group.len() - group_batch_index * BATCH_SIZE;
+                    let remaining_records = batches[group_batch_index..]
+                        .iter()
+                        .map(|remaining| remaining.len())
+                        .sum::<usize>();
                     total_records -= remaining_records;
-                    total_batches -= group_batches - group_batch_index;
+                    total_batches -= group_batch_count - group_batch_index;
                     on_progress(&SyncProgress::UploadVendorHeldBack {
                         vendor: vendor.clone(),
                         records: remaining_records,
@@ -303,6 +363,9 @@ where
             uploaded_records += batch.len();
             accepted += response.accepted;
             ignored += response.ignored;
+            stable_data_changed |= batch.iter().any(|candidate| {
+                timestamp_precedes_integrity_range(&candidate.wire.timestamp, integrity_range_end)
+            });
             for candidate in batch {
                 upload_log.insert(candidate.key.clone());
                 if response.accepted > 0
@@ -331,7 +394,10 @@ where
         ignored,
     });
 
-    Ok(UploadOutcome { held_back_vendors })
+    Ok(UploadOutcome {
+        held_back_vendors,
+        stable_data_changed,
+    })
 }
 
 fn run_snapshot_upload_once_with_progress<F>(
@@ -339,16 +405,55 @@ fn run_snapshot_upload_once_with_progress<F>(
     config: &EnabledSyncConfig,
     transport: &impl SyncTransport,
     mut on_progress: F,
-) -> Result<bool, SyncError>
+) -> Result<Option<UploadOutcome>, SyncError>
 where
     F: FnMut(&SyncProgress),
 {
     let snapshot_id = snapshot_id(&config.machine_id);
-    let snapshot = collect_snapshot_records(cache_root, config)?;
-    let previous = state::load_snapshot_upload_state(cache_root);
-    if previous.schema_version == SNAPSHOT_UPLOAD_STATE_VERSION
-        && previous.full_hash == snapshot.full_hash
+    let cache_generation =
+        crate::sync::cache_generation::local_cache_generation(cache_root, &VENDORS);
+    let server_instance_id = transport.server_instance_id()?;
+    let sync_scope = crate::sync::cache_generation::sync_scope_fingerprint(
+        config,
+        server_instance_id.as_deref(),
+    );
+    let receipt = state::snapshot_cache_receipt(cache_root, &sync_scope);
+    let remote_status = receipt
+        .as_ref()
+        .map(|receipt| remote_snapshot_status(transport, &config.machine_id, receipt))
+        .transpose()?;
+    let mut requires_full_reconciliation =
+        receipt.is_none() || matches!(remote_status, Some(RemoteSnapshotStatus::Stale));
+    if let Some(receipt) = receipt
+        .as_ref()
+        .filter(|receipt| receipt.cache_generation == cache_generation)
+        && matches!(remote_status, Some(RemoteSnapshotStatus::Current { .. }))
     {
+        on_progress(&SyncProgress::UploadPlanned {
+            total_records: 0,
+            total_batches: 0,
+            skipped_records: receipt.record_count,
+        });
+        on_progress(&SyncProgress::UploadFinished {
+            uploaded_records: 0,
+            total_records: 0,
+            accepted: 0,
+            ignored: 0,
+        });
+        return Ok(Some(UploadOutcome::default()));
+    }
+
+    let mut previous = state::load_snapshot_upload_state(cache_root);
+    let snapshot = collect_snapshot_records(cache_root, config)?;
+    if !requires_full_reconciliation
+        && previous.schema_version == SNAPSHOT_UPLOAD_STATE_VERSION
+        && previous.full_hash == snapshot.full_hash
+        && let Some(receipt) = receipt.as_ref()
+        && receipt.record_count == snapshot.records.len()
+        && let Some(RemoteSnapshotStatus::Current { content_revision }) = remote_status
+    {
+        previous.cache_generation = cache_generation;
+        state::save_snapshot_upload_state(cache_root, &previous, &sync_scope, content_revision)?;
         on_progress(&SyncProgress::UploadPlanned {
             total_records: 0,
             total_batches: 0,
@@ -360,12 +465,15 @@ where
             accepted: 0,
             ignored: 0,
         });
-        return Ok(true);
+        return Ok(Some(UploadOutcome::default()));
     }
 
-    let key_set_changed = previous.schema_version != SNAPSHOT_UPLOAD_STATE_VERSION
-        || previous.key_set_hash != snapshot.key_set_hash;
-    let manifest_records = if key_set_changed {
+    requires_full_reconciliation |= previous.schema_version != SNAPSHOT_UPLOAD_STATE_VERSION
+        || previous
+            .record_hashes
+            .keys()
+            .any(|key| !snapshot.record_hashes.contains_key(key));
+    let manifest_records = if requires_full_reconciliation {
         snapshot.records.iter().collect::<Vec<_>>()
     } else {
         snapshot
@@ -379,10 +487,15 @@ where
             })
             .collect::<Vec<_>>()
     };
+    let integrity_range_end = crate::sync::integrity::integrity_range_end_utc(Utc::now());
+    let stable_data_changed = requires_full_reconciliation
+        || manifest_records.iter().any(|record| {
+            timestamp_precedes_integrity_range(&record.wire.timestamp, integrity_range_end)
+        });
 
     let mut needed_keys = BTreeSet::new();
     let mut chunks = snapshot_fingerprint_chunks(&manifest_records);
-    if chunks.is_empty() && key_set_changed {
+    if chunks.is_empty() && requires_full_reconciliation {
         chunks.push(Vec::new());
     }
     for chunk in chunks {
@@ -403,7 +516,7 @@ where
             Err(err)
                 if is_unsupported_snapshot_error(&err) || is_unsupported_vendor_error(&err) =>
             {
-                return Ok(false);
+                return Ok(None);
             }
             Err(err) => return Err(err),
         }
@@ -415,7 +528,8 @@ where
         .filter(|record| needed_keys.contains(&record.key))
         .collect::<Vec<_>>();
     let skipped_records = snapshot.records.len().saturating_sub(needed_records.len());
-    let total_batches = needed_records.len().div_ceil(BATCH_SIZE);
+    let record_batches = snapshot_record_chunks(&needed_records);
+    let total_batches = record_batches.len();
     on_progress(&SyncProgress::UploadPlanned {
         total_records: needed_records.len(),
         total_batches,
@@ -425,7 +539,7 @@ where
     let mut uploaded_records = 0usize;
     let mut accepted = 0usize;
     let mut ignored = 0usize;
-    for (batch_index, batch) in needed_records.chunks(BATCH_SIZE).enumerate() {
+    for (batch_index, batch) in record_batches.into_iter().enumerate() {
         let records = batch
             .iter()
             .map(|record| record.wire.clone())
@@ -438,7 +552,7 @@ where
             Ok(response) => response,
             // A server that defers vendor validation to the record upload:
             // fall back to batch upload, which holds unknown vendors back.
-            Err(err) if is_unsupported_vendor_error(&err) => return Ok(false),
+            Err(err) if is_unsupported_vendor_error(&err) => return Ok(None),
             Err(err) => return Err(err),
         };
         uploaded_records += batch.len();
@@ -454,21 +568,25 @@ where
         });
     }
 
-    if key_set_changed {
+    if requires_full_reconciliation {
         transport.snapshot_finalize(&SnapshotFinalizeRequest {
             host_id: config.machine_id.clone(),
             snapshot_id,
         })?;
     }
 
+    let content_revision =
+        reconciled_snapshot_revision(transport, &config.machine_id, snapshot.records.len())?;
     state::save_snapshot_upload_state(
         cache_root,
         &state::SnapshotUploadState {
             schema_version: SNAPSHOT_UPLOAD_STATE_VERSION,
             full_hash: snapshot.full_hash,
-            key_set_hash: snapshot.key_set_hash,
+            cache_generation,
             record_hashes: snapshot.record_hashes,
         },
+        &sync_scope,
+        content_revision,
     )?;
     on_progress(&SyncProgress::UploadFinished {
         uploaded_records,
@@ -476,13 +594,71 @@ where
         accepted,
         ignored,
     });
-    Ok(true)
+    Ok(Some(UploadOutcome {
+        held_back_vendors: Vec::new(),
+        stable_data_changed,
+    }))
+}
+
+fn remote_snapshot_status(
+    transport: &impl SyncTransport,
+    host_id: &str,
+    receipt: &state::SnapshotCacheReceipt,
+) -> Result<RemoteSnapshotStatus, SyncError> {
+    Ok(match transport.remote_snapshot_state(host_id)? {
+        RemoteSnapshotState::Unavailable => RemoteSnapshotStatus::Current {
+            content_revision: None,
+        },
+        RemoteSnapshotState::Missing => RemoteSnapshotStatus::Stale,
+        RemoteSnapshotState::Present {
+            record_count,
+            content_revision,
+        } if record_count == receipt.record_count as u64 => {
+            let revision_is_current = match (receipt.content_revision, content_revision) {
+                (Some(previous), Some(current)) => previous == current,
+                (None, None) => {
+                    state_receipt_age_secs(receipt.verified_at_secs)
+                        <= LEGACY_SNAPSHOT_RECEIPT_MAX_AGE_SECS
+                }
+                _ => false,
+            };
+            if revision_is_current {
+                RemoteSnapshotStatus::Current { content_revision }
+            } else {
+                RemoteSnapshotStatus::Stale
+            }
+        }
+        RemoteSnapshotState::Present { .. } => RemoteSnapshotStatus::Stale,
+    })
+}
+
+fn reconciled_snapshot_revision(
+    transport: &impl SyncTransport,
+    host_id: &str,
+    local_record_count: usize,
+) -> Result<Option<u64>, SyncError> {
+    Ok(match transport.remote_snapshot_state(host_id)? {
+        RemoteSnapshotState::Present {
+            record_count,
+            content_revision,
+        } if record_count == local_record_count as u64 => content_revision,
+        RemoteSnapshotState::Unavailable
+        | RemoteSnapshotState::Missing
+        | RemoteSnapshotState::Present { .. } => None,
+    })
+}
+
+fn state_receipt_age_secs(verified_at_secs: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(verified_at_secs)
 }
 
 #[derive(Debug)]
 struct SnapshotRecords {
     records: Vec<SnapshotRecord>,
-    key_set_hash: String,
     full_hash: String,
     record_hashes: BTreeMap<(String, String), String>,
 }
@@ -515,11 +691,9 @@ fn collect_snapshot_records(
         }
     }
     records.sort_by(|left, right| left.key.cmp(&right.key));
-    let key_set_hash = snapshot_key_set_hash(&records);
     let full_hash = snapshot_full_hash(&records);
     Ok(SnapshotRecords {
         records,
-        key_set_hash,
         full_hash,
         record_hashes,
     })
@@ -530,19 +704,22 @@ fn snapshot_fingerprint_chunks(records: &[&SnapshotRecord]) -> Vec<Vec<RecordFin
     let mut current = Vec::new();
     let mut current_bytes = 0usize;
     for record in records {
-        let estimated_bytes =
-            record.key.0.len() + record.key.1.len() + record.record_hash.len() + 96;
-        if !current.is_empty() && current_bytes + estimated_bytes > SNAPSHOT_DIFF_TARGET_BYTES {
+        let fingerprint = RecordFingerprint {
+            vendor: record.key.0.clone(),
+            dedup_key: record.key.1.clone(),
+            record_hash: record.record_hash.clone(),
+        };
+        let fingerprint_bytes = serde_json::to_vec(&fingerprint)
+            .expect("validated fingerprints always serialize")
+            .len()
+            + 1;
+        if !current.is_empty() && current_bytes + fingerprint_bytes > SNAPSHOT_DIFF_TARGET_BYTES {
             chunks.push(current);
             current = Vec::new();
             current_bytes = 0;
         }
-        current.push(RecordFingerprint {
-            vendor: record.key.0.clone(),
-            dedup_key: record.key.1.clone(),
-            record_hash: record.record_hash.clone(),
-        });
-        current_bytes += estimated_bytes;
+        current.push(fingerprint);
+        current_bytes += fingerprint_bytes;
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -550,16 +727,49 @@ fn snapshot_fingerprint_chunks(records: &[&SnapshotRecord]) -> Vec<Vec<RecordFin
     chunks
 }
 
-fn snapshot_key_set_hash(records: &[SnapshotRecord]) -> String {
-    let mut hasher = Sha256::new();
-    for record in records {
-        hasher.update((record.key.0.len() as u64).to_be_bytes());
-        hasher.update(record.key.0.as_bytes());
-        hasher.update((record.key.1.len() as u64).to_be_bytes());
-        hasher.update(record.key.1.as_bytes());
+fn snapshot_record_chunks<'a>(records: &'a [&'a SnapshotRecord]) -> Vec<&'a [&'a SnapshotRecord]> {
+    batch_ranges_by_bytes(records, |record| wire_record_bytes(&record.wire))
+        .into_iter()
+        .map(|range| &records[range])
+        .collect()
+}
+
+fn upload_candidate_chunks(records: &[UploadCandidate]) -> Vec<&[UploadCandidate]> {
+    batch_ranges_by_bytes(records, |record| wire_record_bytes(&record.wire))
+        .into_iter()
+        .map(|range| &records[range])
+        .collect()
+}
+
+fn batch_ranges_by_bytes<T>(
+    records: &[T],
+    mut record_bytes: impl FnMut(&T) -> usize,
+) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut current_bytes = 128usize;
+    for (index, record) in records.iter().enumerate() {
+        let bytes = record_bytes(record);
+        let reached_count_limit = index - start >= BATCH_SIZE;
+        let reached_byte_limit = index > start && current_bytes + bytes > UPLOAD_TARGET_BYTES;
+        if reached_count_limit || reached_byte_limit {
+            ranges.push(start..index);
+            start = index;
+            current_bytes = 128;
+        }
+        current_bytes += bytes;
     }
-    let digest = hasher.finalize();
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    if start < records.len() {
+        ranges.push(start..records.len());
+    }
+    ranges
+}
+
+fn wire_record_bytes(record: &WireRecord) -> usize {
+    serde_json::to_vec(record)
+        .expect("validated wire records always serialize")
+        .len()
+        + 1
 }
 
 fn snapshot_full_hash(records: &[SnapshotRecord]) -> String {
@@ -733,7 +943,7 @@ fn omp_v220_key(message_id: &str, response_id: &str, model: &str, usage: &TokenU
 
 pub fn run_pull_once_with_progress<F>(
     cache_root: &Path,
-    _config: &EnabledSyncConfig,
+    config: &EnabledSyncConfig,
     transport: &impl SyncTransport,
     mut on_progress: F,
 ) -> Result<PullOutcome, SyncError>
@@ -741,7 +951,23 @@ where
     F: FnMut(&SyncProgress),
 {
     let mut sync_state = state::load_sync_state(cache_root);
-    let (vendors, fingerprint, mut response) = negotiate_first_pull_page(transport, &sync_state)?;
+    let pull_started_at = Utc::now();
+    let server_instance_id = transport.server_instance_id()?;
+    let pull_scope = crate::sync::cache_generation::server_scope_fingerprint(
+        config,
+        server_instance_id.as_deref(),
+    );
+    let scope_changed = sync_state.pull_scope != pull_scope;
+    let legacy_backfill_due = server_instance_id.is_none()
+        && legacy_pull_backfill_due(sync_state.last_full_pull.as_deref(), pull_started_at);
+    let requires_full_backfill = scope_changed || legacy_backfill_due;
+    let mut request_state = sync_state.clone();
+    if requires_full_backfill {
+        request_state.last_seen_seq = 0;
+    }
+    let (vendors, fingerprint, mut response) =
+        negotiate_first_pull_page(transport, &request_state)?;
+    let mut stable_data_changed = false;
     if vendors != SUPPORTED_PULL_VENDORS {
         let unavailable: Vec<String> = SUPPORTED_PULL_VENDORS
             .iter()
@@ -756,7 +982,15 @@ where
     // Commit the vendor-set migration only after the server has accepted the
     // set: an older server rejecting the new vendor must never wipe the
     // existing remote cache.
-    if sync_state.pull_vendors != fingerprint {
+    let mut performed_full_backfill = false;
+    if requires_full_backfill {
+        cache::clear_remote_cache(cache_root)?;
+        stable_data_changed = true;
+        performed_full_backfill = true;
+        sync_state.last_seen_seq = 0;
+        sync_state.pull_vendors = fingerprint;
+        sync_state.pull_scope = pull_scope;
+    } else if sync_state.pull_vendors != fingerprint {
         if is_fingerprint_subset(&fingerprint, &sync_state.pull_vendors) {
             // Downgrade (server rollback): cursor and cache stay valid for a
             // vendor subset, so keep the already-pulled records visible and
@@ -765,16 +999,22 @@ where
             sync_state.pull_vendors = fingerprint;
         } else {
             cache::clear_remote_cache(cache_root)?;
+            stable_data_changed = true;
+            performed_full_backfill = true;
             sync_state.last_seen_seq = 0;
             sync_state.pull_vendors = fingerprint;
         }
     }
     let mut page_index = 0;
     let mut pulled_records = 0;
+    let integrity_range_end = crate::sync::integrity::integrity_range_end_utc(Utc::now());
 
     loop {
         page_index += 1;
         pulled_records += response.records.len();
+        stable_data_changed |= response.records.iter().any(|record| {
+            timestamp_precedes_integrity_range(&record.record.timestamp, integrity_range_end)
+        });
         merge_pulled_records(cache_root, &response)?;
         sync_state.last_seen_seq = response.max_seq;
         state::save_sync_state(cache_root, &sync_state)?;
@@ -791,6 +1031,9 @@ where
         response = transport.pull(sync_state.last_seen_seq, "", PULL_LIMIT, vendors)?;
     }
 
+    if performed_full_backfill {
+        sync_state.last_full_pull = Some(pull_started_at.to_rfc3339());
+    }
     sync_state.last_successful_sync = Some(Utc::now().to_rfc3339());
     sync_state.last_error = None;
     state::save_sync_state(cache_root, &sync_state)?;
@@ -801,7 +1044,22 @@ where
     });
     Ok(PullOutcome {
         used_full_vendor_set: vendors == SUPPORTED_PULL_VENDORS,
+        stable_data_changed,
     })
+}
+
+fn legacy_pull_backfill_due(last_full_pull: Option<&str>, now: DateTime<Utc>) -> bool {
+    let Some(last_full_pull) = last_full_pull
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+    else {
+        return true;
+    };
+    last_full_pull > now || now - last_full_pull >= LEGACY_PULL_BACKFILL_INTERVAL
+}
+
+fn timestamp_precedes_integrity_range(timestamp: &str, range_end: DateTime<Utc>) -> bool {
+    parse_timestamp(timestamp).is_some_and(|value| value.with_timezone(&Utc) < range_end)
 }
 
 pub fn run_pull_and_integrity_once_with_progress<F>(
@@ -832,6 +1090,29 @@ pub fn run_integrity_once_with_repair<F>(
 where
     F: FnMut(&SyncProgress),
 {
+    let checked_at = Utc::now();
+    let server_instance_id = transport.server_instance_id()?;
+    let verification =
+        run_integrity_once_with_repair_result(cache_root, config, transport, &mut on_progress)?;
+    persist_successful_integrity_check(
+        cache_root,
+        config,
+        server_instance_id.as_deref(),
+        checked_at,
+        verification.as_ref(),
+    )?;
+    Ok(())
+}
+
+fn run_integrity_once_with_repair_result<F>(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    transport: &impl SyncTransport,
+    mut on_progress: F,
+) -> Result<Option<crate::sync::integrity::IntegrityVerification>, SyncError>
+where
+    F: FnMut(&SyncProgress),
+{
     let verification =
         run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress)?;
     if matches!(
@@ -841,8 +1122,57 @@ where
         cache::clear_remote_cache(cache_root)?;
         state::clear_sync_state(cache_root)?;
         run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
-        run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+        return run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress);
     }
+    Ok(verification)
+}
+
+fn reusable_integrity_check(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    server_instance_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<usize> {
+    let check = state::load_sync_state(cache_root).integrity_check?;
+    let sync_scope =
+        crate::sync::cache_generation::sync_scope_fingerprint(config, server_instance_id);
+    let checked_at = DateTime::parse_from_rfc3339(&check.checked_at)
+        .ok()?
+        .with_timezone(&Utc);
+    let range_end = DateTime::parse_from_rfc3339(&check.range_end_utc)
+        .ok()?
+        .with_timezone(&Utc);
+    let current_range_end = crate::sync::integrity::integrity_range_end_utc(now);
+    (check.sync_scope == sync_scope
+        && range_end == current_range_end
+        && checked_at <= now
+        && now - checked_at < INTEGRITY_RECHECK_INTERVAL)
+        .then_some(check.checked_hosts)
+}
+
+fn persist_successful_integrity_check(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    server_instance_id: Option<&str>,
+    checked_at: DateTime<Utc>,
+    verification: Option<&crate::sync::integrity::IntegrityVerification>,
+) -> Result<(), SyncError> {
+    let Some(crate::sync::integrity::IntegrityVerification::Checked { checked_hosts }) =
+        verification
+    else {
+        return Ok(());
+    };
+    let mut sync_state = state::load_sync_state(cache_root);
+    sync_state.integrity_check = Some(state::IntegrityCheckState {
+        checked_at: checked_at.to_rfc3339(),
+        range_end_utc: crate::sync::integrity::integrity_range_end_utc(checked_at).to_rfc3339(),
+        checked_hosts: *checked_hosts,
+        sync_scope: crate::sync::cache_generation::sync_scope_fingerprint(
+            config,
+            server_instance_id,
+        ),
+    });
+    state::save_sync_state(cache_root, &sync_state)?;
     Ok(())
 }
 

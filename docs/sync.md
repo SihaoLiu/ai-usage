@@ -121,17 +121,29 @@ ai-usage sync status
 
 Normal monitor mode starts a background sync worker after local cache refreshes when sync is enabled. If the secrets file is missing, invalid, or too widely readable, sync is disabled and the rest of the CLI continues to work.
 
+## Load Balancing and Recovery
+
+Clients identify themselves to current servers with their configured `machine_id`. The server maintains a separate token bucket for each machine, so a busy client cannot consume another client's request allowance. A bounded aggregate bucket protects the whole service from request floods, and idle per-machine buckets are discarded so authenticated clients cannot grow the limiter indefinitely by rotating identifiers. Clients from older releases that do not send the identity header remain supported through a legacy bucket.
+
+Normal uploads use snapshot reconciliation. An append-only cache change sends only new or changed fingerprints and records; a full manifest and finalization are reserved for deletions or missing local state. Request bodies are kept below approximately 700 KiB, and pull pages are capped at 5,000 records by both current clients and servers. The server cap also protects small deployments when an older client requests a 20,000-record page.
+
+Monitor mode applies a stable per-machine delay of up to 60 seconds after cache refreshes, preventing machines with similar schedules from synchronizing at once. A local file lock also prevents multiple `ai-usage` processes on one machine from running overlapping sync cycles.
+
+The client retries temporary transport failures and HTTP `408`, `425`, `429`, `500`, `502`, `503`, and `504` responses with exponential, per-machine jitter. A server `Retry-After` header is honored. If a whole background cycle still fails, the worker retries it automatically instead of waiting for the next monitor refresh.
+
+When the local vendor caches have not changed, a small upload receipt lets the upload path skip loading the full fingerprint state and rescanning every record. The receipt is scoped to the server instance, URL, machine ID, and project-hash policy. The client checks both the server's record count and per-host content revision before using it, so a replaced or restored database, missing host, or wire-affecting configuration change triggers reconciliation. A v3.0.0 server exposes neither instance IDs nor content revisions, so current clients force both a full upload reconciliation and a pull backfill at least every six hours while connected to one. The large fingerprint file is rebuildable state: corruption cannot strand the server, because the next local cache change falls back to a full manifest.
+
 ## Integrity Checks
 
-Each sync cycle computes a SHA-256 digest for the machine's own cached records, submits that report to the server, downloads the other machine reports, and recomputes the same digest over the pulled remote cache for each reported host. The monitor prompt shows `Integrity Checked` when the local remote-cache digest matches the host's own server report, and `Integrity Failed` when any reported host differs.
+Integrity checks compute a SHA-256 digest for the machine's own cached records, submit that report to the server, download the other machine reports, and recompute the same digest over the pulled remote cache for each reported host. The monitor prompt shows `Integrity Checked` when the local remote-cache digest matches the host's own server report, and `Integrity Failed` when any reported host differs.
 
 The checked range is independent of local time zones. Clients include records with RFC3339 timestamps earlier than the current UTC day's `00:00:00Z` boundary, so every machine checks the same complete UTC-day prefix and avoids the still-changing current UTC day. The digest uses normalized usage fields that both local and remote caches persist, including vendor, dedup key, timestamps, model, effort, fast tier, token counts, and embedded costs. It does not include local source file paths or project hashes.
 
-`ai-usage sync push` refreshes local caches, uploads records, and submits the local integrity report. `ai-usage sync pull` downloads remote records and verifies them against the reports stored on the server. Older servers that do not expose the integrity endpoints still allow record push and pull, but they cannot produce a checked integrity result until upgraded.
+Successful background checks are reused for up to six hours within the same server, machine, and upload-policy scope. A new UTC-day boundary, a sync-scope change, or any uploaded or pulled change inside the stable historical range invalidates the saved result immediately. `ai-usage sync push` and `ai-usage sync pull` always force a new check. Older servers that do not expose the integrity endpoints still allow record push and pull, but they cannot produce a checked integrity result until upgraded.
 
-Each integrity run writes compact JSONL transcripts below the cache root under `integrity/`. The local machine report is written as `local-<machine_id>.jsonl`; each remote verification view is written as `remote-<machine_id>.jsonl`. The first line is a summary with the range, digest, record count, and expected-versus-actual server comparison for remote views. Later lines are sorted per-record fingerprints with the hashed dedup key, canonical record hash, timestamps, model, token counts, and costs.
+Each integrity run writes compact JSONL summaries below the cache root under `integrity/`. The local machine report is written as `local-<machine_id>.jsonl`; each remote verification view is written as `remote-<machine_id>.jsonl`. Each file contains one summary line with the range, digest, record count, and expected-versus-actual server comparison for remote views. This replaces the previous per-record transcripts, which could grow to hundreds of megabytes.
 
-To debug a mismatch between two machines, copy the owner machine's `local-<machine_id>.jsonl` to the other machine and compare it with that machine's `remote-<machine_id>.jsonl`. For example, if `kilia` is checking records from `icarus3`, compare `kilia`'s `~/.cache/ai-usage/integrity/remote-icarus3.jsonl` with `icarus3`'s copied `~/.cache/ai-usage/integrity/local-icarus3.jsonl`.
+To debug a mismatch, compare the owner machine's `local-<machine_id>.jsonl` summary with the viewing machine's `remote-<machine_id>.jsonl` summary. The expected and actual counts and digests identify which host and stable range need to be pulled again.
 
 ## Viewing Data
 
@@ -163,7 +175,7 @@ A newer client against an older server degrades gracefully: it holds the new ven
 
 The reverse skew is the one to keep short: a client still on the previous release cannot pull the new vendor's records, so its integrity verification of hosts that already upload them fails on every cycle and repeatedly clears and refetches its remote cache. This resolves as soon as that machine upgrades (monitor mode's `update` command or `--auto-update` handles this).
 
-The server uses SQLite WAL mode and stores its database at the configured `db_path`. A simple backup can be taken with SQLite's online backup command:
+The server uses SQLite WAL mode and stores its database at the configured `db_path`. Write transactions are serialized through an asynchronous gate, avoiding competing `BEGIN IMMEDIATE` transactions and `database is locked` failures while reads remain concurrent. A simple backup can be taken with SQLite's online backup command:
 
 ```bash
 sqlite3 /var/lib/ai-usage/data.db ".backup '/var/lib/ai-usage/backup-YYYY-MM-DD.db'"
@@ -178,6 +190,8 @@ ai-usage sync status
 ```
 
 Client-side sync errors are recorded in the local cache root as `sync_state.json` and `sync.log`.
+
+Current clients and servers remain wire-compatible with v3.0.0 during a staggered rollout. Upgrade the server first when practical so current clients receive per-machine rate limits and smaller server-enforced pull pages immediately.
 
 ## Auto Update
 
@@ -205,4 +219,7 @@ Keep publishing the legacy names until no deployment older than the rename remai
 - Permission warning: run `chmod 600 ~/.secrets/ai-usage.yaml`.
 - `401` from the server: client and server tokens do not match.
 - `403` from upload: `machine_id` is not listed in `allowed_hosts`.
+- Repeated `429`: confirm each current client has a distinct valid `machine_id`. Current clients retry the server's `Retry-After` automatically; older clients share the legacy rate-limit bucket until upgraded.
+- Repeated timeout or `502`/`503`/`504`: inspect the reverse-proxy and service logs. Current clients retry transient failures automatically, but a persistent error usually indicates an unavailable service or proxy limit.
+- `another sync is already running`: wait for the existing local process to finish; overlapping manual and monitor syncs are intentionally suppressed.
 - No remote records: run `ai-usage sync push` on the source machine, then `ai-usage sync pull` on the viewing machine.

@@ -239,10 +239,19 @@ impl WorkerShared {
 
     fn mark_progress(&self, progress: SyncWorkerProgress) {
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        if let SyncWorkerProgress::Sync(SyncProgress::IntegrityCheckFinished { verification }) =
-            &progress
-        {
-            inner.stats.integrity_verification = Some(verification.clone());
+        if let SyncWorkerProgress::Sync(event) = &progress {
+            match event {
+                SyncProgress::IntegrityCheckFinished { verification } => {
+                    inner.stats.integrity_verification = Some(verification.clone());
+                }
+                SyncProgress::IntegrityCheckReused { checked_hosts } => {
+                    inner.stats.integrity_verification =
+                        Some(crate::sync::integrity::IntegrityVerification::Checked {
+                            checked_hosts: *checked_hosts,
+                        });
+                }
+                _ => {}
+            }
         }
         inner.stats.progress = Some(progress);
         inner.stats.revision += 1;
@@ -262,16 +271,31 @@ fn run_worker_loop<F>(
     let mut panic_count = 0;
 
     loop {
-        if !shared.wait_for_request() {
+        if let Some(deadline) = retry_after {
+            if !shared.wait_until_or_shutdown(deadline) {
+                break;
+            }
+        } else if !shared.wait_for_request() {
             break;
         }
 
-        if let Some(deadline) = retry_after
-            && !shared.wait_until_or_shutdown(deadline)
-        {
-            break;
-        }
-
+        let _sync_lock = match crate::sync::lock::SyncLock::try_acquire(&cache_root) {
+            Ok(Some(sync_lock)) => sync_lock,
+            Ok(None) => {
+                retry_after = Some(Instant::now() + backoff);
+                backoff = next_backoff(backoff, settings.max_backoff);
+                continue;
+            }
+            Err(err) => {
+                let message = format!("acquire sync lock: {err}");
+                shared.mark_running();
+                shared.mark_error(message.clone());
+                let _ = append_log(&cache_root, &message);
+                retry_after = Some(Instant::now() + backoff);
+                backoff = next_backoff(backoff, settings.max_backoff);
+                continue;
+            }
+        };
         shared.mark_running();
         let result = panic::catch_unwind(AssertUnwindSafe(&mut run_cycle));
         match result {
@@ -422,13 +446,38 @@ mod tests {
 
         worker.request_sync();
         wait_until(|| worker.stats().error_count == 1);
-        worker.request_sync();
         wait_until(|| worker.stats().success_count == 1);
 
         let stats = worker.stats();
         assert_eq!(stats.error_count, 1);
         assert_eq!(stats.success_count, 1);
         assert_eq!(state::load_sync_state(&cache_root).last_error, None);
+        worker.shutdown();
+    }
+
+    #[test]
+    fn worker_defers_without_reporting_success_while_sync_lock_is_busy() {
+        let cache_root = unique_temp_dir("lock-contention");
+        let lock = crate::sync::lock::SyncLock::try_acquire(&cache_root)
+            .expect("acquire lock")
+            .expect("lock");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let run_counter = Arc::clone(&runs);
+        let mut worker = SyncWorker::spawn_with_settings(cache_root, test_settings(), move || {
+            run_counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        worker.request_sync();
+        thread::sleep(Duration::from_millis(40));
+
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(worker.stats().success_count, 0);
+        assert_eq!(worker.stats().error_count, 0);
+
+        drop(lock);
+        wait_until(|| worker.stats().success_count == 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
         worker.shutdown();
     }
 
@@ -448,7 +497,6 @@ mod tests {
 
         worker.request_sync();
         wait_until(|| worker.stats().error_count == 1);
-        worker.request_sync();
         wait_until(|| worker.stats().success_count == 1);
 
         let stats = worker.stats();

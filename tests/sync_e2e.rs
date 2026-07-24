@@ -1,10 +1,10 @@
+use ai_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 use chrono::{Duration, Utc};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
-use ai_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -262,21 +262,10 @@ async fn integrity_passes_for_claude_records_without_source_ids() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse transcript"))
         .collect::<Vec<_>>();
 
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines.len(), 1);
     assert_eq!(lines[0]["status"], "checked");
     assert_eq!(lines[0]["expected_record_count"], 2);
     assert_eq!(lines[0]["actual_record_count"], 2);
-    let first_hash = lines[1]["dedup_key_sha256"]
-        .as_str()
-        .expect("first dedup hash");
-    let second_hash = lines[2]["dedup_key_sha256"]
-        .as_str()
-        .expect("second dedup hash");
-    assert_ne!(
-        first_hash,
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    );
-    assert_ne!(first_hash, second_hash);
 
     server.abort();
 }

@@ -1,3 +1,8 @@
+use ai_usage_proto::{
+    INTEGRITY_ALGORITHM, IntegrityReport, IntegrityReportList, IntegritySubmitResponse,
+    MachineList, PullResponse, SCHEMA_VERSION, UploadResponse, WireRecord,
+};
+use ai_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use rusqlite::params;
@@ -7,11 +12,6 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
-use ai_usage_proto::{
-    INTEGRITY_ALGORITHM, IntegrityReport, IntegrityReportList, IntegritySubmitResponse,
-    PullResponse, SCHEMA_VERSION, UploadResponse, WireRecord,
-};
-use ai_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -112,6 +112,22 @@ fn authed_request(method: &str, uri: &str, body: impl Into<Body>) -> Request<Bod
         .method(method)
         .uri(uri)
         .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(body.into())
+        .expect("request")
+}
+
+fn authed_request_for_client(
+    method: &str,
+    uri: &str,
+    client_id: &str,
+    body: impl Into<Body>,
+) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .header("x-ai-usage-client", client_id)
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .body(body.into())
         .expect("request")
@@ -243,6 +259,39 @@ async fn health_is_public() {
     assert_eq!(body["ok"], json!(true));
     assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
     assert_eq!(body["schema_version"], json!(SCHEMA_VERSION));
+    assert_eq!(
+        body["instance_id"].as_str().map(str::len),
+        Some(64),
+        "health must expose a stable server identity"
+    );
+}
+
+#[tokio::test]
+async fn health_instance_id_tracks_the_database() {
+    async fn instance_id(cfg: ServerConfig) -> String {
+        let response = build_app(AppState::new(cfg).expect("app state"))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body: serde_json::Value = read_json(response).await;
+        body["instance_id"]
+            .as_str()
+            .expect("instance id")
+            .to_string()
+    }
+
+    let first_config = config("health-instance-persistent");
+    let first = instance_id(first_config.clone()).await;
+    let restarted = instance_id(first_config).await;
+    let replacement = instance_id(config("health-instance-replacement")).await;
+
+    assert_eq!(first, restarted);
+    assert_ne!(first, replacement);
 }
 
 #[tokio::test]
@@ -991,6 +1040,38 @@ async fn upload_rejects_disallowed_hosts() {
 }
 
 #[tokio::test]
+async fn upload_rejects_client_identity_that_differs_from_record_host() {
+    let app = app("client-record-host-mismatch").await;
+    let response = app
+        .oneshot(authed_request_for_client(
+            "POST",
+            "/v1/upload",
+            "workstation",
+            ndjson(&[record("laptop", "claude", "a", 10)]),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn upload_rejects_an_invalid_client_identity() {
+    let app = app("invalid-client-identity").await;
+    let response = app
+        .oneshot(authed_request_for_client(
+            "POST",
+            "/v1/upload",
+            "INVALID!",
+            ndjson(&[record("laptop", "claude", "a", 10)]),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn machines_reports_last_seen_and_record_count() {
     let app = app("machines").await;
     let records = vec![
@@ -1013,6 +1094,56 @@ async fn machines_reports_last_seen_and_record_count() {
     let body: serde_json::Value = read_json(response).await;
     assert_eq!(body["machines"][0]["host_id"], json!("laptop"));
     assert_eq!(body["machines"][0]["record_count"], json!(2));
+}
+
+#[tokio::test]
+async fn machines_content_revision_changes_when_record_content_changes() {
+    let app = app("machines-content-revision").await;
+    let first_upload = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/upload",
+            ndjson(&[record("laptop", "claude", "same-key", 10)]),
+        ))
+        .await
+        .expect("first upload");
+    assert_eq!(first_upload.status(), StatusCode::OK);
+
+    let first: MachineList = read_json(
+        app.clone()
+            .oneshot(authed_request("GET", "/v1/machines", Body::empty()))
+            .await
+            .expect("first machines response"),
+    )
+    .await;
+
+    let second_upload = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/upload",
+            ndjson(&[record("laptop", "claude", "same-key", 20)]),
+        ))
+        .await
+        .expect("second upload");
+    assert_eq!(second_upload.status(), StatusCode::OK);
+
+    let second: MachineList = read_json(
+        app.oneshot(authed_request("GET", "/v1/machines", Body::empty()))
+            .await
+            .expect("second machines response"),
+    )
+    .await;
+
+    assert_eq!(first.machines[0].record_count, 1);
+    assert_eq!(second.machines[0].record_count, 1);
+    assert!(
+        second.machines[0]
+            .content_revision
+            .expect("second revision")
+            > first.machines[0].content_revision.expect("first revision")
+    );
 }
 
 #[tokio::test]
@@ -1235,4 +1366,74 @@ async fn token_bucket_rejects_after_burst_is_spent() {
         .expect("limited response");
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn token_buckets_are_isolated_per_client() {
+    let app = app("rate-limit-client-isolation").await;
+
+    for _ in 0..30 {
+        let response = app
+            .clone()
+            .oneshot(authed_request_for_client(
+                "GET",
+                "/v1/machines",
+                "workstation",
+                Body::empty(),
+            ))
+            .await
+            .expect("workstation response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let other_client = app
+        .clone()
+        .oneshot(authed_request_for_client(
+            "GET",
+            "/v1/machines",
+            "laptop",
+            Body::empty(),
+        ))
+        .await
+        .expect("laptop response");
+    assert_eq!(other_client.status(), StatusCode::OK);
+
+    let exhausted_client = app
+        .oneshot(authed_request_for_client(
+            "GET",
+            "/v1/machines",
+            "workstation",
+            Body::empty(),
+        ))
+        .await
+        .expect("limited workstation response");
+    assert_eq!(exhausted_client.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn rate_limit_response_includes_retry_after() {
+    let app = app("rate-limit-retry-after").await;
+
+    for _ in 0..30 {
+        let response = app
+            .clone()
+            .oneshot(authed_request("GET", "/v1/machines", Body::empty()))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = app
+        .oneshot(authed_request("GET", "/v1/machines", Body::empty()))
+        .await
+        .expect("limited response");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
 }

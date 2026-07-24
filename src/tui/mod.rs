@@ -153,11 +153,7 @@ fn load_duration_text(elapsed: Duration) -> String {
     }
 }
 
-pub fn run_monitor(
-    state: &mut AppState,
-    sync_worker: Option<SyncWorker>,
-    config: MonitorConfig,
-) {
+pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config: MonitorConfig) {
     install_panic_hook();
     let mut terminal = match setup_terminal() {
         Ok(terminal) => terminal,
@@ -197,7 +193,9 @@ pub fn run_monitor(
 
     let monitor_interval = |state: &AppState| Duration::from_secs(state.monitor_interval);
     let mut next_refresh = Instant::now() + monitor_interval(state);
-    let mut next_sync = Instant::now() + crate::monitor_sync_interval(monitor_interval(state));
+    let machine_id = state.local_host_id.clone().unwrap_or_default();
+    let mut next_sync =
+        Instant::now() + crate::monitor_sync_delay(monitor_interval(state), &machine_id);
     let mut next_auto_update = config.auto_update.then(Instant::now);
     let mut initial_refresh_pending = true;
 
@@ -211,9 +209,13 @@ pub fn run_monitor(
                 state.raw_cache = None;
                 request_background_refresh(state, &mut refresh_tracker);
             }
-            if let Some(worker) = sync_worker.as_ref() {
-                worker.request_sync();
-                next_sync = Instant::now() + crate::monitor_sync_interval(monitor_interval(state));
+            if sync_worker.is_some() {
+                next_sync = crate::monitor_sync_deadline_after_refresh(
+                    Instant::now(),
+                    next_sync,
+                    monitor_interval(state),
+                    &machine_id,
+                );
             }
             dashboard = data::build(state);
         } else if refresh_tracker.running && state.raw_refresh.is_none() {
@@ -303,8 +305,8 @@ pub fn run_monitor(
             initial_refresh_pending = false;
         }
 
-        let mut timeout = Duration::from_millis(500)
-            .min(next_refresh.saturating_duration_since(Instant::now()));
+        let mut timeout =
+            Duration::from_millis(500).min(next_refresh.saturating_duration_since(Instant::now()));
         if sync_worker.is_some() {
             timeout = timeout.min(next_sync.saturating_duration_since(Instant::now()));
         }
@@ -373,6 +375,7 @@ pub fn run_monitor(
                         let (refresh_at, sync_at) = crate::monitor_deadlines_after_interval_change(
                             Instant::now(),
                             state.monitor_interval,
+                            &machine_id,
                         );
                         next_refresh = refresh_at;
                         next_sync = sync_at;

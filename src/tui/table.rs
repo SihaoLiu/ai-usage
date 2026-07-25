@@ -187,7 +187,8 @@ fn dashboard_model_column_width(rows: &[DisplayRow]) -> u16 {
         .iter()
         .filter_map(|row| match row {
             DisplayRow::Data(data) => Some(data.model_label.chars().count()),
-            _ => None,
+            DisplayRow::Subtotal { vendor, .. } => Some(vendor.chars().count() + " total".len()),
+            DisplayRow::GroupHeader { .. } => None,
         })
         .max()
         .unwrap_or(0);
@@ -983,6 +984,27 @@ mod tests {
         assert_eq!(model_column_width(5), 14);
         assert_eq!(model_column_width(15), 17);
         assert_eq!(model_column_width(80), 26);
+    }
+
+    #[test]
+    fn model_column_reserves_room_for_vendor_subtotals() {
+        let rows = vec![
+            DisplayRow::Data(Box::new(DataRow {
+                vendor: Vendor::Anthropic,
+                vendor_label: "Anthropic".to_string(),
+                model_label: "Opus 5".to_string(),
+                model_raw: "claude-opus-5".to_string(),
+                harness_label: "Claude Code".to_string(),
+                harness_short: "CC".to_string(),
+                metrics: RowMetrics::default(),
+            })),
+            DisplayRow::Subtotal {
+                vendor: "Anthropic".to_string(),
+                metrics: RowMetrics::default(),
+            },
+        ];
+
+        assert_eq!(dashboard_model_column_width(&rows), 17);
     }
 
     #[test]

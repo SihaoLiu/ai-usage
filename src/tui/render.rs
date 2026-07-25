@@ -880,6 +880,7 @@ mod tests {
         assert_eq!(buffer[(header_x, header_y)].bg, Color::Indexed(236));
         assert_eq!(background_at("Anthropic"), Color::Indexed(235));
         assert_eq!(background_at("Beta"), Color::Indexed(233));
+        line_containing(&text, "Anthropic total");
         let subtotal_y = line_index_containing(&text, "Beta") + 1;
         assert_eq!(buffer[(1, subtotal_y)].bg, Color::Indexed(234));
         assert_eq!(background_at("OpenAI"), Color::Indexed(235));

@@ -84,6 +84,16 @@ pub(crate) fn monitor_sync_deadline_after_refresh(
     current_deadline.min(triggered_deadline)
 }
 
+pub(crate) fn monitor_deadlines_on_start(
+    now: std::time::Instant,
+    monitor_interval_seconds: u64,
+) -> (std::time::Instant, std::time::Instant) {
+    (
+        now + std::time::Duration::from_secs(monitor_interval_seconds),
+        now,
+    )
+}
+
 pub(crate) fn monitor_deadlines_after_interval_change(
     now: std::time::Instant,
     monitor_interval_seconds: u64,
@@ -434,6 +444,16 @@ mod tests {
             next_sync,
             now + monitor_sync_delay(std::time::Duration::from_secs(3600), "workstation")
         );
+    }
+
+    #[test]
+    fn monitor_start_makes_initial_sync_immediately_due() {
+        let now = std::time::Instant::now();
+
+        let (next_refresh, next_sync) = monitor_deadlines_on_start(now, 3600);
+
+        assert_eq!(next_refresh, now + std::time::Duration::from_secs(3600));
+        assert_eq!(next_sync, now);
     }
 
     #[test]

@@ -432,10 +432,9 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
     request_background_reload_to(state, &mut refresh_tracker, initial_range);
 
     let monitor_interval = |state: &AppState| Duration::from_secs(state.monitor_interval);
-    let mut next_refresh = Instant::now() + monitor_interval(state);
+    let (mut next_refresh, mut next_sync) =
+        crate::monitor_deadlines_on_start(Instant::now(), state.monitor_interval);
     let machine_id = state.local_host_id.clone().unwrap_or_default();
-    let mut next_sync =
-        Instant::now() + crate::monitor_sync_delay(monitor_interval(state), &machine_id);
     let mut next_auto_update = config.auto_update.then(Instant::now);
     let mut initial_load_pending = true;
     let mut initial_source_refresh_pending = true;

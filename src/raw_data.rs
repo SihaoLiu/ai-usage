@@ -896,7 +896,7 @@ fn filter_all_tool_data_owned(
     }
 }
 
-fn filter_all_tool_data_borrowed<'a>(
+pub(crate) fn filter_all_tool_data_borrowed<'a>(
     cache: &'a RawDataCache,
     window: &TimeWindow,
     session_id: Option<&str>,

@@ -7,6 +7,7 @@ mod model_overrides;
 mod pricing;
 mod process_usage;
 mod raw_data;
+mod snapshot;
 mod stats;
 mod sync;
 mod sync_status;
@@ -137,11 +138,28 @@ struct Args {
     command: Option<CliCommand>,
 }
 
-#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     Sync {
         #[command(subcommand)]
         command: SyncCommand,
+    },
+    Snapshot {
+        /// Number of local calendar days to include
+        #[arg(long, default_value = "7", value_parser = clap::value_parser!(i64).range(1..))]
+        days: i64,
+
+        /// Tool to include in the snapshot
+        #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "kimi", "omp", "all"])]
+        tool: String,
+
+        /// Filter usage to a single machine id
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Filter usage to one harness session id
+        #[arg(long)]
+        session: Option<String>,
     },
 }
 
@@ -695,6 +713,56 @@ fn print_stats(state: &mut AppState, once: bool) -> Option<bool> {
 fn run_cli_command(command: CliCommand, sync_config: sync::config::SyncConfig) -> i32 {
     match command {
         CliCommand::Sync { command } => run_sync_command(command, sync_config),
+        CliCommand::Snapshot {
+            days,
+            tool,
+            host,
+            session,
+        } => {
+            let query = snapshot::SnapshotQuery {
+                days,
+                tool: Tool::from_key(&tool).expect("clap validates snapshot tools"),
+                session_id: session.filter(|id| !id.trim().is_empty()),
+            };
+            let now = Local::now();
+            let required_range = snapshot::required_range(&query, now);
+            let local_host_id = match &sync_config {
+                sync::config::SyncConfig::Enabled(config) => Some(config.machine_id.as_str()),
+                sync::config::SyncConfig::Disabled => None,
+            };
+            let mut cache = read_cached_raw_data_for_window(
+                host.as_deref(),
+                local_host_id,
+                required_range,
+                now,
+            );
+            if !cache.has_source_data || needs_session_metadata(query.session_id.as_deref(), &cache)
+            {
+                refresh_all_tool_caches();
+                cache = load_persistent_raw_data_for_window(
+                    host.as_deref(),
+                    local_host_id,
+                    required_range,
+                    Local::now(),
+                );
+            }
+            if !cache.has_source_data {
+                eprintln!("ai-usage: no usage source data found");
+                return 1;
+            }
+
+            let document =
+                snapshot::build_from_cache(&cache, &query, &pricing::load_layered(), Local::now());
+            let stdout = std::io::stdout();
+            let output = std::io::BufWriter::new(stdout.lock());
+            match snapshot::write_json(output, &document) {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("ai-usage: failed to write snapshot: {err}");
+                    1
+                }
+            }
+        }
     }
 }
 
@@ -1089,6 +1157,22 @@ mod tests {
             Some(CliCommand::Sync {
                 command: SyncCommand::Clean
             })
+        ));
+    }
+
+    #[test]
+    fn snapshot_subcommand_parses_its_query() {
+        let args = Args::try_parse_from(["ai-usage", "snapshot", "--days", "7", "--tool", "all"])
+            .expect("snapshot parses");
+
+        assert!(matches!(
+            args.command,
+            Some(CliCommand::Snapshot {
+                days: 7,
+                tool,
+                host: None,
+                session: None,
+            }) if tool == "all"
         ));
     }
 

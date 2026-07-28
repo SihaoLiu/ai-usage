@@ -12,6 +12,7 @@ A fast terminal dashboard for tracking token usage and costs across **Claude Cod
 - Responsive display adapting to terminal width
 - Live monitor mode with interactive keyboard controls and process CPU/RSS telemetry
 - Runtime monthly-cost editing with validated `.fee.env` persistence
+- Versioned JSON snapshots for local integrations
 
 ## Install
 
@@ -51,6 +52,9 @@ ai-usage --once
 
 # Last 30 days, specific tool
 ai-usage --days 30 --tool claude
+
+# Machine-readable usage for the last 7 local calendar days
+ai-usage snapshot --days 7 --tool all
 ```
 
 See [docs/usage.md](docs/usage.md) for full usage details, data sources, monitor mode controls, and configuration. For optional cross-machine sync, see [docs/sync.md](docs/sync.md).

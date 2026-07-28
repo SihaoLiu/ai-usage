@@ -17,6 +17,22 @@ Options:
 
 Default behavior (no flags) enters monitor mode showing all vendors for the last 3 days.
 
+## JSON Snapshots
+
+Use the `snapshot` command for local dashboards and other machine consumers:
+
+```bash
+ai-usage snapshot --days 7 --tool all
+```
+
+The command writes one versioned JSON document to stdout. Diagnostics are written
+to stderr. `--tool` accepts `claude`, `codex`, `gemini`, `kimi`, `omp`, or `all`;
+`--host` and `--session` apply the same filters as the interactive dashboard.
+
+The document contains `schema_version`, `generated_at`, `timezone`, `range`,
+`window`, `daily`, and `top_models`. Token totals use inference-oriented names:
+`cache_hit`, `prefill`, and `decoding`. API costs are estimates in US dollars.
+
 ## Monitor Mode Controls
 
 | Key | Action |

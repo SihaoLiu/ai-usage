@@ -5,8 +5,10 @@ use chrono::{
 /// Time range selected for usage aggregation and display.
 #[derive(Clone, Debug)]
 pub enum TimeWindow {
-    RollingDays {
-        days: i64,
+    Latest {
+        span: Duration,
+        projection_days: f64,
+        page_step: Duration,
     },
     ExplicitRange {
         start: DateTime<Local>,
@@ -21,7 +23,12 @@ pub enum TimeWindow {
 
 impl TimeWindow {
     pub fn rolling_days(days: i64) -> Self {
-        Self::RollingDays { days }
+        let span = Duration::days(days.max(1));
+        Self::Latest {
+            span,
+            projection_days: days.max(1) as f64,
+            page_step: span,
+        }
     }
 
     pub fn from_date(input: &str) -> Result<Self, String> {
@@ -85,14 +92,16 @@ impl TimeWindow {
 
     pub fn bounds(&self, now: DateTime<Local>) -> (DateTime<Local>, DateTime<Local>) {
         match self {
-            Self::RollingDays { days } => (now - Duration::days(*days), now),
+            Self::Latest { span, .. } => (now - *span, now),
             Self::ExplicitRange { start, end, .. } => (*start, *end),
         }
     }
 
     pub fn projection_days(&self, _now: DateTime<Local>) -> f64 {
         match self {
-            Self::RollingDays { days } => (*days).max(1) as f64,
+            Self::Latest {
+                projection_days, ..
+            } => *projection_days,
             Self::ExplicitRange {
                 projection_days, ..
             } => *projection_days,
@@ -102,14 +111,18 @@ impl TimeWindow {
     /// Span used for PageUp/PageDown paging. Always positive.
     pub fn page_step(&self) -> Duration {
         match self {
-            Self::RollingDays { days } => Duration::days((*days).max(1)),
+            Self::Latest { page_step, .. } => *page_step,
             Self::ExplicitRange { page_step, .. } => *page_step,
         }
     }
 
     pub fn display_label(&self, _now: DateTime<Local>) -> String {
         match self {
-            Self::RollingDays { days } => format!("last {} days", days),
+            Self::Latest {
+                span,
+                projection_days,
+                page_step,
+            } => latest_display_label(*span, *projection_days, *page_step),
             Self::ExplicitRange { start, end, .. } => {
                 format!(
                     "{} to {}",
@@ -141,9 +154,9 @@ impl TimeWindow {
         })
     }
 
-    /// Translate the window forward by `page_step`. Clamps so the new end
-    /// never exceeds `now`, which makes paging into the future a no-op
-    /// (returns `None`) when the window already touches the present.
+    /// Translate the window forward by `page_step`. Reaching the present
+    /// resumes a live window with the same span; advancing an already-live
+    /// window is a no-op.
     pub fn slide_forward(&self, now: DateTime<Local>) -> Option<Self> {
         self.slide_forward_by(now, self.page_step())
     }
@@ -155,12 +168,17 @@ impl TimeWindow {
             return None;
         }
         let (start, end) = self.bounds(now);
-        let mut new_start = start + step;
-        let mut new_end = end + step;
-        if new_end > now {
-            let overshoot = new_end - now;
-            new_end -= overshoot;
-            new_start -= overshoot;
+        let new_start = start + step;
+        let new_end = end + step;
+        if new_end >= now {
+            if matches!(self, Self::Latest { .. }) {
+                return None;
+            }
+            return Some(Self::Latest {
+                span: end - start,
+                projection_days: self.projection_days(now),
+                page_step: self.page_step(),
+            });
         }
         if new_start == start && new_end == end {
             return None;
@@ -204,9 +222,15 @@ impl TimeWindow {
         let (start, end) = self.bounds(now);
         let span = end - start;
 
-        let (new_start, new_end) = if matches!(self, Self::RollingDays { .. }) {
-            (now - new_span, now)
-        } else {
+        if matches!(self, Self::Latest { .. }) {
+            return Some(Self::Latest {
+                span: new_span,
+                projection_days: projection_days_for_span(new_span),
+                page_step: new_span,
+            });
+        }
+
+        let (new_start, new_end) = {
             let center = start + span / 2;
             let mut new_start = center - new_span / 2;
             let mut new_end = new_start + new_span;
@@ -225,6 +249,48 @@ impl TimeWindow {
             page_step: new_span,
         })
     }
+
+    pub fn follow_latest(&self, now: DateTime<Local>) -> Self {
+        let span = self.span(now).unwrap_or_else(|| Duration::seconds(1));
+        Self::Latest {
+            span,
+            projection_days: self.projection_days(now),
+            page_step: self.page_step(),
+        }
+    }
+
+    pub fn is_rolling_days(&self, days: i64) -> bool {
+        let expected = Duration::days(days.max(1));
+        matches!(
+            self,
+            Self::Latest {
+                span,
+                projection_days,
+                page_step,
+            } if *span == expected
+                && *page_step == expected
+                && (*projection_days - days.max(1) as f64).abs() < f64::EPSILON
+        )
+    }
+}
+
+fn latest_display_label(span: Duration, projection_days: f64, page_step: Duration) -> String {
+    let rounded_days = projection_days.round() as i64;
+    if rounded_days >= 1
+        && (projection_days - rounded_days as f64).abs() < f64::EPSILON
+        && page_step == Duration::days(rounded_days)
+        && (span - Duration::days(rounded_days)).num_seconds().abs() <= 1
+    {
+        return format!("last {rounded_days} days");
+    }
+    let seconds = span.num_seconds().max(1);
+    if seconds % 3_600 == 0 {
+        return format!("last {} hours", seconds / 3_600);
+    }
+    if seconds % 60 == 0 {
+        return format!("last {} minutes", seconds / 60);
+    }
+    format!("last {seconds} seconds")
 }
 
 fn min_zoom_span() -> Duration {
@@ -678,6 +744,23 @@ mod tests {
     }
 
     #[test]
+    fn slide_forward_to_present_resumes_following_time() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let later = now + Duration::minutes(5);
+        let window = TimeWindow::rolling_days(3);
+
+        let back = window.slide_back(now).expect("slide back");
+        let forward = back.slide_forward(now).expect("slide forward");
+        let (start, end) = forward.bounds(later);
+
+        assert_eq!(end, later);
+        assert_eq!(end - start, Duration::days(3));
+    }
+
+    #[test]
     fn slide_forward_clamps_end_at_now_preserving_width() {
         let now = Local
             .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
@@ -714,6 +797,21 @@ mod tests {
         assert_eq!(start, now - Duration::days(2));
         assert_eq!(zoomed.page_step(), Duration::days(2));
         assert_eq!(zoomed.projection_days(now), 2.0);
+    }
+
+    #[test]
+    fn zoomed_present_window_keeps_following_time() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let later = now + Duration::minutes(5);
+
+        let zoomed = TimeWindow::rolling_days(4).zoom_in(now).expect("zoom in");
+        let (start, end) = zoomed.bounds(later);
+
+        assert_eq!(end, later);
+        assert_eq!(end - start, Duration::days(2));
     }
 
     #[test]

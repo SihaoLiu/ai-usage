@@ -6,12 +6,13 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Duration, Local};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use std::path::Path;
 
+use crate::AppState;
 use crate::constants::{AllPricing, SubscriptionFees};
 use crate::data::claude::detect_fast_tier_snapshot as detect_claude_fast_tier_snapshot;
 use crate::data::codex::{
@@ -25,7 +26,6 @@ use crate::stats::{self, ModelBreakdownRow, ToolTimeSeries};
 use crate::sync_status::IntegrityStatus;
 use crate::time_utils::{self, TimeWindow};
 use crate::tool::Tool;
-use crate::{AppState, FULL_CACHE_HORIZON};
 
 /// Short rolling windows are common enough to keep a compact derived snapshot
 /// beside the authoritative per-source caches.
@@ -46,9 +46,9 @@ fn hot_snapshot_covers(
         && elapsed_seconds <= (horizon_days - required_horizon).saturating_mul(86_400)
 }
 
-/// In-memory snapshot of raw tool entries, scoped to a known scan
-/// horizon (in days back from `now`). PageUp/PageDown reuse this cache so
-/// they feel instant; only manual `r` and auto-refresh invalidate it.
+/// In-memory snapshot of raw tool entries, scoped to a known scan horizon in
+/// days back from `now`. Navigation reuses it while covered; wider historical
+/// windows are loaded in the background.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RawDataCache {
     pub(crate) claude: Vec<UsageEntry>,
@@ -59,6 +59,8 @@ pub(crate) struct RawDataCache {
     pub(crate) horizon_days: i64,
     pub(crate) local_host_id: Option<String>,
     pub(crate) local_record_keys: HashSet<(String, String)>,
+    #[serde(default)]
+    pub(crate) persistent_generation: String,
     /// True when cached local records were parsed by the session-id-aware
     /// parser. An absent requested id is then a valid result, not a reason to
     /// rescan every source log.
@@ -66,10 +68,21 @@ pub(crate) struct RawDataCache {
     pub(crate) local_session_metadata_current: bool,
 }
 
+pub(crate) enum BackgroundRawLoad {
+    Unchanged,
+    Refreshed(Box<RawDataCache>),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct HotRawSnapshot {
     captured_at_seconds: i64,
     cache: RawDataCache,
+}
+
+#[derive(Serialize)]
+struct HotRawSnapshotRef<'a> {
+    captured_at_seconds: i64,
+    cache: &'a RawDataCache,
 }
 
 fn recent_entries(entries: &[UsageEntry], now: DateTime<Local>) -> Vec<UsageEntry> {
@@ -85,6 +98,15 @@ fn write_hot_raw_snapshot(
     source: &RawDataCache,
     captured_at: DateTime<Local>,
 ) -> std::io::Result<()> {
+    if source.horizon_days == HOT_CACHE_HORIZON_DAYS && source.local_record_keys.is_empty() {
+        return data::cache::write_hot_snapshot(
+            cache_root,
+            &HotRawSnapshotRef {
+                captured_at_seconds: captured_at.timestamp(),
+                cache: source,
+            },
+        );
+    }
     let cache = RawDataCache {
         claude: recent_entries(&source.claude, captured_at),
         codex: recent_entries(&source.codex, captured_at),
@@ -96,6 +118,7 @@ fn write_hot_raw_snapshot(
         // A hot snapshot is never extended in place: a full refresh replaces
         // it, so retaining every historic local dedup key wastes memory.
         local_record_keys: HashSet::new(),
+        persistent_generation: source.persistent_generation.clone(),
         local_session_metadata_current: source.local_session_metadata_current,
     };
     data::cache::write_hot_snapshot(
@@ -117,6 +140,8 @@ fn load_hot_raw_snapshot(
     let captured_at =
         DateTime::from_timestamp(snapshot.captured_at_seconds, 0)?.with_timezone(&Local);
     (snapshot.cache.local_host_id.as_deref() == local_host_id
+        && snapshot.cache.persistent_generation
+            == crate::sync::cache_generation::raw_data_generation(cache_root)
         && snapshot.cache.horizon_days == HOT_CACHE_HORIZON_DAYS
         && hot_snapshot_covers(
             snapshot.cache.horizon_days,
@@ -150,11 +175,57 @@ pub(crate) fn get_tool_data_dir(tool: &str) -> Option<PathBuf> {
 /// Days of history needed to render the current time window.
 ///
 /// A recent hot snapshot keeps this bounded to the visible window. Once the
-/// user navigates beyond that snapshot, the complete cache is loaded.
+/// user navigates beyond that snapshot, a wider slice is loaded.
 pub(crate) fn compute_required_horizon(window: &TimeWindow, now: DateTime<Local>) -> i64 {
     let (start, _) = window.bounds(now);
     let days = now.signed_duration_since(start).num_days() + 2;
     days.max(1)
+}
+
+fn retained_horizon(required_horizon: i64) -> i64 {
+    required_horizon.max(HOT_CACHE_HORIZON_DAYS)
+}
+
+pub(crate) fn raw_cache_covers_window(state: &AppState, now: DateTime<Local>) -> bool {
+    let required_horizon = compute_required_horizon(&state.time_window, now);
+    state
+        .raw_cache
+        .as_ref()
+        .is_some_and(|cache| cache.horizon_days >= required_horizon)
+}
+
+pub(crate) fn trim_raw_cache_to_window(state: &mut AppState, now: DateTime<Local>) -> bool {
+    let target_horizon = retained_horizon(compute_required_horizon(&state.time_window, now));
+    let Some(cache) = state
+        .raw_cache
+        .as_mut()
+        .filter(|cache| cache.horizon_days > target_horizon)
+    else {
+        return false;
+    };
+    scope_raw_cache(cache, target_horizon, now);
+    true
+}
+
+fn scope_raw_cache(cache: &mut RawDataCache, required_horizon: i64, now: DateTime<Local>) {
+    let cutoff = now - Duration::days(required_horizon.max(1));
+    let retain_recent = |entries: &mut Vec<UsageEntry>| {
+        entries.retain(|entry| {
+            entry
+                .parsed_timestamp
+                .or_else(|| time_utils::parse_timestamp(&entry.timestamp))
+                .is_some_and(|timestamp| timestamp >= cutoff)
+        });
+        entries.shrink_to_fit();
+    };
+    retain_recent(&mut cache.claude);
+    retain_recent(&mut cache.codex);
+    retain_recent(&mut cache.gemini);
+    retain_recent(&mut cache.kimi);
+    retain_recent(&mut cache.omp);
+    cache.local_record_keys.clear();
+    cache.local_record_keys.shrink_to_fit();
+    cache.horizon_days = required_horizon.max(1);
 }
 
 pub(crate) fn include_local_for_host_filter(
@@ -196,17 +267,22 @@ pub(crate) fn merge_remote_records_into_raw_cache(
 /// Entries plus their `(vendor, dedup_key)` identities for one vendor cache.
 type LoadedVendorCache = (Vec<UsageEntry>, HashSet<(String, String)>, bool);
 
-pub(crate) fn load_local_tool_cached_records(cache_root: &Path, tool: &str) -> LoadedVendorCache {
-    let records = data::cache::load_vendor_cached_records(cache_root, tool);
+pub(crate) fn load_local_tool_cached_records(
+    cache_root: &Path,
+    tool: &str,
+    cutoff: DateTime<Local>,
+) -> LoadedVendorCache {
+    let (records, has_cached_records) =
+        data::cache::load_recent_vendor_cached_records(cache_root, tool, cutoff);
     let session_metadata_current =
-        records.is_empty() || data::cache::vendor_session_metadata_is_current(cache_root, tool);
+        !has_cached_records || data::cache::vendor_session_metadata_is_current(cache_root, tool);
     let mut entries = Vec::with_capacity(records.len());
     let mut keys = HashSet::with_capacity(records.len());
-    for record in records {
-        if !record.dedup_key.is_empty() {
-            keys.insert((tool.to_string(), record.dedup_key));
+    for (dedup_key, entry) in records {
+        if !dedup_key.is_empty() {
+            keys.insert((tool.to_string(), dedup_key));
         }
-        entries.push(record.entry);
+        entries.push(entry);
     }
     (entries, keys, session_metadata_current)
 }
@@ -215,13 +291,17 @@ pub(crate) fn local_cached_raw_cache(
     cache_root: &Path,
     include_local: bool,
     local_host_id: Option<&str>,
+    required_horizon: i64,
+    now: DateTime<Local>,
 ) -> RawDataCache {
-    // The five vendor caches deserialize independently; load them in parallel.
+    let cutoff = now - Duration::days(required_horizon.max(1));
+    // Decode one cache at a time so a large history cannot multiply its peak
+    // memory use across all vendors.
     let mut loaded: Vec<LoadedVendorCache> = ["claude", "codex", "gemini", "kimi", "omp"]
-        .par_iter()
+        .iter()
         .map(|tool| {
             if include_local {
-                load_local_tool_cached_records(cache_root, tool)
+                load_local_tool_cached_records(cache_root, tool, cutoff)
             } else {
                 (Vec::new(), HashSet::new(), true)
             }
@@ -246,47 +326,51 @@ pub(crate) fn local_cached_raw_cache(
         gemini,
         kimi,
         omp,
-        horizon_days: FULL_CACHE_HORIZON,
+        horizon_days: required_horizon.max(1),
         local_host_id: local_host_id.map(str::to_string),
         local_record_keys,
+        persistent_generation: String::new(),
         local_session_metadata_current,
     }
 }
 
-pub(crate) fn clear_local_raw_cache(cache: &mut RawDataCache) {
-    cache.claude.clear();
-    cache.codex.clear();
-    cache.gemini.clear();
-    cache.kimi.clear();
-    cache.omp.clear();
-    cache.local_record_keys.clear();
-    cache.local_session_metadata_current = true;
-}
-
-pub(crate) fn read_all_tool_cached_snapshot_for_hosts(
+fn load_scoped_persistent_raw_data(
     host_filter: Option<&str>,
     local_host_id: Option<&str>,
+    required_horizon: i64,
+    now: DateTime<Local>,
 ) -> RawDataCache {
     let cache_root = data::cache::default_cache_dir();
+    let persistent_generation = crate::sync::cache_generation::raw_data_generation(&cache_root);
     let include_local = include_local_for_host_filter(host_filter, local_host_id);
     let host_set = host_filter.map(|host| HashSet::from([host.to_string()]));
-    // Local vendor caches and the remote per-host caches load concurrently.
-    let (mut cache, remote_records) = rayon::join(
-        || local_cached_raw_cache(&cache_root, include_local, local_host_id),
-        || data::cache::load_remote_entries(&cache_root, host_set.as_ref()),
+    let cutoff = now - Duration::days(required_horizon.max(1));
+    let mut cache = local_cached_raw_cache(
+        &cache_root,
+        include_local,
+        local_host_id,
+        required_horizon,
+        now,
     );
+    let remote_records =
+        data::cache::load_recent_remote_entries(&cache_root, host_set.as_ref(), cutoff);
     merge_remote_records_into_raw_cache(&mut cache, remote_records);
+    cache.local_record_keys.clear();
+    cache.local_record_keys.shrink_to_fit();
+    cache.persistent_generation = persistent_generation;
     cache
 }
 
-/// Load the complete authoritative cache and refresh the derived hot snapshot
-/// for ordinary all-host views.
-pub(crate) fn read_full_cached_raw_data_for_hosts(
+/// Load the requested slice of the authoritative caches and refresh the
+/// derived hot snapshot for ordinary all-host views.
+pub(crate) fn load_persistent_raw_data_for_window(
     host_filter: Option<&str>,
     local_host_id: Option<&str>,
+    required_horizon: i64,
     now: DateTime<Local>,
 ) -> RawDataCache {
-    let cache = read_all_tool_cached_snapshot_for_hosts(host_filter, local_host_id);
+    let load_horizon = retained_horizon(required_horizon);
+    let cache = load_scoped_persistent_raw_data(host_filter, local_host_id, load_horizon, now);
     if host_filter.is_none() && raw_cache_has_any_tool_data(&cache) {
         let _ = write_hot_raw_snapshot(&data::cache::default_cache_dir(), &cache, now);
     }
@@ -295,7 +379,7 @@ pub(crate) fn read_full_cached_raw_data_for_hosts(
 
 /// Prefer the compact recent snapshot for the common all-host rolling view.
 /// It is only accepted while its timestamp range fully covers the request;
-/// otherwise the canonical complete cache is loaded and regenerates it.
+/// otherwise the requested slice of the canonical caches regenerates it.
 pub(crate) fn read_cached_raw_data_for_window(
     host_filter: Option<&str>,
     local_host_id: Option<&str>,
@@ -304,18 +388,19 @@ pub(crate) fn read_cached_raw_data_for_window(
 ) -> RawDataCache {
     let cache_root = data::cache::default_cache_dir();
     if host_filter.is_none()
-        && let Some(cache) =
+        && let Some(mut cache) =
             load_hot_raw_snapshot(&cache_root, local_host_id, required_horizon, now)
     {
+        scope_raw_cache(&mut cache, retained_horizon(required_horizon), now);
         return cache;
     }
-    read_full_cached_raw_data_for_hosts(host_filter, local_host_id, now)
+    load_persistent_raw_data_for_window(host_filter, local_host_id, required_horizon, now)
 }
 
-pub(crate) fn refresh_all_tool_raw_full(local_host_id: Option<&str>) -> RawDataCache {
+pub(crate) fn refresh_all_tool_caches() {
     let cache_root = data::cache::default_cache_dir();
     let claude_fast_tier = detect_claude_fast_tier_snapshot();
-    let _ = data::cache::refresh_retaining_vendor_cache(
+    data::cache::refresh_retaining_vendor_cache(
         &cache_root,
         "claude",
         data::claude::collect_usage_files(None),
@@ -325,7 +410,7 @@ pub(crate) fn refresh_all_tool_raw_full(local_host_id: Option<&str>) -> RawDataC
 
     let codex_dir = get_codex_dir().join("sessions");
     let codex_fast_tier = detect_codex_fast_tier_snapshot();
-    let _ = data::cache::refresh_retaining_vendor_cache(
+    data::cache::refresh_retaining_vendor_cache(
         &cache_root,
         "codex",
         data::codex::collect_usage_files(&codex_dir, None),
@@ -334,7 +419,7 @@ pub(crate) fn refresh_all_tool_raw_full(local_host_id: Option<&str>) -> RawDataC
     );
 
     let gemini_dir = get_gemini_dir().join("tmp");
-    let _ = data::cache::refresh_retaining_vendor_cache(
+    data::cache::refresh_retaining_vendor_cache(
         &cache_root,
         "gemini",
         data::gemini::collect_usage_files(&gemini_dir, None),
@@ -343,7 +428,7 @@ pub(crate) fn refresh_all_tool_raw_full(local_host_id: Option<&str>) -> RawDataC
     );
 
     let kimi_dir = get_kimi_dir().join("sessions");
-    let _ = data::cache::refresh_retaining_vendor_cache(
+    data::cache::refresh_retaining_vendor_cache(
         &cache_root,
         "kimi",
         data::kimi::collect_usage_files(&kimi_dir, None),
@@ -352,15 +437,13 @@ pub(crate) fn refresh_all_tool_raw_full(local_host_id: Option<&str>) -> RawDataC
     );
 
     let omp_dir = get_omp_dir().join("agent").join("sessions");
-    let _ = data::cache::refresh_retaining_vendor_cache(
+    data::cache::refresh_retaining_vendor_cache(
         &cache_root,
         "omp",
         data::omp::collect_usage_files(&omp_dir, None),
         0,
         data::omp::read_omp_file_records,
     );
-
-    local_cached_raw_cache(&cache_root, true, local_host_id)
 }
 
 /// Ensure `state.raw_cache` covers at least `required_horizon` days back.
@@ -383,30 +466,50 @@ pub(crate) fn ensure_raw_cache(state: &mut AppState, required_horizon: i64) -> &
 }
 
 pub(crate) fn start_background_raw_refresh(state: &mut AppState) {
+    start_background_raw_load(state, true);
+}
+
+pub(crate) fn start_background_raw_reload(state: &mut AppState) {
+    start_background_raw_load(state, false);
+}
+
+fn start_background_raw_load(state: &mut AppState, refresh_sources: bool) {
     if state.raw_refresh.is_some() {
         return;
     }
     let (tx, rx) = mpsc::channel();
     let host_filter = state.host.clone();
     let local_host_id = state.local_host_id.clone();
+    let time_window = state.time_window.clone();
+    let loaded_generation = state
+        .raw_cache
+        .as_ref()
+        .map(|cache| cache.persistent_generation.clone());
     state.raw_refresh = Some(rx);
     state.integrity_status = IntegrityStatus::Checking;
     state.integrity_started_at = Some(std::time::Instant::now());
     thread::spawn(move || {
-        let mut refreshed = refresh_all_tool_raw_full(local_host_id.as_deref());
-        if !include_local_for_host_filter(host_filter.as_deref(), local_host_id.as_deref()) {
-            clear_local_raw_cache(&mut refreshed);
+        if refresh_sources {
+            refresh_all_tool_caches();
+            let current_generation = crate::sync::cache_generation::raw_data_generation(
+                &data::cache::default_cache_dir(),
+            );
+            if loaded_generation.as_deref() == Some(current_generation.as_str()) {
+                crate::release_unused_heap_memory();
+                let _ = tx.send(BackgroundRawLoad::Unchanged);
+                return;
+            }
         }
-        let cache_root = data::cache::default_cache_dir();
-        let host_set = host_filter
-            .as_ref()
-            .map(|host| HashSet::from([host.clone()]));
-        let remote_records = data::cache::load_remote_entries(&cache_root, host_set.as_ref());
-        merge_remote_records_into_raw_cache(&mut refreshed, remote_records);
-        if host_filter.is_none() && raw_cache_has_any_tool_data(&refreshed) {
-            let _ = write_hot_raw_snapshot(&cache_root, &refreshed, Local::now());
-        }
-        let _ = tx.send(refreshed);
+        let now = Local::now();
+        let required_horizon = compute_required_horizon(&time_window, now);
+        let refreshed = load_persistent_raw_data_for_window(
+            host_filter.as_deref(),
+            local_host_id.as_deref(),
+            required_horizon,
+            now,
+        );
+        crate::release_unused_heap_memory();
+        let _ = tx.send(BackgroundRawLoad::Refreshed(Box::new(refreshed)));
     });
 }
 
@@ -415,8 +518,24 @@ pub(crate) fn poll_background_raw_refresh(state: &mut AppState) -> bool {
         return false;
     };
     match rx.try_recv() {
-        Ok(cache) => {
+        Ok(BackgroundRawLoad::Refreshed(cache)) => {
+            let mut cache = *cache;
+            let now = Local::now();
+            let required_horizon = compute_required_horizon(&state.time_window, now);
+            let scoped_horizon = retained_horizon(required_horizon).min(cache.horizon_days);
+            if scoped_horizon < cache.horizon_days {
+                scope_raw_cache(&mut cache, scoped_horizon, now);
+            }
             state.raw_cache = Some(cache);
+            let duration = state
+                .integrity_started_at
+                .take()
+                .map(|started_at| started_at.elapsed())
+                .unwrap_or_default();
+            state.integrity_status = IntegrityStatus::Checked { duration };
+            true
+        }
+        Ok(BackgroundRawLoad::Unchanged) => {
             let duration = state
                 .integrity_started_at
                 .take()
@@ -676,8 +795,13 @@ pub(crate) fn calculate_weighted_cost_per_mtok(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{AllPricing, SubscriptionFees};
+    use crate::table_view::TableView;
     #[allow(unused_imports)]
     use chrono::{Duration, TimeZone};
+    use std::collections::HashMap;
+
+    const TEST_FULL_HORIZON: i64 = i64::MAX / 4;
 
     #[test]
     fn weighted_cost_reuses_model_breakdown_totals() {
@@ -777,9 +901,10 @@ mod tests {
             gemini: Vec::new(),
             kimi: Vec::new(),
             omp: Vec::new(),
-            horizon_days: FULL_CACHE_HORIZON,
+            horizon_days: TEST_FULL_HORIZON,
             local_host_id: Some("workstation".to_string()),
             local_record_keys: HashSet::new(),
+            persistent_generation: crate::sync::cache_generation::raw_data_generation(&cache_root),
             local_session_metadata_current: true,
         };
 
@@ -795,6 +920,11 @@ mod tests {
         assert!(snapshot.local_session_metadata_current);
         assert!(load_hot_raw_snapshot(&cache_root, Some("other-host"), 3, now).is_none());
 
+        fs::create_dir_all(cache_root.join("remote")).expect("create remote cache");
+        fs::write(cache_root.join("remote").join("laptop.bin"), b"changed")
+            .expect("change persistent cache generation");
+        assert!(load_hot_raw_snapshot(&cache_root, Some("workstation"), 3, now).is_none());
+
         fs::remove_dir_all(cache_root).expect("remove cache root");
     }
 
@@ -807,6 +937,83 @@ mod tests {
         let window = TimeWindow::rolling_days(3);
 
         assert_eq!(compute_required_horizon(&window, now), 5);
+    }
+
+    #[test]
+    fn completed_background_refresh_is_scoped_to_the_visible_horizon() {
+        let now = Local::now();
+        let entry = |timestamp: DateTime<Local>| UsageEntry {
+            host_id: None,
+            session_id: None,
+            timestamp: timestamp.to_rfc3339(),
+            parsed_timestamp: Some(timestamp),
+            session_start_time: String::new(),
+            session_end_time: String::new(),
+            model: "test-model".to_string(),
+            effort: None,
+            fast_tier: -1,
+            usage: data::TokenUsage::default(),
+            costs: None,
+        };
+        let cache = RawDataCache {
+            claude: vec![
+                entry(now - Duration::days(1)),
+                entry(now - Duration::days(30)),
+            ],
+            codex: Vec::new(),
+            gemini: Vec::new(),
+            kimi: Vec::new(),
+            omp: Vec::new(),
+            horizon_days: TEST_FULL_HORIZON,
+            local_host_id: Some("workstation".to_string()),
+            local_record_keys: HashSet::from([("claude".to_string(), "key".to_string())]),
+            persistent_generation: String::new(),
+            local_session_metadata_current: true,
+        };
+        let (tx, rx) = mpsc::channel();
+        tx.send(BackgroundRawLoad::Refreshed(Box::new(cache)))
+            .expect("send cache");
+        let mut state = AppState {
+            tool: "all".to_string(),
+            table_view: TableView::Flat,
+            host: None,
+            session_id: None,
+            local_host_id: Some("workstation".to_string()),
+            days: 3,
+            time_window: TimeWindow::rolling_days(3),
+            monitor_interval: 3600,
+            pricing: AllPricing::load_raw().finalize(),
+            subscription_fees: SubscriptionFees::default(),
+            version_cache: HashMap::new(),
+            all_tool_prompt: None,
+            raw_cache: None,
+            raw_refresh: Some(rx),
+            integrity_status: IntegrityStatus::Checking,
+            integrity_started_at: None,
+        };
+
+        assert!(poll_background_raw_refresh(&mut state));
+
+        let cache = state.raw_cache.expect("foreground cache");
+        assert_eq!(cache.horizon_days, HOT_CACHE_HORIZON_DAYS);
+        assert_eq!(cache.claude.len(), 1);
+        assert!(cache.local_record_keys.is_empty());
+
+        state.raw_cache = Some(cache);
+        let (tx, rx) = mpsc::channel();
+        tx.send(BackgroundRawLoad::Unchanged)
+            .expect("send unchanged result");
+        state.raw_refresh = Some(rx);
+        assert!(poll_background_raw_refresh(&mut state));
+        assert_eq!(
+            state
+                .raw_cache
+                .as_ref()
+                .expect("retained cache")
+                .claude
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -845,9 +1052,10 @@ mod tests {
             gemini: Vec::new(),
             kimi: Vec::new(),
             omp: Vec::new(),
-            horizon_days: FULL_CACHE_HORIZON,
+            horizon_days: TEST_FULL_HORIZON,
             local_host_id: None,
             local_record_keys: HashSet::new(),
+            persistent_generation: String::new(),
             local_session_metadata_current: true,
         };
         merge_remote_records_into_raw_cache(
@@ -916,9 +1124,10 @@ mod tests {
             gemini: Vec::new(),
             kimi: Vec::new(),
             omp: Vec::new(),
-            horizon_days: FULL_CACHE_HORIZON,
+            horizon_days: TEST_FULL_HORIZON,
             local_host_id: Some("laptop".to_string()),
             local_record_keys: HashSet::from([("claude".to_string(), "a".to_string())]),
+            persistent_generation: String::new(),
             local_session_metadata_current: true,
         };
         merge_remote_records_into_raw_cache(

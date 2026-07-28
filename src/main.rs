@@ -39,7 +39,6 @@ pub(crate) use window_nav::*;
 
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 35;
-const FULL_CACHE_HORIZON: i64 = i64::MAX / 4;
 const DAY_PRESET_DAYS: i64 = 1;
 const WEEK_PRESET_DAYS: i64 = 7;
 const MONTH_PRESET_DAYS: i64 = 30;
@@ -63,10 +62,23 @@ struct AppState {
     version_cache: HashMap<String, VersionCacheEntry>,
     all_tool_prompt: Option<String>,
     raw_cache: Option<RawDataCache>,
-    raw_refresh: Option<mpsc::Receiver<RawDataCache>>,
+    raw_refresh: Option<mpsc::Receiver<BackgroundRawLoad>>,
     integrity_status: IntegrityStatus,
     integrity_started_at: Option<std::time::Instant>,
 }
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_unused_heap_memory() {
+    // Large cache rebuilds use short-lived allocations across several glibc
+    // arenas. Returning free pages here keeps the monitor's idle RSS tied to
+    // its live window rather than to the largest completed refresh.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_unused_heap_memory() {}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -704,7 +716,7 @@ fn run_sync_command(command: SyncCommand, sync_config: sync::config::SyncConfig)
             let result = match command {
                 SyncCommand::Push => {
                     eprintln!("sync push: refreshing local cache");
-                    let _ = refresh_all_tool_raw_full(Some(&config.machine_id));
+                    refresh_all_tool_caches();
                     let mut on_progress = |event: &sync::engine::SyncProgress| {
                         if let Some(message) = format_manual_sync_progress(event) {
                             eprintln!("{message}");
@@ -904,18 +916,13 @@ fn main() {
         let needs_session_metadata =
             needs_session_metadata(state.session_id.as_deref(), &refreshed);
         if !raw_cache_has_any_tool_data(&refreshed) || needs_session_metadata {
-            refreshed = refresh_all_tool_raw_full(state.local_host_id.as_deref());
-            if !include_local_for_host_filter(state.host.as_deref(), state.local_host_id.as_deref())
-            {
-                clear_local_raw_cache(&mut refreshed);
-            }
-            let cache_root = data::cache::default_cache_dir();
-            let host_set = state
-                .host
-                .as_ref()
-                .map(|host| HashSet::from([host.clone()]));
-            let remote_records = data::cache::load_remote_entries(&cache_root, host_set.as_ref());
-            merge_remote_records_into_raw_cache(&mut refreshed, remote_records);
+            refresh_all_tool_caches();
+            refreshed = load_persistent_raw_data_for_window(
+                state.host.as_deref(),
+                state.local_host_id.as_deref(),
+                required_horizon,
+                Local::now(),
+            );
         }
         state.raw_cache = Some(refreshed);
         let result = print_stats(&mut state, true);
@@ -968,9 +975,10 @@ mod tests {
             gemini: Vec::new(),
             kimi: Vec::new(),
             omp: Vec::new(),
-            horizon_days: FULL_CACHE_HORIZON,
+            horizon_days: i64::MAX,
             local_host_id: None,
             local_record_keys: HashSet::new(),
+            persistent_generation: String::new(),
             local_session_metadata_current: true,
         }
     }

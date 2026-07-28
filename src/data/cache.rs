@@ -1,17 +1,23 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Local};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageCost, UsageEntry};
 use crate::model_id::{Vendor, is_reasoning_effort, parse_model_identity};
 use crate::time_utils::parse_timestamp;
+
+#[cfg(test)]
+thread_local! {
+    static CACHED_RECORD_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 const CACHE_VERSION: u32 = 1;
 const ENTRY_FILE_MAGIC: &[u8; 8] = b"AIUCACH1";
@@ -172,6 +178,12 @@ struct PersistedVendorRecords {
     records: Vec<PersistedSourceRecord>,
 }
 
+#[derive(Serialize)]
+struct PersistedVendorRecordsRef<'a> {
+    format_version: u32,
+    records: &'a [PersistedSourceRecord],
+}
+
 /// Cache record layout before conversation ids were retained. Kept only for
 /// an in-place migration of existing binary caches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +248,12 @@ struct PersistedRemoteRecord {
 struct PersistedRemoteRecords {
     format_version: u32,
     records: Vec<PersistedRemoteRecord>,
+}
+
+#[derive(Serialize)]
+struct PersistedRemoteRecordsRef<'a> {
+    format_version: u32,
+    records: &'a [PersistedRemoteRecord],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -566,6 +584,7 @@ impl PersistedSourceRecord {
         }
     }
 
+    #[cfg(test)]
     fn to_usage_entry(&self) -> UsageEntry {
         UsageEntry {
             host_id: None,
@@ -576,6 +595,34 @@ impl PersistedSourceRecord {
             session_end_time: self.session_end_time.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            fast_tier: self.fast_tier,
+            usage: TokenUsage {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                cache_read_input_tokens: self.cache_read_input_tokens,
+                cache_creation_input_tokens: self.cache_creation_input_tokens,
+                reasoning_output_tokens: self.reasoning_output_tokens,
+            },
+            costs: persisted_costs(
+                self.cost_input,
+                self.cost_output,
+                self.cost_cache_read,
+                self.cost_cache_creation,
+            ),
+        }
+    }
+
+    fn into_usage_entry(self) -> UsageEntry {
+        let parsed_timestamp = parse_timestamp(&self.timestamp);
+        UsageEntry {
+            host_id: None,
+            session_id: self.session_id,
+            timestamp: self.timestamp,
+            parsed_timestamp,
+            session_start_time: self.session_start_time,
+            session_end_time: self.session_end_time,
+            model: self.model,
+            effort: self.effort,
             fast_tier: self.fast_tier,
             usage: TokenUsage {
                 input_tokens: self.input_tokens,
@@ -627,19 +674,20 @@ impl PersistedRemoteRecord {
         }
     }
 
-    fn to_remote_usage_record(&self, host_id: &str) -> RemoteUsageRecord {
+    fn into_remote_usage_record(self, host_id: &str) -> RemoteUsageRecord {
+        let parsed_timestamp = parse_timestamp(&self.timestamp);
         RemoteUsageRecord {
-            vendor: self.vendor.clone(),
-            dedup_key: self.dedup_key.clone(),
+            vendor: self.vendor,
+            dedup_key: self.dedup_key,
             entry: UsageEntry {
                 host_id: Some(host_id.to_string()),
                 session_id: None,
-                timestamp: self.timestamp.clone(),
-                parsed_timestamp: parse_timestamp(&self.timestamp),
-                session_start_time: self.session_start_time.clone(),
-                session_end_time: self.session_end_time.clone(),
-                model: self.model.clone(),
-                effort: self.effort.clone(),
+                timestamp: self.timestamp,
+                parsed_timestamp,
+                session_start_time: self.session_start_time,
+                session_end_time: self.session_end_time,
+                model: self.model,
+                effort: self.effort,
                 fast_tier: self.fast_tier,
                 usage: TokenUsage {
                     input_tokens: self.input_tokens,
@@ -691,48 +739,22 @@ pub fn default_cache_dir() -> PathBuf {
 /// checksum and atomic-write protocol as the authoritative record caches.
 pub(crate) fn load_hot_snapshot<T: DeserializeOwned>(cache_root: &Path) -> io::Result<Option<T>> {
     let path = cache_root.join(HOT_SNAPSHOT_FILE);
-    let content = match fs::read(path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    if content.len() < HOT_SNAPSHOT_MAGIC.len() + 8
-        || &content[..HOT_SNAPSHOT_MAGIC.len()] != HOT_SNAPSHOT_MAGIC
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid hot snapshot header",
-        ));
+    match validate_framed_file(&path, HOT_SNAPSHOT_MAGIC, "hot snapshot") {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     }
-    let checksum_start = HOT_SNAPSHOT_MAGIC.len();
-    let payload_start = checksum_start + 8;
-    let stored_checksum = u64::from_le_bytes(
-        content[checksum_start..payload_start]
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid checksum"))?,
-    );
-    let payload = &content[payload_start..];
-    if stored_checksum != fnv1a_bytes(0, payload) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "hot snapshot checksum mismatch",
-        ));
-    }
-    bincode::deserialize(payload)
-        .map(Some)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    deserialize_framed(&path, HOT_SNAPSHOT_MAGIC).map(Some)
 }
 
 /// Persist a compact derived snapshot. The canonical per-source cache files
 /// remain the source of truth and can always rebuild this file.
 pub(crate) fn write_hot_snapshot<T: Serialize>(cache_root: &Path, snapshot: &T) -> io::Result<()> {
-    let payload = bincode::serialize(snapshot).map_err(io::Error::other)?;
-    let checksum = fnv1a_bytes(0, &payload);
-    let mut content = Vec::with_capacity(HOT_SNAPSHOT_MAGIC.len() + 8 + payload.len());
-    content.extend_from_slice(HOT_SNAPSHOT_MAGIC);
-    content.extend_from_slice(&checksum.to_le_bytes());
-    content.extend_from_slice(&payload);
-    atomic_write(&cache_root.join(HOT_SNAPSHOT_FILE), &content)
+    atomic_serialize_framed(
+        &cache_root.join(HOT_SNAPSHOT_FILE),
+        HOT_SNAPSHOT_MAGIC,
+        snapshot,
+    )
 }
 
 /// Load cached entries for one vendor without touching source files.
@@ -753,11 +775,13 @@ pub fn load_vendor_cached_records(cache_root: &Path, vendor: &str) -> Vec<Cached
                     if !record.dedup_key.is_empty() && !seen.insert(record.dedup_key.clone()) {
                         return None;
                     }
-                    let entry = record.to_usage_entry();
+                    let source_path = record.source_path.clone();
+                    let dedup_key = record.dedup_key.clone();
+                    let entry = record.into_usage_entry();
                     Some(CachedUsageRecord {
                         vendor: vendor.to_string(),
-                        source_path: record.source_path,
-                        dedup_key: record.dedup_key,
+                        source_path,
+                        dedup_key,
                         entry,
                     })
                 })
@@ -766,15 +790,93 @@ pub fn load_vendor_cached_records(cache_root: &Path, vendor: &str) -> Vec<Cached
         .unwrap_or_default()
 }
 
+pub(crate) fn load_recent_vendor_cached_records(
+    cache_root: &Path,
+    vendor: &str,
+    cutoff: DateTime<Local>,
+) -> (Vec<(String, UsageEntry)>, bool) {
+    let path = vendor_entries_path(cache_root, vendor);
+    match read_cached_records(&path) {
+        Ok(records) => {
+            let has_cached_records = !records.is_empty();
+            let mut seen = HashSet::new();
+            let recent = records
+                .into_iter()
+                .filter_map(|record| {
+                    let timestamp = parse_timestamp(&record.timestamp)?;
+                    if timestamp < cutoff
+                        || (!record.dedup_key.is_empty() && !seen.insert(record.dedup_key.clone()))
+                    {
+                        return None;
+                    }
+                    let dedup_key = record.dedup_key.clone();
+                    Some((dedup_key, record.into_usage_entry()))
+                })
+                .collect();
+            (recent, has_cached_records)
+        }
+        Err(error) => {
+            if error.kind() == io::ErrorKind::InvalidData {
+                let _ = fs::remove_file(path);
+            }
+            (Vec::new(), false)
+        }
+    }
+}
+
 pub fn load_remote_entries(
     cache_root: &Path,
     hosts_filter: Option<&HashSet<String>>,
 ) -> Vec<RemoteUsageRecord> {
+    let host_files = remote_host_files(cache_root, hosts_filter);
+
+    // Per-host files decode in parallel; the indexed collect keeps the
+    // deterministic host order.
+    let per_host: Vec<Vec<RemoteUsageRecord>> = host_files
+        .par_iter()
+        .map(|(host_id, path)| {
+            let Ok(host_records) = read_remote_records(path) else {
+                return Vec::new();
+            };
+            let host_records = deduplicate_remote_omp_aliases(host_records);
+            host_records
+                .into_iter()
+                .map(|record| record.into_remote_usage_record(host_id))
+                .collect()
+        })
+        .collect();
+    per_host.into_iter().flatten().collect()
+}
+
+pub(crate) fn load_recent_remote_entries(
+    cache_root: &Path,
+    hosts_filter: Option<&HashSet<String>>,
+    cutoff: DateTime<Local>,
+) -> Vec<RemoteUsageRecord> {
+    let host_files = remote_host_files(cache_root, hosts_filter);
+    host_files
+        .into_iter()
+        .flat_map(|(host_id, path)| {
+            let records = read_remote_records(&path).unwrap_or_default();
+            deduplicate_remote_omp_aliases(records)
+                .into_iter()
+                .filter(|record| {
+                    parse_timestamp(&record.timestamp).is_some_and(|timestamp| timestamp >= cutoff)
+                })
+                .map(|record| record.into_remote_usage_record(&host_id))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn remote_host_files(
+    cache_root: &Path,
+    hosts_filter: Option<&HashSet<String>>,
+) -> Vec<(String, PathBuf)> {
     let remote_root = cache_root.join(REMOTE_DIR);
     let Ok(entries) = fs::read_dir(remote_root) else {
         return Vec::new();
     };
-
     let mut host_files: Vec<(String, PathBuf)> = entries
         .filter_map(|entry| {
             let entry = entry.ok()?;
@@ -790,23 +892,7 @@ pub fn load_remote_entries(
         })
         .collect();
     host_files.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // Per-host files decode in parallel; the indexed collect keeps the
-    // deterministic host order.
-    let per_host: Vec<Vec<RemoteUsageRecord>> = host_files
-        .par_iter()
-        .map(|(host_id, path)| {
-            let Ok(host_records) = read_remote_records(path) else {
-                return Vec::new();
-            };
-            let host_records = deduplicate_remote_omp_aliases(host_records);
-            host_records
-                .iter()
-                .map(|record| record.to_remote_usage_record(host_id))
-                .collect()
-        })
-        .collect();
-    per_host.into_iter().flatten().collect()
+    host_files
 }
 
 /// Remove every per-host file in the remote cache directory and report
@@ -1004,14 +1090,16 @@ pub fn load_or_update_vendor_cache<F>(
 where
     F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
 {
-    load_or_update_vendor_cache_inner(
+    let active_sources = current_sources(source_files);
+    let records = load_or_update_vendor_cache_inner(
         cache_root,
         vendor,
-        source_files,
+        active_sources,
         current_fast_tier,
         parse_file,
         true,
-    )
+    );
+    aggregate_persisted_records(records.iter())
 }
 
 #[cfg(test)]
@@ -1025,14 +1113,16 @@ pub fn refresh_full_vendor_cache<F>(
 where
     F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
 {
-    load_or_update_vendor_cache_inner(
+    let active_sources = current_sources(source_files);
+    let records = load_or_update_vendor_cache_inner(
         cache_root,
         vendor,
-        source_files,
+        active_sources,
         current_fast_tier,
         parse_file,
         false,
-    )
+    );
+    aggregate_persisted_records(records.iter())
 }
 
 pub fn refresh_retaining_vendor_cache<F>(
@@ -1041,37 +1131,72 @@ pub fn refresh_retaining_vendor_cache<F>(
     source_files: Vec<PathBuf>,
     current_fast_tier: i8,
     parse_file: F,
-) -> Vec<UsageEntry>
-where
+) where
     F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
 {
-    load_or_update_vendor_cache_inner(
+    let active_sources = current_sources(source_files);
+    if retaining_vendor_cache_is_current(cache_root, vendor, &active_sources) {
+        return;
+    }
+    let _ = load_or_update_vendor_cache_inner(
         cache_root,
         vendor,
-        source_files,
+        active_sources,
         current_fast_tier,
         parse_file,
         true,
-    )
+    );
+}
+
+fn retaining_vendor_cache_is_current(
+    cache_root: &Path,
+    vendor: &str,
+    active_sources: &[CurrentSource],
+) -> bool {
+    let entries_path = vendor_entries_path(cache_root, vendor);
+    let manifest_path = cache_root.join(MANIFEST_FILE);
+    if !cache_artifact_precedes_manifest(&entries_path, &manifest_path) {
+        return false;
+    }
+    let manifest = read_manifest(&manifest_path);
+    let Some(vendor_manifest) = manifest.vendors.get(vendor) else {
+        return false;
+    };
+    let required_revision = parser_revision(vendor);
+    vendor_manifest.session_metadata_revision == required_revision
+        && active_sources.iter().all(|source| {
+            vendor_manifest.files.get(&source.key).is_some_and(|meta| {
+                meta.parser_revision == required_revision && meta.matches_stat(&source.stat)
+            })
+        })
+}
+
+fn cache_artifact_precedes_manifest(entries_path: &Path, manifest_path: &Path) -> bool {
+    let Some(entries_stat) = stat_source_file(entries_path) else {
+        return false;
+    };
+    let Some(manifest_stat) = stat_source_file(manifest_path) else {
+        return false;
+    };
+    (entries_stat.modified_secs, entries_stat.modified_nanos)
+        < (manifest_stat.modified_secs, manifest_stat.modified_nanos)
 }
 
 fn load_or_update_vendor_cache_inner<F>(
     cache_root: &Path,
     vendor: &str,
-    source_files: Vec<PathBuf>,
+    active_sources: Vec<CurrentSource>,
     current_fast_tier: i8,
     parse_file: F,
     retain_inactive_sources: bool,
-) -> Vec<UsageEntry>
+) -> Vec<PersistedSourceRecord>
 where
     F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
 {
-    let active_sources = current_sources(source_files);
     if fs::create_dir_all(cache_root).is_err()
         || fs::create_dir_all(cache_root.join(ENTRIES_DIR)).is_err()
     {
-        let records = parse_active_sources(&active_sources, current_fast_tier, &parse_file);
-        return aggregate_persisted_records(records.iter());
+        return parse_active_sources(&active_sources, current_fast_tier, &parse_file);
     }
 
     let manifest_path = cache_root.join(MANIFEST_FILE);
@@ -1168,50 +1293,33 @@ where
         cache_changed |= has_inactive_records || has_inactive_manifest_entries;
     }
 
-    let mut retained_inactive_records = Vec::new();
     if retain_inactive_sources {
-        for (source_path, records) in &records_by_path {
-            if !active_keys.contains(source_path) {
-                retained_inactive_records.extend(records.iter().cloned());
+        for (source_path, records) in records_by_path {
+            if !active_keys.contains(&source_path) {
+                active_records.extend(records);
             }
         }
     }
 
-    let returned_records = if retain_inactive_sources {
-        let mut records =
-            Vec::with_capacity(active_records.len() + retained_inactive_records.len());
-        records.extend(active_records.iter().cloned());
-        records.extend(retained_inactive_records.iter().cloned());
-        records
-    } else {
-        active_records.clone()
-    };
-
+    if parser_revision != 0 {
+        next_vendor_manifest.session_metadata_revision = parser_revision;
+    }
+    if !retain_inactive_sources {
+        next_vendor_manifest
+            .files
+            .retain(|source_path, _| active_keys.contains(source_path));
+    }
+    manifest
+        .vendors
+        .insert(vendor.to_string(), next_vendor_manifest);
     if cache_changed {
-        if parser_revision != 0 {
-            next_vendor_manifest.session_metadata_revision = parser_revision;
-        }
-        if !retain_inactive_sources {
-            next_vendor_manifest
-                .files
-                .retain(|source_path, _| active_keys.contains(source_path));
-        }
-        let mut records_to_write: Vec<PersistedSourceRecord> = Vec::new();
-        records_to_write.extend(active_records.iter().cloned());
-        for (source_path, records) in records_by_path {
-            if retain_inactive_sources && !active_keys.contains(&source_path) {
-                records_to_write.extend(records);
-            }
-        }
-
-        manifest
-            .vendors
-            .insert(vendor.to_string(), next_vendor_manifest);
-        let _ = write_cached_records(&entries_path, &records_to_write);
+        let _ = write_cached_records(&entries_path, &active_records);
+    }
+    if cache_changed || !cache_artifact_precedes_manifest(&entries_path, &manifest_path) {
         let _ = write_manifest(&manifest_path, &manifest);
     }
 
-    aggregate_persisted_records(returned_records.iter())
+    active_records
 }
 
 fn rebuild_vendor_cache<F>(
@@ -1222,7 +1330,7 @@ fn rebuild_vendor_cache<F>(
     active_sources: Vec<CurrentSource>,
     current_fast_tier: i8,
     parse_file: &F,
-) -> Vec<UsageEntry>
+) -> Vec<PersistedSourceRecord>
 where
     F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
 {
@@ -1249,7 +1357,7 @@ where
     let _ = write_cached_records(&vendor_entries_path(cache_root, vendor), &active_records);
     let _ = write_manifest(manifest_path, &manifest);
 
-    aggregate_persisted_records(active_records.iter())
+    active_records
 }
 
 fn parse_active_sources<F>(
@@ -1379,31 +1487,10 @@ fn write_manifest(path: &Path, manifest: &CacheManifest) -> io::Result<()> {
 }
 
 fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
-    let content = fs::read(path)?;
-    if content.len() < ENTRY_FILE_MAGIC.len() + 8
-        || &content[..ENTRY_FILE_MAGIC.len()] != ENTRY_FILE_MAGIC
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid cache entry header",
-        ));
-    }
-    let checksum_start = ENTRY_FILE_MAGIC.len();
-    let payload_start = checksum_start + 8;
-    let stored_checksum = u64::from_le_bytes(
-        content[checksum_start..payload_start]
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid checksum"))?,
-    );
-    let payload = &content[payload_start..];
-    let actual_checksum = fnv1a_bytes(0, payload);
-    if stored_checksum != actual_checksum {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cache entry checksum mismatch",
-        ));
-    }
-    if let Ok(decoded) = bincode::deserialize::<PersistedVendorRecords>(payload) {
+    #[cfg(test)]
+    CACHED_RECORD_READS.set(CACHED_RECORD_READS.get() + 1);
+    validate_framed_file(path, ENTRY_FILE_MAGIC, "cache entry")?;
+    if let Ok(decoded) = deserialize_framed::<PersistedVendorRecords>(path, ENTRY_FILE_MAGIC) {
         if decoded.format_version != CACHE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1423,7 +1510,9 @@ fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
         return Ok(decoded.records);
     }
 
-    if let Ok(decoded) = bincode::deserialize::<PersistedVendorRecordsBeforeSession>(payload) {
+    if let Ok(decoded) =
+        deserialize_framed::<PersistedVendorRecordsBeforeSession>(path, ENTRY_FILE_MAGIC)
+    {
         if decoded.format_version != CACHE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1444,7 +1533,9 @@ fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
         return Ok(records);
     }
 
-    if let Ok(decoded) = bincode::deserialize::<PersistedVendorRecordsWithFastTier>(payload) {
+    if let Ok(decoded) =
+        deserialize_framed::<PersistedVendorRecordsWithFastTier>(path, ENTRY_FILE_MAGIC)
+    {
         if decoded.format_version != CACHE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1465,8 +1556,7 @@ fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
         return Ok(records);
     }
 
-    let decoded: PersistedVendorRecordsV1 = bincode::deserialize(payload)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let decoded: PersistedVendorRecordsV1 = deserialize_framed(path, ENTRY_FILE_MAGIC)?;
     if decoded.format_version != CACHE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1487,45 +1577,19 @@ fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
 }
 
 fn write_cached_records(path: &Path, records: &[PersistedSourceRecord]) -> io::Result<()> {
-    let payload = bincode::serialize(&PersistedVendorRecords {
-        format_version: CACHE_VERSION,
-        records: records.to_vec(),
-    })
-    .map_err(io::Error::other)?;
-    let checksum = fnv1a_bytes(0, &payload);
-    let mut content = Vec::with_capacity(ENTRY_FILE_MAGIC.len() + 8 + payload.len());
-    content.extend_from_slice(ENTRY_FILE_MAGIC);
-    content.extend_from_slice(&checksum.to_le_bytes());
-    content.extend_from_slice(&payload);
-    atomic_write(path, &content)
+    atomic_serialize_framed(
+        path,
+        ENTRY_FILE_MAGIC,
+        &PersistedVendorRecordsRef {
+            format_version: CACHE_VERSION,
+            records,
+        },
+    )
 }
 
 fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
-    let content = fs::read(path)?;
-    if content.len() < REMOTE_FILE_MAGIC.len() + 8
-        || &content[..REMOTE_FILE_MAGIC.len()] != REMOTE_FILE_MAGIC
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid remote cache entry header",
-        ));
-    }
-    let checksum_start = REMOTE_FILE_MAGIC.len();
-    let payload_start = checksum_start + 8;
-    let stored_checksum = u64::from_le_bytes(
-        content[checksum_start..payload_start]
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid checksum"))?,
-    );
-    let payload = &content[payload_start..];
-    let actual_checksum = fnv1a_bytes(0, payload);
-    if stored_checksum != actual_checksum {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "remote cache entry checksum mismatch",
-        ));
-    }
-    if let Ok(decoded) = bincode::deserialize::<PersistedRemoteRecords>(payload) {
+    validate_framed_file(path, REMOTE_FILE_MAGIC, "remote cache entry")?;
+    if let Ok(decoded) = deserialize_framed::<PersistedRemoteRecords>(path, REMOTE_FILE_MAGIC) {
         if decoded.format_version != CACHE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1545,7 +1609,9 @@ fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
         return Ok(decoded.records);
     }
 
-    if let Ok(decoded) = bincode::deserialize::<PersistedRemoteRecordsWithFastTier>(payload) {
+    if let Ok(decoded) =
+        deserialize_framed::<PersistedRemoteRecordsWithFastTier>(path, REMOTE_FILE_MAGIC)
+    {
         if decoded.format_version != CACHE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1566,8 +1632,7 @@ fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
         return Ok(records);
     }
 
-    let decoded: PersistedRemoteRecordsV1 = bincode::deserialize(payload)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let decoded: PersistedRemoteRecordsV1 = deserialize_framed(path, REMOTE_FILE_MAGIC)?;
     if decoded.format_version != CACHE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1588,20 +1653,114 @@ fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
 }
 
 fn write_remote_records(path: &Path, records: &[PersistedRemoteRecord]) -> io::Result<()> {
-    let payload = bincode::serialize(&PersistedRemoteRecords {
-        format_version: CACHE_VERSION,
-        records: records.to_vec(),
+    atomic_serialize_framed(
+        path,
+        REMOTE_FILE_MAGIC,
+        &PersistedRemoteRecordsRef {
+            format_version: CACHE_VERSION,
+            records,
+        },
+    )
+}
+
+fn validate_framed_file(path: &Path, magic: &[u8], label: &str) -> io::Result<()> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut actual_magic = vec![0_u8; magic.len()];
+    reader.read_exact(&mut actual_magic).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {label} header"),
+        )
+    })?;
+    if actual_magic != magic {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {label} header"),
+        ));
+    }
+    let mut checksum_bytes = [0_u8; 8];
+    reader
+        .read_exact(&mut checksum_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid checksum"))?;
+    let stored_checksum = u64::from_le_bytes(checksum_bytes);
+    let mut actual_checksum = fnv1a_bytes(0, &[]);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        actual_checksum = fnv1a_bytes(actual_checksum, &buffer[..read]);
+    }
+    if stored_checksum != actual_checksum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} checksum mismatch"),
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_framed<T: DeserializeOwned>(path: &Path, magic: &[u8]) -> io::Result<T> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    reader.seek(SeekFrom::Start((magic.len() + 8) as u64))?;
+    bincode::deserialize_from(reader)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+struct FnvWriter<W> {
+    inner: W,
+    checksum: u64,
+}
+
+impl<W> FnvWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            checksum: fnv1a_bytes(0, &[]),
+        }
+    }
+}
+
+impl<W: Write> Write for FnvWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.checksum = fnv1a_bytes(self.checksum, &bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn atomic_serialize_framed<T: Serialize + ?Sized>(
+    path: &Path,
+    magic: &[u8],
+    value: &T,
+) -> io::Result<()> {
+    atomic_write_with(path, |file| {
+        file.seek(SeekFrom::Start((magic.len() + 8) as u64))?;
+        let checksum = {
+            let mut writer = FnvWriter::new(BufWriter::new(&mut *file));
+            bincode::serialize_into(&mut writer, value).map_err(io::Error::other)?;
+            writer.flush()?;
+            writer.checksum
+        };
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(magic)?;
+        file.write_all(&checksum.to_le_bytes())
     })
-    .map_err(io::Error::other)?;
-    let checksum = fnv1a_bytes(0, &payload);
-    let mut content = Vec::with_capacity(REMOTE_FILE_MAGIC.len() + 8 + payload.len());
-    content.extend_from_slice(REMOTE_FILE_MAGIC);
-    content.extend_from_slice(&checksum.to_le_bytes());
-    content.extend_from_slice(&payload);
-    atomic_write(path, &content)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write_with(path, |file| file.write_all(bytes))
+}
+
+fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1610,10 +1769,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_nanos();
     let tmp_path = path.with_extension(format!("tmp-{}", stamp));
-    {
+    let result = (|| {
         let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+        write(&mut file)?;
+        file.sync_all()
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
     }
     fs::rename(tmp_path, path)?;
     Ok(())
@@ -1624,10 +1787,11 @@ fn records_by_path(
 ) -> BTreeMap<String, Vec<PersistedSourceRecord>> {
     let mut result: BTreeMap<String, Vec<PersistedSourceRecord>> = BTreeMap::new();
     for record in records {
-        result
-            .entry(record.source_path.clone())
-            .or_default()
-            .push(record);
+        if let Some(records) = result.get_mut(record.source_path.as_str()) {
+            records.push(record);
+        } else {
+            result.insert(record.source_path.clone(), vec![record]);
+        }
     }
     result
 }
@@ -1727,7 +1891,11 @@ fn persisted_record_fingerprint_without_effort(
 fn record_stats_by_path(records: &[PersistedSourceRecord]) -> HashMap<String, RecordStats> {
     let mut stats: HashMap<String, RecordStats> = HashMap::new();
     for record in records {
-        let entry = stats.entry(record.source_path.clone()).or_default();
+        let entry = if let Some(entry) = stats.get_mut(record.source_path.as_str()) {
+            entry
+        } else {
+            stats.entry(record.source_path.clone()).or_default()
+        };
         entry.count += 1;
         entry.hash = update_record_hash(entry.hash, record);
     }
@@ -1788,6 +1956,7 @@ fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+#[cfg(test)]
 fn aggregate_persisted_records<'a>(
     records: impl IntoIterator<Item = &'a PersistedSourceRecord>,
 ) -> Vec<UsageEntry> {
@@ -2193,10 +2362,9 @@ mod tests {
         .expect("write stale manifest");
         fs::remove_file(&retired).expect("remove retired source");
 
-        let _ =
-            super::refresh_retaining_vendor_cache(&cache_root, "claude", vec![active], -1, |_| {
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            });
+        super::refresh_retaining_vendor_cache(&cache_root, "claude", vec![active], -1, |_| {
+            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
+        });
 
         assert!(super::vendor_session_metadata_is_current(
             &cache_root,
@@ -2492,6 +2660,61 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].usage.input_tokens, 42);
         assert_eq!(second[0].fast_tier, 1);
+    }
+
+    #[test]
+    fn unchanged_retaining_refresh_does_not_decode_the_entry_cache() {
+        let cache_root = unique_temp_dir("retaining-refresh-fast-path");
+        let source = cache_root.join("source.jsonl");
+        write_source(&source, "first");
+
+        let _ = super::load_or_update_vendor_cache(
+            &cache_root,
+            "claude",
+            vec![source.clone()],
+            -1,
+            |_| vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)],
+        );
+        super::CACHED_RECORD_READS.set(0);
+
+        super::refresh_retaining_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
+            panic!("unchanged source should not be parsed")
+        });
+
+        assert_eq!(super::CACHED_RECORD_READS.get(), 0);
+    }
+
+    #[test]
+    fn retaining_refresh_rebuilds_a_tampered_entry_cache() {
+        let cache_root = unique_temp_dir("retaining-refresh-tampered-cache");
+        let source = cache_root.join("source.jsonl");
+        write_source(&source, "first");
+        let calls = AtomicUsize::new(0);
+
+        super::refresh_retaining_vendor_cache(
+            &cache_root,
+            "claude",
+            vec![source.clone()],
+            -1,
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
+            },
+        );
+        let entries_path = cache_root.join("entries").join("claude.bin");
+        let mut content = fs::read(&entries_path).expect("read cache");
+        let last = content.last_mut().expect("nonempty cache");
+        *last = last.wrapping_add(1);
+        fs::write(&entries_path, content).expect("tamper cache");
+
+        super::refresh_retaining_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
+        });
+
+        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "claude");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(entry_tokens(&snapshot), vec![77]);
     }
 
     #[test]
@@ -3006,14 +3229,14 @@ mod tests {
     }
 
     #[test]
-    fn retaining_refresh_keeps_records_for_deleted_sources_in_returned_view() {
+    fn retaining_refresh_keeps_records_for_deleted_sources_in_cache() {
         let cache_root = unique_temp_dir("retain-deleted");
         let first_source = cache_root.join("a.jsonl");
         let second_source = cache_root.join("b.jsonl");
         write_source(&first_source, "first");
         write_source(&second_source, "second");
 
-        let _ = super::refresh_retaining_vendor_cache(
+        super::refresh_retaining_vendor_cache(
             &cache_root,
             "test",
             vec![first_source.clone(), second_source.clone()],
@@ -3028,16 +3251,11 @@ mod tests {
         );
         fs::remove_file(&second_source).expect("remove source");
 
-        let refreshed = super::refresh_retaining_vendor_cache(
-            &cache_root,
-            "test",
-            vec![first_source],
-            -1,
-            |_| vec![usage_record("first", "2026-05-01T00:00:00Z", 1)],
-        );
+        super::refresh_retaining_vendor_cache(&cache_root, "test", vec![first_source], -1, |_| {
+            vec![usage_record("first", "2026-05-01T00:00:00Z", 1)]
+        });
         let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
 
-        assert_eq!(entry_tokens(&refreshed), vec![1, 2]);
         assert_eq!(entry_tokens(&snapshot), vec![1, 2]);
     }
 }

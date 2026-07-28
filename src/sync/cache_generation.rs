@@ -14,29 +14,71 @@ pub(crate) fn local_cache_generation(cache_root: &Path, vendors: &[&str]) -> Str
         hasher.update((vendor.len() as u64).to_le_bytes());
         hasher.update(vendor.as_bytes());
         let path = cache_root.join("entries").join(format!("{vendor}.bin"));
-        let Ok(metadata) = fs::metadata(path) else {
-            hasher.update([0]);
-            continue;
-        };
-        hasher.update([1]);
-        hasher.update(metadata.len().to_le_bytes());
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .unwrap_or_default();
-        hasher.update(modified.as_secs().to_le_bytes());
-        hasher.update(modified.subsec_nanos().to_le_bytes());
-        #[cfg(unix)]
-        {
-            hasher.update(metadata.ctime().to_le_bytes());
-            hasher.update(metadata.ctime_nsec().to_le_bytes());
-            hasher.update(metadata.dev().to_le_bytes());
-            hasher.update(metadata.ino().to_le_bytes());
-        }
+        update_file_generation(&mut hasher, &path);
     }
-    hasher
-        .finalize()
+    format_digest(hasher.finalize())
+}
+
+pub(crate) fn remote_cache_generation(cache_root: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sync-remote-cache-generation-v1");
+    let Ok(entries) = fs::read_dir(cache_root.join("remote")) else {
+        return format_digest(hasher.finalize());
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        update_file_generation(&mut hasher, &path);
+    }
+    format_digest(hasher.finalize())
+}
+
+pub(crate) fn raw_data_generation(cache_root: &Path) -> String {
+    let local = local_cache_generation(cache_root, &super::engine::SUPPORTED_PULL_VENDORS);
+    let remote = remote_cache_generation(cache_root);
+    let mut hasher = Sha256::new();
+    hasher.update(b"raw-data-generation-v1");
+    hasher.update(local.as_bytes());
+    hasher.update(remote.as_bytes());
+    format_digest(hasher.finalize())
+}
+
+fn update_file_generation(hasher: &mut Sha256, path: &Path) {
+    let Ok(metadata) = fs::metadata(path) else {
+        hasher.update([0]);
+        return;
+    };
+    hasher.update([1]);
+    hasher.update(metadata.len().to_le_bytes());
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    hasher.update(modified.as_secs().to_le_bytes());
+    hasher.update(modified.subsec_nanos().to_le_bytes());
+    #[cfg(unix)]
+    {
+        hasher.update(metadata.ctime().to_le_bytes());
+        hasher.update(metadata.ctime_nsec().to_le_bytes());
+        hasher.update(metadata.dev().to_le_bytes());
+        hasher.update(metadata.ino().to_le_bytes());
+    }
+}
+
+fn format_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()

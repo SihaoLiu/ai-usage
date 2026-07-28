@@ -164,7 +164,6 @@ fn switch_host(state: &mut AppState, selection: &str) -> Outcome {
             }
             state.host = new_host;
             state.raw_cache = None;
-            state.raw_refresh = None;
             Outcome::message(
                 Effect::ReloadRefresh,
                 format!("Switched to host {}", host_label(state.host.as_deref())),
@@ -269,16 +268,14 @@ pub fn execute(state: &mut AppState, raw: &str) -> Outcome {
         },
         "session" => set_session(state, None),
         _ => {
-            if let Some(parsed) = parse_time_window_command(command, state.days) {
+            let now = Local::now();
+            if let Some(parsed) = parse_time_window_command(command, &state.time_window, now) {
                 return match parsed {
                     Ok(window) => {
                         state.time_window = window;
                         Outcome::message(
                             Effect::Refresh,
-                            format!(
-                                "Time window: {}",
-                                state.time_window.display_label(Local::now())
-                            ),
+                            format!("Time window: {}", state.time_window.display_label(now)),
                         )
                     }
                     Err(err) => Outcome::message(Effect::None, err),
@@ -472,12 +469,12 @@ static HELP_TOPICS: &[HelpTopic] = &[
         name: "latest",
         invocation: "latest",
         keys: &[],
-        summary: "Return to the rolling days window",
+        summary: "Follow the present with the current span",
         detail: &[
             "Usage: latest",
             "",
-            "Leaves a pinned date/range (or a slid/zoomed window) and returns",
-            "to the rolling N-days window anchored at now.",
+            "Keeps the current window width and anchors its newest edge at",
+            "now. Each refresh advances both bounds by the elapsed time.",
         ],
     },
     HelpTopic {
@@ -618,6 +615,18 @@ mod tests {
     }
 
     #[test]
+    fn host_switch_keeps_the_in_flight_refresh_receiver() {
+        let mut state = test_state();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        state.raw_refresh = Some(rx);
+
+        let outcome = execute(&mut state, "host workstation");
+
+        assert_eq!(outcome.effect, Effect::ReloadRefresh);
+        assert!(state.raw_refresh.is_some());
+    }
+
+    #[test]
     fn day_presets_and_custom_days_change_window() {
         let mut state = test_state();
         let outcome = execute(&mut state, "w");
@@ -631,6 +640,23 @@ mod tests {
         let outcome = execute(&mut state, "days 14");
         assert_eq!(outcome.effect, Effect::Refresh);
         assert_eq!(state.days, 14);
+    }
+
+    #[test]
+    fn latest_preserves_the_current_window_span() {
+        let mut state = test_state();
+        state.time_window =
+            TimeWindow::from_range("2026-07-27T08:00", "2026-07-27T20:00").expect("range");
+        let now = Local::now();
+        let (before_start, before_end) = state.time_window.bounds(now);
+
+        let outcome = execute(&mut state, "latest");
+        let later = Local::now() + chrono::Duration::minutes(5);
+        let (after_start, after_end) = state.time_window.bounds(later);
+
+        assert_eq!(outcome.effect, Effect::Refresh);
+        assert_eq!(after_end - after_start, before_end - before_start);
+        assert_eq!(after_end, later);
     }
 
     #[test]

@@ -40,14 +40,21 @@ struct Notice {
     expires_at: Instant,
 }
 
-/// Tracks the host that the in-flight source refresh was started for. Source
-/// scans are intentionally single-flight, but a host change must not let an
-/// older scan replace the newly selected host's cache.
+/// Tracks the host and kind of the in-flight cache load. Loads are
+/// intentionally single-flight, but newer requests must run after a stale
+/// result completes.
 #[derive(Default)]
 struct RawRefreshTracker {
     running: bool,
     active_host: Option<String>,
-    refresh_again: bool,
+    active_kind: Option<RawLoadKind>,
+    follow_up: Option<RawLoadKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawLoadKind {
+    Cached,
+    Sources,
 }
 
 impl RawRefreshTracker {
@@ -56,29 +63,89 @@ impl RawRefreshTracker {
     /// one follow-up request instead of launching another source scan.
     fn request(&mut self, host: &Option<String>) -> bool {
         if self.running {
-            self.refresh_again = self.active_host.as_deref() != host.as_deref();
+            if self.active_host.as_deref() != host.as_deref() {
+                self.follow_up = Some(RawLoadKind::Sources);
+            } else {
+                match self.active_kind {
+                    Some(RawLoadKind::Cached) => {
+                        self.follow_up = Some(RawLoadKind::Sources);
+                    }
+                    Some(RawLoadKind::Sources) if self.follow_up == Some(RawLoadKind::Sources) => {
+                        self.follow_up = None;
+                    }
+                    _ => {}
+                }
+            }
             return false;
         }
         self.running = true;
         self.active_host = host.clone();
+        self.active_kind = Some(RawLoadKind::Sources);
         true
     }
 
-    /// Returns true if the completed data belongs to an obsolete host or a
-    /// newer host request was coalesced while it ran.
-    fn complete(&mut self, current_host: &Option<String>) -> bool {
+    fn request_reload(&mut self, host: &Option<String>) -> bool {
+        if self.running {
+            self.follow_up.get_or_insert(RawLoadKind::Cached);
+            return false;
+        }
+        self.running = true;
+        self.active_host = host.clone();
+        self.active_kind = Some(RawLoadKind::Cached);
+        true
+    }
+
+    /// Returns the coalesced follow-up, if any. A result for an obsolete host
+    /// always schedules a source refresh for the current host.
+    fn complete(&mut self, current_host: &Option<String>) -> Option<RawLoadKind> {
         let stale = self.active_host.as_deref() != current_host.as_deref();
         self.running = false;
         self.active_host = None;
-        let refresh_again = stale || self.refresh_again;
-        self.refresh_again = false;
-        refresh_again
+        self.active_kind = None;
+        if stale {
+            self.follow_up = Some(RawLoadKind::Sources);
+        }
+        self.follow_up.take()
     }
 
     fn abandon(&mut self) {
         self.running = false;
         self.active_host = None;
-        self.refresh_again = false;
+        self.active_kind = None;
+        self.follow_up = None;
+    }
+}
+
+fn request_background_reload(state: &mut AppState, tracker: &mut RawRefreshTracker) {
+    if tracker.request_reload(&state.host) {
+        crate::start_background_raw_reload(state);
+        if state.raw_refresh.is_none() {
+            tracker.abandon();
+        }
+    }
+}
+
+fn request_follow_up(state: &mut AppState, tracker: &mut RawRefreshTracker, kind: RawLoadKind) {
+    match kind {
+        RawLoadKind::Cached => request_background_reload(state, tracker),
+        RawLoadKind::Sources => request_background_refresh(state, tracker),
+    }
+}
+
+fn rebuild_or_reload_window(
+    state: &mut AppState,
+    dashboard: &mut data::Dashboard,
+    tracker: &mut RawRefreshTracker,
+) {
+    let now = Local::now();
+    if crate::raw_cache_covers_window(state, now) {
+        let trimmed = crate::trim_raw_cache_to_window(state, now);
+        *dashboard = data::build(state);
+        if trimmed {
+            crate::release_unused_heap_memory();
+        }
+    } else {
+        request_background_reload(state, tracker);
     }
 }
 
@@ -190,6 +257,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
     let mut notice = make_notice(vec![load_duration_text(load_started.elapsed())]);
     let mut help: Option<HelpView> = None;
     let mut observed_sync_revision = 0_u64;
+    let mut observed_remote_cache_revision = 0_u64;
     let mut sync_status = crate::current_sync_status(sync_worker.as_ref());
     let mut refresh_tracker = RawRefreshTracker::default();
 
@@ -203,13 +271,14 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
 
     'monitor: loop {
         if crate::poll_background_raw_refresh(state) {
-            let needs_replacement = refresh_tracker.complete(&state.host);
-            if needs_replacement {
-                // Do not retain a result collected for an old host. The
-                // current host can be rebuilt from its cache while the single
-                // replacement source scan runs in the background.
+            if let Some(kind) = refresh_tracker.complete(&state.host) {
+                // A coalesced request supersedes this snapshot. Release it
+                // before starting the single follow-up load.
                 state.raw_cache = None;
-                request_background_refresh(state, &mut refresh_tracker);
+                request_follow_up(state, &mut refresh_tracker, kind);
+            } else if crate::raw_cache_covers_window(state, Local::now()) {
+                dashboard = data::build(state);
+                crate::release_unused_heap_memory();
             }
             if sync_worker.is_some() {
                 next_sync = crate::monitor_sync_deadline_after_refresh(
@@ -219,7 +288,6 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                     &machine_id,
                 );
             }
-            dashboard = data::build(state);
         } else if refresh_tracker.running && state.raw_refresh.is_none() {
             // A worker can disconnect without sending its snapshot. Let the
             // next refresh request start normally instead of keeping the
@@ -243,13 +311,12 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 state.integrity_status =
                     crate::integrity_status_from_verification(verification, duration);
             }
-            if !stats.running && stats.last_error.is_none() && stats.success_count > 0 {
-                state.raw_cache = Some(crate::read_full_cached_raw_data_for_hosts(
-                    state.host.as_deref(),
-                    state.local_host_id.as_deref(),
-                    Local::now(),
-                ));
-                dashboard = data::build(state);
+            if !stats.running
+                && stats.last_error.is_none()
+                && stats.remote_cache_revision > observed_remote_cache_revision
+            {
+                observed_remote_cache_revision = stats.remote_cache_revision;
+                request_background_reload(state, &mut refresh_tracker);
             }
             sync_status = crate::format_monitor_sync_status(&stats);
         }
@@ -274,7 +341,6 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
 
         if Instant::now() >= next_refresh {
             request_background_refresh(state, &mut refresh_tracker);
-            dashboard = data::build(state);
             next_refresh = Instant::now() + monitor_interval(state);
         }
 
@@ -362,7 +428,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                         notice = make_notice(messages);
                     }
                     Effect::Refresh => {
-                        dashboard = data::build(state);
+                        rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
                         next_refresh = Instant::now() + monitor_interval(state);
                     }
                     Effect::ViewChanged => {
@@ -370,7 +436,6 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                     }
                     Effect::ReloadRefresh => {
                         request_background_refresh(state, &mut refresh_tracker);
-                        dashboard = data::build(state);
                         next_refresh = Instant::now() + monitor_interval(state);
                     }
                     Effect::IntervalChanged => {
@@ -395,7 +460,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 let step = if code == KeyCode::Tab { 1 } else { -1 };
                 let outcome = commands::rotate_tool(state, step);
                 if outcome.effect == Effect::Refresh {
-                    dashboard = data::build(state);
+                    rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
                     next_refresh = Instant::now() + monitor_interval(state);
                 }
                 notice = make_notice(outcome.messages);
@@ -424,7 +489,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 let now = Local::now();
                 if let Some(new_window) = state.time_window.slide_back(now) {
                     state.time_window = new_window;
-                    dashboard = data::build(state);
+                    rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
                     next_refresh = Instant::now() + monitor_interval(state);
                 }
             }
@@ -435,7 +500,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 let now = Local::now();
                 if let Some(new_window) = state.time_window.slide_forward(now) {
                     state.time_window = new_window;
-                    dashboard = data::build(state);
+                    rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
                     next_refresh = Instant::now() + monitor_interval(state);
                 }
             }
@@ -459,7 +524,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                         directions,
                     ) {
                         state.time_window = new_window;
-                        dashboard = data::build(state);
+                        rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
                         next_refresh = Instant::now() + monitor_interval(state);
                     }
                 } else if code == KeyCode::Left {
@@ -481,7 +546,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 };
                 if let Some(new_window) = new_window {
                     state.time_window = new_window;
-                    dashboard = data::build(state);
+                    rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
                     next_refresh = Instant::now() + monitor_interval(state);
                 }
             }
@@ -512,7 +577,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 input.insert_char(c);
             }
             Event::Resize(_, _) => {
-                dashboard = data::build(state);
+                rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
             }
             _ => {}
         }
@@ -534,10 +599,10 @@ mod tests {
 
         assert!(tracker.request(&all_hosts));
         assert!(!tracker.request(&remote_host));
-        assert!(tracker.complete(&remote_host));
+        assert_eq!(tracker.complete(&remote_host), Some(RawLoadKind::Sources));
 
         assert!(tracker.request(&remote_host));
-        assert!(!tracker.complete(&remote_host));
+        assert_eq!(tracker.complete(&remote_host), None);
     }
 
     #[test]
@@ -549,6 +614,26 @@ mod tests {
         assert!(tracker.request(&all_hosts));
         assert!(!tracker.request(&remote_host));
         assert!(!tracker.request(&all_hosts));
-        assert!(!tracker.complete(&all_hosts));
+        assert_eq!(tracker.complete(&all_hosts), None);
+    }
+
+    #[test]
+    fn sync_completion_queues_a_cached_reload_behind_a_source_refresh() {
+        let mut tracker = RawRefreshTracker::default();
+        let host = None;
+
+        assert!(tracker.request(&host));
+        assert!(!tracker.request_reload(&host));
+        assert_eq!(tracker.complete(&host), Some(RawLoadKind::Cached));
+    }
+
+    #[test]
+    fn source_refresh_supersedes_an_in_flight_cached_reload() {
+        let mut tracker = RawRefreshTracker::default();
+        let host = None;
+
+        assert!(tracker.request_reload(&host));
+        assert!(!tracker.request(&host));
+        assert_eq!(tracker.complete(&host), Some(RawLoadKind::Sources));
     }
 }

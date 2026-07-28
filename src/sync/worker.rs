@@ -22,6 +22,7 @@ pub struct SyncStats {
     pub success_count: u64,
     pub error_count: u64,
     pub revision: u64,
+    pub remote_cache_revision: u64,
     pub running: bool,
     pub last_started_at: Option<String>,
     pub last_finished_at: Option<String>,
@@ -217,10 +218,13 @@ impl WorkerShared {
         inner.stats.progress = None;
     }
 
-    fn mark_success(&self) {
+    fn mark_success(&self, remote_cache_changed: bool) {
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         inner.stats.running = false;
         inner.stats.success_count += 1;
+        if remote_cache_changed {
+            inner.stats.remote_cache_revision += 1;
+        }
         inner.stats.revision += 1;
         inner.stats.last_finished_at = Some(Utc::now().to_rfc3339());
         inner.stats.last_error = None;
@@ -297,11 +301,16 @@ fn run_worker_loop<F>(
             }
         };
         shared.mark_running();
+        let remote_cache_before =
+            crate::sync::cache_generation::remote_cache_generation(&cache_root);
         let result = panic::catch_unwind(AssertUnwindSafe(&mut run_cycle));
+        crate::release_unused_heap_memory();
         match result {
             Ok(Ok(())) => {
+                let remote_cache_changed = remote_cache_before
+                    != crate::sync::cache_generation::remote_cache_generation(&cache_root);
                 record_success(&cache_root);
-                shared.mark_success();
+                shared.mark_success(remote_cache_changed);
                 backoff = settings.initial_backoff;
                 retry_after = None;
             }
@@ -517,8 +526,33 @@ mod tests {
                 verification: verification.clone(),
             },
         ));
-        shared.mark_success();
+        shared.mark_success(false);
 
         assert_eq!(shared.stats().integrity_verification, Some(verification));
+    }
+
+    #[test]
+    fn worker_advances_remote_cache_revision_only_when_remote_cache_changes() {
+        let cache_root = unique_temp_dir("remote-cache-revision");
+        let runner_root = cache_root.clone();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let run_counter = Arc::clone(&runs);
+        let mut worker = SyncWorker::spawn_with_settings(cache_root, test_settings(), move || {
+            if run_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                let remote_root = runner_root.join("remote");
+                fs::create_dir_all(&remote_root).expect("create remote cache");
+                fs::write(remote_root.join("laptop.bin"), b"first").expect("write remote cache");
+            }
+            Ok(())
+        });
+
+        worker.request_sync();
+        wait_until(|| worker.stats().success_count == 1);
+        assert_eq!(worker.stats().remote_cache_revision, 1);
+
+        worker.request_sync();
+        wait_until(|| worker.stats().success_count == 2);
+        assert_eq!(worker.stats().remote_cache_revision, 1);
+        worker.shutdown();
     }
 }

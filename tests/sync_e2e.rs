@@ -32,6 +32,11 @@ fn server_config(db_path: PathBuf) -> ServerConfig {
 }
 
 fn write_client_config(home: &Path, server_url: &str, machine_id: &str) {
+    fs::write(
+        home.join(".fee.env"),
+        "CLAUDE_MONTHLY_FEE=0\nCODEX_MONTHLY_FEE=0\nGEMINI_MONTHLY_FEE=0\nKIMI_MONTHLY_FEE=0\n",
+    )
+    .expect("write fee config");
     let path = home.join(".secrets").join("ai-usage.yaml");
     fs::create_dir_all(path.parent().expect("secrets parent")).expect("create secrets dir");
     fs::write(
@@ -88,6 +93,7 @@ fn ensure_claude_dir(home: &Path) {
 fn run_cli(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ai-usage"))
         .args(args)
+        .current_dir(home)
         .env("HOME", home)
         .env("AI_USAGE_CACHE_DIR", home.join(".cache").join("ai-usage"))
         .env(

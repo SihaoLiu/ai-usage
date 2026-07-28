@@ -113,7 +113,7 @@ pub(crate) fn display_chart_granularity(
 }
 
 pub(crate) fn is_current_rolling_days_preset(window: &TimeWindow, days: i64) -> bool {
-    matches!(window, TimeWindow::RollingDays { days: current } if *current == days)
+    window.is_rolling_days(days)
 }
 
 pub(crate) fn round_to_nice_interval(optimal: f64) -> i64 {
@@ -228,7 +228,8 @@ pub(crate) fn showing_data_line(window: &TimeWindow, now: DateTime<Local>) -> St
 
 pub(crate) fn parse_time_window_command(
     command: &str,
-    current_days: i64,
+    current_window: &TimeWindow,
+    now: DateTime<Local>,
 ) -> Option<Result<TimeWindow, String>> {
     let parts: Vec<&str> = command.split_whitespace().collect();
     match parts.as_slice() {
@@ -236,7 +237,7 @@ pub(crate) fn parse_time_window_command(
         ["date"] => Some(Err("Usage: date YYYY-MM-DD".to_string())),
         ["range", start, end] => Some(TimeWindow::from_range(start, end)),
         ["range"] | ["range", _] => Some(Err("Usage: range YYYY-MM-DD YYYY-MM-DD".to_string())),
-        ["latest"] | ["last"] => Some(Ok(TimeWindow::rolling_days(current_days))),
+        ["latest"] | ["last"] => Some(Ok(current_window.follow_latest(now))),
         _ => None,
     }
 }
@@ -249,9 +250,13 @@ mod tests {
 
     #[test]
     fn date_command_selects_single_inclusive_day() {
-        let command = parse_time_window_command("date 2026-05-07", 3)
-            .expect("recognized command")
-            .expect("valid date");
+        let command = parse_time_window_command(
+            "date 2026-05-07",
+            &TimeWindow::rolling_days(3),
+            Local::now(),
+        )
+        .expect("recognized command")
+        .expect("valid date");
         let TimeWindow::ExplicitRange {
             start,
             end,
@@ -275,9 +280,13 @@ mod tests {
 
     #[test]
     fn range_command_selects_inclusive_date_span() {
-        let command = parse_time_window_command("range 2026-05-01 2026-05-07", 3)
-            .expect("recognized command")
-            .expect("valid range");
+        let command = parse_time_window_command(
+            "range 2026-05-01 2026-05-07",
+            &TimeWindow::rolling_days(3),
+            Local::now(),
+        )
+        .expect("recognized command")
+        .expect("valid range");
 
         assert_eq!(command.projection_days(Local::now()), 7.0);
     }
@@ -434,14 +443,12 @@ mod tests {
 
     #[test]
     fn latest_command_returns_to_rolling_days() {
-        let command = parse_time_window_command("latest", 5)
+        let current = TimeWindow::rolling_days(5);
+        let command = parse_time_window_command("latest", &current, Local::now())
             .expect("recognized command")
             .expect("valid latest command");
-        let TimeWindow::RollingDays { days } = command else {
-            panic!("latest should create a rolling window");
-        };
 
-        assert_eq!(days, 5);
+        assert!(command.is_rolling_days(5));
     }
 
     #[test]

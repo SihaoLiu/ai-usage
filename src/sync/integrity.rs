@@ -147,14 +147,38 @@ fn build_remote_report_digest_at(
     build_report_from_records(host_id, records, range_end_utc, computed_at)
 }
 
+#[cfg(test)]
 pub fn verify_remote_reports_at(
     cache_root: &Path,
     local_host_id: &str,
     reports: &[IntegrityReport],
     computed_at: DateTime<Utc>,
 ) -> Result<IntegrityVerification, SyncError> {
+    verify_remote_reports_at_with_progress(
+        cache_root,
+        local_host_id,
+        reports,
+        computed_at,
+        |_, _| {},
+    )
+}
+
+pub(crate) fn verify_remote_reports_at_with_progress(
+    cache_root: &Path,
+    local_host_id: &str,
+    reports: &[IntegrityReport],
+    computed_at: DateTime<Utc>,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Result<IntegrityVerification, SyncError> {
     let mut checked_hosts = 0usize;
     let mut failures = Vec::new();
+    let total_hosts = reports
+        .iter()
+        .filter(|report| report.host_id != local_host_id)
+        .count();
+    if total_hosts == 0 {
+        on_progress(0, 0);
+    }
 
     for report in reports {
         report
@@ -182,6 +206,7 @@ pub fn verify_remote_reports_at(
                 actual_digest_sha256: actual.digest_sha256,
             });
         }
+        on_progress(checked_hosts, total_hosts);
     }
 
     if failures.is_empty() {

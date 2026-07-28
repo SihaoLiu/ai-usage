@@ -83,6 +83,7 @@ struct AppState {
     version_cache: HashMap<String, VersionCacheEntry>,
     all_tool_prompt: Option<String>,
     raw_cache: Option<RawDataCache>,
+    raw_cache_last_used_at: Option<std::time::Instant>,
     raw_refresh: Option<mpsc::Receiver<BackgroundRawLoad>>,
     integrity_status: IntegrityStatus,
     integrity_started_at: Option<std::time::Instant>,
@@ -919,6 +920,7 @@ fn main() {
         version_cache: HashMap::new(),
         all_tool_prompt: None,
         raw_cache: None,
+        raw_cache_last_used_at: None,
         raw_refresh: None,
         integrity_status: initial_integrity_status(matches!(
             &sync_config,

@@ -25,6 +25,7 @@ pub struct SyncStats {
     pub remote_cache_revision: u64,
     pub integrity_revision: u64,
     pub integrity_unavailable: bool,
+    pub integrity_progress_percent: Option<u8>,
     pub running: bool,
     pub last_started_at: Option<String>,
     pub last_finished_at: Option<String>,
@@ -220,6 +221,7 @@ impl WorkerShared {
         inner.stats.progress = None;
         inner.stats.integrity_verification = None;
         inner.stats.integrity_unavailable = false;
+        inner.stats.integrity_progress_percent = None;
     }
 
     fn mark_success(&self, remote_cache_changed: bool) {
@@ -249,13 +251,21 @@ impl WorkerShared {
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         if let SyncWorkerProgress::Sync(event) = &progress {
             match event {
+                SyncProgress::IntegrityCheckProgress { percent } => {
+                    if *percent == 0 {
+                        inner.stats.integrity_verification = None;
+                    }
+                    inner.stats.integrity_progress_percent = Some((*percent).min(100));
+                }
                 SyncProgress::IntegrityCheckFinished { verification } => {
                     inner.stats.integrity_unavailable = false;
+                    inner.stats.integrity_progress_percent = Some(100);
                     inner.stats.integrity_verification = Some(verification.clone());
                     inner.stats.integrity_revision += 1;
                 }
                 SyncProgress::IntegrityCheckReused { checked_hosts } => {
                     inner.stats.integrity_unavailable = false;
+                    inner.stats.integrity_progress_percent = Some(100);
                     inner.stats.integrity_verification =
                         Some(crate::sync::integrity::IntegrityVerification::Checked {
                             checked_hosts: *checked_hosts,
@@ -264,6 +274,7 @@ impl WorkerShared {
                 }
                 SyncProgress::IntegrityUnsupported => {
                     inner.stats.integrity_unavailable = true;
+                    inner.stats.integrity_progress_percent = None;
                 }
                 _ => {}
             }
@@ -560,6 +571,43 @@ mod tests {
         assert!(stats.running);
         assert_eq!(stats.integrity_verification, None);
         assert_eq!(stats.integrity_revision, 1);
+    }
+
+    #[test]
+    fn worker_keeps_integrity_percentage_across_unrelated_progress() {
+        let shared = WorkerShared::new();
+
+        shared.mark_running();
+        shared.mark_progress(SyncWorkerProgress::Sync(
+            SyncProgress::IntegrityCheckProgress { percent: 37 },
+        ));
+        shared.mark_progress(SyncWorkerProgress::Http(HttpProgress::RateLimited {
+            attempt: 1,
+            retry_after: Duration::from_secs(1),
+        }));
+
+        assert_eq!(shared.stats().integrity_progress_percent, Some(37));
+    }
+
+    #[test]
+    fn restarted_integrity_check_clears_failed_attempt() {
+        let shared = WorkerShared::new();
+        shared.mark_running();
+        shared.mark_progress(SyncWorkerProgress::Sync(
+            SyncProgress::IntegrityCheckFinished {
+                verification: crate::sync::integrity::IntegrityVerification::Failed {
+                    failures: Vec::new(),
+                },
+            },
+        ));
+
+        shared.mark_progress(SyncWorkerProgress::Sync(
+            SyncProgress::IntegrityCheckProgress { percent: 0 },
+        ));
+
+        let stats = shared.stats();
+        assert_eq!(stats.integrity_verification, None);
+        assert_eq!(stats.integrity_progress_percent, Some(0));
     }
 
     #[test]

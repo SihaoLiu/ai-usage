@@ -26,6 +26,7 @@ fn state_with_cache(cache: RawDataCache, window: TimeWindow) -> AppState {
         version_cache: HashMap::new(),
         all_tool_prompt: None,
         raw_cache: Some(cache),
+        raw_cache_last_used_at: None,
         raw_refresh: None,
         integrity_status: crate::IntegrityStatus::Checked {
             duration: std::time::Duration::ZERO,
@@ -479,6 +480,63 @@ fn resident_window_reuses_cache_storage_without_cloning() {
 }
 
 #[test]
+fn resident_raw_cache_expires_after_idle_timeout() {
+    let now = Local::now();
+    let cache = RawDataCache {
+        claude: Vec::new(),
+        codex: Vec::new(),
+        gemini: Vec::new(),
+        kimi: Vec::new(),
+        omp: Vec::new(),
+        range: hot_cache_range(now),
+        has_source_data: true,
+        local_host_id: None,
+        local_record_keys: HashMap::new(),
+        persistent_generation: String::new(),
+        local_session_metadata_current: true,
+    };
+    let mut state = state_with_cache(cache, TimeWindow::rolling_days(3));
+    let accessed_at = std::time::Instant::now();
+
+    touch_raw_cache_at(&mut state, accessed_at);
+
+    assert!(!retire_idle_raw_cache_at(
+        &mut state,
+        accessed_at + RAW_CACHE_IDLE_TTL - std::time::Duration::from_millis(1),
+    ));
+    assert!(state.raw_cache.is_some());
+    assert!(retire_idle_raw_cache_at(
+        &mut state,
+        accessed_at + RAW_CACHE_IDLE_TTL,
+    ));
+    assert!(state.raw_cache.is_none());
+}
+
+#[test]
+fn dashboard_build_marks_resident_cache_as_used() {
+    let now = Local::now();
+    let cache = RawDataCache {
+        claude: Vec::new(),
+        codex: Vec::new(),
+        gemini: Vec::new(),
+        kimi: Vec::new(),
+        omp: Vec::new(),
+        range: hot_cache_range(now),
+        has_source_data: true,
+        local_host_id: None,
+        local_record_keys: HashMap::new(),
+        persistent_generation: String::new(),
+        local_session_metadata_current: true,
+    };
+    let mut state = state_with_cache(cache, TimeWindow::rolling_days(3));
+    assert!(state.raw_cache_last_used_at.is_none());
+
+    let _dashboard = crate::tui::data::build(&mut state);
+
+    assert!(state.raw_cache_last_used_at.is_some());
+}
+
+#[test]
 fn background_completion_does_not_compact_on_the_event_loop() {
     let now = Local::now();
     let entry = |timestamp: DateTime<Local>| UsageEntry {
@@ -527,13 +585,17 @@ fn background_completion_does_not_compact_on_the_event_loop() {
         version_cache: HashMap::new(),
         all_tool_prompt: None,
         raw_cache: None,
+        raw_cache_last_used_at: None,
         raw_refresh: Some(rx),
-        integrity_status: crate::IntegrityStatus::Checking,
+        integrity_status: crate::IntegrityStatus::Checking { percent: 0 },
         integrity_started_at: None,
     };
 
     assert!(poll_background_raw_refresh(&mut state));
-    assert_eq!(state.integrity_status, crate::IntegrityStatus::Checking);
+    assert_eq!(
+        state.integrity_status,
+        crate::IntegrityStatus::Checking { percent: 0 }
+    );
 
     let cache = state.raw_cache.expect("foreground cache");
     assert_eq!(cache.range, test_range(now));

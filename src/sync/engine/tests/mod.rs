@@ -1231,6 +1231,17 @@ fn sync_cycle_submits_local_integrity_report_and_verifies_remote_reports() {
     .expect("sync cycle");
 
     assert_eq!(transport.integrity_submissions.borrow().len(), 1);
+    let progress: Vec<u8> = events
+        .iter()
+        .filter_map(|event| match event {
+            SyncProgress::IntegrityCheckProgress { percent } => Some(*percent),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(progress.first(), Some(&0));
+    assert_eq!(progress.last(), Some(&100));
+    assert!(progress.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(progress.iter().any(|percent| (1..100).contains(percent)));
     assert!(events.iter().any(|event| {
         matches!(
             event,

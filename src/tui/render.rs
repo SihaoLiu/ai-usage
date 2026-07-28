@@ -154,16 +154,7 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
             Style::default().fg(Color::Indexed(143)),
         ));
     }
-    let (integrity_text, integrity_color) = match ui.state.integrity_status {
-        IntegrityStatus::Unavailable => ("integrity: unavailable".to_string(), DIM),
-        IntegrityStatus::Pending => ("integrity: pending".to_string(), Color::Indexed(143)),
-        IntegrityStatus::Checking => ("integrity: checking".to_string(), Color::Indexed(143)),
-        IntegrityStatus::Checked { duration } => (
-            format!("integrity: ok ({:.1}s)", duration.as_secs_f64()),
-            Color::Indexed(108),
-        ),
-        IntegrityStatus::Failed => ("integrity: FAILED".to_string(), Color::Indexed(203)),
-    };
+    let (integrity_text, integrity_color) = integrity_status_display(ui.state.integrity_status);
     right_spans.push(Span::styled(
         integrity_text,
         Style::default().fg(integrity_color),
@@ -191,6 +182,22 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
         Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
         right_area,
     );
+}
+
+fn integrity_status_display(status: IntegrityStatus) -> (String, Color) {
+    match status {
+        IntegrityStatus::Unavailable => ("integrity: unavailable".to_string(), DIM),
+        IntegrityStatus::Pending => ("integrity: pending".to_string(), Color::Indexed(143)),
+        IntegrityStatus::Checking { percent } => (
+            format!("integrity: checking {percent}%"),
+            Color::Indexed(143),
+        ),
+        IntegrityStatus::Checked { duration } => (
+            format!("integrity: ok ({:.1}s)", duration.as_secs_f64()),
+            Color::Indexed(108),
+        ),
+        IntegrityStatus::Failed => ("integrity: FAILED".to_string(), Color::Indexed(203)),
+    }
 }
 
 fn draw_charts(frame: &mut Frame, area: Rect, ui: &Ui) {
@@ -509,11 +516,16 @@ fn draw_chart_legend(frame: &mut Frame, area: Rect, chart: &ChartData, with_hint
     let budget = legend_area.width as usize;
     let mut used = Y_GUTTER as usize;
     let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(Y_GUTTER as usize))];
-    for (i, series) in chart.series.iter().enumerate() {
-        let item_width = 3 + series.name.chars().count() + 2;
+    let legend_items = chart_legend_items(chart);
+    for (i, (series, share)) in legend_items.iter().enumerate() {
+        let label = share.map_or_else(
+            || series.name.clone(),
+            |share| format!("{} ({share}%)", series.name),
+        );
+        let item_width = 3 + label.chars().count() + 2;
         if used + item_width + 4 > budget {
             spans.push(Span::styled(
-                format!("+{}", chart.series.len() - i),
+                format!("+{}", legend_items.len() - i),
                 Style::default().fg(DIM),
             ));
             break;
@@ -522,7 +534,7 @@ fn draw_chart_legend(frame: &mut Frame, area: Rect, chart: &ChartData, with_hint
             "\u{2500}\u{2500} ",
             Style::default().fg(Color::Indexed(series.color)),
         ));
-        spans.push(Span::raw(format!("{}  ", series.name)));
+        spans.push(Span::raw(format!("{label}  ")));
         used += item_width;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
@@ -533,6 +545,37 @@ fn draw_chart_legend(frame: &mut Frame, area: Rect, chart: &ChartData, with_hint
             hint_area,
         );
     }
+}
+
+fn chart_legend_items(chart: &ChartData) -> Vec<(&crate::tui::data::Series, Option<u8>)> {
+    let Some(all) = chart.series.iter().find(|series| series.name == "All") else {
+        return chart.series.iter().map(|series| (series, None)).collect();
+    };
+    let mut tools: Vec<(&crate::tui::data::Series, f64)> = chart
+        .series
+        .iter()
+        .filter(|series| series.name != "All")
+        .map(|series| (series, series.points.iter().map(|point| point.1).sum()))
+        .collect();
+    tools.sort_by(|(left, left_total), (right, right_total)| {
+        right_total
+            .total_cmp(left_total)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let total: f64 = tools.iter().map(|(_, value)| value).sum();
+    let mut items: Vec<_> = tools
+        .into_iter()
+        .map(|(series, value)| {
+            let share = if total > 0.0 {
+                (value * 100.0 / total).round().clamp(0.0, 100.0) as u8
+            } else {
+                0
+            };
+            (series, Some(share))
+        })
+        .collect();
+    items.push((all, None));
+    items
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, ui: &Ui) {
@@ -1059,6 +1102,63 @@ mod tests {
             "sparse y ticks:\n{}",
             text
         );
+    }
+
+    #[test]
+    fn comparison_legend_shows_descending_consumption_shares() {
+        let points = |value| vec![(0.0, value), (1.0, value)];
+        let chart = ChartData {
+            title: "Total Token Consumption by Tool".to_string(),
+            series: vec![
+                Series {
+                    name: "Codex".to_string(),
+                    color: 39,
+                    points: points(45.0),
+                },
+                Series {
+                    name: "Claude Code".to_string(),
+                    color: 173,
+                    points: points(55.0),
+                },
+                Series {
+                    name: "Kimi Code".to_string(),
+                    color: 49,
+                    points: points(400.0),
+                },
+                Series {
+                    name: "All".to_string(),
+                    color: 226,
+                    points: points(500.0),
+                },
+            ],
+            max_y: 500.0,
+            len: 2,
+            granularity: ChartGranularity::Hour,
+            segments: Vec::new(),
+            x_ticks: Vec::new(),
+        };
+        let backend = TestBackend::new(180, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_chart(frame, frame.area(), &chart, None))
+            .expect("draw");
+
+        let text = buffer_text(&terminal);
+        let legend = line_containing(&text, "Kimi Code");
+        let kimi = char_index(&legend, "Kimi Code (80%)");
+        let claude = char_index(&legend, "Claude Code (11%)");
+        let codex = char_index(&legend, "Codex (9%)");
+        let all = char_index(&legend, "All");
+        assert!(kimi < claude && claude < codex && codex < all, "{legend}");
+        assert!(!legend.contains("All ("), "{legend}");
+    }
+
+    #[test]
+    fn integrity_header_displays_checking_percentage() {
+        let (text, _) = integrity_status_display(IntegrityStatus::Checking { percent: 37 });
+
+        assert_eq!(text, "integrity: checking 37%");
     }
 
     #[test]

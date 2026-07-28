@@ -89,6 +89,9 @@ pub enum SyncProgress {
         record_count: u64,
         range_end_utc: String,
     },
+    IntegrityCheckProgress {
+        percent: u8,
+    },
     IntegrityCheckFinished {
         verification: crate::sync::integrity::IntegrityVerification,
     },
@@ -1186,12 +1189,17 @@ where
     F: FnMut(&SyncProgress),
 {
     let now = Utc::now();
+    on_progress(&SyncProgress::IntegrityCheckProgress { percent: 0 });
     let local_report = crate::sync::integrity::build_local_report_at(cache_root, config, now, now)?;
+    on_progress(&SyncProgress::IntegrityCheckProgress { percent: 35 });
     match transport.submit_integrity_report(&local_report) {
-        Ok(_) => on_progress(&SyncProgress::IntegrityReportSubmitted {
-            record_count: local_report.record_count,
-            range_end_utc: local_report.range_end_utc.clone(),
-        }),
+        Ok(_) => {
+            on_progress(&SyncProgress::IntegrityReportSubmitted {
+                record_count: local_report.record_count,
+                range_end_utc: local_report.range_end_utc.clone(),
+            });
+            on_progress(&SyncProgress::IntegrityCheckProgress { percent: 45 });
+        }
         Err(err) if is_unsupported_integrity_error(&err) => {
             on_progress(&SyncProgress::IntegrityUnsupported);
             return Ok(None);
@@ -1207,11 +1215,20 @@ where
         }
         Err(err) => return Err(err),
     };
-    let verification = crate::sync::integrity::verify_remote_reports_at(
+    on_progress(&SyncProgress::IntegrityCheckProgress { percent: 50 });
+    let verification = crate::sync::integrity::verify_remote_reports_at_with_progress(
         cache_root,
         &config.machine_id,
         &reports.reports,
         now,
+        |completed, total| {
+            let percent = if total == 0 {
+                100
+            } else {
+                50 + completed.saturating_mul(50).min(total.saturating_mul(50)) / total
+            } as u8;
+            on_progress(&SyncProgress::IntegrityCheckProgress { percent });
+        },
     )?;
     on_progress(&SyncProgress::IntegrityCheckFinished {
         verification: verification.clone(),

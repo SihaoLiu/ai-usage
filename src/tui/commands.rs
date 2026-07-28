@@ -166,6 +166,7 @@ fn switch_host(state: &mut AppState, selection: &str) -> Outcome {
             if let Some(cache) = state.raw_cache.take() {
                 crate::retire_raw_cache(cache);
             }
+            state.raw_cache_last_used_at = None;
             Outcome::message(
                 Effect::ReloadRefresh,
                 format!("Switched to host {}", host_label(state.host.as_deref())),
@@ -579,8 +580,9 @@ mod tests {
             version_cache: HashMap::new(),
             all_tool_prompt: None,
             raw_cache: None,
+            raw_cache_last_used_at: None,
             raw_refresh: None,
-            integrity_status: crate::IntegrityStatus::Checking,
+            integrity_status: crate::IntegrityStatus::Checking { percent: 0 },
             integrity_started_at: None,
         }
     }

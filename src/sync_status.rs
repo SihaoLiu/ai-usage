@@ -8,7 +8,7 @@ use crate::sync;
 pub(crate) enum IntegrityStatus {
     Unavailable,
     Pending,
-    Checking,
+    Checking { percent: u8 },
     Checked { duration: std::time::Duration },
     Failed,
 }
@@ -170,6 +170,9 @@ pub(crate) fn format_manual_sync_progress(event: &sync::engine::SyncProgress) ->
         } => Some(format!(
             "sync integrity: submitted {record_count} records through {range_end_utc}"
         )),
+        sync::engine::SyncProgress::IntegrityCheckProgress { percent } => {
+            Some(format!("sync integrity: checking {percent}%"))
+        }
         sync::engine::SyncProgress::IntegrityCheckFinished { verification } => Some(format!(
             "sync integrity: {}",
             format_integrity_verification(verification)
@@ -282,6 +285,9 @@ pub(crate) fn format_monitor_worker_progress(
                 record_count,
                 range_end_utc,
             } => format!("integrity submitted {record_count} records through {range_end_utc}"),
+            sync::engine::SyncProgress::IntegrityCheckProgress { percent } => {
+                format!("integrity checking {percent}%")
+            }
             sync::engine::SyncProgress::IntegrityCheckFinished { verification } => {
                 format!("integrity {}", format_integrity_verification(verification))
             }

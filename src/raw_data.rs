@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, Local};
 use rayon::prelude::*;
@@ -34,6 +35,7 @@ const NAVIGATION_PREFETCH_WINDOWS: i64 = 8;
 const LARGE_WINDOW_PREFETCH_SPANS: i64 = 4;
 const MIN_NAVIGATION_PREFETCH_DAYS: i64 = 14;
 const MAX_SCALED_NAVIGATION_PREFETCH_DAYS: i64 = 365;
+pub(crate) const RAW_CACHE_IDLE_TTL: StdDuration = StdDuration::from_secs(5 * 60);
 
 fn background_refresh_parallelism(available: usize) -> usize {
     (available / 4).clamp(1, 4)
@@ -697,6 +699,27 @@ pub(crate) fn retire_raw_cache(cache: RawDataCache) {
     let _ = thread::Builder::new()
         .name("usage-cache-retire".to_string())
         .spawn(move || drop(cache));
+}
+
+pub(crate) fn touch_raw_cache_at(state: &mut AppState, accessed_at: Instant) {
+    if state.raw_cache.is_some() {
+        state.raw_cache_last_used_at = Some(accessed_at);
+    }
+}
+
+pub(crate) fn retire_idle_raw_cache_at(state: &mut AppState, now: Instant) -> bool {
+    let expired = state.raw_cache_last_used_at.is_some_and(|accessed_at| {
+        now.saturating_duration_since(accessed_at) >= RAW_CACHE_IDLE_TTL
+    });
+    if !expired {
+        return false;
+    }
+    state.raw_cache_last_used_at = None;
+    let Some(cache) = state.raw_cache.take() else {
+        return false;
+    };
+    retire_raw_cache(cache);
+    true
 }
 
 /// Loaded and filtered data for all tools.

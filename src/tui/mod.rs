@@ -395,7 +395,9 @@ fn apply_integrity_stats(
     }
 
     if stats.running {
-        state.integrity_status = IntegrityStatus::Checking;
+        state.integrity_status = IntegrityStatus::Checking {
+            percent: stats.integrity_progress_percent.unwrap_or(0).min(100),
+        };
         state.integrity_started_at.get_or_insert_with(Instant::now);
     } else {
         state.integrity_status = IntegrityStatus::Pending;
@@ -439,6 +441,8 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
     let mut initial_source_refresh_pending = true;
 
     'monitor: loop {
+        crate::retire_idle_raw_cache_at(state, Instant::now());
+
         if crate::poll_version_cache(state) {
             dashboard = data::build(state);
         }
@@ -450,6 +454,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 if let Some(stale) = state.raw_cache.take() {
                     crate::retire_raw_cache(stale);
                 }
+                state.raw_cache_last_used_at = None;
             } else {
                 dashboard = data::build(state);
                 if initial_load_pending {
@@ -829,6 +834,7 @@ mod tests {
                 persistent_generation: String::new(),
                 local_session_metadata_current: true,
             }),
+            raw_cache_last_used_at: None,
             raw_refresh: None,
             integrity_status: IntegrityStatus::Checked {
                 duration: Duration::ZERO,
@@ -1160,7 +1166,7 @@ mod tests {
     #[test]
     fn completed_cycle_without_integrity_result_becomes_pending() {
         let mut state = state_with_hot_cache();
-        state.integrity_status = IntegrityStatus::Checking;
+        state.integrity_status = IntegrityStatus::Checking { percent: 0 };
         state.integrity_started_at = Some(Instant::now());
         let stats = crate::sync::worker::SyncStats {
             running: false,
@@ -1173,6 +1179,24 @@ mod tests {
 
         assert_eq!(state.integrity_status, IntegrityStatus::Pending);
         assert!(state.integrity_started_at.is_none());
+    }
+
+    #[test]
+    fn active_integrity_check_exposes_worker_percentage() {
+        let mut state = state_with_hot_cache();
+        let stats = crate::sync::worker::SyncStats {
+            running: true,
+            integrity_progress_percent: Some(37),
+            ..Default::default()
+        };
+        let mut observed = 0;
+
+        apply_integrity_stats(&mut state, &stats, &mut observed);
+
+        assert_eq!(
+            state.integrity_status,
+            IntegrityStatus::Checking { percent: 37 }
+        );
     }
 
     #[test]
@@ -1222,7 +1246,7 @@ mod tests {
     #[test]
     fn unsupported_integrity_check_is_not_left_checking() {
         let mut state = state_with_hot_cache();
-        state.integrity_status = IntegrityStatus::Checking;
+        state.integrity_status = IntegrityStatus::Checking { percent: 0 };
         let stats = crate::sync::worker::SyncStats {
             running: true,
             integrity_unavailable: true,
@@ -1238,7 +1262,7 @@ mod tests {
     #[test]
     fn completed_unsupported_integrity_cycle_remains_unavailable() {
         let mut state = state_with_hot_cache();
-        state.integrity_status = IntegrityStatus::Checking;
+        state.integrity_status = IntegrityStatus::Checking { percent: 0 };
         state.integrity_started_at = Some(Instant::now());
         let stats = crate::sync::worker::SyncStats {
             running: false,

@@ -329,6 +329,7 @@ pub fn build(state: &mut AppState) -> Dashboard {
     let times = interval_times(&range_start, &range_end, interval_minutes);
 
     let window_complete = crate::raw_cache_covers_window(state, now);
+    crate::touch_raw_cache_at(state, std::time::Instant::now());
     let all_data = crate::load_resident_all_tool_data(state, now);
     let has_visible_data = crate::all_tool_data_has_window_data(&all_data);
 

@@ -123,15 +123,6 @@ pub struct SourceUsageRecord {
     pub entry: UsageEntry,
 }
 
-/// Filter usage data to the selected local time window.
-pub fn filter_usage_data_by_window(
-    usage_data: &[UsageEntry],
-    window: &TimeWindow,
-    now: DateTime<Local>,
-) -> Vec<UsageEntry> {
-    filter_usage_data_by_window_and_session(usage_data, window, None, now)
-}
-
 /// Filter usage data to a time window and, when selected, one conversation.
 pub fn filter_usage_data_by_window_and_session(
     usage_data: &[UsageEntry],
@@ -198,7 +189,7 @@ mod tests {
             entry_at(end + Duration::nanoseconds(1), 40),
         ];
 
-        let filtered = filter_usage_data_by_window(&usage, &window, Local::now());
+        let filtered = filter_usage_data_by_window_and_session(&usage, &window, None, Local::now());
         let tokens: Vec<i64> = filtered
             .iter()
             .map(|entry| entry.usage.input_tokens)

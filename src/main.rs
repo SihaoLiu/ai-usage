@@ -46,6 +46,27 @@ const YEAR_PRESET_DAYS: i64 = 365;
 
 struct VersionCacheEntry {
     version_str: String,
+    receiver: Option<mpsc::Receiver<String>>,
+}
+
+impl VersionCacheEntry {
+    fn poll(&mut self) -> bool {
+        let Some(receiver) = self.receiver.take() else {
+            return false;
+        };
+        match receiver.try_recv() {
+            Ok(version_str) => {
+                let changed = self.version_str != version_str;
+                self.version_str = version_str;
+                changed
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.receiver = Some(receiver);
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        }
+    }
 }
 
 struct AppState {
@@ -66,19 +87,6 @@ struct AppState {
     integrity_status: IntegrityStatus,
     integrity_started_at: Option<std::time::Instant>,
 }
-
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn release_unused_heap_memory() {
-    // Large cache rebuilds use short-lived allocations across several glibc
-    // arenas. Returning free pages here keeps the monitor's idle RSS tied to
-    // its live window rather than to the largest completed refresh.
-    unsafe {
-        libc::malloc_trim(0);
-    }
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn release_unused_heap_memory() {}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -228,18 +236,15 @@ fn known_host_ids(local_host_id: Option<&str>) -> Vec<String> {
     if let Some(local_host_id) = local_host_id {
         hosts.insert(local_host_id.to_string());
     }
-    for record in data::cache::load_remote_entries(&cache_root, None) {
-        if let Some(host_id) = record.entry.host_id {
-            hosts.insert(host_id);
-        }
-    }
+    hosts.extend(data::cache::remote_host_ids(&cache_root));
     let mut hosts = hosts.into_iter().collect::<Vec<_>>();
     hosts.sort();
     hosts
 }
 
 fn get_version(state: &mut AppState, tool: &str) -> String {
-    if let Some(cached) = state.version_cache.get(tool) {
+    if let Some(cached) = state.version_cache.get_mut(tool) {
+        cached.poll();
         return cached.version_str.clone();
     }
 
@@ -251,6 +256,25 @@ fn get_version(state: &mut AppState, tool: &str) -> String {
         _ => return String::new(),
     };
 
+    let fallback = format_local_version_label(display_name, None);
+    let (tx, rx) = mpsc::channel();
+    state.version_cache.insert(
+        tool.to_string(),
+        VersionCacheEntry {
+            version_str: fallback.clone(),
+            receiver: Some(rx),
+        },
+    );
+    let _ = std::thread::Builder::new()
+        .name(format!("{tool}-version"))
+        .spawn(move || {
+            let _ = tx.send(resolve_local_version(cmd, display_name));
+        });
+
+    fallback
+}
+
+fn resolve_local_version(cmd: &str, display_name: &str) -> String {
     let current_version = ProcessCommand::new(cmd)
         .arg("--version")
         .output()
@@ -288,16 +312,15 @@ fn get_version(state: &mut AppState, tool: &str) -> String {
             }
         });
 
-    let version_str = format_local_version_label(display_name, current_version);
+    format_local_version_label(display_name, current_version)
+}
 
-    state.version_cache.insert(
-        tool.to_string(),
-        VersionCacheEntry {
-            version_str: version_str.clone(),
-        },
-    );
-
-    version_str
+fn poll_version_cache(state: &mut AppState) -> bool {
+    let mut changed = false;
+    for entry in state.version_cache.values_mut() {
+        changed |= entry.poll();
+    }
+    changed
 }
 
 fn format_local_version_label(display_name: &str, current_version: Option<String>) -> String {
@@ -366,8 +389,8 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let projection_days = state.time_window.projection_days(now);
 
     // Cache feeds both the raw-emptiness check and the filtered slice.
-    let horizon = compute_required_horizon(&state.time_window, now);
-    let _ = ensure_raw_cache(state, horizon);
+    let range = raw_cache_visible_range(&state.time_window, now);
+    let _ = ensure_raw_cache(state, range);
     let cache = state.raw_cache.as_ref().expect("cache populated");
     let tool = state.tool.clone();
     let raw_for_tool: &[UsageEntry] = match tool.as_str() {
@@ -391,7 +414,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         );
         return Some(false);
     }
-    if classify_window_data(!raw_for_tool.is_empty(), !filtered.is_empty())
+    if classify_window_data(cache.has_source_data, !filtered.is_empty())
         == WindowDataState::NoSourceData
     {
         if !once {
@@ -577,7 +600,7 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     let has_source_data = state
         .raw_cache
         .as_ref()
-        .is_some_and(raw_cache_has_any_tool_data);
+        .is_some_and(|cache| cache.has_source_data);
     let data_state =
         classify_window_data(has_source_data, all_tool_data_has_window_data(&all_data));
     if data_state == WindowDataState::NoSourceData {
@@ -897,17 +920,20 @@ fn main() {
         all_tool_prompt: None,
         raw_cache: None,
         raw_refresh: None,
-        integrity_status: IntegrityStatus::Checking,
+        integrity_status: initial_integrity_status(matches!(
+            &sync_config,
+            sync::config::SyncConfig::Enabled(_)
+        )),
         integrity_started_at: None,
     };
 
     if args.once {
         let now = Local::now();
-        let required_horizon = compute_required_horizon(&state.time_window, now);
+        let required_range = raw_cache_visible_range(&state.time_window, now);
         let mut refreshed = read_cached_raw_data_for_window(
             state.host.as_deref(),
             state.local_host_id.as_deref(),
-            required_horizon,
+            required_range,
             now,
         );
         // A missing cache must still bootstrap from the canonical source logs.
@@ -915,12 +941,12 @@ fn main() {
         // session metadata, so its first run after an upgrade is accurate.
         let needs_session_metadata =
             needs_session_metadata(state.session_id.as_deref(), &refreshed);
-        if !raw_cache_has_any_tool_data(&refreshed) || needs_session_metadata {
+        if !refreshed.has_source_data || needs_session_metadata {
             refresh_all_tool_caches();
             refreshed = load_persistent_raw_data_for_window(
                 state.host.as_deref(),
                 state.local_host_id.as_deref(),
-                required_horizon,
+                required_range,
                 Local::now(),
             );
         }
@@ -957,6 +983,7 @@ mod tests {
 
     fn cache_with_session(session_id: Option<&str>) -> RawDataCache {
         let timestamp = "2026-07-23T00:00:00Z".to_string();
+        let center = time_utils::parse_timestamp(&timestamp).expect("test timestamp");
         RawDataCache {
             claude: vec![UsageEntry {
                 host_id: None,
@@ -975,9 +1002,13 @@ mod tests {
             gemini: Vec::new(),
             kimi: Vec::new(),
             omp: Vec::new(),
-            horizon_days: i64::MAX,
+            range: RawDataRange::from_bounds(
+                center - chrono::Duration::days(1),
+                center + chrono::Duration::days(1),
+            ),
+            has_source_data: true,
             local_host_id: None,
-            local_record_keys: HashSet::new(),
+            local_record_keys: HashMap::new(),
             persistent_generation: String::new(),
             local_session_metadata_current: true,
         }
@@ -990,6 +1021,24 @@ mod tests {
             "Codex (1.2.3)"
         );
         assert_eq!(format_local_version_label("Codex", None), "Codex");
+    }
+
+    #[test]
+    fn version_cache_poll_never_waits_for_a_pending_lookup() {
+        let (tx, rx) = mpsc::channel();
+        let mut entry = VersionCacheEntry {
+            version_str: "Codex".to_string(),
+            receiver: Some(rx),
+        };
+
+        assert!(!entry.poll());
+        assert_eq!(entry.version_str, "Codex");
+
+        tx.send("Codex (1.2.3)".to_string())
+            .expect("send resolved version");
+        assert!(entry.poll());
+        assert_eq!(entry.version_str, "Codex (1.2.3)");
+        assert!(entry.receiver.is_none());
     }
 
     #[test]

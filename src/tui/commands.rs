@@ -163,7 +163,9 @@ fn switch_host(state: &mut AppState, selection: &str) -> Outcome {
                 );
             }
             state.host = new_host;
-            state.raw_cache = None;
+            if let Some(cache) = state.raw_cache.take() {
+                crate::retire_raw_cache(cache);
+            }
             Outcome::message(
                 Effect::ReloadRefresh,
                 format!("Switched to host {}", host_label(state.host.as_deref())),

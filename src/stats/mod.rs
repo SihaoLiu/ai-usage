@@ -5,6 +5,8 @@ pub mod kimi;
 pub mod omp;
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::thread;
 
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
@@ -74,7 +76,7 @@ fn resolve_entry_pricing<'a>(
 /// pricing on each individual entry, then summing. This is the only correct
 /// way to handle Claude's 1M-context >200k-tier pricing — applying the tier
 /// post-aggregation overstates cost when many entries are below the threshold.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelBreakdownRow {
     pub model: String,
     pub tool: String,
@@ -94,7 +96,7 @@ pub struct ModelBreakdownRow {
 }
 
 /// Token breakdown for a time interval (per model).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct IntervalTokenBreakdown {
     pub input: f64,
     pub output: f64,
@@ -112,6 +114,30 @@ pub type ToolTimeSeries = HashMap<DateTime<Local>, HashMap<String, f64>>;
 /// per-chunk HashMap merge cost is negligible, small enough to spread a
 /// million-entry scan across every core.
 pub(crate) const PAR_CHUNK: usize = 16_384;
+
+fn dashboard_aggregation_parallelism(available: usize) -> usize {
+    (available / 2).clamp(1, 4)
+}
+
+fn dashboard_aggregation_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let available = thread::available_parallelism().map_or(1, usize::from);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(dashboard_aggregation_parallelism(available))
+            .thread_name(|index| format!("usage-dashboard-{index}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+fn run_dashboard_aggregation<T: Send>(operation: impl FnOnce() -> T + Send) -> T {
+    match dashboard_aggregation_pool() {
+        Some(pool) => pool.install(operation),
+        None => operation(),
+    }
+}
 
 fn accumulate_breakdown_entry(
     model_stats: &mut HashMap<String, ModelBreakdownRow>,
@@ -217,6 +243,44 @@ fn merge_breakdown_rows(a: &mut ModelBreakdownRow, b: ModelBreakdownRow) {
     a.cache_creation_cost += b.cache_creation_cost;
 }
 
+fn merge_breakdown_maps(
+    mut a: HashMap<String, ModelBreakdownRow>,
+    b: HashMap<String, ModelBreakdownRow>,
+) -> HashMap<String, ModelBreakdownRow> {
+    for (key, row) in b {
+        match a.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                merge_breakdown_rows(slot.get_mut(), row);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(row);
+            }
+        }
+    }
+    a
+}
+
+fn finish_model_breakdown(
+    model_stats: HashMap<String, ModelBreakdownRow>,
+    tool: &str,
+) -> Vec<ModelBreakdownRow> {
+    let mut result: Vec<ModelBreakdownRow> = model_stats
+        .into_values()
+        .filter(|row| !row.model.contains("<synthetic>"))
+        .map(|mut row| {
+            row.total = row.input + row.output;
+            row.total_with_cache = match tool {
+                "codex" => row.input + row.output + row.cache_read + row.reasoning,
+                "gemini" => row.input + row.output + row.cache_read + row.thinking,
+                _ => row.input + row.output + row.cache_creation + row.cache_read,
+            };
+            row
+        })
+        .collect();
+    result.sort_by(|a, b| b.count.cmp(&a.count));
+    result
+}
+
 /// Calculate the per-model breakdown across all entries.
 ///
 /// Rows are aggregated per model (optionally split by effort), `<synthetic>`
@@ -240,36 +304,9 @@ pub(crate) fn calculate_model_breakdown_generic(
             }
             local
         })
-        .reduce(HashMap::new, |mut a, b| {
-            for (key, row) in b {
-                match a.entry(key) {
-                    std::collections::hash_map::Entry::Occupied(mut slot) => {
-                        merge_breakdown_rows(slot.get_mut(), row);
-                    }
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(row);
-                    }
-                }
-            }
-            a
-        });
+        .reduce(HashMap::new, merge_breakdown_maps);
 
-    let mut result: Vec<ModelBreakdownRow> = model_stats
-        .into_values()
-        .filter(|r| !r.model.contains("<synthetic>"))
-        .map(|mut r| {
-            r.total = r.input + r.output;
-            r.total_with_cache = match tool {
-                "codex" => r.input + r.output + r.cache_read + r.reasoning,
-                "gemini" => r.input + r.output + r.cache_read + r.thinking,
-                _ => r.input + r.output + r.cache_creation + r.cache_read,
-            };
-            r
-        })
-        .collect();
-
-    result.sort_by(|a, b| b.count.cmp(&a.count));
-    result
+    finish_model_breakdown(model_stats, tool)
 }
 
 fn accumulate_time_series_entry(
@@ -343,6 +380,144 @@ fn merge_time_series(mut a: ModelTimeSeries, b: ModelTimeSeries) -> ModelTimeSer
     a
 }
 
+fn accumulate_tool_time_series_entry(
+    time_series: &mut ToolTimeSeries,
+    entry: &UsageEntry,
+    interval_minutes: i64,
+    tool: &str,
+    tool_label: &str,
+) {
+    if entry.timestamp.is_empty() {
+        return;
+    }
+    let total = match tool {
+        "codex" => {
+            entry.usage.input_tokens
+                + entry.usage.output_tokens
+                + entry.usage.cache_read_input_tokens
+                + entry.usage.reasoning_output_tokens
+        }
+        _ => {
+            entry.usage.input_tokens
+                + entry.usage.output_tokens
+                + entry.usage.cache_read_input_tokens
+                + entry.usage.cache_creation_input_tokens
+        }
+    } as f64;
+    let timestamp = entry
+        .parsed_timestamp
+        .or_else(|| parse_timestamp(&entry.timestamp));
+    if let Some(timestamp) = timestamp {
+        let interval_time = to_interval(&timestamp, interval_minutes);
+        *time_series
+            .entry(interval_time)
+            .or_default()
+            .entry(tool_label.to_string())
+            .or_insert(0.0) += total;
+    }
+}
+
+fn merge_tool_time_series(mut a: ToolTimeSeries, b: ToolTimeSeries) -> ToolTimeSeries {
+    for (interval_time, tools) in b {
+        let target = a.entry(interval_time).or_default();
+        for (label, total) in tools {
+            *target.entry(label).or_insert(0.0) += total;
+        }
+    }
+    a
+}
+
+pub(crate) fn calculate_model_dashboard_data(
+    usage_data: &[UsageEntry],
+    interval_minutes: i64,
+    tool: &str,
+    pricing: &AllPricing,
+) -> (Vec<ModelBreakdownRow>, ModelTimeSeries) {
+    let entry_pricing = resolve_entry_pricing(usage_data, tool, pricing);
+    let (model_stats, time_series) = run_dashboard_aggregation(|| {
+        usage_data
+            .par_chunks(PAR_CHUNK)
+            .fold(
+                || (HashMap::new(), HashMap::new()),
+                |(mut model_stats, mut time_series), chunk| {
+                    for entry in chunk {
+                        accumulate_breakdown_entry(
+                            &mut model_stats,
+                            entry,
+                            tool,
+                            false,
+                            &entry_pricing,
+                        );
+                        accumulate_time_series_entry(
+                            &mut time_series,
+                            entry,
+                            interval_minutes,
+                            false,
+                            tool,
+                        );
+                    }
+                    (model_stats, time_series)
+                },
+            )
+            .reduce(
+                || (HashMap::new(), HashMap::new()),
+                |(model_stats_a, time_series_a), (model_stats_b, time_series_b)| {
+                    (
+                        merge_breakdown_maps(model_stats_a, model_stats_b),
+                        merge_time_series(time_series_a, time_series_b),
+                    )
+                },
+            )
+    });
+    (finish_model_breakdown(model_stats, tool), time_series)
+}
+
+pub(crate) fn calculate_comparison_dashboard_data(
+    usage_data: &[UsageEntry],
+    interval_minutes: i64,
+    tool: &str,
+    tool_label: &str,
+    pricing: &AllPricing,
+) -> (Vec<ModelBreakdownRow>, ToolTimeSeries) {
+    let entry_pricing = resolve_entry_pricing(usage_data, tool, pricing);
+    let (model_stats, time_series) = run_dashboard_aggregation(|| {
+        usage_data
+            .par_chunks(PAR_CHUNK)
+            .fold(
+                || (HashMap::new(), HashMap::new()),
+                |(mut model_stats, mut time_series), chunk| {
+                    for entry in chunk {
+                        accumulate_breakdown_entry(
+                            &mut model_stats,
+                            entry,
+                            tool,
+                            false,
+                            &entry_pricing,
+                        );
+                        accumulate_tool_time_series_entry(
+                            &mut time_series,
+                            entry,
+                            interval_minutes,
+                            tool,
+                            tool_label,
+                        );
+                    }
+                    (model_stats, time_series)
+                },
+            )
+            .reduce(
+                || (HashMap::new(), HashMap::new()),
+                |(model_stats_a, time_series_a), (model_stats_b, time_series_b)| {
+                    (
+                        merge_breakdown_maps(model_stats_a, model_stats_b),
+                        merge_tool_time_series(time_series_a, time_series_b),
+                    )
+                },
+            )
+    });
+    (finish_model_breakdown(model_stats, tool), time_series)
+}
+
 /// Calculate model token breakdown time series with interval distribution.
 /// Chunk-parallel: the per-entry session-time parsing dominates this scan.
 pub(crate) fn calculate_model_token_breakdown_time_series_generic(
@@ -414,6 +589,15 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_aggregation_leaves_cpu_capacity_for_input_and_rendering() {
+        assert_eq!(dashboard_aggregation_parallelism(1), 1);
+        assert_eq!(dashboard_aggregation_parallelism(2), 1);
+        assert_eq!(dashboard_aggregation_parallelism(4), 2);
+        assert_eq!(dashboard_aggregation_parallelism(8), 4);
+        assert_eq!(dashboard_aggregation_parallelism(64), 4);
+    }
+
+    #[test]
     fn omp_breakdown_ignores_endpoint_provider_in_effort() {
         let pricing = AllPricing::load_raw().finalize();
         let entry = usage_entry("gpt-5", Some("rust-cat"), Some(UsageCost::default()));
@@ -463,6 +647,30 @@ mod tests {
         assert!(models.iter().any(|model| model.as_str() == "gpt-5"));
         assert!(!models.iter().any(|model| model.contains("high")));
         assert!(!models.iter().any(|model| model.contains("max")));
+    }
+
+    #[test]
+    fn fused_dashboard_scan_matches_separate_aggregations() {
+        let pricing = AllPricing::load_raw().finalize();
+        let entries = [
+            usage_entry("gpt-5", Some("high"), None),
+            usage_entry("gpt-5", Some("max"), None),
+        ];
+        let expected_rows = calculate_model_breakdown_generic(&entries, "codex", false, &pricing);
+        let expected_series =
+            calculate_model_token_breakdown_time_series_generic(&entries, 60, false, "codex");
+
+        let (rows, series) = calculate_model_dashboard_data(&entries, 60, "codex", &pricing);
+
+        assert_eq!(rows, expected_rows);
+        assert_eq!(series, expected_series);
+
+        let (rows, comparison) =
+            calculate_comparison_dashboard_data(&entries, 60, "codex", "Codex", &pricing);
+        assert_eq!(rows, expected_rows);
+        let timestamp = parse_timestamp("2026-06-15T12:00:00Z").expect("timestamp");
+        let bucket = to_interval(&timestamp, 60);
+        assert_eq!(comparison[&bucket]["Codex"], 3_200_000.0);
     }
 
     #[test]

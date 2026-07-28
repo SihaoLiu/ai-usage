@@ -47,10 +47,14 @@ pub fn draw(frame: &mut Frame, ui: &Ui) {
 
     draw_header(frame, header, ui);
 
-    if !ui.dash.has_source_data || !ui.dash.has_visible_data {
-        let message = match ui.dash.session_id.as_deref() {
-            Some(session_id) => format!("No usage data found for session {session_id}."),
-            None => "No usage data found from any tool.".to_string(),
+    if !ui.dash.has_visible_data {
+        let message = if !ui.dash.window_complete {
+            "Loading usage history...".to_string()
+        } else {
+            match ui.dash.session_id.as_deref() {
+                Some(session_id) => format!("No usage data found for session {session_id}."),
+                None => "No usage data found from any tool.".to_string(),
+            }
         };
         frame.render_widget(
             Paragraph::new(message)
@@ -144,7 +148,15 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
             Style::default().fg(DIM),
         ));
     }
+    if !ui.dash.window_complete {
+        right_spans.push(Span::styled(
+            "history: loading  |  ",
+            Style::default().fg(Color::Indexed(143)),
+        ));
+    }
     let (integrity_text, integrity_color) = match ui.state.integrity_status {
+        IntegrityStatus::Unavailable => ("integrity: unavailable".to_string(), DIM),
+        IntegrityStatus::Pending => ("integrity: pending".to_string(), Color::Indexed(143)),
         IntegrityStatus::Checking => ("integrity: checking".to_string(), Color::Indexed(143)),
         IntegrityStatus::Checked { duration } => (
             format!("integrity: ok ({:.1}s)", duration.as_secs_f64()),
@@ -680,7 +692,7 @@ mod tests {
             tool: Tool::All,
             view,
             window_label: String::new(),
-            has_source_data: true,
+            window_complete: true,
             has_visible_data: true,
             session_id: None,
             model_stats: Vec::new(),
@@ -924,7 +936,7 @@ mod tests {
             tool: Tool::All,
             view: TableView::Flat,
             window_label: String::new(),
-            has_source_data: true,
+            window_complete: true,
             has_visible_data: true,
             session_id: None,
             model_stats: Vec::new(),

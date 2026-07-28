@@ -28,7 +28,9 @@ pub(crate) fn remote_cache_generation(cache_root: &Path) -> String {
     let mut paths = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("bin")
+        })
         .collect::<Vec<_>>();
     paths.sort();
     for path in paths {
@@ -121,4 +123,34 @@ pub(crate) fn server_scope_fingerprint(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ai-usage-generation-test-{name}-{stamp}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn remote_generation_ignores_derived_record_indexes() {
+        let cache_root = unique_temp_dir("derived-index");
+        let remote_root = cache_root.join("remote");
+        fs::create_dir_all(&remote_root).expect("create remote cache");
+        fs::write(remote_root.join("laptop.bin"), b"authoritative data")
+            .expect("write remote cache");
+        let generation = remote_cache_generation(&cache_root);
+
+        fs::write(remote_root.join("laptop.idx"), b"derived index").expect("write record index");
+
+        assert_eq!(remote_cache_generation(&cache_root), generation);
+    }
 }

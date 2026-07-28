@@ -50,7 +50,7 @@ pub struct Dashboard {
     pub tool: Tool,
     pub view: TableView,
     pub window_label: String,
-    pub has_source_data: bool,
+    pub window_complete: bool,
     pub has_visible_data: bool,
     pub session_id: Option<String>,
     /// Aggregated per-(harness, model) rows the table views are built from;
@@ -306,6 +306,12 @@ pub fn rebuild_view(dash: &mut Dashboard, view: TableView) {
 pub fn build(state: &mut AppState) -> Dashboard {
     let now = Local::now();
     let tool = Tool::from_key(&state.tool).unwrap_or(Tool::All);
+    let single_tool_headline = if tool.is_all() {
+        None
+    } else {
+        let version = crate::get_version(state, tool.key());
+        (!version.is_empty()).then_some(version)
+    };
     let view = state.table_view;
     let (range_start, range_end) = state.time_window.bounds(now);
     let projection_days = state.time_window.projection_days(now);
@@ -322,16 +328,13 @@ pub fn build(state: &mut AppState) -> Dashboard {
     let interval_minutes = crate::round_to_nice_interval(optimal);
     let times = interval_times(&range_start, &range_end, interval_minutes);
 
-    let all_data = crate::load_all_tool_data(state, now);
-    let has_source_data = state
-        .raw_cache
-        .as_ref()
-        .is_some_and(crate::raw_cache_has_any_tool_data);
+    let window_complete = crate::raw_cache_covers_window(state, now);
+    let all_data = crate::load_resident_all_tool_data(state, now);
     let has_visible_data = crate::all_tool_data_has_window_data(&all_data);
 
     let (model_stats, charts_data, headline) = if tool.is_all() {
-        let model_stats = crate::calculate_all_model_breakdown(&all_data, &state.pricing);
-        let tool_ts = crate::calculate_tool_aggregate_time_series(&all_data, interval_minutes);
+        let (model_stats, tool_ts) =
+            crate::calculate_all_dashboard_data(&all_data, &state.pricing, interval_minutes);
         let (weighted_cost, total_savings) = crate::calculate_weighted_cost_per_mtok(
             &model_stats,
             projection_days,
@@ -354,32 +357,12 @@ pub fn build(state: &mut AppState) -> Dashboard {
             Tool::Omp => &all_data.omp,
             _ => &all_data.claude,
         };
-        let model_stats = match tool {
-            Tool::Codex => stats::calculate_codex_model_breakdown(filtered, &state.pricing),
-            Tool::Gemini => stats::calculate_gemini_model_breakdown(filtered, &state.pricing),
-            Tool::Kimi => stats::calculate_kimi_model_breakdown(filtered, &state.pricing),
-            Tool::Omp => stats::calculate_omp_model_breakdown(filtered, &state.pricing),
-            _ => stats::calculate_claude_model_breakdown(filtered, &state.pricing),
-        };
-        let model_ts = match tool {
-            Tool::Codex => {
-                stats::calculate_codex_model_token_breakdown_time_series(filtered, interval_minutes)
-            }
-            Tool::Gemini => stats::calculate_gemini_model_token_breakdown_time_series(
-                filtered,
-                interval_minutes,
-            ),
-            Tool::Kimi => {
-                stats::calculate_kimi_model_token_breakdown_time_series(filtered, interval_minutes)
-            }
-            Tool::Omp => {
-                stats::calculate_omp_model_token_breakdown_time_series(filtered, interval_minutes)
-            }
-            _ => stats::calculate_claude_model_token_breakdown_time_series(
-                filtered,
-                interval_minutes,
-            ),
-        };
+        let (model_stats, model_ts) = stats::calculate_model_dashboard_data(
+            filtered,
+            interval_minutes,
+            tool.key(),
+            &state.pricing,
+        );
         let included: HashSet<String> = model_stats.iter().map(|s| s.model.clone()).collect();
         let io = model_chart(
             &model_ts,
@@ -399,9 +382,7 @@ pub fn build(state: &mut AppState) -> Dashboard {
             interval_minutes,
             granularity,
         );
-        let version = crate::get_version(state, tool.key());
-        let headline = (!version.is_empty()).then_some(version);
-        (model_stats, vec![io, cache], headline)
+        (model_stats, vec![io, cache], single_tool_headline)
     };
 
     let rows = build_table(&model_stats, view);
@@ -424,7 +405,7 @@ pub fn build(state: &mut AppState) -> Dashboard {
         tool,
         view,
         window_label,
-        has_source_data,
+        window_complete,
         has_visible_data,
         session_id: state.session_id.clone(),
         model_stats: model_stats_kept,

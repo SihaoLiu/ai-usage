@@ -23,6 +23,8 @@ pub struct SyncStats {
     pub error_count: u64,
     pub revision: u64,
     pub remote_cache_revision: u64,
+    pub integrity_revision: u64,
+    pub integrity_unavailable: bool,
     pub running: bool,
     pub last_started_at: Option<String>,
     pub last_finished_at: Option<String>,
@@ -216,6 +218,8 @@ impl WorkerShared {
         inner.stats.revision += 1;
         inner.stats.last_started_at = Some(Utc::now().to_rfc3339());
         inner.stats.progress = None;
+        inner.stats.integrity_verification = None;
+        inner.stats.integrity_unavailable = false;
     }
 
     fn mark_success(&self, remote_cache_changed: bool) {
@@ -246,13 +250,20 @@ impl WorkerShared {
         if let SyncWorkerProgress::Sync(event) = &progress {
             match event {
                 SyncProgress::IntegrityCheckFinished { verification } => {
+                    inner.stats.integrity_unavailable = false;
                     inner.stats.integrity_verification = Some(verification.clone());
+                    inner.stats.integrity_revision += 1;
                 }
                 SyncProgress::IntegrityCheckReused { checked_hosts } => {
+                    inner.stats.integrity_unavailable = false;
                     inner.stats.integrity_verification =
                         Some(crate::sync::integrity::IntegrityVerification::Checked {
                             checked_hosts: *checked_hosts,
                         });
+                    inner.stats.integrity_revision += 1;
+                }
+                SyncProgress::IntegrityUnsupported => {
+                    inner.stats.integrity_unavailable = true;
                 }
                 _ => {}
             }
@@ -304,7 +315,6 @@ fn run_worker_loop<F>(
         let remote_cache_before =
             crate::sync::cache_generation::remote_cache_generation(&cache_root);
         let result = panic::catch_unwind(AssertUnwindSafe(&mut run_cycle));
-        crate::release_unused_heap_memory();
         match result {
             Ok(Ok(())) => {
                 let remote_cache_changed = remote_cache_before
@@ -529,6 +539,44 @@ mod tests {
         shared.mark_success(false);
 
         assert_eq!(shared.stats().integrity_verification, Some(verification));
+    }
+
+    #[test]
+    fn worker_starts_each_cycle_without_a_stale_integrity_result() {
+        let shared = WorkerShared::new();
+        shared.mark_running();
+        shared.mark_progress(SyncWorkerProgress::Sync(
+            SyncProgress::IntegrityCheckFinished {
+                verification: crate::sync::integrity::IntegrityVerification::Checked {
+                    checked_hosts: 1,
+                },
+            },
+        ));
+        shared.mark_success(false);
+
+        shared.mark_running();
+
+        let stats = shared.stats();
+        assert!(stats.running);
+        assert_eq!(stats.integrity_verification, None);
+        assert_eq!(stats.integrity_revision, 1);
+    }
+
+    #[test]
+    fn worker_preserves_unsupported_integrity_for_the_entire_cycle() {
+        let shared = WorkerShared::new();
+        shared.mark_running();
+        shared.mark_progress(SyncWorkerProgress::Sync(SyncProgress::IntegrityUnsupported));
+        shared.mark_progress(SyncWorkerProgress::Http(HttpProgress::RateLimited {
+            attempt: 1,
+            retry_after: Duration::from_secs(1),
+        }));
+        shared.mark_success(false);
+
+        assert!(shared.stats().integrity_unavailable);
+
+        shared.mark_running();
+        assert!(!shared.stats().integrity_unavailable);
     }
 
     #[test]

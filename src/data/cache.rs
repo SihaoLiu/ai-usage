@@ -8,20 +8,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageCost, UsageEntry};
 use crate::model_id::{Vendor, is_reasoning_effort, parse_model_identity};
 use crate::time_utils::parse_timestamp;
 
+mod index;
+mod persistence;
+
+use persistence::*;
+
+#[cfg(test)]
+mod tests;
 #[cfg(test)]
 thread_local! {
     static CACHED_RECORD_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REMOTE_RECORD_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INDEXED_CACHE_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static INDEX_FULL_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HOT_SNAPSHOT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 const CACHE_VERSION: u32 = 1;
 const ENTRY_FILE_MAGIC: &[u8; 8] = b"AIUCACH1";
 const REMOTE_FILE_MAGIC: &[u8; 8] = b"AIUREMT1";
+const ENTRY_INDEX_MAGIC: &[u8; 8] = b"AIUIDX01";
+const REMOTE_INDEX_MAGIC: &[u8; 8] = b"AIURIDX1";
 const HOT_SNAPSHOT_FILE: &str = "hot-snapshot.bin";
 const HOT_SNAPSHOT_MAGIC: &[u8; 8] = b"AIUHOT01";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -178,12 +193,6 @@ struct PersistedVendorRecords {
     records: Vec<PersistedSourceRecord>,
 }
 
-#[derive(Serialize)]
-struct PersistedVendorRecordsRef<'a> {
-    format_version: u32,
-    records: &'a [PersistedSourceRecord],
-}
-
 /// Cache record layout before conversation ids were retained. Kept only for
 /// an in-place migration of existing binary caches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,10 +259,59 @@ struct PersistedRemoteRecords {
     records: Vec<PersistedRemoteRecord>,
 }
 
-#[derive(Serialize)]
-struct PersistedRemoteRecordsRef<'a> {
-    format_version: u32,
-    records: &'a [PersistedRemoteRecord],
+impl index::IndexableRecord for PersistedSourceRecord {
+    fn index_timestamp(&self) -> &str {
+        &self.timestamp
+    }
+
+    fn index_dedup_key(&self) -> Option<&str> {
+        (!self.dedup_key.is_empty()).then_some(self.dedup_key.as_str())
+    }
+}
+
+impl index::IndexableRecord for PersistedRemoteRecord {
+    fn index_timestamp(&self) -> &str {
+        &self.timestamp
+    }
+
+    fn append_index_context(&self, digests: &mut Vec<[u8; 32]>) {
+        if self.vendor != "omp" || parse_omp_v220_key(&self.dedup_key).is_some() {
+            return;
+        }
+        digests.push(omp_stable_key_digest(&self.dedup_key));
+        if self.dedup_key.starts_with("omp:file:") {
+            digests.push(omp_file_alias_digest(&remote_omp_file_alias(self)));
+        }
+    }
+
+    fn index_duplicate_context(&self) -> Option<[u8; 32]> {
+        if self.vendor != "omp" {
+            return None;
+        }
+        let key = parse_omp_v220_key(&self.dedup_key)?;
+        if !omp_v220_key_matches_remote_record(&key, self) {
+            return None;
+        }
+        Some(
+            omp_stable_key_from_v220_key(&key)
+                .map(|stable_key| omp_stable_key_digest(&stable_key))
+                .unwrap_or_else(|| omp_file_alias_digest(&remote_omp_file_alias_from_key(&key))),
+        )
+    }
+}
+
+impl PersistedRemoteRecord {
+    fn collect_omp_stable_aliases(&self, aliases: &mut OmpStableAliases) {
+        if self.vendor != "omp" {
+            return;
+        }
+        if parse_omp_v220_key(&self.dedup_key).is_none() {
+            aliases.keys.insert(self.dedup_key.clone());
+        }
+        if self.dedup_key.starts_with("omp:file:") {
+            aliases.file_aliases.insert(remote_omp_file_alias(self));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,6 +472,12 @@ struct OmpRemoteFileAlias {
     output_tokens: i64,
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
+}
+
+#[derive(Default)]
+struct OmpStableAliases {
+    keys: HashSet<String>,
+    file_aliases: HashSet<OmpRemoteFileAlias>,
 }
 
 fn default_fast_tier() -> i8 {
@@ -738,13 +802,24 @@ pub fn default_cache_dir() -> PathBuf {
 /// Its payload is versioned by the caller's type and protected by the same
 /// checksum and atomic-write protocol as the authoritative record caches.
 pub(crate) fn load_hot_snapshot<T: DeserializeOwned>(cache_root: &Path) -> io::Result<Option<T>> {
+    #[cfg(test)]
+    HOT_SNAPSHOT_READS.set(HOT_SNAPSHOT_READS.get() + 1);
     let path = cache_root.join(HOT_SNAPSHOT_FILE);
-    match validate_framed_file(&path, HOT_SNAPSHOT_MAGIC, "hot snapshot") {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    match deserialize_framed(&path, HOT_SNAPSHOT_MAGIC) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-    deserialize_framed(&path, HOT_SNAPSHOT_MAGIC).map(Some)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_hot_snapshot_reads() {
+    HOT_SNAPSHOT_READS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn hot_snapshot_reads() -> usize {
+    HOT_SNAPSHOT_READS.get()
 }
 
 /// Persist a compact derived snapshot. The canonical per-source cache files
@@ -790,21 +865,32 @@ pub fn load_vendor_cached_records(cache_root: &Path, vendor: &str) -> Vec<Cached
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 pub(crate) fn load_recent_vendor_cached_records(
     cache_root: &Path,
     vendor: &str,
     cutoff: DateTime<Local>,
 ) -> (Vec<(String, UsageEntry)>, bool) {
+    load_vendor_cached_records_in_range(cache_root, vendor, cutoff, far_future())
+}
+
+pub(crate) fn load_vendor_cached_records_in_range(
+    cache_root: &Path,
+    vendor: &str,
+    start: DateTime<Local>,
+    end: DateTime<Local>,
+) -> (Vec<(String, UsageEntry)>, bool) {
     let path = vendor_entries_path(cache_root, vendor);
-    match read_cached_records(&path) {
-        Ok(records) => {
-            let has_cached_records = !records.is_empty();
+    let loaded = read_cached_records_in_range(&path, start, end);
+    match loaded {
+        Ok((records, has_cached_records)) => {
             let mut seen = HashSet::new();
             let recent = records
                 .into_iter()
                 .filter_map(|record| {
                     let timestamp = parse_timestamp(&record.timestamp)?;
-                    if timestamp < cutoff
+                    if timestamp < start
+                        || timestamp > end
                         || (!record.dedup_key.is_empty() && !seen.insert(record.dedup_key.clone()))
                     {
                         return None;
@@ -824,20 +910,72 @@ pub(crate) fn load_recent_vendor_cached_records(
     }
 }
 
+fn read_cached_records_in_range(
+    path: &Path,
+    start: DateTime<Local>,
+    end: DateTime<Local>,
+) -> io::Result<(Vec<PersistedSourceRecord>, bool)> {
+    if let Ok(indexed) = index::read_range::<PersistedSourceRecord>(
+        path,
+        ENTRY_FILE_MAGIC,
+        ENTRY_INDEX_MAGIC,
+        start,
+        end,
+    ) {
+        if indexed
+            .records
+            .iter()
+            .any(|record| !record.has_non_negative_token_usage())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache entry has negative token count",
+            ));
+        }
+        return Ok((indexed.records, indexed.has_records));
+    }
+    let records = read_cached_records(path)?;
+    let has_records = !records.is_empty();
+    let _ = index::ensure(
+        path,
+        ENTRY_FILE_MAGIC,
+        ENTRY_INDEX_MAGIC,
+        CACHE_VERSION,
+        &records,
+    );
+    Ok((
+        records
+            .into_iter()
+            .filter(|record| {
+                parse_timestamp(&record.timestamp)
+                    .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+            })
+            .collect(),
+        has_records,
+    ))
+}
+
 pub fn load_remote_entries(
     cache_root: &Path,
     hosts_filter: Option<&HashSet<String>>,
 ) -> Vec<RemoteUsageRecord> {
     let host_files = remote_host_files(cache_root, hosts_filter);
 
-    // Per-host files decode in parallel; the indexed collect keeps the
-    // deterministic host order.
+    // Decode and migrate one host at a time so old multi-gigabyte caches do
+    // not multiply their peak memory during the one-time index build.
     let per_host: Vec<Vec<RemoteUsageRecord>> = host_files
-        .par_iter()
+        .iter()
         .map(|(host_id, path)| {
             let Ok(host_records) = read_remote_records(path) else {
                 return Vec::new();
             };
+            let _ = index::ensure(
+                path,
+                REMOTE_FILE_MAGIC,
+                REMOTE_INDEX_MAGIC,
+                CACHE_VERSION,
+                &host_records,
+            );
             let host_records = deduplicate_remote_omp_aliases(host_records);
             host_records
                 .into_iter()
@@ -848,25 +986,101 @@ pub fn load_remote_entries(
     per_host.into_iter().flatten().collect()
 }
 
+#[cfg(test)]
 pub(crate) fn load_recent_remote_entries(
     cache_root: &Path,
     hosts_filter: Option<&HashSet<String>>,
     cutoff: DateTime<Local>,
 ) -> Vec<RemoteUsageRecord> {
+    load_remote_entries_in_range(cache_root, hosts_filter, cutoff, far_future()).0
+}
+
+pub(crate) fn load_remote_entries_in_range(
+    cache_root: &Path,
+    hosts_filter: Option<&HashSet<String>>,
+    start: DateTime<Local>,
+    end: DateTime<Local>,
+) -> (Vec<RemoteUsageRecord>, bool) {
     let host_files = remote_host_files(cache_root, hosts_filter);
-    host_files
-        .into_iter()
-        .flat_map(|(host_id, path)| {
-            let records = read_remote_records(&path).unwrap_or_default();
-            deduplicate_remote_omp_aliases(records)
+    let mut entries = Vec::new();
+    let mut has_source_data = false;
+    for (host_id, path) in host_files {
+        let (records, host_has_records) = read_remote_records_in_range(&path, start, end)
+            .unwrap_or_else(|_| {
+                let records = read_remote_records(&path).unwrap_or_default();
+                let has_records = !records.is_empty();
+                let records = deduplicate_remote_omp_aliases(records)
+                    .into_iter()
+                    .filter(|record| {
+                        parse_timestamp(&record.timestamp)
+                            .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+                    })
+                    .collect();
+                (records, has_records)
+            });
+        has_source_data |= host_has_records;
+        entries.extend(
+            records
                 .into_iter()
-                .filter(|record| {
-                    parse_timestamp(&record.timestamp).is_some_and(|timestamp| timestamp >= cutoff)
-                })
-                .map(|record| record.into_remote_usage_record(&host_id))
-                .collect::<Vec<_>>()
-        })
-        .collect()
+                .map(|record| record.into_remote_usage_record(&host_id)),
+        );
+    }
+    (entries, has_source_data)
+}
+
+fn read_remote_records_in_range(
+    path: &Path,
+    start: DateTime<Local>,
+    end: DateTime<Local>,
+) -> io::Result<(Vec<PersistedRemoteRecord>, bool)> {
+    if let Ok(indexed) = index::read_range::<PersistedRemoteRecord>(
+        path,
+        REMOTE_FILE_MAGIC,
+        REMOTE_INDEX_MAGIC,
+        start,
+        end,
+    ) {
+        if indexed
+            .records
+            .iter()
+            .any(|record| !record.has_non_negative_token_usage())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote cache entry has negative token count",
+            ));
+        }
+        return Ok((
+            deduplicate_remote_omp_aliases(indexed.records),
+            indexed.has_records,
+        ));
+    }
+    let records = read_remote_records(path)?;
+    let has_records = !records.is_empty();
+    let _ = index::ensure(
+        path,
+        REMOTE_FILE_MAGIC,
+        REMOTE_INDEX_MAGIC,
+        CACHE_VERSION,
+        &records,
+    );
+    Ok((
+        deduplicate_remote_omp_aliases(records)
+            .into_iter()
+            .filter(|record| {
+                parse_timestamp(&record.timestamp)
+                    .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+            })
+            .collect(),
+        has_records,
+    ))
+}
+
+#[cfg(test)]
+fn far_future() -> DateTime<Local> {
+    DateTime::from_timestamp(253_402_300_799, 0)
+        .expect("year 9999 timestamp")
+        .with_timezone(&Local)
 }
 
 fn remote_host_files(
@@ -881,7 +1095,7 @@ fn remote_host_files(
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if !path.is_file() {
+            if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("bin") {
                 return None;
             }
             let host_id = path.file_stem()?.to_str()?.to_string();
@@ -895,9 +1109,15 @@ fn remote_host_files(
     host_files
 }
 
-/// Remove every per-host file in the remote cache directory and report
-/// how many files were deleted. Returns Ok(0) if the directory does
-/// not exist.
+pub(crate) fn remote_host_ids(cache_root: &Path) -> Vec<String> {
+    remote_host_files(cache_root, None)
+        .into_iter()
+        .map(|(host_id, _)| host_id)
+        .collect()
+}
+
+/// Remove every per-host data file and derived index, reporting the number of
+/// host data files removed. Returns Ok(0) if the directory does not exist.
 pub fn clear_remote_cache(cache_root: &Path) -> io::Result<usize> {
     let remote_root = cache_root.join(REMOTE_DIR);
     let entries = match fs::read_dir(&remote_root) {
@@ -910,8 +1130,10 @@ pub fn clear_remote_cache(cache_root: &Path) -> io::Result<usize> {
         let entry = entry?;
         let path = entry.path();
         if path.is_file() {
+            if path.extension().and_then(|value| value.to_str()) == Some("bin") {
+                removed += 1;
+            }
             fs::remove_file(&path)?;
-            removed += 1;
         }
     }
     Ok(removed)
@@ -956,17 +1178,17 @@ fn deduplicate_remote_omp_aliases(
         return records;
     }
 
-    let stable_keys = records
-        .iter()
-        .filter(|record| record.vendor == "omp" && parse_omp_v220_key(&record.dedup_key).is_none())
-        .map(|record| record.dedup_key.clone())
-        .collect::<HashSet<_>>();
-    let stable_file_aliases = records
-        .iter()
-        .filter(|record| record.vendor == "omp" && record.dedup_key.starts_with("omp:file:"))
-        .map(remote_omp_file_alias)
-        .collect::<HashSet<_>>();
+    let mut stable_aliases = OmpStableAliases::default();
+    for record in &records {
+        record.collect_omp_stable_aliases(&mut stable_aliases);
+    }
+    deduplicate_remote_omp_aliases_with_stable_aliases(records, &stable_aliases)
+}
 
+fn deduplicate_remote_omp_aliases_with_stable_aliases(
+    records: Vec<PersistedRemoteRecord>,
+    stable_aliases: &OmpStableAliases,
+) -> Vec<PersistedRemoteRecord> {
     let stale_indexes = records
         .iter()
         .enumerate()
@@ -979,9 +1201,11 @@ fn deduplicate_remote_omp_aliases(
                 return None;
             }
             let duplicate_exists = omp_stable_key_from_v220_key(&key)
-                .map(|stable_key| stable_keys.contains(&stable_key))
+                .map(|stable_key| stable_aliases.keys.contains(&stable_key))
                 .unwrap_or_else(|| {
-                    stable_file_aliases.contains(&remote_omp_file_alias_from_key(&key))
+                    stable_aliases
+                        .file_aliases
+                        .contains(&remote_omp_file_alias_from_key(&key))
                 });
             duplicate_exists.then_some(idx)
         })
@@ -1042,6 +1266,29 @@ fn remote_omp_file_alias_from_key(key: &OmpV220Key) -> OmpRemoteFileAlias {
         cache_read_input_tokens: key.cache_read_input_tokens,
         cache_creation_input_tokens: key.cache_creation_input_tokens,
     }
+}
+
+fn omp_stable_key_digest(key: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"omp-stable-key\0");
+    hasher.update(key.as_bytes());
+    hasher.finalize().into()
+}
+
+fn omp_file_alias_digest(alias: &OmpRemoteFileAlias) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"omp-file-alias\0");
+    hasher.update((alias.model.len() as u64).to_le_bytes());
+    hasher.update(alias.model.as_bytes());
+    for value in [
+        alias.input_tokens,
+        alias.output_tokens,
+        alias.cache_read_input_tokens,
+        alias.cache_creation_input_tokens,
+    ] {
+        hasher.update(value.to_le_bytes());
+    }
+    hasher.finalize().into()
 }
 
 fn omp_model_candidates_for(model: &str, effort: Option<&str>) -> Vec<String> {
@@ -1163,7 +1410,8 @@ fn retaining_vendor_cache_is_current(
         return false;
     };
     let required_revision = parser_revision(vendor);
-    vendor_manifest.session_metadata_revision == required_revision
+    index::matches_source_generation(&entries_path, ENTRY_FILE_MAGIC, ENTRY_INDEX_MAGIC)
+        && vendor_manifest.session_metadata_revision == required_revision
         && active_sources.iter().all(|source| {
             vendor_manifest.files.get(&source.key).is_some_and(|meta| {
                 meta.parser_revision == required_revision && meta.matches_stat(&source.stat)
@@ -1312,474 +1560,23 @@ where
     manifest
         .vendors
         .insert(vendor.to_string(), next_vendor_manifest);
-    if cache_changed {
-        let _ = write_cached_records(&entries_path, &active_records);
+    let rewrite_entries = cache_changed
+        || index::ensure(
+            &entries_path,
+            ENTRY_FILE_MAGIC,
+            ENTRY_INDEX_MAGIC,
+            CACHE_VERSION,
+            &active_records,
+        )
+        .is_err();
+    if rewrite_entries && write_cached_records(&entries_path, &active_records).is_err() {
+        return active_records;
     }
     if cache_changed || !cache_artifact_precedes_manifest(&entries_path, &manifest_path) {
         let _ = write_manifest(&manifest_path, &manifest);
     }
 
     active_records
-}
-
-fn rebuild_vendor_cache<F>(
-    cache_root: &Path,
-    vendor: &str,
-    manifest_path: &Path,
-    mut manifest: CacheManifest,
-    active_sources: Vec<CurrentSource>,
-    current_fast_tier: i8,
-    parse_file: &F,
-) -> Vec<PersistedSourceRecord>
-where
-    F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
-{
-    let active_records = parse_active_sources(&active_sources, current_fast_tier, parse_file);
-    let mut vendor_manifest = VendorManifest {
-        session_metadata_revision: parser_revision(vendor),
-        ..Default::default()
-    };
-    let stats = record_stats_by_path(&active_records);
-
-    for source in &active_sources {
-        vendor_manifest.files.insert(
-            source.key.clone(),
-            SourceFileMeta::from_stat(
-                &source.stat,
-                stats.get(&source.key).copied().unwrap_or_default(),
-                parser_revision(vendor),
-            ),
-        );
-    }
-
-    manifest.vendors.insert(vendor.to_string(), vendor_manifest);
-    let _ = fs::create_dir_all(cache_root.join(ENTRIES_DIR));
-    let _ = write_cached_records(&vendor_entries_path(cache_root, vendor), &active_records);
-    let _ = write_manifest(manifest_path, &manifest);
-
-    active_records
-}
-
-fn parse_active_sources<F>(
-    active_sources: &[CurrentSource],
-    current_fast_tier: i8,
-    parse_file: &F,
-) -> Vec<PersistedSourceRecord>
-where
-    F: Fn(&Path) -> Vec<SourceUsageRecord> + Sync,
-{
-    let per_source: Vec<Vec<PersistedSourceRecord>> = active_sources
-        .par_iter()
-        .map(|source| {
-            parse_file(&source.path)
-                .into_iter()
-                .map(|record| {
-                    PersistedSourceRecord::from_source_record(
-                        source.key.clone(),
-                        record,
-                        current_fast_tier,
-                    )
-                })
-                .collect()
-        })
-        .collect();
-    per_source.into_iter().flatten().collect()
-}
-
-fn current_sources(source_files: Vec<PathBuf>) -> Vec<CurrentSource> {
-    let mut sources = Vec::new();
-    let mut occurrences: HashMap<String, usize> = HashMap::new();
-    for path in source_files {
-        let Some(stat) = stat_source_file(&path) else {
-            continue;
-        };
-        let base_key = source_path_key(&path);
-        let occurrence = occurrences.entry(base_key.clone()).or_insert(0);
-        let key = if *occurrence == 0 {
-            base_key
-        } else {
-            format!("{}#{}", base_key, occurrence)
-        };
-        *occurrence += 1;
-        sources.push(CurrentSource { key, path, stat });
-    }
-    sources
-}
-
-fn stat_source_file(path: &Path) -> Option<SourceFileStat> {
-    let metadata = fs::metadata(path).ok()?;
-    let modified = metadata.modified().ok()?;
-    let duration = modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0));
-    Some(SourceFileStat {
-        size_bytes: metadata.len(),
-        modified_secs: duration.as_secs(),
-        modified_nanos: duration.subsec_nanos(),
-        #[cfg(unix)]
-        changed_secs: metadata.ctime(),
-        #[cfg(not(unix))]
-        changed_secs: 0,
-        #[cfg(unix)]
-        changed_nanos: metadata.ctime_nsec(),
-        #[cfg(not(unix))]
-        changed_nanos: 0,
-        #[cfg(unix)]
-        device_id: metadata.dev(),
-        #[cfg(not(unix))]
-        device_id: 0,
-        #[cfg(unix)]
-        inode: metadata.ino(),
-        #[cfg(not(unix))]
-        inode: 0,
-    })
-}
-
-fn source_path_key(path: &Path) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn vendor_entries_path(cache_root: &Path, vendor: &str) -> PathBuf {
-    cache_root
-        .join(ENTRIES_DIR)
-        .join(format!("{}.bin", safe_file_stem(vendor)))
-}
-
-fn remote_entries_path(cache_root: &Path, host_id: &str) -> PathBuf {
-    cache_root
-        .join(REMOTE_DIR)
-        .join(format!("{}.bin", safe_file_stem(host_id)))
-}
-
-fn safe_file_stem(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn read_manifest(path: &Path) -> CacheManifest {
-    let Ok(content) = fs::read_to_string(path) else {
-        return CacheManifest::default();
-    };
-    let Ok(manifest) = serde_json::from_str::<CacheManifest>(&content) else {
-        return CacheManifest::default();
-    };
-    if manifest.version == CACHE_VERSION {
-        manifest
-    } else {
-        CacheManifest::default()
-    }
-}
-
-fn write_manifest(path: &Path, manifest: &CacheManifest) -> io::Result<()> {
-    let content = serde_json::to_string_pretty(manifest)?;
-    atomic_write(path, content.as_bytes())
-}
-
-fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
-    #[cfg(test)]
-    CACHED_RECORD_READS.set(CACHED_RECORD_READS.get() + 1);
-    validate_framed_file(path, ENTRY_FILE_MAGIC, "cache entry")?;
-    if let Ok(decoded) = deserialize_framed::<PersistedVendorRecords>(path, ENTRY_FILE_MAGIC) {
-        if decoded.format_version != CACHE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported cache entry version",
-            ));
-        }
-        if decoded
-            .records
-            .iter()
-            .any(|record| !record.has_non_negative_token_usage())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cache entry has negative token count",
-            ));
-        }
-        return Ok(decoded.records);
-    }
-
-    if let Ok(decoded) =
-        deserialize_framed::<PersistedVendorRecordsBeforeSession>(path, ENTRY_FILE_MAGIC)
-    {
-        if decoded.format_version != CACHE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported cache entry version",
-            ));
-        }
-        let records: Vec<PersistedSourceRecord> =
-            decoded.records.into_iter().map(Into::into).collect();
-        if records
-            .iter()
-            .any(|record| !record.has_non_negative_token_usage())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cache entry has negative token count",
-            ));
-        }
-        return Ok(records);
-    }
-
-    if let Ok(decoded) =
-        deserialize_framed::<PersistedVendorRecordsWithFastTier>(path, ENTRY_FILE_MAGIC)
-    {
-        if decoded.format_version != CACHE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported cache entry version",
-            ));
-        }
-        let records: Vec<PersistedSourceRecord> =
-            decoded.records.into_iter().map(Into::into).collect();
-        if records
-            .iter()
-            .any(|record| !record.has_non_negative_token_usage())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cache entry has negative token count",
-            ));
-        }
-        return Ok(records);
-    }
-
-    let decoded: PersistedVendorRecordsV1 = deserialize_framed(path, ENTRY_FILE_MAGIC)?;
-    if decoded.format_version != CACHE_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported cache entry version",
-        ));
-    }
-    let records: Vec<PersistedSourceRecord> = decoded.records.into_iter().map(Into::into).collect();
-    if records
-        .iter()
-        .any(|record| !record.has_non_negative_token_usage())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cache entry has negative token count",
-        ));
-    }
-    Ok(records)
-}
-
-fn write_cached_records(path: &Path, records: &[PersistedSourceRecord]) -> io::Result<()> {
-    atomic_serialize_framed(
-        path,
-        ENTRY_FILE_MAGIC,
-        &PersistedVendorRecordsRef {
-            format_version: CACHE_VERSION,
-            records,
-        },
-    )
-}
-
-fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
-    validate_framed_file(path, REMOTE_FILE_MAGIC, "remote cache entry")?;
-    if let Ok(decoded) = deserialize_framed::<PersistedRemoteRecords>(path, REMOTE_FILE_MAGIC) {
-        if decoded.format_version != CACHE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported remote cache entry version",
-            ));
-        }
-        if decoded
-            .records
-            .iter()
-            .any(|record| !record.has_non_negative_token_usage())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "remote cache entry has negative token count",
-            ));
-        }
-        return Ok(decoded.records);
-    }
-
-    if let Ok(decoded) =
-        deserialize_framed::<PersistedRemoteRecordsWithFastTier>(path, REMOTE_FILE_MAGIC)
-    {
-        if decoded.format_version != CACHE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported remote cache entry version",
-            ));
-        }
-        let records: Vec<PersistedRemoteRecord> =
-            decoded.records.into_iter().map(Into::into).collect();
-        if records
-            .iter()
-            .any(|record| !record.has_non_negative_token_usage())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "remote cache entry has negative token count",
-            ));
-        }
-        return Ok(records);
-    }
-
-    let decoded: PersistedRemoteRecordsV1 = deserialize_framed(path, REMOTE_FILE_MAGIC)?;
-    if decoded.format_version != CACHE_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported remote cache entry version",
-        ));
-    }
-    let records: Vec<PersistedRemoteRecord> = decoded.records.into_iter().map(Into::into).collect();
-    if records
-        .iter()
-        .any(|record| !record.has_non_negative_token_usage())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "remote cache entry has negative token count",
-        ));
-    }
-    Ok(records)
-}
-
-fn write_remote_records(path: &Path, records: &[PersistedRemoteRecord]) -> io::Result<()> {
-    atomic_serialize_framed(
-        path,
-        REMOTE_FILE_MAGIC,
-        &PersistedRemoteRecordsRef {
-            format_version: CACHE_VERSION,
-            records,
-        },
-    )
-}
-
-fn validate_framed_file(path: &Path, magic: &[u8], label: &str) -> io::Result<()> {
-    let mut reader = BufReader::new(fs::File::open(path)?);
-    let mut actual_magic = vec![0_u8; magic.len()];
-    reader.read_exact(&mut actual_magic).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid {label} header"),
-        )
-    })?;
-    if actual_magic != magic {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid {label} header"),
-        ));
-    }
-    let mut checksum_bytes = [0_u8; 8];
-    reader
-        .read_exact(&mut checksum_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid checksum"))?;
-    let stored_checksum = u64::from_le_bytes(checksum_bytes);
-    let mut actual_checksum = fnv1a_bytes(0, &[]);
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        actual_checksum = fnv1a_bytes(actual_checksum, &buffer[..read]);
-    }
-    if stored_checksum != actual_checksum {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{label} checksum mismatch"),
-        ));
-    }
-    Ok(())
-}
-
-fn deserialize_framed<T: DeserializeOwned>(path: &Path, magic: &[u8]) -> io::Result<T> {
-    let mut reader = BufReader::new(fs::File::open(path)?);
-    reader.seek(SeekFrom::Start((magic.len() + 8) as u64))?;
-    bincode::deserialize_from(reader)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-struct FnvWriter<W> {
-    inner: W,
-    checksum: u64,
-}
-
-impl<W> FnvWriter<W> {
-    fn new(inner: W) -> Self {
-        Self {
-            inner,
-            checksum: fnv1a_bytes(0, &[]),
-        }
-    }
-}
-
-impl<W: Write> Write for FnvWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(bytes)?;
-        self.checksum = fnv1a_bytes(self.checksum, &bytes[..written]);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-fn atomic_serialize_framed<T: Serialize + ?Sized>(
-    path: &Path,
-    magic: &[u8],
-    value: &T,
-) -> io::Result<()> {
-    atomic_write_with(path, |file| {
-        file.seek(SeekFrom::Start((magic.len() + 8) as u64))?;
-        let checksum = {
-            let mut writer = FnvWriter::new(BufWriter::new(&mut *file));
-            bincode::serialize_into(&mut writer, value).map_err(io::Error::other)?;
-            writer.flush()?;
-            writer.checksum
-        };
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(magic)?;
-        file.write_all(&checksum.to_le_bytes())
-    })
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    atomic_write_with(path, |file| file.write_all(bytes))
-}
-
-fn atomic_write_with(
-    path: &Path,
-    write: impl FnOnce(&mut fs::File) -> io::Result<()>,
-) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_nanos();
-    let tmp_path = path.with_extension(format!("tmp-{}", stamp));
-    let result = (|| {
-        let mut file = fs::File::create(&tmp_path)?;
-        write(&mut file)?;
-        file.sync_all()
-    })();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(error);
-    }
-    fs::rename(tmp_path, path)?;
-    Ok(())
 }
 
 fn records_by_path(
@@ -1969,1293 +1766,4 @@ fn aggregate_persisted_records<'a>(
         entries.push(record.to_usage_entry());
     }
     entries
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-    use std::fs;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct PersistedVendorRecordsWithFastTier {
-        format_version: u32,
-        records: Vec<PersistedSourceRecordWithFastTier>,
-    }
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct PersistedSourceRecordWithFastTier {
-        source_path: String,
-        dedup_key: String,
-        timestamp: String,
-        session_start_time: String,
-        session_end_time: String,
-        model: String,
-        effort: Option<String>,
-        input_tokens: i64,
-        output_tokens: i64,
-        cache_read_input_tokens: i64,
-        cache_creation_input_tokens: i64,
-        reasoning_output_tokens: i64,
-        fast_tier: i8,
-    }
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct PersistedRemoteRecordsWithFastTier {
-        format_version: u32,
-        records: Vec<PersistedRemoteRecordWithFastTier>,
-    }
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct PersistedRemoteRecordWithFastTier {
-        vendor: String,
-        dedup_key: String,
-        timestamp: String,
-        session_start_time: String,
-        session_end_time: String,
-        model: String,
-        effort: Option<String>,
-        input_tokens: i64,
-        output_tokens: i64,
-        cache_read_input_tokens: i64,
-        cache_creation_input_tokens: i64,
-        reasoning_output_tokens: i64,
-        fast_tier: i8,
-    }
-
-    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("ai-usage-cache-test-{}-{}", name, stamp));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
-
-    fn write_source(path: &Path, content: &str) {
-        fs::write(path, content).expect("write source");
-    }
-
-    fn write_payload_file(path: &Path, magic: &[u8], payload: &[u8]) {
-        let checksum = super::fnv1a_bytes(0, payload);
-        let mut content = Vec::new();
-        content.extend_from_slice(magic);
-        content.extend_from_slice(&checksum.to_le_bytes());
-        content.extend_from_slice(payload);
-        fs::write(path, content).expect("write payload file");
-    }
-
-    fn usage_record(key: &str, timestamp: &str, input_tokens: i64) -> SourceUsageRecord {
-        SourceUsageRecord {
-            dedup_key: key.to_string(),
-            entry: UsageEntry {
-                host_id: None,
-                session_id: None,
-                timestamp: timestamp.to_string(),
-                parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
-                session_start_time: timestamp.to_string(),
-                session_end_time: timestamp.to_string(),
-                model: "test-model".to_string(),
-                effort: None,
-                fast_tier: UNKNOWN_FAST_TIER,
-                usage: TokenUsage {
-                    input_tokens,
-                    output_tokens: 2,
-                    cache_read_input_tokens: 3,
-                    cache_creation_input_tokens: 4,
-                    reasoning_output_tokens: 5,
-                },
-                costs: None,
-            },
-        }
-    }
-
-    fn entry_tokens(entries: &[UsageEntry]) -> Vec<i64> {
-        entries
-            .iter()
-            .map(|entry| entry.usage.input_tokens)
-            .collect()
-    }
-
-    fn remote_record(
-        vendor: &str,
-        dedup_key: &str,
-        timestamp: &str,
-        input_tokens: i64,
-    ) -> super::RemoteUsageRecord {
-        super::RemoteUsageRecord {
-            vendor: vendor.to_string(),
-            dedup_key: dedup_key.to_string(),
-            entry: UsageEntry {
-                host_id: None,
-                session_id: None,
-                timestamp: timestamp.to_string(),
-                parsed_timestamp: crate::time_utils::parse_timestamp(timestamp),
-                session_start_time: timestamp.to_string(),
-                session_end_time: timestamp.to_string(),
-                model: "remote-model".to_string(),
-                effort: None,
-                fast_tier: UNKNOWN_FAST_TIER,
-                usage: TokenUsage {
-                    input_tokens,
-                    output_tokens: 2,
-                    cache_read_input_tokens: 3,
-                    cache_creation_input_tokens: 4,
-                    reasoning_output_tokens: 5,
-                },
-                costs: None,
-            },
-        }
-    }
-
-    fn omp_v220_key(message_id: &str, response_id: &str, model: &str, input_tokens: i64) -> String {
-        serde_json::json!({
-            "message": message_id,
-            "response": response_id,
-            "model": model,
-            "input": input_tokens,
-            "output": 2,
-            "cache_read": 3,
-            "cache_write": 4,
-        })
-        .to_string()
-    }
-
-    fn remote_fingerprints(
-        records: &[super::RemoteUsageRecord],
-    ) -> Vec<(String, String, Option<String>, i64)> {
-        records
-            .iter()
-            .map(|record| {
-                (
-                    record.vendor.clone(),
-                    record.dedup_key.clone(),
-                    record.entry.host_id.clone(),
-                    record.entry.usage.input_tokens,
-                )
-            })
-            .collect()
-    }
-
-    type EntryFingerprint = (
-        String,
-        Option<String>,
-        String,
-        String,
-        String,
-        Option<String>,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i8,
-    );
-
-    fn entry_fingerprints(entries: &[UsageEntry]) -> Vec<EntryFingerprint> {
-        entries
-            .iter()
-            .map(|entry| {
-                (
-                    entry.timestamp.clone(),
-                    entry
-                        .parsed_timestamp
-                        .map(|timestamp| timestamp.to_rfc3339()),
-                    entry.session_start_time.clone(),
-                    entry.session_end_time.clone(),
-                    entry.model.clone(),
-                    entry.effort.clone(),
-                    entry.usage.input_tokens,
-                    entry.usage.output_tokens,
-                    entry.usage.cache_read_input_tokens,
-                    entry.usage.cache_creation_input_tokens,
-                    entry.usage.reasoning_output_tokens,
-                    entry.fast_tier,
-                )
-            })
-            .collect()
-    }
-
-    fn direct_parse(
-        source_files: Vec<std::path::PathBuf>,
-        parse_file: impl Fn(&Path) -> Vec<SourceUsageRecord>,
-    ) -> Vec<UsageEntry> {
-        let mut seen = std::collections::HashSet::new();
-        let mut entries = Vec::new();
-        for source_file in source_files {
-            for record in parse_file(&source_file) {
-                if !record.dedup_key.is_empty() && !seen.insert(record.dedup_key.clone()) {
-                    continue;
-                }
-                entries.push(record.entry);
-            }
-        }
-        entries
-    }
-
-    #[test]
-    fn omp_alias_candidates_ignore_reasoning_effort_values() {
-        let with_provider = super::omp_model_candidates_for("gpt-5", Some("rust-cat"));
-        let with_effort = super::omp_model_candidates_for("gpt-5", Some("xhigh"));
-
-        assert!(with_provider.contains(&"rust-cat/gpt-5".to_string()));
-        assert!(with_provider.contains(&"openai-codex/gpt-5".to_string()));
-        assert!(!with_effort.contains(&"xhigh/gpt-5".to_string()));
-        assert!(with_effort.contains(&"openai-codex/gpt-5".to_string()));
-    }
-
-    #[test]
-    fn local_cache_entries_have_no_host_id() {
-        let cache_root = unique_temp_dir("local-host");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-
-        let entries =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            });
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].host_id, None);
-    }
-
-    #[test]
-    fn local_cache_round_trips_session_ids() {
-        let cache_root = unique_temp_dir("session-id");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-
-        let _ = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
-            let mut record = usage_record("stable-key", "2026-05-01T00:00:00Z", 42);
-            record.entry.session_id = Some("conversation-42".to_string());
-            vec![record]
-        });
-        let records = super::load_vendor_cached_records(&cache_root, "test");
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].entry.session_id.as_deref(),
-            Some("conversation-42")
-        );
-    }
-
-    #[test]
-    fn cache_before_session_ids_remains_readable() {
-        let cache_root = unique_temp_dir("before-session-id");
-        let entries_dir = cache_root.join(super::ENTRIES_DIR);
-        fs::create_dir_all(&entries_dir).expect("create entries directory");
-
-        let legacy = super::PersistedVendorRecordsBeforeSession {
-            format_version: super::CACHE_VERSION,
-            records: vec![super::PersistedSourceRecordBeforeSession {
-                source_path: "source.jsonl".to_string(),
-                dedup_key: "stable-key".to_string(),
-                timestamp: "2026-05-01T00:00:00Z".to_string(),
-                session_start_time: "2026-05-01T00:00:00Z".to_string(),
-                session_end_time: "2026-05-01T00:00:00Z".to_string(),
-                model: "test-model".to_string(),
-                effort: None,
-                input_tokens: 42,
-                output_tokens: 0,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-                reasoning_output_tokens: 0,
-                fast_tier: UNKNOWN_FAST_TIER,
-                cost_input: None,
-                cost_output: None,
-                cost_cache_read: None,
-                cost_cache_creation: None,
-            }],
-        };
-        let payload = bincode::serialize(&legacy).expect("serialize legacy cache");
-        let mut content = Vec::new();
-        content.extend_from_slice(super::ENTRY_FILE_MAGIC);
-        content.extend_from_slice(&super::fnv1a_bytes(0, &payload).to_le_bytes());
-        content.extend_from_slice(&payload);
-        fs::write(entries_dir.join("claude.bin"), content).expect("write legacy cache");
-
-        let records = super::load_vendor_cached_records(&cache_root, "claude");
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].entry.session_id, None);
-        assert_eq!(records[0].entry.usage.input_tokens, 42);
-    }
-
-    #[test]
-    fn manifest_marks_session_metadata_stale_until_current_parser_revision() {
-        let cache_root = unique_temp_dir("session-metadata-revision");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-
-        let _ = super::load_or_update_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
-            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-        });
-        assert!(super::vendor_session_metadata_is_current(
-            &cache_root,
-            "claude"
-        ));
-
-        let manifest_path = cache_root.join(super::MANIFEST_FILE);
-        let mut manifest: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
-                .expect("parse manifest");
-        manifest["vendors"]["claude"]["session_metadata_revision"] = serde_json::json!(0);
-        fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
-        )
-        .expect("write stale manifest");
-
-        assert!(!super::vendor_session_metadata_is_current(
-            &cache_root,
-            "claude"
-        ));
-
-        manifest["vendors"]["claude"]["files"] = serde_json::json!({});
-        fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest).expect("serialize empty manifest"),
-        )
-        .expect("write empty manifest");
-
-        assert!(!super::vendor_session_metadata_is_current(
-            &cache_root,
-            "claude"
-        ));
-    }
-
-    #[test]
-    fn retained_inactive_sources_do_not_keep_session_metadata_stale() {
-        let cache_root = unique_temp_dir("inactive-session-metadata");
-        let active = cache_root.join("active.jsonl");
-        let retired = cache_root.join("retired.jsonl");
-        write_source(&active, "active");
-        write_source(&retired, "retired");
-
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "claude",
-            vec![active.clone(), retired.clone()],
-            -1,
-            |_| vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)],
-        );
-
-        let manifest_path = cache_root.join(super::MANIFEST_FILE);
-        let mut manifest: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
-                .expect("parse manifest");
-        let retired_key = fs::canonicalize(&retired)
-            .expect("canonical retired path")
-            .to_string_lossy()
-            .into_owned();
-        manifest["vendors"]["claude"]["files"][&retired_key]["parser_revision"] =
-            serde_json::json!(0);
-        fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
-        )
-        .expect("write stale manifest");
-        fs::remove_file(&retired).expect("remove retired source");
-
-        super::refresh_retaining_vendor_cache(&cache_root, "claude", vec![active], -1, |_| {
-            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-        });
-
-        assert!(super::vendor_session_metadata_is_current(
-            &cache_root,
-            "claude"
-        ));
-    }
-
-    #[test]
-    fn remote_records_are_loaded_with_host_metadata() {
-        let cache_root = unique_temp_dir("remote-load");
-
-        super::merge_remote_records(
-            &cache_root,
-            "laptop",
-            vec![
-                remote_record("claude", "a", "2026-05-01T00:00:00Z", 10),
-                remote_record("codex", "b", "2026-05-01T00:01:00Z", 20),
-            ],
-        )
-        .expect("merge remote records");
-
-        let records = super::load_remote_entries(&cache_root, None);
-
-        assert_eq!(
-            remote_fingerprints(&records),
-            vec![
-                (
-                    "claude".to_string(),
-                    "a".to_string(),
-                    Some("laptop".to_string()),
-                    10
-                ),
-                (
-                    "codex".to_string(),
-                    "b".to_string(),
-                    Some("laptop".to_string()),
-                    20
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn remote_load_suppresses_existing_omp_alias_duplicates() {
-        let cache_root = unique_temp_dir("remote-omp-alias-dedup");
-        let remote_dir = cache_root.join(super::REMOTE_DIR);
-        fs::create_dir_all(&remote_dir).expect("create remote dir");
-        let payload = bincode::serialize(&super::PersistedRemoteRecords {
-            format_version: super::CACHE_VERSION,
-            records: vec![
-                super::PersistedRemoteRecord::from_remote_record(remote_record(
-                    "omp",
-                    &omp_v220_key("msg-a", "resp-a", "remote-model", 10),
-                    "2026-05-01T00:00:00Z",
-                    10,
-                )),
-                super::PersistedRemoteRecord::from_remote_record(remote_record(
-                    "omp",
-                    "omp:message:msg-a:response:resp-a",
-                    "2026-05-01T00:00:00Z",
-                    10,
-                )),
-                super::PersistedRemoteRecord::from_remote_record(remote_record(
-                    "omp",
-                    &omp_v220_key("", "", "remote-model", 20),
-                    "2026-05-01T00:01:00Z",
-                    20,
-                )),
-                super::PersistedRemoteRecord::from_remote_record(remote_record(
-                    "omp",
-                    "omp:file:/tmp/omp.jsonl:0",
-                    "2026-05-01T00:01:00Z",
-                    20,
-                )),
-                super::PersistedRemoteRecord::from_remote_record(remote_record(
-                    "omp",
-                    "omp:file:/tmp/omp.jsonl:1",
-                    "2026-05-01T00:02:00Z",
-                    20,
-                )),
-            ],
-        })
-        .expect("serialize remote records");
-        write_payload_file(
-            &remote_dir.join("laptop.bin"),
-            super::REMOTE_FILE_MAGIC,
-            &payload,
-        );
-
-        let records = super::load_remote_entries(&cache_root, None);
-
-        assert_eq!(
-            remote_fingerprints(&records),
-            vec![
-                (
-                    "omp".to_string(),
-                    "omp:message:msg-a:response:resp-a".to_string(),
-                    Some("laptop".to_string()),
-                    10
-                ),
-                (
-                    "omp".to_string(),
-                    "omp:file:/tmp/omp.jsonl:0".to_string(),
-                    Some("laptop".to_string()),
-                    20
-                ),
-                (
-                    "omp".to_string(),
-                    "omp:file:/tmp/omp.jsonl:1".to_string(),
-                    Some("laptop".to_string()),
-                    20
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn remote_records_deduplicate_by_vendor_and_key() {
-        let cache_root = unique_temp_dir("remote-dedup");
-
-        super::merge_remote_records(
-            &cache_root,
-            "laptop",
-            vec![
-                remote_record("claude", "same", "2026-05-01T00:00:00Z", 10),
-                remote_record("codex", "same", "2026-05-01T00:01:00Z", 20),
-            ],
-        )
-        .expect("merge first batch");
-        super::merge_remote_records(
-            &cache_root,
-            "laptop",
-            vec![remote_record("claude", "same", "2026-05-01T00:02:00Z", 99)],
-        )
-        .expect("merge duplicate batch");
-
-        let records = super::load_remote_entries(&cache_root, None);
-
-        assert_eq!(
-            remote_fingerprints(&records),
-            vec![
-                (
-                    "claude".to_string(),
-                    "same".to_string(),
-                    Some("laptop".to_string()),
-                    99
-                ),
-                (
-                    "codex".to_string(),
-                    "same".to_string(),
-                    Some("laptop".to_string()),
-                    20
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn remote_omp_stable_records_refresh_existing_metadata() {
-        let cache_root = unique_temp_dir("remote-omp-metadata-refresh");
-        let stale = remote_record(
-            "omp",
-            "omp:message:msg-a:response:resp-a",
-            "2026-05-01T00:00:00Z",
-            10,
-        );
-        super::merge_remote_records(&cache_root, "laptop", vec![stale])
-            .expect("merge stale remote record");
-
-        let mut refreshed = remote_record(
-            "omp",
-            "omp:message:msg-a:response:resp-a",
-            "2026-05-01T00:00:00Z",
-            10,
-        );
-        refreshed.entry.effort = Some("anthropic".to_string());
-        refreshed.entry.costs = Some(crate::data::UsageCost {
-            input: 0.01,
-            output: 0.02,
-            cache_read: 0.03,
-            cache_creation: 0.04,
-        });
-        super::merge_remote_records(&cache_root, "laptop", vec![refreshed])
-            .expect("merge refreshed remote record");
-
-        let records = super::load_remote_entries(&cache_root, None);
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].dedup_key, "omp:message:msg-a:response:resp-a");
-        assert_eq!(records[0].entry.effort.as_deref(), Some("anthropic"));
-        let costs = records[0].entry.costs.expect("refreshed costs");
-        assert_eq!(costs.input, 0.01);
-        assert_eq!(costs.output, 0.02);
-        assert_eq!(costs.cache_read, 0.03);
-        assert_eq!(costs.cache_creation, 0.04);
-    }
-
-    #[test]
-    fn clear_remote_cache_drops_pulled_records_and_leaves_local_cache() {
-        let cache_root = unique_temp_dir("clear-remote");
-        super::merge_remote_records(
-            &cache_root,
-            "laptop",
-            vec![remote_record("claude", "a", "2026-05-01T00:00:00Z", 10)],
-        )
-        .expect("merge laptop");
-        super::merge_remote_records(
-            &cache_root,
-            "workstation",
-            vec![remote_record("claude", "b", "2026-05-01T00:01:00Z", 20)],
-        )
-        .expect("merge workstation");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-        let _ = super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
-            vec![usage_record("local-key", "2026-05-01T00:00:00Z", 7)]
-        });
-
-        let removed = super::clear_remote_cache(&cache_root).expect("clear");
-
-        assert_eq!(removed, 2);
-        assert!(super::load_remote_entries(&cache_root, None).is_empty());
-        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].usage.input_tokens, 7);
-
-        let removed_again = super::clear_remote_cache(&cache_root).expect("clear again");
-        assert_eq!(removed_again, 0);
-    }
-
-    #[test]
-    fn clear_remote_cache_on_missing_directory_returns_zero() {
-        let cache_root = unique_temp_dir("clear-remote-missing");
-
-        assert_eq!(super::clear_remote_cache(&cache_root).expect("clear"), 0);
-    }
-
-    #[test]
-    fn remote_load_honors_host_filter() {
-        let cache_root = unique_temp_dir("remote-filter");
-        super::merge_remote_records(
-            &cache_root,
-            "laptop",
-            vec![remote_record("claude", "a", "2026-05-01T00:00:00Z", 10)],
-        )
-        .expect("merge laptop");
-        super::merge_remote_records(
-            &cache_root,
-            "workstation",
-            vec![remote_record("claude", "b", "2026-05-01T00:01:00Z", 20)],
-        )
-        .expect("merge workstation");
-        let filter = HashSet::from(["workstation".to_string()]);
-
-        let records = super::load_remote_entries(&cache_root, Some(&filter));
-
-        assert_eq!(
-            remote_fingerprints(&records),
-            vec![(
-                "claude".to_string(),
-                "b".to_string(),
-                Some("workstation".to_string()),
-                20,
-            )]
-        );
-    }
-
-    #[test]
-    fn unchanged_source_file_reuses_cached_records_without_reparsing() {
-        let cache_root = unique_temp_dir("reuse");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-        let calls = AtomicUsize::new(0);
-
-        let first = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            vec![source.clone()],
-            1,
-            |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            },
-        );
-        let second =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], 0, |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 99)]
-            });
-
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].usage.input_tokens, 42);
-        assert_eq!(second[0].fast_tier, 1);
-    }
-
-    #[test]
-    fn unchanged_retaining_refresh_does_not_decode_the_entry_cache() {
-        let cache_root = unique_temp_dir("retaining-refresh-fast-path");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "claude",
-            vec![source.clone()],
-            -1,
-            |_| vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)],
-        );
-        super::CACHED_RECORD_READS.set(0);
-
-        super::refresh_retaining_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
-            panic!("unchanged source should not be parsed")
-        });
-
-        assert_eq!(super::CACHED_RECORD_READS.get(), 0);
-    }
-
-    #[test]
-    fn retaining_refresh_rebuilds_a_tampered_entry_cache() {
-        let cache_root = unique_temp_dir("retaining-refresh-tampered-cache");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-        let calls = AtomicUsize::new(0);
-
-        super::refresh_retaining_vendor_cache(
-            &cache_root,
-            "claude",
-            vec![source.clone()],
-            -1,
-            |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            },
-        );
-        let entries_path = cache_root.join("entries").join("claude.bin");
-        let mut content = fs::read(&entries_path).expect("read cache");
-        let last = content.last_mut().expect("nonempty cache");
-        *last = last.wrapping_add(1);
-        fs::write(&entries_path, content).expect("tamper cache");
-
-        super::refresh_retaining_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
-        });
-
-        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "claude");
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(entry_tokens(&snapshot), vec![77]);
-    }
-
-    #[test]
-    fn old_omp_manifest_reparses_unchanged_sources_after_parser_change() {
-        let cache_root = unique_temp_dir("omp-provider-refresh");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-        let calls = AtomicUsize::new(0);
-
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "omp",
-            vec![source.clone()],
-            -1,
-            |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                let mut record = usage_record("omp:message:msg-a", "2026-05-01T00:00:00Z", 42);
-                record.entry.model = "claude-sonnet-4-5-20250929".to_string();
-                record.entry.effort = None;
-                vec![record]
-            },
-        );
-        let manifest_path = cache_root.join(super::MANIFEST_FILE);
-        let mut manifest: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
-                .expect("manifest json");
-        manifest["vendors"]["omp"]["files"]
-            .as_object_mut()
-            .expect("files object")
-            .values_mut()
-            .for_each(|meta| meta["parser_revision"] = serde_json::json!(0));
-        fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest).expect("manifest json"),
-        )
-        .expect("write old manifest");
-
-        let refreshed =
-            super::load_or_update_vendor_cache(&cache_root, "omp", vec![source], -1, |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                let mut record = usage_record("omp:message:msg-a", "2026-05-01T00:00:00Z", 42);
-                record.entry.model = "claude-sonnet-4-5-20250929".to_string();
-                record.entry.effort = None;
-                vec![record]
-            });
-
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(refreshed.len(), 1);
-        assert_eq!(refreshed[0].effort.as_deref(), None);
-    }
-
-    #[test]
-    fn changed_source_file_replaces_cached_records() {
-        let cache_root = unique_temp_dir("changed");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-        let calls = AtomicUsize::new(0);
-
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            vec![source.clone()],
-            1,
-            |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            },
-        );
-        std::thread::sleep(Duration::from_millis(2));
-        write_source(&source, "second-content");
-
-        let refreshed =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], 0, |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 99)]
-            });
-
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(refreshed.len(), 1);
-        assert_eq!(refreshed[0].usage.input_tokens, 99);
-        assert_eq!(refreshed[0].fast_tier, 0);
-    }
-
-    #[test]
-    fn changed_source_file_preserves_matching_record_fast_tier() {
-        let cache_root = unique_temp_dir("changed-preserve-fast-tier");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-        let calls = AtomicUsize::new(0);
-
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            vec![source.clone()],
-            1,
-            |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            },
-        );
-        std::thread::sleep(Duration::from_millis(2));
-        write_source(&source, "second-content");
-
-        let refreshed =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], 0, |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            });
-
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(refreshed.len(), 1);
-        assert_eq!(refreshed[0].fast_tier, 1);
-    }
-
-    #[test]
-    fn damaged_entry_cache_triggers_vendor_rebuild() {
-        let cache_root = unique_temp_dir("damaged");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-        let calls = AtomicUsize::new(0);
-
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            vec![source.clone()],
-            -1,
-            |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            },
-        );
-        fs::write(cache_root.join("entries").join("test.bin"), b"not binary")
-            .expect("damage cache");
-
-        let rebuilt =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
-            });
-
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(rebuilt.len(), 1);
-        assert_eq!(rebuilt[0].usage.input_tokens, 77);
-    }
-
-    #[test]
-    fn valid_but_tampered_entry_cache_triggers_vendor_rebuild() {
-        let cache_root = unique_temp_dir("tampered");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-        let calls = AtomicUsize::new(0);
-
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            vec![source.clone()],
-            -1,
-            |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
-            },
-        );
-
-        let entries_path = cache_root.join("entries").join("test.bin");
-        let mut original = fs::read(&entries_path).expect("read cache");
-        let last = original.last_mut().expect("nonempty cache");
-        *last = last.wrapping_add(1);
-        fs::write(&entries_path, original).expect("tamper cache");
-
-        let rebuilt =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
-            });
-
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(entry_tokens(&rebuilt), vec![77]);
-    }
-
-    #[test]
-    fn cached_records_with_negative_tokens_trigger_vendor_rebuild() {
-        let cache_root = unique_temp_dir("negative-tokens");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-        let calls = AtomicUsize::new(0);
-
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            vec![source.clone()],
-            -1,
-            |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                let mut record = usage_record("stable-key", "2026-05-01T00:00:00Z", 42);
-                record.entry.usage.output_tokens = -1;
-                vec![record]
-            },
-        );
-
-        let rebuilt =
-            super::load_or_update_vendor_cache(&cache_root, "test", vec![source], -1, |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 77)]
-            });
-
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(entry_tokens(&rebuilt), vec![77]);
-        assert_eq!(rebuilt[0].usage.output_tokens, 2);
-    }
-
-    #[test]
-    fn nonempty_dedup_keys_are_counted_once_across_files() {
-        let cache_root = unique_temp_dir("dedup");
-        let first_source = cache_root.join("a.jsonl");
-        let second_source = cache_root.join("b.jsonl");
-        write_source(&first_source, "first");
-        write_source(&second_source, "second");
-
-        let entries = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            vec![first_source.clone(), second_source.clone()],
-            -1,
-            |path| {
-                let input = if path == first_source { 10 } else { 20 };
-                vec![usage_record("same-key", "2026-05-01T00:00:00Z", input)]
-            },
-        );
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].usage.input_tokens, 10);
-    }
-
-    #[test]
-    fn warm_cache_matches_direct_uncached_parse_order_and_dedup() {
-        let cache_root = unique_temp_dir("equivalence");
-        let first_source = cache_root.join("a.jsonl");
-        let second_source = cache_root.join("b.jsonl");
-        write_source(&first_source, "first");
-        write_source(&second_source, "second");
-        let source_files = vec![first_source.clone(), second_source.clone()];
-
-        let parse = |path: &Path| {
-            if path == first_source {
-                vec![
-                    usage_record("first", "2026-05-01T00:00:00Z", 1),
-                    usage_record("shared", "2026-05-01T00:01:00Z", 10),
-                ]
-            } else {
-                vec![
-                    usage_record("shared", "2026-05-01T00:02:00Z", 20),
-                    usage_record("", "2026-05-01T00:03:00Z", 30),
-                    usage_record("", "2026-05-01T00:04:00Z", 40),
-                ]
-            }
-        };
-
-        let direct = direct_parse(source_files.clone(), parse);
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            source_files.clone(),
-            -1,
-            parse,
-        );
-        let cached =
-            super::load_or_update_vendor_cache(&cache_root, "test", source_files, -1, |_| {
-                panic!("unchanged files should not be reparsed")
-            });
-
-        assert_eq!(entry_tokens(&cached), entry_tokens(&direct));
-        assert_eq!(entry_tokens(&cached), vec![1, 10, 30, 40]);
-    }
-
-    #[test]
-    fn full_refresh_and_binary_snapshot_match_direct_uncached_parse_fields() {
-        let cache_root = unique_temp_dir("full-equivalence");
-        let first_source = cache_root.join("a.jsonl");
-        let second_source = cache_root.join("b.jsonl");
-        write_source(&first_source, "first");
-        write_source(&second_source, "second");
-        let source_files = vec![first_source.clone(), second_source.clone()];
-
-        let parse = |path: &Path| {
-            if path == first_source {
-                let mut first = usage_record("first", "2026-05-01T00:00:00Z", 1);
-                first.entry.session_start_time = "2026-05-01T00:00:00Z".to_string();
-                first.entry.session_end_time = "2026-05-01T00:05:00Z".to_string();
-                first.entry.model = "model-a".to_string();
-                first.entry.effort = Some("high".to_string());
-                first.entry.usage.output_tokens = 12;
-                first.entry.usage.cache_read_input_tokens = 13;
-                first.entry.usage.cache_creation_input_tokens = 14;
-                first.entry.usage.reasoning_output_tokens = 15;
-                vec![first, usage_record("shared", "2026-05-01T00:10:00Z", 2)]
-            } else {
-                let mut second = usage_record("second", "2026-05-01T00:20:00Z", 3);
-                second.entry.model = "model-b".to_string();
-                second.entry.effort = Some("low".to_string());
-                vec![usage_record("shared", "2026-05-01T00:15:00Z", 99), second]
-            }
-        };
-
-        let direct = direct_parse(source_files.clone(), parse);
-        let refreshed =
-            super::refresh_full_vendor_cache(&cache_root, "test", source_files, -1, parse);
-        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
-
-        assert_eq!(entry_fingerprints(&refreshed), entry_fingerprints(&direct));
-        assert_eq!(entry_fingerprints(&snapshot), entry_fingerprints(&direct));
-    }
-
-    #[test]
-    fn repeated_source_paths_match_direct_uncached_parse() {
-        let cache_root = unique_temp_dir("repeated");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-        let source_files = vec![source.clone(), source.clone()];
-
-        let parse = |_path: &Path| vec![usage_record("", "2026-05-01T00:00:00Z", 11)];
-        let direct = direct_parse(source_files.clone(), parse);
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            source_files.clone(),
-            -1,
-            parse,
-        );
-        let cached =
-            super::load_or_update_vendor_cache(&cache_root, "test", source_files, -1, |_| {
-                panic!("unchanged files should not be reparsed")
-            });
-
-        assert_eq!(entry_tokens(&cached), entry_tokens(&direct));
-        assert_eq!(entry_tokens(&cached), vec![11, 11]);
-    }
-
-    #[test]
-    fn cached_snapshot_reads_entries_without_source_validation_or_parsing() {
-        let cache_root = unique_temp_dir("snapshot");
-        let source = cache_root.join("source.jsonl");
-        write_source(&source, "first");
-
-        let _ = super::load_or_update_vendor_cache(
-            &cache_root,
-            "test",
-            vec![source.clone()],
-            -1,
-            |_| vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)],
-        );
-        fs::remove_file(source).expect("remove source");
-
-        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
-
-        assert_eq!(entry_tokens(&snapshot), vec![42]);
-    }
-
-    #[test]
-    fn old_cached_records_default_to_unknown_fast_tier() {
-        let cache_root = unique_temp_dir("snapshot-old-fast-tier");
-        fs::create_dir_all(cache_root.join("entries")).expect("create entries dir");
-        let payload = bincode::serialize(&super::PersistedVendorRecordsV1 {
-            format_version: super::CACHE_VERSION,
-            records: vec![super::PersistedSourceRecordV1 {
-                source_path: "source.jsonl".to_string(),
-                dedup_key: "stable-key".to_string(),
-                timestamp: "2026-05-01T00:00:00Z".to_string(),
-                session_start_time: "2026-05-01T00:00:00Z".to_string(),
-                session_end_time: "2026-05-01T00:00:00Z".to_string(),
-                model: "test-model".to_string(),
-                effort: None,
-                input_tokens: 42,
-                output_tokens: 2,
-                cache_read_input_tokens: 3,
-                cache_creation_input_tokens: 4,
-                reasoning_output_tokens: 5,
-            }],
-        })
-        .expect("serialize old cache");
-        let checksum = super::fnv1a_bytes(0, &payload);
-        let mut content = Vec::new();
-        content.extend_from_slice(super::ENTRY_FILE_MAGIC);
-        content.extend_from_slice(&checksum.to_le_bytes());
-        content.extend_from_slice(&payload);
-        fs::write(cache_root.join("entries").join("test.bin"), content).expect("write old cache");
-
-        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
-
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].usage.input_tokens, 42);
-        assert_eq!(snapshot[0].fast_tier, UNKNOWN_FAST_TIER);
-    }
-
-    #[test]
-    fn cache_records_from_fast_tier_format_keep_fast_tier_after_cost_fields() {
-        let cache_root = unique_temp_dir("snapshot-fast-tier-compat");
-        let entries_dir = cache_root.join("entries");
-        fs::create_dir_all(&entries_dir).expect("create entries dir");
-        let payload = bincode::serialize(&PersistedVendorRecordsWithFastTier {
-            format_version: super::CACHE_VERSION,
-            records: vec![PersistedSourceRecordWithFastTier {
-                source_path: "source.jsonl".to_string(),
-                dedup_key: "stable-key".to_string(),
-                timestamp: "2026-05-01T00:00:00Z".to_string(),
-                session_start_time: "2026-05-01T00:00:00Z".to_string(),
-                session_end_time: "2026-05-01T00:00:00Z".to_string(),
-                model: "test-model".to_string(),
-                effort: None,
-                input_tokens: 42,
-                output_tokens: 2,
-                cache_read_input_tokens: 3,
-                cache_creation_input_tokens: 4,
-                reasoning_output_tokens: 5,
-                fast_tier: 1,
-            }],
-        })
-        .expect("serialize fast-tier cache");
-        write_payload_file(
-            &entries_dir.join("test.bin"),
-            super::ENTRY_FILE_MAGIC,
-            &payload,
-        );
-
-        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
-
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].fast_tier, 1);
-        assert!(snapshot[0].costs.is_none());
-    }
-
-    #[test]
-    fn remote_records_from_fast_tier_format_keep_fast_tier_after_cost_fields() {
-        let cache_root = unique_temp_dir("remote-fast-tier-compat");
-        let remote_dir = cache_root.join("remote");
-        fs::create_dir_all(&remote_dir).expect("create remote dir");
-        let payload = bincode::serialize(&PersistedRemoteRecordsWithFastTier {
-            format_version: super::CACHE_VERSION,
-            records: vec![PersistedRemoteRecordWithFastTier {
-                vendor: "codex".to_string(),
-                dedup_key: "remote-key".to_string(),
-                timestamp: "2026-05-01T00:00:00Z".to_string(),
-                session_start_time: "2026-05-01T00:00:00Z".to_string(),
-                session_end_time: "2026-05-01T00:00:00Z".to_string(),
-                model: "test-model".to_string(),
-                effort: None,
-                input_tokens: 42,
-                output_tokens: 2,
-                cache_read_input_tokens: 3,
-                cache_creation_input_tokens: 4,
-                reasoning_output_tokens: 5,
-                fast_tier: 1,
-            }],
-        })
-        .expect("serialize fast-tier remote cache");
-        write_payload_file(
-            &remote_dir.join("laptop.bin"),
-            super::REMOTE_FILE_MAGIC,
-            &payload,
-        );
-
-        let records = super::load_remote_entries(&cache_root, None);
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].entry.host_id.as_deref(), Some("laptop"));
-        assert_eq!(records[0].entry.fast_tier, 1);
-        assert!(records[0].entry.costs.is_none());
-    }
-
-    #[test]
-    fn damaged_cached_snapshot_returns_empty_without_panicking() {
-        let cache_root = unique_temp_dir("snapshot-damaged");
-        fs::create_dir_all(cache_root.join("entries")).expect("create entries dir");
-        fs::write(cache_root.join("entries").join("test.bin"), b"not binary")
-            .expect("damage cache");
-
-        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
-
-        assert!(snapshot.is_empty());
-    }
-
-    #[test]
-    fn full_refresh_purges_records_for_deleted_sources() {
-        let cache_root = unique_temp_dir("purge-deleted");
-        let first_source = cache_root.join("a.jsonl");
-        let second_source = cache_root.join("b.jsonl");
-        write_source(&first_source, "first");
-        write_source(&second_source, "second");
-
-        let _ = super::refresh_full_vendor_cache(
-            &cache_root,
-            "test",
-            vec![first_source.clone(), second_source.clone()],
-            -1,
-            |path| {
-                if path == first_source {
-                    vec![usage_record("first", "2026-05-01T00:00:00Z", 1)]
-                } else {
-                    vec![usage_record("second", "2026-05-01T00:01:00Z", 2)]
-                }
-            },
-        );
-        fs::remove_file(&second_source).expect("remove source");
-
-        let refreshed =
-            super::refresh_full_vendor_cache(&cache_root, "test", vec![first_source], -1, |_| {
-                vec![usage_record("first", "2026-05-01T00:00:00Z", 1)]
-            });
-        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
-
-        assert_eq!(entry_tokens(&refreshed), vec![1]);
-        assert_eq!(entry_tokens(&snapshot), vec![1]);
-    }
-
-    #[test]
-    fn retaining_refresh_keeps_records_for_deleted_sources_in_cache() {
-        let cache_root = unique_temp_dir("retain-deleted");
-        let first_source = cache_root.join("a.jsonl");
-        let second_source = cache_root.join("b.jsonl");
-        write_source(&first_source, "first");
-        write_source(&second_source, "second");
-
-        super::refresh_retaining_vendor_cache(
-            &cache_root,
-            "test",
-            vec![first_source.clone(), second_source.clone()],
-            -1,
-            |path| {
-                if path == first_source {
-                    vec![usage_record("first", "2026-05-01T00:00:00Z", 1)]
-                } else {
-                    vec![usage_record("second", "2026-05-01T00:01:00Z", 2)]
-                }
-            },
-        );
-        fs::remove_file(&second_source).expect("remove source");
-
-        super::refresh_retaining_vendor_cache(&cache_root, "test", vec![first_source], -1, |_| {
-            vec![usage_record("first", "2026-05-01T00:00:00Z", 1)]
-        });
-        let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
-
-        assert_eq!(entry_tokens(&snapshot), vec![1, 2]);
-    }
 }

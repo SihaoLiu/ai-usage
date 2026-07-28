@@ -6,9 +6,19 @@ use crate::sync;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IntegrityStatus {
+    Unavailable,
+    Pending,
     Checking,
     Checked { duration: std::time::Duration },
     Failed,
+}
+
+pub(crate) fn initial_integrity_status(sync_enabled: bool) -> IntegrityStatus {
+    if sync_enabled {
+        IntegrityStatus::Pending
+    } else {
+        IntegrityStatus::Unavailable
+    }
 }
 
 pub(crate) fn poll_sync_worker_status(
@@ -340,8 +350,15 @@ pub(crate) fn format_retry_duration(duration: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
-    use chrono::TimeZone;
+
+    #[test]
+    fn initial_integrity_status_never_fabricates_a_completed_check() {
+        assert_eq!(initial_integrity_status(true), IntegrityStatus::Pending);
+        assert_eq!(
+            initial_integrity_status(false),
+            IntegrityStatus::Unavailable
+        );
+    }
 
     #[test]
     fn sync_integrity_verification_maps_to_prompt_status() {

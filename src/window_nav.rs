@@ -245,7 +245,6 @@ pub(crate) fn parse_time_window_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
     use chrono::TimeZone;
 
     #[test]

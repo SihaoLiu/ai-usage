@@ -603,10 +603,10 @@ def build_parser():
     parser.add_argument("--vendor", default="all")
     parser.add_argument("--days", type=int, default=3)
     parser.add_argument("--font")
-    parser.add_argument("--font-size", type=int, default=12)
-    parser.add_argument("--padding", type=int, default=6)
+    parser.add_argument("--font-size", type=int, default=16)
+    parser.add_argument("--padding", type=int, default=8)
     parser.add_argument("--duration", type=float, default=5.0)
-    parser.add_argument("--fps", type=float, default=8.0)
+    parser.add_argument("--fps", type=float, default=12.0)
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--key-interval", type=float, default=0.1)
     return parser

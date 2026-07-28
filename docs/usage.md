@@ -33,6 +33,8 @@ Default behavior (no flags) enters monitor mode showing all vendors for the last
 | `range YYYY-MM-DD YYYY-MM-DD` | Show an inclusive local date span |
 | `range YYYY-MM-DDTHH:MM YYYY-MM-DDTHH:MM` | Show an explicit local date-time span |
 | `latest` / `last` | Return to the current rolling days range |
+| `cost` / `cost all` / `cost <VENDOR>` | Show all monthly fixed costs or one vendor's cost |
+| `cost <VENDOR> <AMOUNT>` | Save a non-negative monthly fixed cost and redraw |
 | Up / Down arrows | Recall previous / next typed command (shell-style history) |
 | Left / Right arrows | Empty prompt: slide newer / older by one chart interval; text prompt: move cursor |
 | PgUp / PgDn | Slide the time window backward / forward by its width (PgDn snaps to the present) |
@@ -79,7 +81,9 @@ The table layout adapts to terminal width:
 
 ## Subscription Fees
 
-On first run, you will be prompted to enter your monthly subscription fees for each vendor. These are saved to `.fee.env` in the project directory and used to calculate monthly savings estimates.
+On first run, you will be prompted to enter your monthly subscription fees for each vendor. These are saved to `.fee.env` and used to calculate monthly savings estimates.
+
+In monitor mode, `cost` or `cost all` shows all current values, while `cost claude`, `cost codex`, `cost gemini`, or `cost kimi` shows one value. Set a fee with a command such as `cost claude 200` or `cost gemini 19.99`. The amount must be a non-negative integer or decimal. A valid change is written to the active `.fee.env` file before the dashboard updates; if the write fails, the in-memory value remains unchanged.
 
 ## Supported Models
 

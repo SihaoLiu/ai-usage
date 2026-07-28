@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ai-usage"
-version = "3.1.3"
+version = "3.1.4"
 dependencies = [
  "ai-usage-proto",
  "ai-usage-server",
@@ -40,6 +40,7 @@ dependencies = [
  "toml",
  "ureq",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -53,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "ai-usage-server"
-version = "3.1.3"
+version = "3.1.4"
 dependencies = [
  "ai-usage-proto",
  "ai-usage-updater",
@@ -75,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "ai-usage-updater"
-version = "3.1.3"
+version = "3.1.4"
 dependencies = [
  "libc",
  "serde_json",

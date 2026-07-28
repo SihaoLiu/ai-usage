@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model_id::{Vendor, parse_model_identity};
 
@@ -507,10 +508,9 @@ fn append_missing_fee_keys(path: &Path, keys: &[&str]) {
     }
 }
 
-/// Load subscription fees from the .fee.env file.
-pub fn load_subscription_fees() -> Option<SubscriptionFees> {
-    let path = fee_env_path();
-    let content = std::fs::read_to_string(&path).ok()?;
+/// Load subscription fees from the selected .fee.env file.
+pub fn load_subscription_fees(path: &Path) -> Option<SubscriptionFees> {
+    let content = std::fs::read_to_string(path).ok()?;
     let parsed = parse_fee_lines(&content);
     for &(key, vendor) in FEE_KEYS {
         if parsed.get(vendor) == Some(&None) {
@@ -522,23 +522,109 @@ pub fn load_subscription_fees() -> Option<SubscriptionFees> {
     }
     let (fees, missing_keys) = interpret_fee_keys(&parsed)?;
     if !missing_keys.is_empty() {
-        append_missing_fee_keys(&path, &missing_keys);
+        append_missing_fee_keys(path, &missing_keys);
     }
     Some(fees)
 }
 
-/// Save subscription fees to .fee.env file.
-pub fn save_subscription_fees(fees: &SubscriptionFees) -> std::io::Result<()> {
-    let path = fee_env_path();
+/// Save subscription fees to the selected .fee.env file.
+pub fn save_subscription_fees(path: &Path, fees: &SubscriptionFees) -> std::io::Result<()> {
     let content = format!(
         "CLAUDE_MONTHLY_FEE={}\nCODEX_MONTHLY_FEE={}\nGEMINI_MONTHLY_FEE={}\nKIMI_MONTHLY_FEE={}\n",
         fees.claude, fees.codex, fees.gemini, fees.kimi
     );
-    std::fs::write(&path, content)
+    atomic_write(path, content.as_bytes())
+}
+
+fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
+    let target = resolve_write_target(path)?;
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("fee.env");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".{file_name}.tmp-{}-{stamp}", std::process::id()));
+    let permissions = std::fs::metadata(&target)
+        .ok()
+        .map(|metadata| metadata.permissions());
+
+    let write_result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.write_all(content)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    if let Err(error) = replace_file(&temporary, &target) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn resolve_write_target(path: &Path) -> io::Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..32 {
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = std::fs::read_link(&target)?;
+                target = if link.is_absolute() {
+                    link
+                } else {
+                    target.parent().unwrap_or_else(|| Path::new(".")).join(link)
+                };
+            }
+            Ok(_) => return Ok(target),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(target),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other("too many symbolic links in fee path"))
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Interactively prompt for subscription fees.
-pub fn prompt_subscription_fees() -> SubscriptionFees {
+pub fn prompt_subscription_fees(path: &Path) -> SubscriptionFees {
     use std::io::{self, BufRead, Write};
 
     if !std::io::stdin().is_terminal() {
@@ -595,10 +681,9 @@ pub fn prompt_subscription_fees() -> SubscriptionFees {
         kimi: values[3],
     };
 
-    if let Err(e) = save_subscription_fees(&fees) {
+    if let Err(e) = save_subscription_fees(path, &fees) {
         eprintln!("Warning: Could not save .fee.env: {}", e);
     } else {
-        let path = fee_env_path();
         println!("\nSaved to {}", path.display());
         println!("(Make sure .fee.env is in your .gitignore)\n");
     }
@@ -808,6 +893,110 @@ mod tests {
             content,
             "# my comment\nCLAUDE_MONTHLY_FEE=100\nKIMI_MONTHLY_FEE=0\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_subscription_fees_atomically_replaces_existing_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ai-usage-fee-save-{stamp}.env"));
+        std::fs::write(&path, "CLAUDE_MONTHLY_FEE=1\n").expect("write old fee file");
+        let old_inode = std::fs::metadata(&path).expect("old metadata").ino();
+        let fees = SubscriptionFees {
+            claude: 200.0,
+            codex: 100.5,
+            gemini: 19.99,
+            kimi: 40.0,
+        };
+
+        save_subscription_fees(&path, &fees).expect("save fees");
+
+        let new_inode = std::fs::metadata(&path).expect("new metadata").ino();
+        let content = std::fs::read_to_string(&path).expect("read saved fees");
+        std::fs::remove_file(&path).ok();
+        assert_ne!(new_inode, old_inode);
+        assert_eq!(
+            content,
+            "CLAUDE_MONTHLY_FEE=200\nCODEX_MONTHLY_FEE=100.5\nGEMINI_MONTHLY_FEE=19.99\nKIMI_MONTHLY_FEE=40\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_subscription_fees_preserves_a_symlinked_fee_file() {
+        use std::os::unix::fs::symlink;
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("ai-usage-fee-link-{stamp}"));
+        std::fs::create_dir(&directory).expect("create fee directory");
+        let target = directory.join("fees.env");
+        let link = directory.join(".fee.env");
+        std::fs::write(&target, "CLAUDE_MONTHLY_FEE=1\n").expect("write fee target");
+        symlink(&target, &link).expect("create fee symlink");
+        let fees = SubscriptionFees {
+            claude: 20.0,
+            codex: 10.0,
+            gemini: 2.0,
+            kimi: 4.0,
+        };
+
+        save_subscription_fees(&link, &fees).expect("save symlinked fees");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("symlink metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read fee target"),
+            "CLAUDE_MONTHLY_FEE=20\nCODEX_MONTHLY_FEE=10\nGEMINI_MONTHLY_FEE=2\nKIMI_MONTHLY_FEE=4\n"
+        );
+        std::fs::remove_dir_all(directory).expect("remove fee directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_subscription_fees_preserves_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("ai-usage-fee-dangling-{stamp}"));
+        std::fs::create_dir(&directory).expect("create fee directory");
+        let target = directory.join("fees.env");
+        let link = directory.join(".fee.env");
+        symlink("fees.env", &link).expect("create dangling fee symlink");
+        let fees = SubscriptionFees {
+            claude: 20.0,
+            codex: 10.0,
+            gemini: 2.0,
+            kimi: 4.0,
+        };
+
+        save_subscription_fees(&link, &fees).expect("save dangling symlinked fees");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("symlink metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read new fee target"),
+            "CLAUDE_MONTHLY_FEE=20\nCODEX_MONTHLY_FEE=10\nGEMINI_MONTHLY_FEE=2\nKIMI_MONTHLY_FEE=4\n"
+        );
+        std::fs::remove_dir_all(directory).expect("remove fee directory");
     }
 
     #[test]

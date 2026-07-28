@@ -13,7 +13,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "3.1.3"
+version = "3.1.4"
 
 [[bin]]
 name = "ai-usage"
@@ -36,6 +36,14 @@ libc = "0.2"
 ai-usage-proto = { path = "crates/ai-usage-proto" }
 ai-usage-updater = { path = "crates/ai-usage-updater" }
 ratatui = "0.29"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 opt-level = 3

@@ -25,6 +25,9 @@ class RenderDemoTests(unittest.TestCase):
         self.assertEqual(args.speed, 1.0)
         self.assertEqual(args.key_interval, 0.1)
         self.assertEqual(args.columns, 240)
+        self.assertEqual(args.font_size, 16)
+        self.assertEqual(args.padding, 8)
+        self.assertEqual(args.fps, 12.0)
 
     def test_frame_duration_uses_playback_speed(self):
         self.assertEqual(self.render_demo.frame_duration_ms(fps=8.0, speed=3.0), 42)

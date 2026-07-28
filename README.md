@@ -10,7 +10,8 @@ A fast terminal dashboard for tracking token usage and costs across **Claude Cod
 - Per-model token breakdown with cost analysis and daily/weekly/monthly projections
 - ASCII time series charts with ANSI colors
 - Responsive display adapting to terminal width
-- Live monitor mode with interactive keyboard controls
+- Live monitor mode with interactive keyboard controls and process CPU/RSS telemetry
+- Runtime monthly-cost editing with validated `.fee.env` persistence
 
 ## Install
 

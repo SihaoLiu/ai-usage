@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::charts::{self, ChartGranularity};
 use crate::formatting::format_y_axis_value;
+use crate::process_usage::{ProcessUsageSnapshot, process_usage_text};
 use crate::tool::Tool;
 use crate::tui::commands::{HelpView, help_topics};
 use crate::tui::data::{ChartData, Dashboard};
@@ -24,6 +25,7 @@ pub struct Ui<'a> {
     pub input: &'a InputLine,
     pub notice: Option<&'a str>,
     pub sync_status: Option<&'a str>,
+    pub process_usage: Option<ProcessUsageSnapshot>,
     pub refresh_in: std::time::Duration,
     pub help: Option<HelpView>,
 }
@@ -141,39 +143,84 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
     }
 
     // Leading spacer keeps a visible gap when the left side is truncated.
-    let mut right_spans: Vec<Span> = vec![Span::raw("  ")];
+    let mut full_right: Vec<Span> = vec![Span::raw("  ")];
     if let Some(sync) = ui.sync_status {
-        right_spans.push(Span::styled(
+        full_right.push(Span::styled(
             format!("{}  |  ", sync),
             Style::default().fg(DIM),
         ));
     }
     if !ui.dash.window_complete {
-        right_spans.push(Span::styled(
+        full_right.push(Span::styled(
             "history: loading  |  ",
             Style::default().fg(Color::Indexed(143)),
         ));
     }
     let (integrity_text, integrity_color) = integrity_status_display(ui.state.integrity_status);
-    right_spans.push(Span::styled(
+    full_right.push(Span::styled(
         integrity_text,
         Style::default().fg(integrity_color),
     ));
-    right_spans.push(Span::styled(
-        format!(
-            "  |  refresh in {} ",
-            crate::formatting::format_countdown(ui.refresh_in)
-        ),
+    full_right.push(Span::raw("  |  "));
+    full_right.push(Span::styled(
+        process_usage_text(ui.process_usage.as_deref(), false),
+        Style::default().fg(Color::Indexed(81)),
+    ));
+    let countdown = crate::formatting::format_countdown(ui.refresh_in);
+    full_right.push(Span::styled(
+        format!("  |  refresh in {countdown} "),
         Style::default().fg(DIM),
     ));
 
+    let right_spans = if spans_width(&full_right) <= status_area.width as usize {
+        full_right
+    } else {
+        let (integrity_text, integrity_color) = integrity_status_compact(ui.state.integrity_status);
+        let usage_text = process_usage_text(ui.process_usage.as_deref(), true);
+        let refresh_text = format!("refresh:{countdown}");
+        let core_width = integrity_text.chars().count()
+            + usage_text.chars().count()
+            + refresh_text.chars().count()
+            + 6;
+        let mut occupied = core_width;
+        let mut compact: Vec<Span> = Vec::new();
+
+        if let Some(sync) = ui.sync_status {
+            let width = sync.chars().count() + 3;
+            if occupied + width <= status_area.width as usize {
+                compact.push(Span::styled(sync, Style::default().fg(DIM)));
+                compact.push(Span::raw(" | "));
+                occupied += width;
+            }
+        }
+        if !ui.dash.window_complete {
+            let history = "history:load";
+            let width = history.len() + 3;
+            if occupied + width <= status_area.width as usize {
+                compact.push(Span::styled(
+                    history,
+                    Style::default().fg(Color::Indexed(143)),
+                ));
+                compact.push(Span::raw(" | "));
+            }
+        }
+        compact.push(Span::styled(
+            integrity_text,
+            Style::default().fg(integrity_color),
+        ));
+        compact.push(Span::raw(" | "));
+        compact.push(Span::styled(
+            usage_text,
+            Style::default().fg(Color::Indexed(81)),
+        ));
+        compact.push(Span::raw(" | "));
+        compact.push(Span::styled(refresh_text, Style::default().fg(DIM)));
+        compact
+    };
+
     // The right side keeps its full width; the left side truncates into
     // whatever remains.
-    let right_width = right_spans
-        .iter()
-        .map(|s| s.content.chars().count() as u16)
-        .sum::<u16>()
-        .min(status_area.width);
+    let right_width = spans_width(&right_spans).min(status_area.width as usize) as u16;
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)])
             .areas(status_area);
@@ -182,6 +229,10 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
         Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
         right_area,
     );
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
 }
 
 fn integrity_status_display(status: IntegrityStatus) -> (String, Color) {
@@ -197,6 +248,18 @@ fn integrity_status_display(status: IntegrityStatus) -> (String, Color) {
             Color::Indexed(108),
         ),
         IntegrityStatus::Failed => ("integrity: FAILED".to_string(), Color::Indexed(203)),
+    }
+}
+
+fn integrity_status_compact(status: IntegrityStatus) -> (String, Color) {
+    match status {
+        IntegrityStatus::Unavailable => ("integrity:n/a".to_string(), DIM),
+        IntegrityStatus::Pending => ("integrity:pending".to_string(), Color::Indexed(143)),
+        IntegrityStatus::Checking { percent } => {
+            (format!("integrity:{percent}%"), Color::Indexed(143))
+        }
+        IntegrityStatus::Checked { .. } => ("integrity:ok".to_string(), Color::Indexed(108)),
+        IntegrityStatus::Failed => ("integrity:FAIL".to_string(), Color::Indexed(203)),
     }
 }
 
@@ -681,12 +744,16 @@ fn draw_help(frame: &mut Frame, area: Rect, view: HelpView) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{AllPricing, SubscriptionFees};
     use crate::model_id::Vendor;
+    use crate::process_usage::{ProcessUsage, ProcessUsageDisplay};
     use crate::table_view::{DataRow, DisplayRow, RowMetrics, TableView};
+    use crate::time_utils::TimeWindow;
     use crate::tui::data::{ChartData, Segment, Series};
     use chrono::TimeZone;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::collections::HashMap;
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
@@ -783,6 +850,78 @@ mod tests {
             .enumerate()
             .filter_map(|(index, ch)| (ch == needle).then_some(index))
             .collect()
+    }
+
+    #[test]
+    fn process_usage_appears_between_integrity_and_refresh() {
+        let dash = dashboard(TableView::Flat, Vec::new(), RowMetrics::default());
+        let state = AppState {
+            tool: "all".to_string(),
+            table_view: TableView::Flat,
+            host: None,
+            session_id: None,
+            local_host_id: None,
+            days: 3,
+            time_window: TimeWindow::rolling_days(3),
+            monitor_interval: 3600,
+            pricing: AllPricing::load_raw().finalize(),
+            subscription_fees: SubscriptionFees::default(),
+            fee_env_path: std::path::PathBuf::from(".fee.env"),
+            version_cache: HashMap::new(),
+            all_tool_prompt: None,
+            raw_cache: None,
+            raw_cache_last_used_at: None,
+            raw_refresh: None,
+            integrity_status: IntegrityStatus::Checked {
+                duration: std::time::Duration::from_millis(8_500),
+            },
+            integrity_started_at: None,
+        };
+        let input = InputLine::new();
+        let ui = Ui {
+            dash: &dash,
+            state: &state,
+            input: &input,
+            notice: None,
+            sync_status: Some("Sync: checked just now"),
+            process_usage: Some(std::sync::Arc::new(ProcessUsageDisplay::new(
+                ProcessUsage {
+                    cpu_percent: 12.34,
+                    memory_bytes: 1_331_438_182,
+                },
+            ))),
+            refresh_in: std::time::Duration::from_secs(3_596),
+            help: None,
+        };
+        let backend = TestBackend::new(240, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_header(frame, frame.area(), &ui))
+            .expect("draw");
+
+        let text = buffer_text(&terminal);
+        let status = line_containing(&text, "CPU: 12.3%");
+        let integrity = char_index(&status, "integrity: ok (8.5s)");
+        let cpu = char_index(&status, "CPU: 12.3%");
+        let memory = char_index(&status, "Mem: 1.24 GiB");
+        let refresh = char_index(&status, "refresh in 00:59:56");
+        assert!(
+            integrity < cpu && cpu < memory && memory < refresh,
+            "{status}"
+        );
+
+        let backend = TestBackend::new(60, 2);
+        let mut terminal = Terminal::new(backend).expect("narrow terminal");
+        terminal
+            .draw(|frame| draw_header(frame, frame.area(), &ui))
+            .expect("draw narrow header");
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("integrity:ok"), "{text}");
+        assert!(text.contains("CPU:12.3%"), "{text}");
+        assert!(text.contains("Mem:1.24G"), "{text}");
+        assert!(text.contains("refresh:00:59:56"), "{text}");
     }
 
     #[test]

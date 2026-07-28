@@ -5,6 +5,7 @@ mod formatting;
 mod model_id;
 mod model_overrides;
 mod pricing;
+mod process_usage;
 mod raw_data;
 mod stats;
 mod sync;
@@ -18,7 +19,7 @@ mod window_nav;
 
 use std::collections::{HashMap, HashSet};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
 
@@ -80,6 +81,7 @@ struct AppState {
     monitor_interval: u64,
     pricing: AllPricing,
     subscription_fees: SubscriptionFees,
+    fee_env_path: PathBuf,
     version_cache: HashMap<String, VersionCacheEntry>,
     all_tool_prompt: Option<String>,
     raw_cache: Option<RawDataCache>,
@@ -892,7 +894,9 @@ fn main() {
     }
 
     let pricing = pricing::load_layered();
-    let subscription_fees = load_subscription_fees().unwrap_or_else(prompt_subscription_fees);
+    let fee_env_path = constants::fee_env_path();
+    let subscription_fees = load_subscription_fees(&fee_env_path)
+        .unwrap_or_else(|| prompt_subscription_fees(&fee_env_path));
     let local_host_id = match &sync_config {
         sync::config::SyncConfig::Enabled(config) => Some(config.machine_id.clone()),
         sync::config::SyncConfig::Disabled => None,
@@ -917,6 +921,7 @@ fn main() {
         monitor_interval: 3600,
         pricing,
         subscription_fees,
+        fee_env_path,
         version_cache: HashMap::new(),
         all_tool_prompt: None,
         raw_cache: None,

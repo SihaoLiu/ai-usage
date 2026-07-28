@@ -6,6 +6,7 @@
 
 use chrono::Local;
 
+use crate::constants::save_subscription_fees;
 use crate::table_view::TableView;
 use crate::time_utils::TimeWindow;
 use crate::tool::Tool;
@@ -219,6 +220,97 @@ fn set_session(state: &mut AppState, session_id: Option<&str>) -> Outcome {
     )
 }
 
+const COST_USAGE: &str =
+    "Usage: cost [all|claude|codex|gemini|kimi] [non-negative integer or decimal]";
+
+fn cost_vendor(vendor: &str) -> Option<&'static str> {
+    match vendor {
+        "claude" => Some("Claude"),
+        "codex" => Some("Codex"),
+        "gemini" => Some("Gemini"),
+        "kimi" => Some("Kimi"),
+        _ => None,
+    }
+}
+
+fn cost_summary(state: &AppState) -> Outcome {
+    Outcome::message(
+        Effect::None,
+        format!(
+            "Monthly costs: Claude ${:.2} | Codex ${:.2} | Gemini ${:.2} | Kimi ${:.2}",
+            state.subscription_fees.claude,
+            state.subscription_fees.codex,
+            state.subscription_fees.gemini,
+            state.subscription_fees.kimi
+        ),
+    )
+}
+
+fn parse_monthly_cost(raw: &str) -> Option<f64> {
+    let valid = match raw.split_once('.') {
+        Some((whole, fraction)) => {
+            !whole.is_empty()
+                && !fraction.is_empty()
+                && whole.bytes().all(|byte| byte.is_ascii_digit())
+                && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        None => !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()),
+    };
+    if !valid {
+        return None;
+    }
+    raw.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn set_monthly_cost(state: &mut AppState, vendor: &str, raw_value: &str) -> Outcome {
+    let Some(label) = cost_vendor(vendor) else {
+        return Outcome::message(Effect::None, COST_USAGE);
+    };
+    let Some(value) = parse_monthly_cost(raw_value) else {
+        return Outcome::message(Effect::None, COST_USAGE);
+    };
+
+    let mut updated = state.subscription_fees.clone();
+    match vendor {
+        "claude" => updated.claude = value,
+        "codex" => updated.codex = value,
+        "gemini" => updated.gemini = value,
+        "kimi" => updated.kimi = value,
+        _ => unreachable!("validated cost vendor"),
+    }
+
+    if let Err(error) = save_subscription_fees(&state.fee_env_path, &updated) {
+        return Outcome::message(
+            Effect::None,
+            format!("Could not save monthly costs: {error}"),
+        );
+    }
+    state.subscription_fees = updated;
+    Outcome::message(
+        Effect::Refresh,
+        format!("{label} monthly cost set to ${value:.2} and saved to .fee.env."),
+    )
+}
+
+fn cost_command(state: &mut AppState, args: &str) -> Outcome {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    match parts.as_slice() {
+        [] | ["all"] => cost_summary(state),
+        [vendor] => match cost_vendor(vendor) {
+            Some(label) => Outcome::message(
+                Effect::None,
+                format!(
+                    "{label} monthly cost: ${:.2}",
+                    state.subscription_fees.get(vendor)
+                ),
+            ),
+            None => Outcome::message(Effect::None, COST_USAGE),
+        },
+        [vendor, value] => set_monthly_cost(state, vendor, value),
+        _ => Outcome::message(Effect::None, COST_USAGE),
+    }
+}
+
 /// Execute one prompt command against the app state.
 pub fn execute(state: &mut AppState, raw: &str) -> Outcome {
     let command = raw.trim();
@@ -241,6 +333,7 @@ pub fn execute(state: &mut AppState, raw: &str) -> Outcome {
         "h" | "help" => Outcome::new(Effect::Help),
         "e" | "exit" => Outcome::new(Effect::Exit),
         "update" | "upgrade" => Outcome::new(Effect::Update),
+        "cost" => cost_command(state, ""),
         "t" | "tool" => Outcome {
             messages: vec![
                 format!("Current tool: {}", state.tool),
@@ -308,6 +401,7 @@ pub fn execute(state: &mut AppState, raw: &str) -> Outcome {
                 "t" | "tool" => switch_tool(state, arg),
                 "host" => switch_host(state, arg),
                 "session" => set_session(state, Some(arg)),
+                "cost" => cost_command(state, arg),
                 "d" | "day" | "days" => match arg.parse::<i64>() {
                     Ok(n) if n >= 1 => {
                         state.days = n;
@@ -350,6 +444,21 @@ pub struct HelpTopic {
 }
 
 static HELP_TOPICS: &[HelpTopic] = &[
+    HelpTopic {
+        name: "cost",
+        invocation: "cost [all|VENDOR [AMOUNT]]",
+        keys: &[],
+        summary: "Show or change monthly fixed costs",
+        detail: &[
+            "Usage: cost | cost all      show every monthly fixed cost",
+            "       cost <vendor>        show one vendor's monthly cost",
+            "       cost <vendor> <fee>  save a new fee and redraw",
+            "",
+            "Vendors: claude, codex, gemini, kimi",
+            "Fees must be non-negative integers or decimals. Successful",
+            "changes are persisted to the active .fee.env file.",
+        ],
+    },
     HelpTopic {
         name: "session",
         invocation: "session <ID> | session clear",
@@ -564,6 +673,9 @@ mod tests {
     use super::*;
     use crate::constants::{AllPricing, SubscriptionFees};
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_state() -> AppState {
         AppState {
@@ -577,6 +689,7 @@ mod tests {
             monitor_interval: 3600,
             pricing: AllPricing::load_raw().finalize(),
             subscription_fees: SubscriptionFees::default(),
+            fee_env_path: PathBuf::from(".fee.env"),
             version_cache: HashMap::new(),
             all_tool_prompt: None,
             raw_cache: None,
@@ -585,6 +698,127 @@ mod tests {
             integrity_status: crate::IntegrityStatus::Checking { percent: 0 },
             integrity_started_at: None,
         }
+    }
+
+    fn unique_fee_path(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ai-usage-cost-test-{}-{name}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create cost test directory");
+        dir.join(".fee.env")
+    }
+
+    fn cost_test_state(name: &str) -> AppState {
+        let mut state = test_state();
+        state.fee_env_path = unique_fee_path(name);
+        state.subscription_fees = SubscriptionFees {
+            claude: 200.0,
+            codex: 100.5,
+            gemini: 19.99,
+            kimi: 0.0,
+        };
+        state
+    }
+
+    fn remove_fee_test_dir(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            fs::remove_dir_all(parent).expect("remove cost test directory");
+        }
+    }
+
+    #[test]
+    fn cost_command_shows_all_or_one_monthly_fee() {
+        let mut state = cost_test_state("show");
+
+        let all = execute(&mut state, "cost");
+        assert_eq!(all.effect, Effect::None);
+        assert_eq!(
+            all.messages,
+            ["Monthly costs: Claude $200.00 | Codex $100.50 | Gemini $19.99 | Kimi $0.00"]
+        );
+        assert_eq!(execute(&mut state, "cost all").messages, all.messages);
+
+        let one = execute(&mut state, "cost claude");
+        assert_eq!(one.effect, Effect::None);
+        assert_eq!(one.messages, ["Claude monthly cost: $200.00"]);
+
+        let fee_path = state.fee_env_path.clone();
+        remove_fee_test_dir(&fee_path);
+    }
+
+    #[test]
+    fn cost_command_persists_one_fee_and_refreshes_the_dashboard() {
+        let mut state = cost_test_state("persist");
+        let fee_path = state.fee_env_path.clone();
+
+        let outcome = execute(&mut state, "cost claude 125.50");
+
+        assert_eq!(outcome.effect, Effect::Refresh);
+        assert_eq!(state.subscription_fees.claude, 125.5);
+        assert_eq!(
+            outcome.messages,
+            ["Claude monthly cost set to $125.50 and saved to .fee.env."]
+        );
+        assert_eq!(
+            fs::read_to_string(&fee_path).expect("read saved fees"),
+            "CLAUDE_MONTHLY_FEE=125.5\nCODEX_MONTHLY_FEE=100.5\nGEMINI_MONTHLY_FEE=19.99\nKIMI_MONTHLY_FEE=0\n"
+        );
+
+        remove_fee_test_dir(&fee_path);
+    }
+
+    #[test]
+    fn cost_command_rejects_non_decimal_or_negative_values() {
+        let mut state = cost_test_state("invalid");
+
+        for input in [
+            "cost claude -1",
+            "cost claude +1",
+            "cost claude .5",
+            "cost claude 1.",
+            "cost claude 1e3",
+            "cost claude NaN",
+            "cost claude inf",
+            "cost claude 10 extra",
+        ] {
+            let outcome = execute(&mut state, input);
+            assert_eq!(outcome.effect, Effect::None, "{input}");
+            assert!(
+                outcome.messages[0].contains("non-negative integer or decimal"),
+                "{input}: {:?}",
+                outcome.messages
+            );
+            assert_eq!(state.subscription_fees.claude, 200.0, "{input}");
+        }
+        assert!(!state.fee_env_path.exists());
+
+        let fee_path = state.fee_env_path.clone();
+        remove_fee_test_dir(&fee_path);
+    }
+
+    #[test]
+    fn cost_command_keeps_memory_unchanged_when_persistence_fails() {
+        let mut state = cost_test_state("write-failure");
+        let test_root = state
+            .fee_env_path
+            .parent()
+            .expect("cost test parent")
+            .to_path_buf();
+        state.fee_env_path = test_root.join("missing").join(".fee.env");
+
+        let outcome = execute(&mut state, "cost kimi 12.25");
+
+        assert_eq!(outcome.effect, Effect::None);
+        assert_eq!(state.subscription_fees.kimi, 0.0);
+        assert!(outcome.messages[0].starts_with("Could not save monthly costs:"));
+        assert!(!state.fee_env_path.exists());
+
+        fs::remove_dir_all(test_root).expect("remove cost test directory");
     }
 
     #[test]
@@ -679,6 +913,7 @@ mod tests {
         let mut state = test_state();
 
         let view_idx = find_help_topic("view").expect("view topic");
+        let cost_idx = find_help_topic("cost").expect("cost topic");
         assert_eq!(find_help_topic("v"), Some(view_idx));
         assert_eq!(
             execute(&mut state, "h view").effect,
@@ -687,6 +922,22 @@ mod tests {
         assert_eq!(
             execute(&mut state, "help days").effect,
             Effect::HelpTopic(find_help_topic("window").expect("window topic"))
+        );
+        assert_eq!(
+            execute(&mut state, "h cost").effect,
+            Effect::HelpTopic(cost_idx)
+        );
+        assert!(
+            help_topics()[cost_idx]
+                .detail
+                .iter()
+                .any(|line| line.contains(".fee.env"))
+        );
+        assert!(
+            help_topics()[cost_idx]
+                .detail
+                .iter()
+                .any(|line| line.contains("cost all"))
         );
 
         let outcome = execute(&mut state, "h nonsense");

@@ -23,7 +23,7 @@ use ratatui::Terminal;
 use ratatui::prelude::CrosstermBackend;
 
 use crate::sync::worker::SyncWorker;
-use crate::{AppState, IntegrityStatus, IntervalSlideDirection, updater};
+use crate::{AppState, IntegrityStatus, IntervalSlideDirection, process_usage, updater};
 use commands::{Effect, HelpView};
 use input::{CommandHistory, InputLine};
 
@@ -414,6 +414,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
             return;
         }
     };
+    let process_usage_monitor = process_usage::ProcessUsageMonitor::start();
 
     let load_started = Instant::now();
     let mut dashboard = data::build(state);
@@ -561,6 +562,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 input: &input,
                 notice: notice.as_ref().map(|n| n.text.as_str()),
                 sync_status: sync_status.as_deref(),
+                process_usage: process_usage_monitor.snapshot(),
                 refresh_in,
                 help,
             };
@@ -815,6 +817,7 @@ mod tests {
             monitor_interval: 3600,
             pricing: AllPricing::load_raw().finalize(),
             subscription_fees: SubscriptionFees::default(),
+            fee_env_path: std::path::PathBuf::from(".fee.env"),
             version_cache: HashMap::new(),
             all_tool_prompt: None,
             raw_cache: Some(crate::RawDataCache {

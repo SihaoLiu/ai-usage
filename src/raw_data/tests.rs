@@ -36,6 +36,22 @@ fn state_with_cache(cache: RawDataCache, window: TimeWindow) -> AppState {
     }
 }
 
+fn usage_entry_at(timestamp: DateTime<Local>) -> UsageEntry {
+    UsageEntry {
+        host_id: None,
+        session_id: None,
+        timestamp: timestamp.to_rfc3339(),
+        parsed_timestamp: Some(timestamp),
+        session_start_time: String::new(),
+        session_end_time: String::new(),
+        model: "test-model".to_string(),
+        effort: None,
+        fast_tier: -1,
+        usage: data::TokenUsage::default(),
+        costs: None,
+    }
+}
+
 #[test]
 fn weighted_cost_reuses_model_breakdown_totals() {
     let row = |tool: &str, tokens: i64, cost: f64| ModelBreakdownRow {
@@ -481,15 +497,85 @@ fn resident_window_reuses_cache_storage_without_cloning() {
 }
 
 #[test]
-fn resident_raw_cache_expires_after_idle_timeout() {
-    let now = Local::now();
+fn idle_historical_cache_keeps_the_adjacent_window_on_each_side() {
+    let now = Local
+        .with_ymd_and_hms(2026, 7, 28, 12, 0, 0)
+        .single()
+        .expect("fixed now");
+    let window = TimeWindow::ExplicitRange {
+        start: now - Duration::days(10),
+        end: now - Duration::days(7),
+        projection_days: 3.0,
+        page_step: Duration::days(3),
+    };
     let cache = RawDataCache {
-        claude: Vec::new(),
+        claude: [-14, -13, -10, -7, -4, -3]
+            .into_iter()
+            .map(|days| usage_entry_at(now + Duration::days(days)))
+            .collect(),
         codex: Vec::new(),
         gemini: Vec::new(),
         kimi: Vec::new(),
         omp: Vec::new(),
-        range: hot_cache_range(now),
+        range: test_range(now),
+        has_source_data: true,
+        local_host_id: None,
+        local_record_keys: HashMap::new(),
+        persistent_generation: String::new(),
+        local_session_metadata_current: true,
+    };
+    let mut state = state_with_cache(cache, window);
+    let accessed_at = std::time::Instant::now();
+
+    touch_raw_cache_at(&mut state, accessed_at);
+
+    assert!(!retire_idle_raw_cache_at(
+        &mut state,
+        accessed_at + RAW_CACHE_IDLE_TTL - std::time::Duration::from_millis(1),
+        now,
+    ));
+    assert!(retire_idle_raw_cache_at(
+        &mut state,
+        accessed_at + RAW_CACHE_IDLE_TTL,
+        now,
+    ));
+
+    let cache = state
+        .raw_cache
+        .as_ref()
+        .expect("adjacent windows remain hot");
+    assert_eq!(cache.range.start(), now - Duration::days(13));
+    assert_eq!(cache.range.end(), now - Duration::days(4));
+    assert_eq!(
+        cache
+            .claude
+            .iter()
+            .map(|entry| entry_timestamp(entry).expect("entry timestamp"))
+            .collect::<Vec<_>>(),
+        [-13, -10, -7, -4]
+            .into_iter()
+            .map(|days| now + Duration::days(days))
+            .collect::<Vec<_>>()
+    );
+    assert!(state.raw_cache_last_used_at.is_none());
+}
+
+#[test]
+fn idle_latest_cache_keeps_only_the_previous_window_and_ages_it_forward() {
+    let now = Local
+        .with_ymd_and_hms(2026, 7, 28, 12, 0, 0)
+        .single()
+        .expect("fixed now");
+    let cache = RawDataCache {
+        claude: [-7, -6, -3, 0, 1]
+            .into_iter()
+            .map(|days| usage_entry_at(now + Duration::days(days)))
+            .collect(),
+        codex: Vec::new(),
+        gemini: Vec::new(),
+        kimi: Vec::new(),
+        omp: Vec::new(),
+        range: test_range(now),
         has_source_data: true,
         local_host_id: None,
         local_record_keys: HashMap::new(),
@@ -500,17 +586,41 @@ fn resident_raw_cache_expires_after_idle_timeout() {
     let accessed_at = std::time::Instant::now();
 
     touch_raw_cache_at(&mut state, accessed_at);
-
-    assert!(!retire_idle_raw_cache_at(
-        &mut state,
-        accessed_at + RAW_CACHE_IDLE_TTL - std::time::Duration::from_millis(1),
-    ));
-    assert!(state.raw_cache.is_some());
     assert!(retire_idle_raw_cache_at(
         &mut state,
         accessed_at + RAW_CACHE_IDLE_TTL,
+        now,
     ));
-    assert!(state.raw_cache.is_none());
+
+    let cache = state
+        .raw_cache
+        .as_ref()
+        .expect("previous window remains hot");
+    assert_eq!(cache.range.start(), now - Duration::days(6));
+    assert_eq!(cache.range.end(), now);
+    assert_eq!(cache.claude.len(), 3);
+
+    touch_raw_cache_at(&mut state, accessed_at + RAW_CACHE_IDLE_TTL);
+    assert!(retire_idle_raw_cache_at(
+        &mut state,
+        accessed_at + RAW_CACHE_IDLE_TTL * 2,
+        now + Duration::days(1),
+    ));
+
+    let cache = state.raw_cache.as_ref().expect("rolling cache remains hot");
+    assert_eq!(cache.range.start(), now - Duration::days(5));
+    assert_eq!(cache.range.end(), now);
+    assert_eq!(
+        cache
+            .claude
+            .iter()
+            .map(|entry| entry_timestamp(entry).expect("entry timestamp"))
+            .collect::<Vec<_>>(),
+        [-3, 0]
+            .into_iter()
+            .map(|days| now + Duration::days(days))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

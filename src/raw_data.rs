@@ -95,6 +95,12 @@ impl RawDataRange {
         (self.start_seconds, self.start_nanos) <= (other.start_seconds, other.start_nanos)
             && (self.end_seconds, self.end_nanos) >= (other.end_seconds, other.end_nanos)
     }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        let start = self.start().max(other.start());
+        let end = self.end().min(other.end());
+        (start <= end).then(|| Self::from_bounds(start, end))
+    }
 }
 
 /// In-memory snapshot of raw tool entries scoped to a bounded time range.
@@ -696,9 +702,13 @@ pub(crate) fn poll_background_raw_refresh(state: &mut AppState) -> bool {
 }
 
 pub(crate) fn retire_raw_cache(cache: RawDataCache) {
+    retire_in_background(cache);
+}
+
+fn retire_in_background<T: Send + 'static>(value: T) {
     let _ = thread::Builder::new()
         .name("usage-cache-retire".to_string())
-        .spawn(move || drop(cache));
+        .spawn(move || drop(value));
 }
 
 pub(crate) fn touch_raw_cache_at(state: &mut AppState, accessed_at: Instant) {
@@ -707,18 +717,68 @@ pub(crate) fn touch_raw_cache_at(state: &mut AppState, accessed_at: Instant) {
     }
 }
 
-pub(crate) fn retire_idle_raw_cache_at(state: &mut AppState, now: Instant) -> bool {
+fn idle_raw_cache_retention_range(window: &TimeWindow, now: DateTime<Local>) -> RawDataRange {
+    let visible = raw_cache_visible_range(window, now);
+    let page_step = window.page_step();
+    let end = if matches!(window, TimeWindow::Latest { .. }) {
+        visible.end()
+    } else {
+        visible.end() + page_step
+    };
+    RawDataRange::from_bounds(visible.start() - page_step, end)
+}
+
+fn take_entries_outside_range(
+    entries: &mut Vec<UsageEntry>,
+    range: RawDataRange,
+) -> Vec<UsageEntry> {
+    let start = range.start();
+    let end = range.end();
+    let first = entries
+        .partition_point(|entry| entry_timestamp(entry).is_none_or(|timestamp| timestamp < start));
+    let last = first
+        + entries[first..].partition_point(|entry| {
+            entry_timestamp(entry).is_some_and(|timestamp| timestamp <= end)
+        });
+    if first == 0 && last == entries.len() {
+        return Vec::new();
+    }
+    let retained = entries.drain(first..last).collect();
+    std::mem::replace(entries, retained)
+}
+
+pub(crate) fn retire_idle_raw_cache_at(
+    state: &mut AppState,
+    idle_now: Instant,
+    window_now: DateTime<Local>,
+) -> bool {
     let expired = state.raw_cache_last_used_at.is_some_and(|accessed_at| {
-        now.saturating_duration_since(accessed_at) >= RAW_CACHE_IDLE_TTL
+        idle_now.saturating_duration_since(accessed_at) >= RAW_CACHE_IDLE_TTL
     });
     if !expired {
         return false;
     }
     state.raw_cache_last_used_at = None;
-    let Some(cache) = state.raw_cache.take() else {
+    let Some(resident_range) = state.raw_cache.as_ref().map(|cache| cache.range) else {
         return false;
     };
-    retire_raw_cache(cache);
+    let desired = idle_raw_cache_retention_range(&state.time_window, window_now);
+    let Some(retained_range) = resident_range.intersection(desired) else {
+        retire_raw_cache(state.raw_cache.take().expect("resident cache"));
+        return true;
+    };
+    let cache = state.raw_cache.as_mut().expect("resident cache");
+    let retired = [
+        take_entries_outside_range(&mut cache.claude, retained_range),
+        take_entries_outside_range(&mut cache.codex, retained_range),
+        take_entries_outside_range(&mut cache.gemini, retained_range),
+        take_entries_outside_range(&mut cache.kimi, retained_range),
+        take_entries_outside_range(&mut cache.omp, retained_range),
+    ];
+    cache.range = retained_range;
+    if retired.iter().any(|entries| !entries.is_empty()) {
+        retire_in_background(retired);
+    }
     true
 }
 

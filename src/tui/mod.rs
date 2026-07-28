@@ -441,7 +441,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
     let mut initial_source_refresh_pending = true;
 
     'monitor: loop {
-        crate::retire_idle_raw_cache_at(state, Instant::now());
+        crate::retire_idle_raw_cache_at(state, Instant::now(), Local::now());
 
         if crate::poll_version_cache(state) {
             dashboard = data::build(state);

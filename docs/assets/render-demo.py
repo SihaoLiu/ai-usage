@@ -34,6 +34,7 @@ KEY_PLUS = "+"
 KEY_MINUS = "-"
 KEY_HELP = "h\r"
 KEY_CTRL_C = "\x03"
+READY_TIMEOUT_SECONDS = 30.0
 
 
 def xterm_palette():
@@ -514,6 +515,14 @@ def read_available(fd, screen):
         screen.feed(chunk)
 
 
+def dashboard_ready(screen):
+    content = "\n".join(line.text for line in screen.render_lines())
+    return (
+        "Usage / API Cost" in content
+        or "No usage data found from any tool." in content
+    )
+
+
 def wait_for_child(pid, timeout=1.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -536,12 +545,25 @@ def capture_demo_frames(repo_root, args, font_path):
     next_frame_at = 0.0
     event_index = 0
     pid, master_fd = spawn_monitor(repo_root, args.columns, args.lines, args.vendor, args.days)
-    start = time.monotonic()
+    startup_started = time.monotonic()
+    start = None
 
     try:
         while True:
-            elapsed = time.monotonic() - start
-            read_available(master_fd, screen)
+            monitor_open = read_available(master_fd, screen)
+            now = time.monotonic()
+            if start is None:
+                if dashboard_ready(screen):
+                    start = now
+                elif not monitor_open:
+                    raise RuntimeError("monitor exited before dashboard became ready")
+                elif now - startup_started >= READY_TIMEOUT_SECONDS:
+                    raise RuntimeError("dashboard did not finish loading before the recording timeout")
+                else:
+                    select.select([master_fd], [], [], 0.05)
+                    continue
+
+            elapsed = now - start
 
             while event_index < len(events) and events[event_index].at <= elapsed:
                 os.write(master_fd, events[event_index].data.encode("ascii"))

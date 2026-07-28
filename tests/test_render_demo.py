@@ -1,7 +1,13 @@
 import importlib.util
 import sys
+import tempfile
+import textwrap
+import time
 import unittest
+from argparse import Namespace
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 
 def load_render_demo():
@@ -11,6 +17,36 @@ def load_render_demo():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@contextmanager
+def fake_monitor_repo(body):
+    temp_root = Path.cwd() / "temp"
+    temp_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="render-demo-test-", dir=temp_root) as directory:
+        repo_root = Path(directory)
+        binary = repo_root / "target" / "release" / "ai-usage"
+        binary.parent.mkdir(parents=True)
+        binary.write_text(
+            "#!/usr/bin/env python3\n" + textwrap.dedent(body),
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        yield repo_root
+
+
+def recording_args(duration=0.05):
+    return Namespace(
+        columns=80,
+        lines=4,
+        vendor="all",
+        days=3,
+        duration=duration,
+        fps=20.0,
+        key_interval=0.1,
+        font_size=12,
+        padding=2,
+    )
 
 
 class RenderDemoTests(unittest.TestCase):
@@ -71,6 +107,74 @@ class RenderDemoTests(unittest.TestCase):
 
         self.assertEqual(environment["TERM"], "xterm-256color")
         self.assertNotIn("NO_COLOR", environment)
+
+    def test_dashboard_ready_requires_a_result_view(self):
+        screen = self.render_demo.TerminalScreen(columns=80, rows=4)
+
+        screen.feed("Loading usage history...")
+        self.assertFalse(self.render_demo.dashboard_ready(screen))
+
+        screen.feed("\x1b[2J\x1b[HUsage / API Cost (Vendor / Model / Harness)")
+        self.assertTrue(self.render_demo.dashboard_ready(screen))
+
+        screen.feed("\x1b[2J\x1b[HNo usage data found from any tool.")
+        self.assertTrue(self.render_demo.dashboard_ready(screen))
+
+    def test_capture_starts_after_dashboard_is_ready(self):
+        monitor = """
+            import sys
+            import time
+
+            sys.stdout.write("\\x1b[2J\\x1b[HLoading usage history...")
+            sys.stdout.flush()
+            time.sleep(0.1)
+            sys.stdout.write("\\x1b[2J\\x1b[HUsage / API Cost (Vendor / Model / Harness)")
+            sys.stdout.flush()
+            time.sleep(0.3)
+        """
+        rendered_screens = []
+
+        def record_screen(screen, _font_path, _font_size, _padding):
+            rendered_screens.append("\n".join(line.text for line in screen.render_lines()))
+            return self.render_demo.Image.new("RGB", (1, 1))
+
+        with fake_monitor_repo(monitor) as repo_root:
+            with patch.object(self.render_demo, "render_screen_image", side_effect=record_screen):
+                frames = self.render_demo.capture_demo_frames(
+                    repo_root,
+                    recording_args(),
+                    Path("unused-font"),
+                )
+
+        self.assertTrue(frames)
+        self.assertTrue(rendered_screens)
+        self.assertTrue(
+            all("Usage / API Cost" in screen for screen in rendered_screens),
+            rendered_screens,
+        )
+
+    def test_capture_fails_promptly_when_monitor_exits_before_ready(self):
+        monitor = """
+            import sys
+
+            sys.stdout.write("Loading usage history...")
+            sys.stdout.flush()
+        """
+
+        with fake_monitor_repo(monitor) as repo_root:
+            started = time.monotonic()
+            with patch.object(self.render_demo, "READY_TIMEOUT_SECONDS", 1.0):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "monitor exited before dashboard became ready",
+                ):
+                    self.render_demo.capture_demo_frames(
+                        repo_root,
+                        recording_args(),
+                        Path("unused-font"),
+                    )
+
+        self.assertLess(time.monotonic() - started, 0.5)
 
     def test_terminal_screen_handles_clear_line_and_cursor_home(self):
         screen = self.render_demo.TerminalScreen(columns=10, rows=3)

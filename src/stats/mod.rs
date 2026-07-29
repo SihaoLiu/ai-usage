@@ -260,6 +260,29 @@ fn merge_breakdown_maps(
     a
 }
 
+fn strategy_tokens(tool: &str, cache_creation: i64, reasoning: i64) -> i64 {
+    match tool {
+        "codex" => reasoning,
+        _ => cache_creation,
+    }
+}
+
+pub(crate) fn entry_total_with_cache(entry: &UsageEntry, tool: &str) -> u128 {
+    [
+        entry.usage.input_tokens,
+        entry.usage.output_tokens,
+        entry.usage.cache_read_input_tokens,
+        strategy_tokens(
+            tool,
+            entry.usage.cache_creation_input_tokens,
+            entry.usage.reasoning_output_tokens,
+        ),
+    ]
+    .into_iter()
+    .map(|tokens| tokens.max(0) as u128)
+    .sum()
+}
+
 fn finish_model_breakdown(
     model_stats: HashMap<String, ModelBreakdownRow>,
     tool: &str,
@@ -269,11 +292,10 @@ fn finish_model_breakdown(
         .filter(|row| !row.model.contains("<synthetic>"))
         .map(|mut row| {
             row.total = row.input + row.output;
-            row.total_with_cache = match tool {
-                "codex" => row.input + row.output + row.cache_read + row.reasoning,
-                "gemini" => row.input + row.output + row.cache_read + row.thinking,
-                _ => row.input + row.output + row.cache_creation + row.cache_read,
-            };
+            row.total_with_cache = row.input
+                + row.output
+                + row.cache_read
+                + strategy_tokens(tool, row.cache_creation, row.reasoning);
             row
         })
         .collect();

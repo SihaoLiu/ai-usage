@@ -177,6 +177,73 @@ fn switch_host(state: &mut AppState, selection: &str) -> Outcome {
     }
 }
 
+fn known_host_usage_labels(
+    state: &AppState,
+    known_hosts: Vec<String>,
+    now: chrono::DateTime<Local>,
+) -> Vec<String> {
+    let selected_tool = Tool::from_key(&state.tool).unwrap_or(Tool::All);
+    let local_host_id = state.local_host_id.as_deref();
+    let all_data = crate::load_resident_all_tool_data(state, now);
+    let buckets: [(&[crate::data::UsageEntry], Tool); 5] = [
+        (&all_data.claude, Tool::Claude),
+        (&all_data.codex, Tool::Codex),
+        (&all_data.gemini, Tool::Gemini),
+        (&all_data.kimi, Tool::Kimi),
+        (&all_data.omp, Tool::Omp),
+    ];
+    let mut totals: std::collections::HashMap<String, u128> =
+        known_hosts.into_iter().map(|host| (host, 0)).collect();
+    for (entries, tool) in buckets {
+        if !selected_tool.is_all() && selected_tool != tool {
+            continue;
+        }
+        for entry in entries {
+            if entry.model.contains("<synthetic>") {
+                continue;
+            }
+            let Some(host) = entry.host_id.as_deref().or(local_host_id) else {
+                continue;
+            };
+            *totals.entry(host.to_string()).or_default() +=
+                crate::stats::entry_total_with_cache(entry, tool.key());
+        }
+    }
+
+    format_host_usage_totals(totals)
+}
+
+fn format_host_usage_totals(totals: std::collections::HashMap<String, u128>) -> Vec<String> {
+    let grand_total: u128 = totals.values().copied().sum();
+    let percentage_tenths = |tokens: u128| {
+        if grand_total > 0 {
+            (tokens * 1_000 + grand_total / 2) / grand_total
+        } else {
+            0
+        }
+    };
+    let mut totals = totals
+        .into_iter()
+        .map(|(host, tokens)| (host, percentage_tenths(tokens)))
+        .collect::<Vec<_>>();
+    totals.sort_by(|(left_host, left_tenths), (right_host, right_tenths)| {
+        right_tenths
+            .cmp(left_tenths)
+            .then_with(|| left_host.cmp(right_host))
+    });
+    totals
+        .into_iter()
+        .map(|(host, tenths)| {
+            let percentage = if tenths % 10 == 0 {
+                format!("{}", tenths / 10)
+            } else {
+                format!("{}.{:01}", tenths / 10, tenths % 10)
+            };
+            format!("{host}({percentage}%)")
+        })
+        .collect()
+}
+
 fn set_view(state: &mut AppState, view: TableView) -> Outcome {
     state.table_view = view;
     Outcome::message(
@@ -343,6 +410,7 @@ pub fn execute(state: &mut AppState, raw: &str) -> Outcome {
         },
         "host" => {
             let known_hosts = known_host_ids(state.local_host_id.as_deref());
+            let known_hosts = known_host_usage_labels(state, known_hosts, Local::now());
             let mut messages = vec![
                 format!("Current host: {}", host_label(state.host.as_deref())),
                 "Usage: host [all|HOST]".to_string(),
@@ -862,6 +930,151 @@ mod tests {
 
         assert_eq!(outcome.effect, Effect::ReloadRefresh);
         assert!(state.raw_refresh.is_some());
+    }
+
+    #[test]
+    fn host_command_labels_an_unused_known_host_with_zero_percent() {
+        let mut state = test_state();
+        state.local_host_id = Some("unused-test-host".to_string());
+
+        let outcome = execute(&mut state, "host");
+        let known_hosts = outcome
+            .messages
+            .iter()
+            .find(|message| message.starts_with("Known hosts:"))
+            .expect("known hosts message");
+
+        assert!(
+            known_hosts.contains("unused-test-host(0%)"),
+            "{known_hosts}"
+        );
+    }
+
+    #[test]
+    fn known_hosts_are_sorted_by_visible_token_share() {
+        let now = Local::now();
+        let entry = |host: Option<&str>, usage: crate::data::TokenUsage| crate::data::UsageEntry {
+            host_id: host.map(str::to_string),
+            session_id: None,
+            timestamp: now.to_rfc3339(),
+            parsed_timestamp: Some(now),
+            session_start_time: String::new(),
+            session_end_time: String::new(),
+            model: "test-model".to_string(),
+            effort: None,
+            fast_tier: -1,
+            usage,
+            costs: None,
+        };
+        let mut state = test_state();
+        state.local_host_id = Some("alpha".to_string());
+        let mut synthetic = entry(
+            Some("foxtrot"),
+            crate::data::TokenUsage {
+                input_tokens: 900,
+                ..Default::default()
+            },
+        );
+        synthetic.model = "<synthetic>".to_string();
+        state.raw_cache = Some(crate::RawDataCache {
+            claude: vec![
+                entry(
+                    None,
+                    crate::data::TokenUsage {
+                        input_tokens: 679,
+                        ..Default::default()
+                    },
+                ),
+                synthetic,
+            ],
+            codex: vec![entry(
+                Some("bravo"),
+                crate::data::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_read_input_tokens: 25,
+                    cache_creation_input_tokens: 999,
+                    reasoning_output_tokens: 25,
+                },
+            )],
+            gemini: vec![entry(
+                Some("charlie"),
+                crate::data::TokenUsage {
+                    input_tokens: 40,
+                    output_tokens: 10,
+                    cache_read_input_tokens: 9,
+                    cache_creation_input_tokens: 20,
+                    reasoning_output_tokens: 999,
+                },
+            )],
+            kimi: vec![entry(
+                Some("delta"),
+                crate::data::TokenUsage {
+                    input_tokens: 32,
+                    ..Default::default()
+                },
+            )],
+            omp: vec![entry(
+                Some("echo"),
+                crate::data::TokenUsage {
+                    input_tokens: 10,
+                    ..Default::default()
+                },
+            )],
+            range: crate::RawDataRange::from_bounds(
+                now - chrono::Duration::days(3),
+                now + chrono::Duration::days(1),
+            ),
+            has_source_data: true,
+            local_host_id: state.local_host_id.clone(),
+            local_record_keys: HashMap::new(),
+            persistent_generation: String::new(),
+            local_session_metadata_current: true,
+        });
+
+        let labels = known_host_usage_labels(
+            &state,
+            [
+                "alpha", "bravo", "charlie", "delta", "echo", "golf", "foxtrot",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            now,
+        );
+
+        assert_eq!(
+            labels,
+            [
+                "alpha(67.9%)",
+                "bravo(20%)",
+                "charlie(7.9%)",
+                "delta(3.2%)",
+                "echo(1%)",
+                "foxtrot(0%)",
+                "golf(0%)",
+            ]
+        );
+    }
+
+    #[test]
+    fn hosts_with_the_same_displayed_percentage_use_alphabetical_order() {
+        let labels = format_host_usage_totals(HashMap::from([
+            ("beta".to_string(), 9),
+            ("dominant".to_string(), 9_985),
+            ("alpha".to_string(), 6),
+        ]));
+
+        assert_eq!(labels, ["dominant(99.9%)", "alpha(0.1%)", "beta(0.1%)"]);
+    }
+
+    #[test]
+    fn host_percentages_handle_totals_larger_than_i64() {
+        let labels = format_host_usage_totals(HashMap::from([
+            ("beta".to_string(), i64::MAX as u128),
+            ("alpha".to_string(), i64::MAX as u128),
+        ]));
+
+        assert_eq!(labels, ["alpha(50%)", "beta(50%)"]);
     }
 
     #[test]

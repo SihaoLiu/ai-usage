@@ -117,7 +117,26 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
         }
         spans.push(Span::raw(" "));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
+    let full_usage = process_usage_text(ui.process_usage.as_deref(), false);
+    let compact_usage = process_usage_text(ui.process_usage.as_deref(), true);
+    let usage_text =
+        if spans_width(&spans) + full_usage.chars().count() + 2 <= tabs_area.width as usize {
+            full_usage
+        } else {
+            compact_usage
+        };
+    let usage_width = usage_text.chars().count().min(tabs_area.width as usize) as u16;
+    let [tabs_left, usage_right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(usage_width)]).areas(tabs_area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), tabs_left);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            usage_text,
+            Style::default().fg(Color::Indexed(81)),
+        ))
+        .alignment(Alignment::Right),
+        usage_right,
+    );
 
     let mut left: Vec<Span> = vec![
         Span::styled(
@@ -161,11 +180,6 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
         integrity_text,
         Style::default().fg(integrity_color),
     ));
-    full_right.push(Span::raw("  |  "));
-    full_right.push(Span::styled(
-        process_usage_text(ui.process_usage.as_deref(), false),
-        Style::default().fg(Color::Indexed(81)),
-    ));
     let countdown = crate::formatting::format_countdown(ui.refresh_in);
     full_right.push(Span::styled(
         format!("  |  refresh in {countdown} "),
@@ -176,12 +190,8 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
         full_right
     } else {
         let (integrity_text, integrity_color) = integrity_status_compact(ui.state.integrity_status);
-        let usage_text = process_usage_text(ui.process_usage.as_deref(), true);
         let refresh_text = format!("refresh:{countdown}");
-        let core_width = integrity_text.chars().count()
-            + usage_text.chars().count()
-            + refresh_text.chars().count()
-            + 6;
+        let core_width = integrity_text.chars().count() + refresh_text.chars().count() + 3;
         let mut occupied = core_width;
         let mut compact: Vec<Span> = Vec::new();
 
@@ -207,11 +217,6 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
         compact.push(Span::styled(
             integrity_text,
             Style::default().fg(integrity_color),
-        ));
-        compact.push(Span::raw(" | "));
-        compact.push(Span::styled(
-            usage_text,
-            Style::default().fg(Color::Indexed(81)),
         ));
         compact.push(Span::raw(" | "));
         compact.push(Span::styled(refresh_text, Style::default().fg(DIM)));
@@ -853,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn process_usage_appears_between_integrity_and_refresh() {
+    fn process_usage_is_right_aligned_on_the_title_line() {
         let dash = dashboard(TableView::Flat, Vec::new(), RowMetrics::default());
         let state = AppState {
             tool: "all".to_string(),
@@ -901,27 +906,32 @@ mod tests {
             .expect("draw");
 
         let text = buffer_text(&terminal);
-        let status = line_containing(&text, "CPU: 12.3%");
-        let integrity = char_index(&status, "integrity: ok (8.5s)");
-        let cpu = char_index(&status, "CPU: 12.3%");
-        let memory = char_index(&status, "Mem: 1.24 GiB");
-        let refresh = char_index(&status, "refresh in 00:59:56");
+        let title = line_containing(&text, "ai-usage CPU: 12.3%");
+        let status = line_containing(&text, "integrity: ok (8.5s)");
+        assert!(title.contains(env!("CARGO_PKG_VERSION")), "{title}");
         assert!(
-            integrity < cpu && cpu < memory && memory < refresh,
-            "{status}"
+            title.ends_with("ai-usage CPU: 12.3%  |  Mem: 1.24 GiB"),
+            "{title}"
         );
+        assert!(status.contains("Sync: checked just now"), "{status}");
+        assert!(status.contains("refresh in 00:59:56"), "{status}");
+        assert!(!status.contains("CPU"), "{status}");
+        assert!(!status.contains("Mem"), "{status}");
 
-        let backend = TestBackend::new(60, 2);
+        let backend = TestBackend::new(68, 2);
         let mut terminal = Terminal::new(backend).expect("narrow terminal");
         terminal
             .draw(|frame| draw_header(frame, frame.area(), &ui))
             .expect("draw narrow header");
 
         let text = buffer_text(&terminal);
+        let title = line_containing(&text, "ai-usage CPU:12.3%");
+        let status = line_containing(&text, "integrity:ok");
+        assert!(title.ends_with("ai-usage CPU:12.3% | Mem:1.24G"), "{title}");
         assert!(text.contains("integrity:ok"), "{text}");
-        assert!(text.contains("CPU:12.3%"), "{text}");
-        assert!(text.contains("Mem:1.24G"), "{text}");
         assert!(text.contains("refresh:00:59:56"), "{text}");
+        assert!(!status.contains("CPU"), "{status}");
+        assert!(!status.contains("Mem"), "{status}");
     }
 
     #[test]

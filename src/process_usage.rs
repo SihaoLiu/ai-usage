@@ -27,12 +27,12 @@ impl ProcessUsageDisplay {
     pub(crate) fn new(usage: ProcessUsage) -> Self {
         Self {
             full: format!(
-                "CPU: {:.1}%  |  Mem: {}",
+                "ai-usage CPU: {:.1}%  |  Mem: {}",
                 usage.cpu_percent,
                 format_memory(usage.memory_bytes, false)
             ),
             compact: format!(
-                "CPU:{:.1}% | Mem:{}",
+                "ai-usage CPU:{:.1}% | Mem:{}",
                 usage.cpu_percent,
                 format_memory(usage.memory_bytes, true)
             ),
@@ -285,8 +285,8 @@ pub fn process_usage_text(usage: Option<&ProcessUsageDisplay>, compact: bool) ->
     match (usage, compact) {
         (Some(usage), true) => usage.compact(),
         (Some(usage), false) => usage.full(),
-        (None, true) => "CPU:-- | Mem:--",
-        (None, false) => "CPU: --  |  Mem: --",
+        (None, true) => "ai-usage CPU:-- | Mem:--",
+        (None, false) => "ai-usage CPU: --  |  Mem: --",
     }
 }
 
@@ -330,14 +330,17 @@ mod tests {
         };
 
         let display = ProcessUsageDisplay::new(usage);
-        assert_eq!(display.full(), "CPU: 12.3%  |  Mem: 1.24 GiB");
-        assert_eq!(display.compact(), "CPU:12.3% | Mem:1.24G");
+        assert_eq!(display.full(), "ai-usage CPU: 12.3%  |  Mem: 1.24 GiB");
+        assert_eq!(display.compact(), "ai-usage CPU:12.3% | Mem:1.24G");
     }
 
     #[test]
     fn status_has_an_explicit_unavailable_state() {
-        assert_eq!(process_usage_text(None, false), "CPU: --  |  Mem: --");
-        assert_eq!(process_usage_text(None, true), "CPU:-- | Mem:--");
+        assert_eq!(
+            process_usage_text(None, false),
+            "ai-usage CPU: --  |  Mem: --"
+        );
+        assert_eq!(process_usage_text(None, true), "ai-usage CPU:-- | Mem:--");
     }
 
     #[test]
@@ -381,7 +384,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
 
-        assert!(usage.full().starts_with("CPU: "));
+        assert!(usage.full().starts_with("ai-usage CPU: "));
         assert!(usage.full().contains("  |  Mem: "));
         assert!(!usage.full().contains("Mem: 0 B"));
     }

@@ -18,8 +18,10 @@ use crate::time_utils::parse_timestamp;
 
 mod index;
 mod persistence;
+mod scan;
 
 use persistence::*;
+pub(crate) use scan::{VisitCachedRecordsError, try_for_each_vendor_persisted_record};
 
 #[cfg(test)]
 mod tests;
@@ -704,6 +706,17 @@ impl PersistedSourceRecord {
         }
     }
 
+    fn into_cached_usage_record(mut self, vendor: &str) -> CachedUsageRecord {
+        let source_path = std::mem::take(&mut self.source_path);
+        let dedup_key = std::mem::take(&mut self.dedup_key);
+        CachedUsageRecord {
+            vendor: vendor.to_string(),
+            source_path,
+            dedup_key,
+            entry: self.into_usage_entry(),
+        }
+    }
+
     fn has_non_negative_token_usage(&self) -> bool {
         token_counts_are_non_negative([
             self.input_tokens,
@@ -822,6 +835,16 @@ pub(crate) fn hot_snapshot_reads() -> usize {
     HOT_SNAPSHOT_READS.get()
 }
 
+#[cfg(test)]
+pub(crate) fn reset_cached_record_reads() {
+    CACHED_RECORD_READS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn cached_record_reads() -> usize {
+    CACHED_RECORD_READS.get()
+}
+
 /// Persist a compact derived snapshot. The canonical per-source cache files
 /// remain the source of truth and can always rebuild this file.
 pub(crate) fn write_hot_snapshot<T: Serialize>(cache_root: &Path, snapshot: &T) -> io::Result<()> {
@@ -850,15 +873,7 @@ pub fn load_vendor_cached_records(cache_root: &Path, vendor: &str) -> Vec<Cached
                     if !record.dedup_key.is_empty() && !seen.insert(record.dedup_key.clone()) {
                         return None;
                     }
-                    let source_path = record.source_path.clone();
-                    let dedup_key = record.dedup_key.clone();
-                    let entry = record.into_usage_entry();
-                    Some(CachedUsageRecord {
-                        vendor: vendor.to_string(),
-                        source_path,
-                        dedup_key,
-                        entry,
-                    })
+                    Some(record.into_cached_usage_record(vendor))
                 })
                 .collect()
         })

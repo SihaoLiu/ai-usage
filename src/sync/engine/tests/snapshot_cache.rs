@@ -38,6 +38,75 @@ fn snapshot_state_records_the_local_cache_generation() {
 }
 
 #[test]
+fn snapshot_upload_does_not_materialize_indexed_vendor_caches() {
+    let cache_root = unique_temp_dir("snapshot-streaming-cache");
+    populate_vendor_cache_with_records(
+        &cache_root,
+        "claude",
+        vec![
+            usage_record("first", "2026-05-18T12:00:00Z", 10),
+            usage_record("second", "2026-05-18T12:01:00Z", 20),
+        ],
+    );
+    let transport = DiffSnapshotTransport::new(vec![
+        RecordKey {
+            vendor: "claude".to_string(),
+            dedup_key: "first".to_string(),
+        },
+        RecordKey {
+            vendor: "claude".to_string(),
+            dedup_key: "second".to_string(),
+        },
+    ]);
+    crate::data::cache::reset_cached_record_reads();
+
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &transport,
+        |_| {},
+    )
+    .expect("streaming snapshot upload");
+
+    assert_eq!(crate::data::cache::cached_record_reads(), 0);
+    assert_eq!(transport.snapshot_record_batches.borrow().len(), 1);
+    assert_eq!(
+        transport.snapshot_record_batches.borrow()[0].records.len(),
+        2
+    );
+}
+
+#[test]
+fn snapshot_upload_retries_when_the_cache_changes_between_scans() {
+    let cache_root = unique_temp_dir("snapshot-generation-race");
+    populate_vendor_cache(&cache_root, "claude", "first");
+    let changed_root = cache_root.clone();
+    let transport = DiffSnapshotTransport::new(vec![RecordKey {
+        vendor: "claude".to_string(),
+        dedup_key: "first".to_string(),
+    }])
+    .with_after_first_diff(move || {
+        populate_vendor_cache_with_records(
+            &changed_root,
+            "claude",
+            vec![usage_record("first", "2026-05-18T12:00:00Z", 99)],
+        );
+    });
+
+    let error = run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &transport,
+        |_| {},
+    )
+    .expect_err("cache mutation must retry");
+
+    assert!(error.to_string().contains("cached records changed"));
+    assert!(transport.snapshot_record_batches.borrow().is_empty());
+    assert!(transport.snapshot_finalizations.borrow().is_empty());
+}
+
+#[test]
 fn snapshot_cache_does_not_cross_machine_id_changes() {
     let cache_root = unique_temp_dir("snapshot-machine-scope");
     populate_vendor_cache(&cache_root, "claude", "first");
@@ -278,11 +347,14 @@ fn fingerprint_budget_accounts_for_json_escaping() {
         .map(|index| usage_record(&format!("{index:04}-{escaped}"), "2026-05-18T12:00:00Z", 10))
         .collect();
     populate_vendor_cache_with_records(&cache_root, "claude", records);
-    let snapshot =
-        collect_snapshot_records(&cache_root, &enabled_config("workstation")).expect("snapshot");
-    let records = snapshot.records.iter().collect::<Vec<_>>();
+    let snapshot = collect_snapshot_manifest(
+        &cache_root,
+        &enabled_config("workstation"),
+        crate::sync::integrity::integrity_range_end_utc(Utc::now()),
+    )
+    .expect("snapshot");
 
-    for chunk in snapshot_fingerprint_chunks(&records) {
+    for chunk in snapshot_fingerprint_chunks(&snapshot) {
         let body = serde_json::to_vec(&SnapshotDiffRequest {
             host_id: "workstation".to_string(),
             snapshot_id: "workstation:20260723T120000Z".to_string(),

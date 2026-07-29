@@ -974,6 +974,131 @@ fn damaged_record_index_falls_back_once_without_deleting_a_new_generation() {
 }
 
 #[test]
+fn streaming_vendor_scan_does_not_depend_on_the_record_index_body() {
+    let cache_root = unique_temp_dir("damaged-streaming-record-index");
+    let source = cache_root.join("source.jsonl");
+    write_source(&source, "records");
+    let _ = super::load_or_update_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
+        vec![
+            usage_record("old", "2026-05-01T00:00:00Z", 1),
+            usage_record("recent", "2026-05-03T00:00:00Z", 2),
+        ]
+    });
+    let index_path = cache_root.join(super::ENTRIES_DIR).join("claude.idx");
+    let mut damaged_index = fs::read(&index_path).expect("read record index");
+    *damaged_index.last_mut().expect("nonempty record index") ^= 0xff;
+    fs::write(&index_path, &damaged_index).expect("damage record index");
+    super::CACHED_RECORD_READS.set(0);
+    let mut keys = Vec::new();
+
+    let result = super::try_for_each_vendor_persisted_record(&cache_root, "claude", |record| {
+        keys.push(record.dedup_key);
+        Ok::<_, ()>(())
+    });
+
+    assert!(result.is_ok());
+    assert_eq!(keys, ["old", "recent"]);
+    assert_eq!(super::CACHED_RECORD_READS.get(), 0);
+    assert_eq!(fs::read(&index_path).expect("record index"), damaged_index);
+}
+
+#[test]
+fn streaming_vendor_scan_visits_records_without_valid_timestamps() {
+    let cache_root = unique_temp_dir("streaming-invalid-timestamp");
+    let source = cache_root.join("source.jsonl");
+    write_source(&source, "records");
+    let _ = super::load_or_update_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
+        vec![usage_record("invalid-time", "not-a-timestamp", 1)]
+    });
+    let mut keys = Vec::new();
+
+    let result = super::try_for_each_vendor_persisted_record(&cache_root, "claude", |record| {
+        keys.push(record.dedup_key);
+        Ok::<_, ()>(())
+    });
+
+    assert!(result.is_ok());
+    assert_eq!(keys, ["invalid-time"]);
+}
+
+#[test]
+fn streaming_vendor_scan_validates_unindexed_duplicate_records() {
+    let cache_root = unique_temp_dir("streaming-invalid-duplicate");
+    let source = cache_root.join("source.jsonl");
+    write_source(&source, "records");
+    let _ = super::load_or_update_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
+        vec![
+            usage_record("duplicate", "2026-05-01T00:00:00Z", 1),
+            usage_record("duplicate", "2026-05-02T00:00:00Z", -1),
+        ]
+    });
+
+    let result =
+        super::try_for_each_vendor_persisted_record(&cache_root, "claude", |_| Ok::<_, ()>(()));
+
+    assert!(matches!(
+        result,
+        Err(super::VisitCachedRecordsError::Cache(_))
+    ));
+}
+
+#[test]
+fn streaming_vendor_scan_validates_unindexed_payload_bytes() {
+    let cache_root = unique_temp_dir("streaming-corrupt-duplicate");
+    let source = cache_root.join("source.jsonl");
+    write_source(&source, "records");
+    let _ = super::load_or_update_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
+        vec![
+            usage_record("duplicate", "2026-05-01T00:00:00Z", 1),
+            usage_record("duplicate", "2026-05-02T00:00:00Z", 2),
+        ]
+    });
+    let entries_path = cache_root.join(super::ENTRIES_DIR).join("claude.bin");
+    let mut entries = fs::read(&entries_path).expect("read entry cache");
+    *entries.last_mut().expect("nonempty entry cache") ^= 0xff;
+    fs::write(entries_path, entries).expect("damage unindexed record");
+
+    let result =
+        super::try_for_each_vendor_persisted_record(&cache_root, "claude", |_| Ok::<_, ()>(()));
+
+    assert!(matches!(
+        result,
+        Err(super::VisitCachedRecordsError::Cache(_))
+    ));
+}
+
+#[test]
+fn compatible_record_index_keeps_range_reads_indexed() {
+    let cache_root = unique_temp_dir("compatible-record-index");
+    let source = cache_root.join("source.jsonl");
+    write_source(&source, "records");
+    let _ = super::load_or_update_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
+        vec![
+            usage_record("first", "2026-05-01T00:00:00Z", 1),
+            usage_record("second", "2026-05-03T00:00:00Z", 2),
+        ]
+    });
+    let index_path = cache_root.join(super::ENTRIES_DIR).join("claude.idx");
+    let mut index = fs::read(&index_path).expect("read record index");
+    let header_start = super::ENTRY_INDEX_MAGIC.len() + 8;
+    index[header_start..header_start + 4].copy_from_slice(&3_u32.to_le_bytes());
+    let header_checksum = super::fnv1a_bytes(0, &index[header_start..header_start + 84]);
+    index[super::ENTRY_INDEX_MAGIC.len()..header_start]
+        .copy_from_slice(&header_checksum.to_le_bytes());
+    fs::write(index_path, index).expect("write compatible record index");
+    let start = crate::time_utils::parse_timestamp("2026-04-30T00:00:00Z").expect("start");
+    let end = crate::time_utils::parse_timestamp("2026-05-04T00:00:00Z").expect("end");
+    super::CACHED_RECORD_READS.set(0);
+
+    let (records, has_records) =
+        super::load_vendor_cached_records_in_range(&cache_root, "claude", start, end);
+
+    assert!(has_records);
+    assert_eq!(records.len(), 2);
+    assert_eq!(super::CACHED_RECORD_READS.get(), 0);
+}
+
+#[test]
 fn retaining_refresh_rebuilds_a_tampered_entry_cache() {
     let cache_root = unique_temp_dir("retaining-refresh-tampered-cache");
     let source = cache_root.join("source.jsonl");

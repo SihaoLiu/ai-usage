@@ -404,6 +404,58 @@ impl<R: Read> Read for FnvReader<R> {
     }
 }
 
+pub(super) enum VisitCurrentCachedRecordsError<E> {
+    Cache(io::Error),
+    Visitor(E),
+}
+
+pub(super) fn try_for_each_current_cached_record<E>(
+    path: &Path,
+    mut visitor: impl FnMut(PersistedSourceRecord) -> Result<(), E>,
+) -> Result<(), VisitCurrentCachedRecordsError<E>> {
+    let mut reader =
+        BufReader::new(fs::File::open(path).map_err(VisitCurrentCachedRecordsError::Cache)?);
+    let stored_checksum = read_framed_header(&mut reader, ENTRY_FILE_MAGIC)
+        .map_err(VisitCurrentCachedRecordsError::Cache)?;
+    let mut reader = FnvReader::new(reader);
+    let format_version: u32 = bincode::deserialize_from(&mut reader).map_err(|error| {
+        VisitCurrentCachedRecordsError::Cache(io::Error::new(io::ErrorKind::InvalidData, error))
+    })?;
+    if format_version != CACHE_VERSION {
+        return Err(VisitCurrentCachedRecordsError::Cache(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported cache entry version",
+        )));
+    }
+    let record_count: u64 = bincode::deserialize_from(&mut reader).map_err(|error| {
+        VisitCurrentCachedRecordsError::Cache(io::Error::new(io::ErrorKind::InvalidData, error))
+    })?;
+    for _ in 0..record_count {
+        let record: PersistedSourceRecord =
+            bincode::deserialize_from(&mut reader).map_err(|error| {
+                VisitCurrentCachedRecordsError::Cache(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    error,
+                ))
+            })?;
+        if !record.has_non_negative_token_usage() {
+            return Err(VisitCurrentCachedRecordsError::Cache(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache entry has negative token count",
+            )));
+        }
+        visitor(record).map_err(VisitCurrentCachedRecordsError::Visitor)?;
+    }
+    io::copy(&mut reader, &mut io::sink()).map_err(VisitCurrentCachedRecordsError::Cache)?;
+    if stored_checksum != reader.checksum {
+        return Err(VisitCurrentCachedRecordsError::Cache(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache checksum mismatch",
+        )));
+    }
+    Ok(())
+}
+
 struct FnvWriter<W> {
     inner: W,
     checksum: u64,

@@ -44,6 +44,7 @@ struct DiffSnapshotTransport {
     needed: Vec<RecordKey>,
     server_instance_id: Option<String>,
     remote_snapshot_state: RemoteSnapshotState,
+    after_first_diff: RefCell<Option<Box<dyn FnOnce()>>>,
 }
 
 impl FakeTransport {
@@ -194,6 +195,7 @@ impl DiffSnapshotTransport {
             needed,
             server_instance_id: None,
             remote_snapshot_state: RemoteSnapshotState::Unavailable,
+            after_first_diff: RefCell::new(None),
         }
     }
 
@@ -204,6 +206,11 @@ impl DiffSnapshotTransport {
 
     fn with_remote_snapshot_state(mut self, state: RemoteSnapshotState) -> Self {
         self.remote_snapshot_state = state;
+        self
+    }
+
+    fn with_after_first_diff(self, action: impl FnOnce() + 'static) -> Self {
+        *self.after_first_diff.borrow_mut() = Some(Box::new(action));
         self
     }
 }
@@ -237,6 +244,9 @@ impl SyncTransport for DiffSnapshotTransport {
         request: &SnapshotDiffRequest,
     ) -> Result<SnapshotDiffResponse, SyncError> {
         self.snapshot_diffs.borrow_mut().push(request.clone());
+        if let Some(action) = self.after_first_diff.borrow_mut().take() {
+            action();
+        }
         let needed = self.needed.clone();
         Ok(SnapshotDiffResponse {
             matched: request.records.len().saturating_sub(needed.len()),
@@ -748,11 +758,14 @@ fn snapshot_fingerprint_requests_stay_below_the_wire_budget() {
         })
         .collect();
     populate_vendor_cache_with_records(&cache_root, "claude", records);
-    let snapshot =
-        collect_snapshot_records(&cache_root, &enabled_config("workstation")).expect("snapshot");
-    let records = snapshot.records.iter().collect::<Vec<_>>();
+    let snapshot = collect_snapshot_manifest(
+        &cache_root,
+        &enabled_config("workstation"),
+        crate::sync::integrity::integrity_range_end_utc(Utc::now()),
+    )
+    .expect("snapshot");
 
-    for chunk in snapshot_fingerprint_chunks(&records) {
+    for chunk in snapshot_fingerprint_chunks(&snapshot) {
         let body = serde_json::to_vec(&SnapshotDiffRequest {
             host_id: "workstation".to_string(),
             snapshot_id: "workstation:20260723T120000Z".to_string(),

@@ -354,6 +354,7 @@ fn run_worker_loop<F>(
                 backoff = next_backoff(backoff, settings.max_backoff);
             }
         }
+        crate::process_usage::release_unused_memory();
     }
 }
 

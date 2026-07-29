@@ -624,7 +624,7 @@ fn idle_latest_cache_keeps_only_the_previous_window_and_ages_it_forward() {
 }
 
 #[test]
-fn dashboard_build_marks_resident_cache_as_used() {
+fn dashboard_build_does_not_count_as_cache_activity() {
     let now = Local::now();
     let cache = RawDataCache {
         claude: Vec::new(),
@@ -644,29 +644,38 @@ fn dashboard_build_marks_resident_cache_as_used() {
 
     let _dashboard = crate::tui::data::build(&mut state);
 
-    assert!(state.raw_cache_last_used_at.is_some());
+    assert!(state.raw_cache_last_used_at.is_none());
 }
 
 #[test]
-fn background_completion_does_not_compact_on_the_event_loop() {
+fn cache_activity_is_recorded_before_the_cache_arrives() {
     let now = Local::now();
-    let entry = |timestamp: DateTime<Local>| UsageEntry {
-        host_id: None,
-        session_id: None,
-        timestamp: timestamp.to_rfc3339(),
-        parsed_timestamp: Some(timestamp),
-        session_start_time: String::new(),
-        session_end_time: String::new(),
-        model: "test-model".to_string(),
-        effort: None,
-        fast_tier: -1,
-        usage: data::TokenUsage::default(),
-        costs: None,
-    };
     let cache = RawDataCache {
+        claude: Vec::new(),
+        codex: Vec::new(),
+        gemini: Vec::new(),
+        kimi: Vec::new(),
+        omp: Vec::new(),
+        range: hot_cache_range(now),
+        has_source_data: true,
+        local_host_id: None,
+        local_record_keys: HashMap::new(),
+        persistent_generation: String::new(),
+        local_session_metadata_current: true,
+    };
+    let mut state = state_with_cache(cache, TimeWindow::rolling_days(3));
+    state.raw_cache = None;
+
+    touch_raw_cache_at(&mut state, std::time::Instant::now());
+
+    assert!(state.raw_cache_last_used_at.is_some());
+}
+
+fn background_cache(now: DateTime<Local>) -> RawDataCache {
+    RawDataCache {
         claude: vec![
-            entry(now - Duration::days(1)),
-            entry(now - Duration::days(30)),
+            usage_entry_at(now - Duration::days(30)),
+            usage_entry_at(now - Duration::days(1)),
         ],
         codex: Vec::new(),
         gemini: Vec::new(),
@@ -678,30 +687,21 @@ fn background_completion_does_not_compact_on_the_event_loop() {
         local_record_keys: HashMap::from([(Tool::Claude, HashSet::from(["key".to_string()]))]),
         persistent_generation: String::new(),
         local_session_metadata_current: true,
-    };
+    }
+}
+
+#[test]
+fn active_background_completion_keeps_the_prefetch_range() {
+    let now = Local::now();
+    let cache = background_cache(now);
     let (tx, rx) = mpsc::channel();
     tx.send(BackgroundRawLoad::Refreshed(Box::new(cache)))
         .expect("send cache");
-    let mut state = AppState {
-        tool: "all".to_string(),
-        table_view: TableView::Flat,
-        host: None,
-        session_id: None,
-        local_host_id: Some("workstation".to_string()),
-        days: 3,
-        time_window: TimeWindow::rolling_days(3),
-        monitor_interval: 3600,
-        pricing: AllPricing::load_raw().finalize(),
-        subscription_fees: SubscriptionFees::default(),
-        fee_env_path: std::path::PathBuf::from(".fee.env"),
-        version_cache: HashMap::new(),
-        all_tool_prompt: None,
-        raw_cache: None,
-        raw_cache_last_used_at: None,
-        raw_refresh: Some(rx),
-        integrity_status: crate::IntegrityStatus::Checking { percent: 0 },
-        integrity_started_at: None,
-    };
+    let mut state = state_with_cache(background_cache(now), TimeWindow::rolling_days(3));
+    state.raw_cache = None;
+    state.raw_cache_last_used_at = Some(std::time::Instant::now());
+    state.raw_refresh = Some(rx);
+    state.integrity_status = crate::IntegrityStatus::Checking { percent: 0 };
 
     assert!(poll_background_raw_refresh(&mut state));
     assert_eq!(
@@ -715,6 +715,74 @@ fn background_completion_does_not_compact_on_the_event_loop() {
     assert_eq!(cache.local_record_keys.len(), 1);
 
     state.raw_cache = Some(cache);
+}
+
+#[test]
+fn idle_background_completion_keeps_only_the_retention_range() {
+    let now = Local::now();
+    let expected = idle_raw_cache_retention_range(&TimeWindow::rolling_days(3), now);
+    let cache = background_cache(now);
+    let (tx, rx) = mpsc::channel();
+    tx.send(BackgroundRawLoad::Refreshed(Box::new(cache)))
+        .expect("send cache");
+    let mut state = state_with_cache(background_cache(now), TimeWindow::rolling_days(3));
+    state.raw_cache = None;
+    state.raw_refresh = Some(rx);
+
+    assert!(poll_background_raw_refresh(&mut state));
+
+    let cache = state.raw_cache.expect("retained cache");
+    assert_eq!(
+        cache.range.end() - cache.range.start(),
+        expected.end() - expected.start()
+    );
+    assert!(
+        (cache.range.end() - expected.end())
+            .num_milliseconds()
+            .abs()
+            < 100
+    );
+    assert_eq!(cache.claude.len(), 1);
+    assert!(state.raw_cache_last_used_at.is_none());
+}
+
+#[test]
+fn idle_background_replacement_reclaims_after_the_old_cache_drops() {
+    let now = Local::now();
+    let desired = idle_raw_cache_retention_range(&TimeWindow::rolling_days(3), now);
+    let incoming_range = RawDataRange::from_bounds(
+        desired.start() - Duration::minutes(1),
+        desired.end() + Duration::minutes(1),
+    );
+    let incoming = RawDataCache {
+        claude: vec![usage_entry_at(now - Duration::days(1))],
+        codex: Vec::new(),
+        gemini: Vec::new(),
+        kimi: Vec::new(),
+        omp: Vec::new(),
+        range: incoming_range,
+        has_source_data: true,
+        local_host_id: None,
+        local_record_keys: HashMap::new(),
+        persistent_generation: String::new(),
+        local_session_metadata_current: true,
+    };
+    let (tx, rx) = mpsc::channel();
+    tx.send(BackgroundRawLoad::Refreshed(Box::new(incoming)))
+        .expect("send cache");
+    let mut state = state_with_cache(background_cache(now), TimeWindow::rolling_days(3));
+    state.raw_refresh = Some(rx);
+    IDLE_RECLAIM_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    assert!(poll_background_raw_refresh(&mut state));
+
+    for _ in 0..100 {
+        if IDLE_RECLAIM_CALLS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(IDLE_RECLAIM_CALLS.load(std::sync::atomic::Ordering::Relaxed) > 0);
 }
 
 #[test]
@@ -740,6 +808,7 @@ fn undersized_background_result_preserves_resident_prefetch_headroom() {
         local_session_metadata_current: true,
     };
     let mut state = state_with_cache(cache(resident_range), TimeWindow::rolling_days(3));
+    state.raw_cache_last_used_at = Some(std::time::Instant::now());
     let (tx, rx) = mpsc::channel();
     tx.send(BackgroundRawLoad::Refreshed(Box::new(cache(stale_range))))
         .expect("send cache");

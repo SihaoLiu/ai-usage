@@ -226,7 +226,12 @@ impl RawRefreshTracker {
 }
 
 fn request_background_reload(state: &mut AppState, tracker: &mut RawRefreshTracker) {
-    let range = crate::raw_cache_target_range(&state.time_window, Local::now());
+    let now = Local::now();
+    let range = if state.raw_cache_last_used_at.is_some() {
+        crate::raw_cache_target_range(&state.time_window, now)
+    } else {
+        crate::idle_raw_cache_retention_range(&state.time_window, now)
+    };
     request_background_reload_to(state, tracker, range);
 }
 
@@ -266,10 +271,12 @@ fn request_follow_up(
     tracker: &mut RawRefreshTracker,
     request: RawLoadRequest,
 ) {
-    let current_range = crate::raw_cache_target_range(&state.time_window, Local::now());
     match request.kind {
-        RawLoadKind::Prefetch => request_background_prefetch_to(state, tracker, current_range),
-        RawLoadKind::Cached => request_background_reload_to(state, tracker, current_range),
+        RawLoadKind::Prefetch if state.raw_cache_last_used_at.is_some() => {
+            request_background_prefetch(state, tracker);
+        }
+        RawLoadKind::Prefetch => {}
+        RawLoadKind::Cached => request_background_reload(state, tracker),
     }
 }
 
@@ -279,6 +286,7 @@ fn rebuild_or_reload_window(
     tracker: &mut RawRefreshTracker,
 ) {
     let now = Local::now();
+    crate::touch_raw_cache_at(state, Instant::now());
     *dashboard = data::build(state);
     if crate::raw_cache_needs_prefetch(state, now) {
         request_background_prefetch(state, tracker);
@@ -297,7 +305,14 @@ fn apply_source_refresh_result(
         *dashboard = data::build(state);
         request_background_reload(state, tracker);
     } else {
-        rebuild_or_reload_window(state, dashboard, tracker);
+        *dashboard = data::build(state);
+        if state.raw_cache_last_used_at.is_some()
+            && crate::raw_cache_needs_prefetch(state, Local::now())
+        {
+            request_background_prefetch(state, tracker);
+        } else {
+            tracker.cancel_pending_prefetch(&state.host);
+        }
     }
 }
 
@@ -309,6 +324,12 @@ fn make_notice(messages: Vec<String>) -> Option<Notice> {
         text: messages.join(" | "),
         expires_at: Instant::now() + NOTICE_TTL,
     })
+}
+
+fn discard_stale_raw_cache(state: &mut AppState) {
+    if let Some(stale) = state.raw_cache.take() {
+        crate::retire_raw_cache(stale);
+    }
 }
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
@@ -417,6 +438,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
     let process_usage_monitor = process_usage::ProcessUsageMonitor::start();
 
     let load_started = Instant::now();
+    crate::touch_raw_cache_at(state, Instant::now());
     let mut dashboard = data::build(state);
     let mut input = InputLine::new();
     let mut history = CommandHistory::new();
@@ -451,11 +473,11 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
             let stale_host = refresh_tracker.active_host.as_deref() != state.host.as_deref();
             let follow_up = refresh_tracker.complete(&state.host);
             if stale_host {
-                if let Some(stale) = state.raw_cache.take() {
-                    crate::retire_raw_cache(stale);
-                }
-                state.raw_cache_last_used_at = None;
+                discard_stale_raw_cache(state);
             } else {
+                if initial_load_pending {
+                    crate::touch_raw_cache_at(state, Instant::now());
+                }
                 dashboard = data::build(state);
                 if initial_load_pending {
                     notice = make_notice(vec![load_duration_text(load_started.elapsed())]);
@@ -464,7 +486,10 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
             }
             if let Some(kind) = follow_up {
                 request_follow_up(state, &mut refresh_tracker, kind);
-            } else if !stale_host && crate::raw_cache_needs_prefetch(state, Local::now()) {
+            } else if !stale_host
+                && state.raw_cache_last_used_at.is_some()
+                && crate::raw_cache_needs_prefetch(state, Local::now())
+            {
                 request_background_prefetch(state, &mut refresh_tracker);
             } else if !stale_host && initial_source_refresh_pending {
                 source_refresh_tracker.request(state);
@@ -1147,6 +1172,82 @@ mod tests {
 
         assert_ne!(dashboard.window_label, "stale window");
         assert!(!tracker.is_running());
+    }
+
+    #[test]
+    fn idle_unchanged_source_refresh_does_not_restore_prefetch() {
+        let mut state = state_with_hot_cache();
+        state.raw_cache.as_mut().unwrap().range =
+            crate::raw_cache_visible_range(&state.time_window, Local::now());
+        let (_raw_tx, raw_rx) = mpsc::channel();
+        state.raw_refresh = Some(raw_rx);
+        let mut dashboard = data::build(&mut state);
+        state.raw_cache_last_used_at = None;
+        let mut tracker = RawRefreshTracker::default();
+
+        apply_source_refresh_result(&mut state, &mut dashboard, &mut tracker, false);
+
+        assert!(state.raw_cache_last_used_at.is_none());
+        assert!(!tracker.is_running());
+    }
+
+    #[test]
+    fn idle_changed_source_refresh_reloads_only_retained_windows() {
+        let mut state = state_with_hot_cache();
+        state.raw_cache.as_mut().unwrap().range =
+            crate::raw_cache_visible_range(&state.time_window, Local::now());
+        let now = Local::now();
+        let visible = crate::raw_cache_visible_range(&state.time_window, now);
+        let expected = crate::RawDataRange::from_bounds(
+            visible.start() - state.time_window.page_step(),
+            visible.end(),
+        );
+        let (_raw_tx, raw_rx) = mpsc::channel();
+        state.raw_refresh = Some(raw_rx);
+        let mut dashboard = data::build(&mut state);
+        state.raw_cache_last_used_at = None;
+        let mut tracker = RawRefreshTracker::default();
+
+        apply_source_refresh_result(&mut state, &mut dashboard, &mut tracker, true);
+
+        assert!(state.raw_cache_last_used_at.is_none());
+        let active = tracker.active.expect("retained window reload");
+        assert_eq!(active.kind, RawLoadKind::Cached);
+        assert_eq!(
+            active.range.end() - active.range.start(),
+            expected.end() - expected.start()
+        );
+        assert!(
+            (active.range.end() - expected.end())
+                .num_milliseconds()
+                .abs()
+                < 100
+        );
+        assert_eq!(tracker.follow_up, None);
+    }
+
+    #[test]
+    fn interactive_rebuild_marks_the_resident_cache_as_used() {
+        let mut state = state_with_hot_cache();
+        let mut dashboard = data::build(&mut state);
+        let mut tracker = RawRefreshTracker::default();
+        assert!(state.raw_cache_last_used_at.is_none());
+
+        rebuild_or_reload_window(&mut state, &mut dashboard, &mut tracker);
+
+        assert!(state.raw_cache_last_used_at.is_some());
+    }
+
+    #[test]
+    fn stale_host_completion_preserves_new_host_activity() {
+        let mut state = state_with_hot_cache();
+        let accessed_at = Instant::now();
+        state.raw_cache_last_used_at = Some(accessed_at);
+
+        discard_stale_raw_cache(&mut state);
+
+        assert!(state.raw_cache.is_none());
+        assert_eq!(state.raw_cache_last_used_at, Some(accessed_at));
     }
 
     #[test]

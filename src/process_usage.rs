@@ -4,6 +4,13 @@ use std::time::{Duration, Instant};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
+pub(crate) fn release_unused_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProcessUsage {
     pub cpu_percent: f32,

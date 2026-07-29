@@ -9,7 +9,8 @@ use serde::de::DeserializeOwned;
 
 use crate::time_utils::parse_timestamp;
 
-const INDEX_VERSION: u32 = 3;
+const INDEX_VERSION: u32 = 4;
+const COMPATIBLE_INDEX_VERSION: u32 = 3;
 const SECONDS_PER_DAY: i64 = 86_400;
 const HEADER_LEN: u64 = 84;
 const BUCKET_METADATA_LEN: u64 = 48;
@@ -222,6 +223,9 @@ pub(super) fn is_current(path: &Path, data_magic: &[u8], index_magic: &[u8]) -> 
     let Ok(loaded) = read_header(&mut reader, index_magic) else {
         return false;
     };
+    if loaded.header.version != INDEX_VERSION {
+        return false;
+    }
     validate_full_index(
         &mut reader,
         &loaded,
@@ -246,6 +250,9 @@ pub(super) fn matches_source_generation(
     let Ok(loaded) = read_header(&mut reader, index_magic) else {
         return false;
     };
+    if loaded.header.version != INDEX_VERSION {
+        return false;
+    }
     validate_header(&loaded, source_checksum, source_len).is_ok()
 }
 
@@ -547,7 +554,7 @@ fn validate_header(loaded: &LoadedIndex, source_checksum: u64, source_len: u64) 
         CONTEXT_ENTRY_LEN,
         "invalid record index context length",
     )?;
-    let valid = header.version == INDEX_VERSION
+    let valid = matches!(header.version, COMPATIBLE_INDEX_VERSION | INDEX_VERSION)
         && header.source_checksum == source_checksum
         && header.source_len == source_len
         && header.directory_offset == loaded.bytes_read

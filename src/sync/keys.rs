@@ -10,22 +10,31 @@ pub(crate) struct SyncKeyedRecord {
     pub(crate) dedup_key: String,
 }
 
+#[derive(Default)]
+pub(crate) struct SyncKeyAssigner {
+    fallback_counts: HashMap<String, usize>,
+}
+
+impl SyncKeyAssigner {
+    pub(crate) fn assign(&mut self, record: CachedUsageRecord) -> SyncKeyedRecord {
+        let dedup_key = if record.dedup_key.is_empty() {
+            let fingerprint = fallback_fingerprint(&record);
+            let occurrence = self.fallback_counts.entry(fingerprint.clone()).or_insert(0);
+            let dedup_key = format!("{FALLBACK_DEDUP_KEY_PREFIX}{fingerprint}:{occurrence}");
+            *occurrence += 1;
+            dedup_key
+        } else {
+            record.dedup_key.clone()
+        };
+        SyncKeyedRecord { record, dedup_key }
+    }
+}
+
 pub(crate) fn assign_sync_dedup_keys(records: Vec<CachedUsageRecord>) -> Vec<SyncKeyedRecord> {
-    let mut fallback_counts: HashMap<String, usize> = HashMap::new();
+    let mut assigner = SyncKeyAssigner::default();
     records
         .into_iter()
-        .map(|record| {
-            let dedup_key = if record.dedup_key.is_empty() {
-                let fingerprint = fallback_fingerprint(&record);
-                let occurrence = fallback_counts.entry(fingerprint.clone()).or_insert(0);
-                let dedup_key = format!("{FALLBACK_DEDUP_KEY_PREFIX}{fingerprint}:{occurrence}");
-                *occurrence += 1;
-                dedup_key
-            } else {
-                record.dedup_key.clone()
-            };
-            SyncKeyedRecord { record, dedup_key }
-        })
+        .map(|record| assigner.assign(record))
         .collect()
 }
 

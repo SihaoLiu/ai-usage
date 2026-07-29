@@ -36,6 +36,8 @@ const LARGE_WINDOW_PREFETCH_SPANS: i64 = 4;
 const MIN_NAVIGATION_PREFETCH_DAYS: i64 = 14;
 const MAX_SCALED_NAVIGATION_PREFETCH_DAYS: i64 = 365;
 pub(crate) const RAW_CACHE_IDLE_TTL: StdDuration = StdDuration::from_secs(5 * 60);
+#[cfg(test)]
+static IDLE_RECLAIM_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn background_refresh_parallelism(available: usize) -> usize {
     (available / 4).clamp(1, 4)
@@ -663,6 +665,7 @@ pub(crate) fn start_background_source_refresh(
         .name("usage-source-refresh".to_string())
         .spawn(move || {
             refresh_all_tool_caches_in_background();
+            crate::process_usage::release_unused_memory();
             let current_generation = crate::sync::cache_generation::raw_data_generation(
                 &data::cache::default_cache_dir(),
             );
@@ -686,9 +689,15 @@ pub(crate) fn poll_background_raw_refresh(state: &mut AppState) -> bool {
             let keep_resident = state.raw_cache.as_ref().is_some_and(|resident| {
                 resident.range.covers(visible_range) && !cache.range.covers(visible_range)
             });
-            if keep_resident {
-                retire_raw_cache(cache);
-            } else if let Some(retired) = state.raw_cache.replace(cache) {
+            let retired = if keep_resident {
+                Some(cache)
+            } else {
+                state.raw_cache.replace(cache)
+            };
+            if state.raw_cache_last_used_at.is_none() {
+                let desired = idle_raw_cache_retention_range(&state.time_window, Local::now());
+                compact_resident_raw_cache(state, desired, retired);
+            } else if let Some(retired) = retired {
                 retire_raw_cache(retired);
             }
             true
@@ -711,13 +720,25 @@ fn retire_in_background<T: Send + 'static>(value: T) {
         .spawn(move || drop(value));
 }
 
-pub(crate) fn touch_raw_cache_at(state: &mut AppState, accessed_at: Instant) {
-    if state.raw_cache.is_some() {
-        state.raw_cache_last_used_at = Some(accessed_at);
-    }
+fn retire_idle_value<T: Send + 'static>(value: T) {
+    let _ = thread::Builder::new()
+        .name("usage-cache-retire".to_string())
+        .spawn(move || {
+            drop(value);
+            #[cfg(test)]
+            IDLE_RECLAIM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::process_usage::release_unused_memory();
+        });
 }
 
-fn idle_raw_cache_retention_range(window: &TimeWindow, now: DateTime<Local>) -> RawDataRange {
+pub(crate) fn touch_raw_cache_at(state: &mut AppState, accessed_at: Instant) {
+    state.raw_cache_last_used_at = Some(accessed_at);
+}
+
+pub(crate) fn idle_raw_cache_retention_range(
+    window: &TimeWindow,
+    now: DateTime<Local>,
+) -> RawDataRange {
     let visible = raw_cache_visible_range(window, now);
     let page_step = window.page_step();
     let end = if matches!(window, TimeWindow::Latest { .. }) {
@@ -759,12 +780,26 @@ pub(crate) fn retire_idle_raw_cache_at(
         return false;
     }
     state.raw_cache_last_used_at = None;
+    let desired = idle_raw_cache_retention_range(&state.time_window, window_now);
+    compact_resident_raw_cache(state, desired, None)
+}
+
+fn compact_resident_raw_cache(
+    state: &mut AppState,
+    desired: RawDataRange,
+    additional_retired: Option<RawDataCache>,
+) -> bool {
     let Some(resident_range) = state.raw_cache.as_ref().map(|cache| cache.range) else {
+        if let Some(retired) = additional_retired {
+            retire_idle_value(retired);
+        }
         return false;
     };
-    let desired = idle_raw_cache_retention_range(&state.time_window, window_now);
     let Some(retained_range) = resident_range.intersection(desired) else {
-        retire_raw_cache(state.raw_cache.take().expect("resident cache"));
+        retire_idle_value((
+            additional_retired,
+            state.raw_cache.take().expect("resident cache"),
+        ));
         return true;
     };
     let cache = state.raw_cache.as_mut().expect("resident cache");
@@ -776,8 +811,8 @@ pub(crate) fn retire_idle_raw_cache_at(
         take_entries_outside_range(&mut cache.omp, retained_range),
     ];
     cache.range = retained_range;
-    if retired.iter().any(|entries| !entries.is_empty()) {
-        retire_in_background(retired);
+    if additional_retired.is_some() || retired.iter().any(|entries| !entries.is_empty()) {
+        retire_idle_value((additional_retired, retired));
     }
     true
 }

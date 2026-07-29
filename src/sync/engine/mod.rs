@@ -1,7 +1,7 @@
 use crate::data::cache::{self, CachedUsageRecord, RemoteUsageRecord};
 use crate::data::{TokenUsage, UsageCost, UsageEntry};
 use crate::sync::config::EnabledSyncConfig;
-use crate::sync::keys::assign_sync_dedup_keys;
+use crate::sync::keys::{SyncKeyAssigner, assign_sync_dedup_keys};
 use crate::sync::state;
 use crate::time_utils::parse_timestamp;
 use ai_usage_proto::{
@@ -447,12 +447,14 @@ where
     }
 
     let mut previous = state::load_snapshot_upload_state(cache_root);
-    let snapshot = collect_snapshot_records(cache_root, config)?;
+    let integrity_range_end = crate::sync::integrity::integrity_range_end_utc(Utc::now());
+    let snapshot = collect_snapshot_manifest(cache_root, config, integrity_range_end)?;
+    let snapshot_record_count = snapshot.fingerprints.len();
     if !requires_full_reconciliation
         && previous.schema_version == SNAPSHOT_UPLOAD_STATE_VERSION
         && previous.full_hash == snapshot.full_hash
         && let Some(receipt) = receipt.as_ref()
-        && receipt.record_count == snapshot.records.len()
+        && receipt.record_count == snapshot_record_count
         && let Some(RemoteSnapshotStatus::Current { content_revision }) = remote_status
     {
         previous.cache_generation = cache_generation;
@@ -460,7 +462,7 @@ where
         on_progress(&SyncProgress::UploadPlanned {
             total_records: 0,
             total_batches: 0,
-            skipped_records: snapshot.records.len(),
+            skipped_records: snapshot_record_count,
         });
         on_progress(&SyncProgress::UploadFinished {
             uploaded_records: 0,
@@ -475,100 +477,91 @@ where
         || previous
             .record_hashes
             .keys()
-            .any(|key| !snapshot.record_hashes.contains_key(key));
-    let manifest_records = if requires_full_reconciliation {
-        snapshot.records.iter().collect::<Vec<_>>()
-    } else {
-        snapshot
-            .records
-            .iter()
-            .filter(|record| {
-                previous
+            .any(|key| !snapshot.fingerprints.contains_key(key));
+    let manifest_count = snapshot
+        .fingerprints
+        .iter()
+        .filter(|(key, record)| {
+            requires_full_reconciliation
+                || previous
                     .record_hashes
-                    .get(&record.key)
+                    .get(*key)
                     .is_none_or(|hash| hash != &record.record_hash)
-            })
-            .collect::<Vec<_>>()
-    };
-    let integrity_range_end = crate::sync::integrity::integrity_range_end_utc(Utc::now());
+        })
+        .count();
     let stable_data_changed = requires_full_reconciliation
-        || manifest_records.iter().any(|record| {
-            timestamp_precedes_integrity_range(&record.wire.timestamp, integrity_range_end)
+        || snapshot.fingerprints.iter().any(|(key, record)| {
+            previous
+                .record_hashes
+                .get(key)
+                .is_none_or(|hash| hash != &record.record_hash)
+                && record.precedes_integrity_range
         });
 
     let mut needed_keys = BTreeSet::new();
-    let mut chunks = snapshot_fingerprint_chunks(&manifest_records);
-    if chunks.is_empty() && requires_full_reconciliation {
-        chunks.push(Vec::new());
-    }
-    for chunk in chunks {
-        let request = SnapshotDiffRequest {
-            host_id: config.machine_id.clone(),
-            snapshot_id: snapshot_id.clone(),
-            records: chunk,
-        };
-        match transport.snapshot_diff(&request) {
-            Ok(response) => {
-                for key in response.needed {
-                    needed_keys.insert((key.vendor, key.dedup_key));
+    let fingerprints_supported = {
+        let mut submit = |records| {
+            let request = SnapshotDiffRequest {
+                host_id: config.machine_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                records,
+            };
+            match transport.snapshot_diff(&request) {
+                Ok(response) => {
+                    for key in response.needed {
+                        needed_keys.insert((key.vendor, key.dedup_key));
+                    }
+                    Ok(true)
                 }
+                // Older servers fall back to batch upload, which can hold
+                // unsupported vendors back while uploading the others.
+                Err(error)
+                    if is_unsupported_snapshot_error(&error)
+                        || is_unsupported_vendor_error(&error) =>
+                {
+                    Ok(false)
+                }
+                Err(error) => Err(error),
             }
-            // An unsupported-vendor rejection means the server predates one
-            // of our vendors: fall back to batch upload, which can hold the
-            // unknown vendor back while still uploading the others.
-            Err(err)
-                if is_unsupported_snapshot_error(&err) || is_unsupported_vendor_error(&err) =>
-            {
-                return Ok(None);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    let needed_records = snapshot
-        .records
-        .iter()
-        .filter(|record| needed_keys.contains(&record.key))
-        .collect::<Vec<_>>();
-    let skipped_records = snapshot.records.len().saturating_sub(needed_records.len());
-    let record_batches = snapshot_record_chunks(&needed_records);
-    let total_batches = record_batches.len();
-    on_progress(&SyncProgress::UploadPlanned {
-        total_records: needed_records.len(),
-        total_batches,
-        skipped_records,
-    });
-
-    let mut uploaded_records = 0usize;
-    let mut accepted = 0usize;
-    let mut ignored = 0usize;
-    for (batch_index, batch) in record_batches.into_iter().enumerate() {
-        let records = batch
-            .iter()
-            .map(|record| record.wire.clone())
-            .collect::<Vec<_>>();
-        let response = match transport.snapshot_records(&SnapshotRecordBatch {
-            host_id: config.machine_id.clone(),
-            snapshot_id: snapshot_id.clone(),
-            records,
-        }) {
-            Ok(response) => response,
-            // A server that defers vendor validation to the record upload:
-            // fall back to batch upload, which holds unknown vendors back.
-            Err(err) if is_unsupported_vendor_error(&err) => return Ok(None),
-            Err(err) => return Err(err),
         };
-        uploaded_records += batch.len();
-        accepted += response.accepted;
-        ignored += response.ignored;
-        on_progress(&SyncProgress::UploadBatchFinished {
-            batch_index: batch_index + 1,
-            total_batches,
-            uploaded_records,
-            total_records: needed_records.len(),
-            accepted,
-            ignored,
-        });
+        if requires_full_reconciliation && manifest_count == 0 && !submit(Vec::new())? {
+            false
+        } else {
+            try_for_each_snapshot_fingerprint_chunk(
+                snapshot.fingerprints.iter().filter(|(key, record)| {
+                    requires_full_reconciliation
+                        || previous
+                            .record_hashes
+                            .get(*key)
+                            .is_none_or(|hash| hash != &record.record_hash)
+                }),
+                submit,
+            )?
+        }
+    };
+    if !fingerprints_supported {
+        return Ok(None);
+    }
+    drop(previous);
+
+    let Some(progress) = upload_needed_snapshot_records(
+        cache_root,
+        config,
+        transport,
+        &snapshot_id,
+        &snapshot,
+        needed_keys,
+        &mut on_progress,
+    )?
+    else {
+        return Ok(None);
+    };
+    if crate::sync::cache_generation::local_cache_generation(cache_root, &VENDORS)
+        != cache_generation
+    {
+        return Err(SyncError::new(
+            "cached records changed while preparing snapshot upload",
+        ));
     }
 
     if requires_full_reconciliation {
@@ -579,23 +572,30 @@ where
     }
 
     let content_revision =
-        reconciled_snapshot_revision(transport, &config.machine_id, snapshot.records.len())?;
+        reconciled_snapshot_revision(transport, &config.machine_id, snapshot_record_count)?;
+    let SnapshotManifest {
+        fingerprints,
+        full_hash,
+    } = snapshot;
     state::save_snapshot_upload_state(
         cache_root,
         &state::SnapshotUploadState {
             schema_version: SNAPSHOT_UPLOAD_STATE_VERSION,
-            full_hash: snapshot.full_hash,
+            full_hash,
             cache_generation,
-            record_hashes: snapshot.record_hashes,
+            record_hashes: fingerprints
+                .into_iter()
+                .map(|(key, record)| (key, record.record_hash))
+                .collect(),
         },
         &sync_scope,
         content_revision,
     )?;
     on_progress(&SyncProgress::UploadFinished {
-        uploaded_records,
-        total_records: needed_records.len(),
-        accepted,
-        ignored,
+        uploaded_records: progress.uploaded_records,
+        total_records: progress.total_records,
+        accepted: progress.accepted,
+        ignored: progress.ignored,
     });
     Ok(Some(UploadOutcome {
         held_back_vendors: Vec::new(),
@@ -660,56 +660,78 @@ fn state_receipt_age_secs(verified_at_secs: u64) -> u64 {
 }
 
 #[derive(Debug)]
-struct SnapshotRecords {
-    records: Vec<SnapshotRecord>,
+struct SnapshotManifest {
+    fingerprints: BTreeMap<(String, String), SnapshotFingerprint>,
     full_hash: String,
-    record_hashes: BTreeMap<(String, String), String>,
 }
 
 #[derive(Debug)]
-struct SnapshotRecord {
-    key: (String, String),
-    wire: WireRecord,
+struct SnapshotFingerprint {
     record_hash: String,
+    wire_bytes: usize,
+    ordinal: u64,
+    precedes_integrity_range: bool,
 }
 
-fn collect_snapshot_records(
+fn collect_snapshot_manifest(
     cache_root: &Path,
     config: &EnabledSyncConfig,
-) -> Result<SnapshotRecords, SyncError> {
-    let mut records = Vec::new();
-    let mut record_hashes = BTreeMap::new();
+    integrity_range_end: DateTime<Utc>,
+) -> Result<SnapshotManifest, SyncError> {
+    let mut fingerprints = BTreeMap::new();
+    let mut ordinal = 0_u64;
     for vendor in VENDORS {
-        for keyed in assign_sync_dedup_keys(cache::load_vendor_cached_records(cache_root, vendor)) {
+        let mut assigner = SyncKeyAssigner::default();
+        let result = cache::try_for_each_vendor_persisted_record(cache_root, vendor, |record| {
+            let keyed = assigner.assign(record);
             let record = keyed.record;
             let key = (record.vendor.clone(), keyed.dedup_key.clone());
+            if fingerprints.contains_key(&key) {
+                return Ok(());
+            }
             let wire = cached_record_to_wire(config, &record, &key.1)?;
-            let record_hash = wire_record_hash(&wire)?;
-            record_hashes.insert(key.clone(), record_hash.clone());
-            records.push(SnapshotRecord {
+            let (record_hash, wire_bytes) = wire_record_fingerprint(&wire)?;
+            fingerprints.insert(
                 key,
-                wire,
-                record_hash,
-            });
+                SnapshotFingerprint {
+                    record_hash,
+                    wire_bytes,
+                    ordinal,
+                    precedes_integrity_range: timestamp_precedes_integrity_range(
+                        &wire.timestamp,
+                        integrity_range_end,
+                    ),
+                },
+            );
+            ordinal = ordinal.saturating_add(1);
+            Ok::<(), SyncError>(())
+        });
+        match result {
+            Ok(()) => {}
+            Err(cache::VisitCachedRecordsError::Cache(error)) => return Err(error.into()),
+            Err(cache::VisitCachedRecordsError::Visitor(error)) => return Err(error),
         }
     }
-    records.sort_by(|left, right| left.key.cmp(&right.key));
-    let full_hash = snapshot_full_hash(&records);
-    Ok(SnapshotRecords {
-        records,
+    let full_hash = snapshot_full_hash(&fingerprints);
+    Ok(SnapshotManifest {
+        fingerprints,
         full_hash,
-        record_hashes,
     })
 }
 
-fn snapshot_fingerprint_chunks(records: &[&SnapshotRecord]) -> Vec<Vec<RecordFingerprint>> {
-    let mut chunks = Vec::new();
+fn try_for_each_snapshot_fingerprint_chunk<'a, I, E>(
+    records: I,
+    mut visitor: impl FnMut(Vec<RecordFingerprint>) -> Result<bool, E>,
+) -> Result<bool, E>
+where
+    I: IntoIterator<Item = (&'a (String, String), &'a SnapshotFingerprint)>,
+{
     let mut current = Vec::new();
     let mut current_bytes = 0usize;
-    for record in records {
+    for (key, record) in records {
         let fingerprint = RecordFingerprint {
-            vendor: record.key.0.clone(),
-            dedup_key: record.key.1.clone(),
+            vendor: key.0.clone(),
+            dedup_key: key.1.clone(),
             record_hash: record.record_hash.clone(),
         };
         let fingerprint_bytes = serde_json::to_vec(&fingerprint)
@@ -717,24 +739,213 @@ fn snapshot_fingerprint_chunks(records: &[&SnapshotRecord]) -> Vec<Vec<RecordFin
             .len()
             + 1;
         if !current.is_empty() && current_bytes + fingerprint_bytes > SNAPSHOT_DIFF_TARGET_BYTES {
-            chunks.push(current);
-            current = Vec::new();
+            if !visitor(std::mem::take(&mut current))? {
+                return Ok(false);
+            }
             current_bytes = 0;
         }
         current.push(fingerprint);
         current_bytes += fingerprint_bytes;
     }
-    if !current.is_empty() {
-        chunks.push(current);
+    if !current.is_empty() && !visitor(current)? {
+        return Ok(false);
     }
+    Ok(true)
+}
+
+#[cfg(test)]
+fn snapshot_fingerprint_chunks(snapshot: &SnapshotManifest) -> Vec<Vec<RecordFingerprint>> {
+    let mut chunks = Vec::new();
+    try_for_each_snapshot_fingerprint_chunk(snapshot.fingerprints.iter(), |chunk| {
+        chunks.push(chunk);
+        Ok::<bool, std::convert::Infallible>(true)
+    })
+    .expect("infallible fingerprint collection");
     chunks
 }
 
-fn snapshot_record_chunks<'a>(records: &'a [&'a SnapshotRecord]) -> Vec<&'a [&'a SnapshotRecord]> {
-    batch_ranges_by_bytes(records, |record| wire_record_bytes(&record.wire))
-        .into_iter()
-        .map(|range| &records[range])
-        .collect()
+#[derive(Default)]
+struct SnapshotUploadProgress {
+    batch_index: usize,
+    total_batches: usize,
+    total_records: usize,
+    uploaded_records: usize,
+    accepted: usize,
+    ignored: usize,
+}
+
+enum SnapshotBatchError {
+    Unsupported,
+    Sync(SyncError),
+}
+
+fn send_snapshot_batch<F>(
+    transport: &impl SyncTransport,
+    host_id: &str,
+    snapshot_id: &str,
+    batch: &mut Vec<WireRecord>,
+    progress: &mut SnapshotUploadProgress,
+    on_progress: &mut F,
+) -> Result<(), SnapshotBatchError>
+where
+    F: FnMut(&SyncProgress),
+{
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let batch_len = batch.len();
+    let response = transport
+        .snapshot_records(&SnapshotRecordBatch {
+            host_id: host_id.to_string(),
+            snapshot_id: snapshot_id.to_string(),
+            records: std::mem::take(batch),
+        })
+        .map_err(|error| {
+            if is_unsupported_vendor_error(&error) {
+                SnapshotBatchError::Unsupported
+            } else {
+                SnapshotBatchError::Sync(error)
+            }
+        })?;
+    progress.batch_index += 1;
+    progress.uploaded_records += batch_len;
+    progress.accepted += response.accepted;
+    progress.ignored += response.ignored;
+    on_progress(&SyncProgress::UploadBatchFinished {
+        batch_index: progress.batch_index,
+        total_batches: progress.total_batches,
+        uploaded_records: progress.uploaded_records,
+        total_records: progress.total_records,
+        accepted: progress.accepted,
+        ignored: progress.ignored,
+    });
+    Ok(())
+}
+
+fn batch_count_by_wire_sizes(sizes: impl IntoIterator<Item = usize>) -> usize {
+    let mut batches = 0usize;
+    let mut records = 0usize;
+    let mut bytes = 128usize;
+    for record_bytes in sizes {
+        if records > 0 && (records >= BATCH_SIZE || bytes + record_bytes > UPLOAD_TARGET_BYTES) {
+            batches += 1;
+            records = 0;
+            bytes = 128;
+        }
+        records += 1;
+        bytes += record_bytes;
+    }
+    batches + usize::from(records > 0)
+}
+
+fn upload_needed_snapshot_records<F>(
+    cache_root: &Path,
+    config: &EnabledSyncConfig,
+    transport: &impl SyncTransport,
+    snapshot_id: &str,
+    snapshot: &SnapshotManifest,
+    mut needed_keys: BTreeSet<(String, String)>,
+    on_progress: &mut F,
+) -> Result<Option<SnapshotUploadProgress>, SyncError>
+where
+    F: FnMut(&SyncProgress),
+{
+    needed_keys.retain(|key| snapshot.fingerprints.contains_key(key));
+    let mut layout = needed_keys
+        .iter()
+        .filter_map(|key| {
+            snapshot
+                .fingerprints
+                .get(key)
+                .map(|record| (record.ordinal, record.wire_bytes))
+        })
+        .collect::<Vec<_>>();
+    layout.sort_unstable_by_key(|record| record.0);
+    let total_records = layout.len();
+    let total_batches = batch_count_by_wire_sizes(layout.into_iter().map(|record| record.1));
+    on_progress(&SyncProgress::UploadPlanned {
+        total_records,
+        total_batches,
+        skipped_records: snapshot.fingerprints.len().saturating_sub(total_records),
+    });
+
+    let mut progress = SnapshotUploadProgress {
+        total_batches,
+        total_records,
+        ..Default::default()
+    };
+    if needed_keys.is_empty() {
+        return Ok(Some(progress));
+    }
+    let mut pending_keys = needed_keys;
+    let mut batch = Vec::new();
+    let mut batch_bytes = 128usize;
+    for vendor in VENDORS {
+        let mut assigner = SyncKeyAssigner::default();
+        let result = cache::try_for_each_vendor_persisted_record(cache_root, vendor, |record| {
+            let keyed = assigner.assign(record);
+            let key = (keyed.record.vendor.clone(), keyed.dedup_key.clone());
+            if !pending_keys.remove(&key) {
+                return Ok(());
+            }
+            let wire = cached_record_to_wire(config, &keyed.record, &key.1)
+                .map_err(SnapshotBatchError::Sync)?;
+            let (record_hash, record_bytes) =
+                wire_record_fingerprint(&wire).map_err(SnapshotBatchError::Sync)?;
+            if snapshot
+                .fingerprints
+                .get(&key)
+                .is_none_or(|expected| expected.record_hash != record_hash)
+            {
+                return Err(SnapshotBatchError::Sync(SyncError::new(
+                    "cached records changed while preparing snapshot upload",
+                )));
+            }
+            if !batch.is_empty()
+                && (batch.len() >= BATCH_SIZE || batch_bytes + record_bytes > UPLOAD_TARGET_BYTES)
+            {
+                send_snapshot_batch(
+                    transport,
+                    &config.machine_id,
+                    snapshot_id,
+                    &mut batch,
+                    &mut progress,
+                    on_progress,
+                )?;
+                batch_bytes = 128;
+            }
+            batch.push(wire);
+            batch_bytes += record_bytes;
+            Ok::<(), SnapshotBatchError>(())
+        });
+        match result {
+            Ok(()) => {}
+            Err(cache::VisitCachedRecordsError::Cache(error)) => return Err(error.into()),
+            Err(cache::VisitCachedRecordsError::Visitor(SnapshotBatchError::Unsupported)) => {
+                return Ok(None);
+            }
+            Err(cache::VisitCachedRecordsError::Visitor(SnapshotBatchError::Sync(error))) => {
+                return Err(error);
+            }
+        }
+    }
+    if !pending_keys.is_empty() {
+        return Err(SyncError::new(
+            "cached records changed while preparing snapshot upload",
+        ));
+    }
+    match send_snapshot_batch(
+        transport,
+        &config.machine_id,
+        snapshot_id,
+        &mut batch,
+        &mut progress,
+        on_progress,
+    ) {
+        Ok(()) => Ok(Some(progress)),
+        Err(SnapshotBatchError::Unsupported) => Ok(None),
+        Err(SnapshotBatchError::Sync(error)) => Err(error),
+    }
 }
 
 fn upload_candidate_chunks(records: &[UploadCandidate]) -> Vec<&[UploadCandidate]> {
@@ -775,23 +986,23 @@ fn wire_record_bytes(record: &WireRecord) -> usize {
         + 1
 }
 
-fn snapshot_full_hash(records: &[SnapshotRecord]) -> String {
+fn snapshot_full_hash(records: &BTreeMap<(String, String), SnapshotFingerprint>) -> String {
     let mut hasher = Sha256::new();
-    for record in records {
-        hasher.update((record.key.0.len() as u64).to_be_bytes());
-        hasher.update(record.key.0.as_bytes());
-        hasher.update((record.key.1.len() as u64).to_be_bytes());
-        hasher.update(record.key.1.as_bytes());
+    for (key, record) in records {
+        hasher.update((key.0.len() as u64).to_be_bytes());
+        hasher.update(key.0.as_bytes());
+        hasher.update((key.1.len() as u64).to_be_bytes());
+        hasher.update(key.1.as_bytes());
         hasher.update(record.record_hash.as_bytes());
     }
     let digest = hasher.finalize();
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn wire_record_hash(record: &WireRecord) -> Result<String, SyncError> {
+fn wire_record_fingerprint(record: &WireRecord) -> Result<(String, usize), SyncError> {
     let bytes = serde_json::to_vec(record)
         .map_err(|err| SyncError::new(format!("serialize snapshot record: {err}")))?;
-    Ok(sha256_hex(&bytes))
+    Ok((sha256_hex(&bytes), bytes.len() + 1))
 }
 
 fn snapshot_id(machine_id: &str) -> String {

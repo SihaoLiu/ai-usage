@@ -5,7 +5,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model_id::{Vendor, parse_model_identity};
+use crate::model_id::{Vendor, canonical_model_leaf, infer_vendor, parse_model_identity};
 
 /// Embedded pricing data from pricing.json
 const PRICING_JSON: &str = include_str!("../pricing.json");
@@ -86,22 +86,38 @@ impl ModelPricing {
 #[derive(Debug, Deserialize)]
 struct VendorPricing {
     models: HashMap<String, ModelPricing>,
-    default: ModelPricing,
+    #[serde(default)]
+    default: Option<ModelPricing>,
 }
 
-/// Per-vendor model pricing tables, one field per tracked vendor. Used both
-/// as an overlay payload for [`AllPricing::overlay`] and as the on-disk /
-/// LiteLLM parse shape in `crate::pricing`.
-#[derive(Debug, Default, Deserialize, Serialize)]
+/// Per-vendor model pricing tables used by remote and cached supplements.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct VendorTables {
-    #[serde(default)]
-    pub claude: HashMap<String, ModelPricing>,
-    #[serde(default)]
-    pub codex: HashMap<String, ModelPricing>,
-    #[serde(default)]
-    pub gemini: HashMap<String, ModelPricing>,
-    #[serde(default)]
-    pub kimi: HashMap<String, ModelPricing>,
+    #[serde(flatten)]
+    tables: HashMap<String, HashMap<String, ModelPricing>>,
+}
+
+impl VendorTables {
+    #[cfg(test)]
+    pub fn models(&self, vendor: &str) -> Option<&HashMap<String, ModelPricing>> {
+        self.tables.get(vendor)
+    }
+
+    pub fn insert_model(&mut self, vendor: &str, model: String, pricing: ModelPricing) {
+        self.tables
+            .entry(vendor.to_string())
+            .or_default()
+            .insert(model, pricing);
+    }
+
+    #[cfg(test)]
+    pub fn insert_table(&mut self, vendor: &str, models: HashMap<String, ModelPricing>) {
+        self.tables.insert(vendor.to_string(), models);
+    }
+
+    fn into_tables(self) -> HashMap<String, HashMap<String, ModelPricing>> {
+        self.tables
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,24 +125,15 @@ struct PricingData {
     #[serde(rename = "_meta")]
     #[serde(default)]
     _meta: Option<serde_json::Value>,
-    claude: VendorPricing,
-    codex: VendorPricing,
-    gemini: VendorPricing,
-    kimi: VendorPricing,
     #[serde(default)]
     fast_tiers: HashMap<String, HashMap<String, FastTierPricing>>,
+    #[serde(flatten)]
+    vendors: HashMap<String, VendorPricing>,
 }
 
 /// All pricing tables for the tracked vendors.
 pub struct AllPricing {
-    pub claude_models: HashMap<String, ModelPricing>,
-    pub claude_default: ModelPricing,
-    pub codex_models: HashMap<String, ModelPricing>,
-    pub codex_default: ModelPricing,
-    pub gemini_models: HashMap<String, ModelPricing>,
-    pub gemini_default: ModelPricing,
-    pub kimi_models: HashMap<String, ModelPricing>,
-    pub kimi_default: ModelPricing,
+    vendors: HashMap<String, VendorPricing>,
     /// User-supplied per-model price overrides (from `models.toml`), keyed by
     /// exact model id and consulted before any table, regardless of vendor.
     overrides_pricing: HashMap<String, ModelPricing>,
@@ -134,20 +141,22 @@ pub struct AllPricing {
 }
 
 impl AllPricing {
-    /// Load the embedded `pricing.json` without applying date-alias expansion.
-    /// Intended as the baseline layer for the layered loader in `crate::pricing`.
+    /// Load the embedded `pricing.json` and its mechanically derived aliases.
+    /// This establishes the complete release-verified baseline before remote
+    /// supplements are merged.
     pub fn load_raw() -> Self {
         let data: PricingData =
             serde_json::from_str(PRICING_JSON).expect("Failed to parse embedded pricing.json");
+        let vendors = data
+            .vendors
+            .into_iter()
+            .map(|(key, mut vendor)| {
+                vendor.models = expand_date_aliases(vendor.models);
+                (key, vendor)
+            })
+            .collect();
         AllPricing {
-            claude_models: data.claude.models,
-            claude_default: data.claude.default,
-            codex_models: data.codex.models,
-            codex_default: data.codex.default,
-            gemini_models: data.gemini.models,
-            gemini_default: data.gemini.default,
-            kimi_models: data.kimi.models,
-            kimi_default: data.kimi.default,
+            vendors,
             overrides_pricing: HashMap::new(),
             fast_tiers: normalize_fast_tiers(data.fast_tiers),
         }
@@ -155,45 +164,51 @@ impl AllPricing {
 
     /// Install user price overrides (highest priority, vendor-agnostic).
     pub fn set_pricing_overrides(&mut self, overrides: HashMap<String, ModelPricing>) {
-        self.overrides_pricing = overrides;
+        self.overrides_pricing = overrides
+            .into_iter()
+            .map(|(model, pricing)| (normalize_model_key(&model), pricing))
+            .collect();
     }
 
     /// Apply `-YYYYMMDD` date-alias expansion to every vendor table. Must be
     /// called once after all overlay layers have been merged in.
     pub fn finalize(mut self) -> Self {
-        self.claude_models = expand_date_aliases(self.claude_models);
-        self.codex_models = expand_date_aliases(self.codex_models);
-        self.gemini_models = expand_date_aliases(self.gemini_models);
-        self.kimi_models = expand_date_aliases(self.kimi_models);
+        for vendor in self.vendors.values_mut() {
+            vendor.models = expand_date_aliases(std::mem::take(&mut vendor.models));
+        }
         self
     }
 
-    /// Overlay another set of vendor tables into this one. Base rates from the
-    /// incoming layer win (so live LiteLLM data refreshes prices), but optional
-    /// tier-pricing fields fall back to the existing entry when the incoming
-    /// one omits them.
+    /// Add remote models without replacing release-verified embedded rates.
     pub fn overlay(&mut self, tables: VendorTables) {
-        overlay_table(&mut self.claude_models, tables.claude);
-        overlay_table(&mut self.codex_models, tables.codex);
-        overlay_table(&mut self.gemini_models, tables.gemini);
-        overlay_table(&mut self.kimi_models, tables.kimi);
+        for (vendor, remote_models) in tables.into_tables() {
+            let book = self.vendors.entry(vendor).or_insert_with(|| VendorPricing {
+                models: HashMap::new(),
+                default: None,
+            });
+            for (model, pricing) in remote_models {
+                book.models.entry(model).or_insert(pricing);
+            }
+        }
     }
 
     pub fn get_pricing(&self, vendor: &str, model: &str) -> &ModelPricing {
-        // User overrides win regardless of vendor routing (covers private
-        // vendors and the day-one gap before LiteLLM lists a new model).
-        if let Some(p) = self.overrides_pricing.get(model) {
+        let full_key = normalize_model_key(model);
+        let leaf_key = canonical_model_leaf(model);
+        if let Some(p) = self
+            .overrides_pricing
+            .get(&full_key)
+            .or_else(|| self.overrides_pricing.get(&leaf_key))
+        {
             return p;
         }
 
-        let (table, default) = match vendor {
-            "codex" => (&self.codex_models, &self.codex_default),
-            "gemini" => (&self.gemini_models, &self.gemini_default),
-            "kimi" => (&self.kimi_models, &self.kimi_default),
-            _ => (&self.claude_models, &self.claude_default),
+        let Some(book) = self.vendors.get(vendor) else {
+            return &UNPRICED_MODEL;
         };
+        let table = &book.models;
 
-        if let Some(p) = table.get(model) {
+        if let Some(p) = table.get(&full_key).or_else(|| table.get(&leaf_key)) {
             return p;
         }
 
@@ -201,7 +216,7 @@ impl AllPricing {
         // Mirrors ccusage's prefix-tolerant matching so e.g. a future
         // claude-sonnet-4-5-20251201 still resolves to claude-sonnet-4-5
         // pricing rather than the vendor default.
-        if let Some(stripped) = strip_date_suffix(model)
+        if let Some(stripped) = strip_date_suffix(&leaf_key)
             && let Some(p) = table.get(stripped)
         {
             return p;
@@ -211,19 +226,21 @@ impl AllPricing {
         // shares provider + family + size/modifier class. Keeps a brand-new
         // claude-opus-4-8 priced like opus instead of the vendor default, while
         // never letting a `-mini`/`-nano` variant inherit the base model's rate.
-        if let Some(p) = same_class_fallback(table, model) {
+        if let Some(p) = same_class_fallback(table, &leaf_key) {
             return p;
         }
 
-        default
+        book.default.as_ref().unwrap_or(&UNPRICED_MODEL)
     }
 
     pub fn pricing_for_entry<'a>(
         &'a self,
-        vendor: &str,
+        harness: &str,
         model: &str,
         fast_tier: i8,
     ) -> Cow<'a, ModelPricing> {
+        let fallback = if harness == "omp" { "codex" } else { harness };
+        let vendor = infer_vendor(model).pricing_key().unwrap_or(fallback);
         let base = self.get_pricing(vendor, model);
         let factor = self.fast_tier_factor(vendor, model, fast_tier);
         if (factor - 1.0).abs() < f64::EPSILON {
@@ -231,6 +248,15 @@ impl AllPricing {
         } else {
             Cow::Owned(base.scaled_by(factor))
         }
+    }
+
+    #[cfg(test)]
+    fn models_mut(&mut self, vendor: &str) -> &mut HashMap<String, ModelPricing> {
+        &mut self
+            .vendors
+            .get_mut(vendor)
+            .expect("embedded vendor exists")
+            .models
     }
 
     fn fast_tier_factor(&self, vendor: &str, model: &str, fast_tier: i8) -> f64 {
@@ -243,16 +269,38 @@ impl AllPricing {
         let Some(tier) = vendor_tiers.get(&fast_tier) else {
             return 1.0;
         };
-        if let Some(mult) = tier.models.get(model) {
+        let full_key = normalize_model_key(model);
+        let leaf_key = canonical_model_leaf(model);
+        if let Some(mult) = tier
+            .models
+            .get(&full_key)
+            .or_else(|| tier.models.get(&leaf_key))
+        {
             return *mult;
         }
-        if let Some(stripped) = strip_date_suffix(model)
+        if let Some(stripped) = strip_date_suffix(&leaf_key)
             && let Some(mult) = tier.models.get(stripped)
         {
             return *mult;
         }
         tier.default.unwrap_or(1.0)
     }
+}
+
+static UNPRICED_MODEL: ModelPricing = ModelPricing {
+    input: 0.0,
+    output: 0.0,
+    cache_input: 0.0,
+    cache_output: 0.0,
+    input_above_200k: None,
+    output_above_200k: None,
+    cache_input_above_200k: None,
+    cache_output_above_200k: None,
+    _comment: None,
+};
+
+fn normalize_model_key(model: &str) -> String {
+    model.trim().to_ascii_lowercase()
 }
 
 fn normalize_fast_tiers(
@@ -269,28 +317,8 @@ fn normalize_fast_tiers(
         .collect()
 }
 
-fn overlay_table(target: &mut HashMap<String, ModelPricing>, src: HashMap<String, ModelPricing>) {
-    for (key, mut new) in src {
-        if let Some(existing) = target.get(&key) {
-            if new.input_above_200k.is_none() {
-                new.input_above_200k = existing.input_above_200k;
-            }
-            if new.output_above_200k.is_none() {
-                new.output_above_200k = existing.output_above_200k;
-            }
-            if new.cache_input_above_200k.is_none() {
-                new.cache_input_above_200k = existing.cache_input_above_200k;
-            }
-            if new.cache_output_above_200k.is_none() {
-                new.cache_output_above_200k = existing.cache_output_above_200k;
-            }
-        }
-        target.insert(key, new);
-    }
-}
-
-/// Find the newest known model that shares the target's provider, family, and
-/// size/modifier class. Returns `None` for unknown-provider ids (no safe peer)
+/// Find the newest known model that shares the target's vendor, family, and
+/// size/modifier class. Returns `None` for unknown-vendor ids (no safe peer)
 /// so the caller drops to the vendor default.
 fn same_class_fallback<'a>(
     table: &'a HashMap<String, ModelPricing>,
@@ -304,13 +332,19 @@ fn same_class_fallback<'a>(
         .iter()
         .filter_map(|(key, pricing)| {
             let candidate = parse_model_identity(key);
-            same_class(&target, &candidate).then_some((candidate.version_key, pricing))
+            let unqualified = canonical_model_leaf(key) == key.as_str();
+            same_class(&target, &candidate).then_some((
+                candidate.version_key,
+                unqualified,
+                key.as_str(),
+                pricing,
+            ))
         })
-        .max_by_key(|(version_key, _)| *version_key)
-        .map(|(_, pricing)| pricing)
+        .max_by_key(|(version_key, unqualified, key, _)| (*version_key, *unqualified, *key))
+        .map(|(_, _, _, pricing)| pricing)
 }
 
-/// Two ids are the same pricing class when they agree on provider, family, and
+/// Two ids are the same pricing class when they agree on vendor, family, and
 /// the exact set of size/modifier tokens (so `gpt-5.5-mini` never matches the
 /// base `gpt-5.5`).
 fn same_class(a: &crate::model_id::ModelIdentity, b: &crate::model_id::ModelIdentity) -> bool {
@@ -596,12 +630,12 @@ fn resolve_write_target(path: &Path) -> io::Result<PathBuf> {
 }
 
 #[cfg(not(windows))]
-fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
     std::fs::rename(source, target)
 }
 
 #[cfg(windows)]
-fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -746,14 +780,17 @@ mod tests {
         assert!((opus8.input - 5.0).abs() < 1e-9);
         assert!((opus8.output - 25.0).abs() < 1e-9);
         assert!(opus8.input_above_200k.is_none());
+
+        let opus7 = p.get_pricing("claude", "claude-opus-4-7");
+        assert!(opus7.input_above_200k.is_none());
+        let opus6 = p.get_pricing("claude", "claude-opus-4-6");
+        assert!(opus6.input_above_200k.is_none());
+        let sonnet6 = p.get_pricing("claude", "claude-sonnet-4-6");
+        assert!(sonnet6.input_above_200k.is_none());
     }
 
     #[test]
-    fn overlay_remote_rates_win_over_embedded_baseline() {
-        // The layered loader applies remote (cache/LiteLLM) tables on top of
-        // the embedded baseline: remote base rates must win per-model, while
-        // the embedded entry only fills in tier fields the remote layer omits
-        // and keeps covering models the remote layer does not know about.
+    fn embedded_rates_win_while_remote_tables_fill_missing_models() {
         let mut p = AllPricing::load_raw();
         let mut remote = HashMap::new();
         remote.insert(
@@ -770,21 +807,64 @@ mod tests {
                 _comment: None,
             },
         );
-        p.overlay(VendorTables {
-            claude: remote,
-            ..VendorTables::default()
-        });
+        let mut tables = VendorTables::default();
+        tables.insert_table("claude", remote);
+        p.overlay(tables);
         let p = p.finalize();
 
         let opus7 = p.get_pricing("claude", "claude-opus-4-7");
-        assert!((opus7.input - 4.0).abs() < 1e-9);
-        assert!((opus7.output - 20.0).abs() < 1e-9);
-        // Tier fields omitted by the remote layer survive from the baseline.
-        assert_eq!(opus7.input_above_200k, Some(10.0));
+        assert!((opus7.input - 5.0).abs() < 1e-9);
+        assert!((opus7.output - 25.0).abs() < 1e-9);
+        assert!(opus7.input_above_200k.is_none());
 
-        // Models absent from the remote layer keep their embedded rates.
         let fable = p.get_pricing("claude", "claude-fable-5");
         assert!((fable.input - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_vendor_controls_pricing_across_harnesses() {
+        let p = AllPricing::load_raw().finalize();
+
+        let deepseek = p.pricing_for_entry("claude", "deepseek-v4-pro", 0);
+        assert!((deepseek.input - 0.435).abs() < 1e-9);
+        assert!((deepseek.output - 0.87).abs() < 1e-9);
+
+        let glm = p.pricing_for_entry("claude", "glm-5.1", 0);
+        assert!((glm.input - 1.4).abs() < 1e-9);
+        assert!((glm.output - 4.4).abs() < 1e-9);
+
+        let grok = p.pricing_for_entry("codex", "grok-4.5", 0);
+        assert!((grok.input - 2.0).abs() < 1e-9);
+        assert!((grok.output - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn embedded_pricing_covers_current_models() {
+        let p = AllPricing::load_raw().finalize();
+        let cases = [
+            ("claude", "claude-opus-5", 5.0, 25.0),
+            ("claude", "claude-sonnet-5", 2.0, 10.0),
+            ("codex", "gpt-5.6-sol", 5.0, 30.0),
+            ("codex", "gpt-5.6-terra", 2.5, 15.0),
+            ("codex", "gpt-5.6-luna", 1.0, 6.0),
+            ("gemini", "gemini-3.6-flash", 1.5, 7.5),
+            ("gemini", "gemini-3.5-flash", 1.5, 9.0),
+            ("gemini", "gemini-3.5-flash-lite", 0.3, 2.5),
+            ("deepseek", "deepseek-v4-flash", 0.14, 0.28),
+            ("zhipu", "glm-5.1", 1.4, 4.4),
+            ("spacexai", "grok-4.5", 2.0, 6.0),
+            ("spacexai", "grok-4.5-latest", 2.0, 6.0),
+            ("spacexai", "grok-build-latest", 2.0, 6.0),
+            ("spacexai", "grok-4.20-0309-reasoning", 1.25, 2.5),
+            ("spacexai", "grok-4.20-0309-non-reasoning", 1.25, 2.5),
+            ("spacexai", "grok-4.20-multi-agent-0309", 1.25, 2.5),
+        ];
+
+        for (vendor, model, input, output) in cases {
+            let pricing = p.get_pricing(vendor, model);
+            assert!((pricing.input - input).abs() < 1e-9, "{model} input");
+            assert!((pricing.output - output).abs() < 1e-9, "{model} output");
+        }
     }
 
     #[test]
@@ -795,6 +875,50 @@ mod tests {
         let mini = p.get_pricing("codex", "gpt-5.9-mini");
         assert!((mini.input - 0.75).abs() < 1e-9);
         assert!(mini.input < 1.0, "must not inherit a base-class rate");
+    }
+
+    #[test]
+    fn same_class_fallback_prefers_unqualified_rate_for_equal_versions() {
+        for _ in 0..64 {
+            let mut table = HashMap::new();
+            let mut canonical = sample_codex_pricing();
+            canonical.input = 1.4;
+            let mut hosted = sample_codex_pricing();
+            hosted.input = 99.0;
+            table.insert("glm-5.1".to_string(), canonical);
+            table.insert("hosted/glm-5.1".to_string(), hosted);
+
+            let selected = same_class_fallback(&table, "glm-5.2").expect("fallback");
+            assert!((selected.input - 1.4).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn same_class_fallback_keeps_distinct_registered_families_separate() {
+        let mixtral = parse_model_identity("mixtral-8x7b");
+        let mistral = parse_model_identity("mistral-8x7b");
+        let nova = parse_model_identity("nova-pro-v1");
+        let titan = parse_model_identity("titan-pro-v1");
+
+        assert!(!same_class(&mixtral, &mistral));
+        assert!(!same_class(&nova, &titan));
+    }
+
+    #[test]
+    fn same_class_fallback_breaks_equal_version_ties_by_model_key() {
+        for _ in 0..64 {
+            let mut table = HashMap::new();
+            let mut earlier = sample_codex_pricing();
+            earlier.input = 1.0;
+            let mut later = sample_codex_pricing();
+            later.input = 2.0;
+            table.insert("claude-opus-4-5-20250101".to_string(), earlier);
+            table.insert("claude-opus-4-5-20251231".to_string(), later);
+
+            let selected =
+                same_class_fallback(&table, "claude-opus-4-6-unknown").expect("fallback");
+            assert!((selected.input - 2.0).abs() < 1e-9);
+        }
     }
 
     #[test]
@@ -1016,6 +1140,12 @@ mod tests {
         let p = AllPricing::load_raw().finalize();
         let unknown = p.get_pricing("claude", "totally-mystery-thing");
         assert!((unknown.input - 3.0).abs() < 1e-9);
+
+        let omp = p.pricing_for_entry("omp", "totally-mystery-thing", 0);
+        assert!((omp.input - 5.0).abs() < 1e-9);
+
+        let recognized_without_book = p.pricing_for_entry("claude", "llama-4-maverick", 0);
+        assert!(recognized_without_book.input.abs() < 1e-9);
     }
 
     #[test]
@@ -1045,7 +1175,7 @@ mod tests {
     fn pricing_for_entry_scales_codex_fast_from_record_tier() {
         let mut pricing = AllPricing::load_raw().finalize();
         pricing
-            .codex_models
+            .models_mut("codex")
             .insert("gpt-5.5".to_string(), sample_codex_pricing());
 
         let p = pricing.pricing_for_entry("codex", "gpt-5.5", -1);
@@ -1061,6 +1191,19 @@ mod tests {
         assert!((p.input - 1.25 * 2.5).abs() < 1e-9);
         assert!((p.output - 10.0 * 2.5).abs() < 1e-9);
         assert!((p.cache_input - 0.125 * 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pricing_for_entry_normalizes_fast_tier_model_keys() {
+        let pricing = AllPricing::load_raw().finalize();
+
+        let uppercase = pricing.pricing_for_entry("codex", "GPT-5.5", 1);
+        assert!((uppercase.input - 12.5).abs() < 1e-9);
+        assert!((uppercase.output - 75.0).abs() < 1e-9);
+
+        let qualified = pricing.pricing_for_entry("claude", "anthropic/claude-opus-4-7", 1);
+        assert!((qualified.input - 30.0).abs() < 1e-9);
+        assert!((qualified.output - 150.0).abs() < 1e-9);
     }
 
     #[test]

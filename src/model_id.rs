@@ -20,21 +20,399 @@ pub enum Vendor {
     Google,
     Moonshot,
     Zhipu,
+    DeepSeek,
+    SpaceXAI,
+    Meta,
+    MistralAI,
+    Alibaba,
+    Cohere,
+    Amazon,
+    Microsoft,
+    Nvidia,
+    MiniMax,
+    Baidu,
+    Tencent,
+    ByteDance,
+    ZeroOneAI,
+    AI21Labs,
+    Ibm,
+    Databricks,
+    Perplexity,
+    ShanghaiAILab,
+    AllenAI,
+    Tii,
+    Writer,
     Unknown,
 }
 
+struct VendorSpec {
+    vendor: Vendor,
+    display_name: &'static str,
+    pricing_key: &'static str,
+    model_aliases: &'static [&'static str],
+    provider_aliases: &'static [&'static str],
+    first_party_providers: &'static [&'static str],
+}
+
+const VENDOR_SPECS: &[VendorSpec] = &[
+    VendorSpec {
+        vendor: Vendor::Anthropic,
+        display_name: "Anthropic",
+        pricing_key: "claude",
+        model_aliases: &["claude", "fable", "mythos", "opus", "sonnet", "haiku"],
+        provider_aliases: &["anthropic"],
+        first_party_providers: &["anthropic"],
+    },
+    VendorSpec {
+        vendor: Vendor::OpenAI,
+        display_name: "OpenAI",
+        pricing_key: "codex",
+        model_aliases: &["gpt", "chatgpt", "codex"],
+        provider_aliases: &["openai"],
+        first_party_providers: &["openai"],
+    },
+    VendorSpec {
+        vendor: Vendor::Google,
+        display_name: "Google",
+        pricing_key: "gemini",
+        model_aliases: &["gemini", "gemma"],
+        provider_aliases: &["google", "gemini", "google_ai_studio", "vertex_ai"],
+        first_party_providers: &["google", "gemini", "google_ai_studio"],
+    },
+    VendorSpec {
+        vendor: Vendor::Moonshot,
+        display_name: "Moonshot",
+        pricing_key: "kimi",
+        model_aliases: &["kimi"],
+        provider_aliases: &["moonshot", "kimi"],
+        first_party_providers: &["moonshot", "kimi"],
+    },
+    VendorSpec {
+        vendor: Vendor::Zhipu,
+        display_name: "Zhipu",
+        pricing_key: "zhipu",
+        model_aliases: &["glm", "codegeex"],
+        provider_aliases: &["zhipu", "zai", "z.ai"],
+        first_party_providers: &["zhipu", "zai", "z.ai"],
+    },
+    VendorSpec {
+        vendor: Vendor::DeepSeek,
+        display_name: "DeepSeek",
+        pricing_key: "deepseek",
+        model_aliases: &["deepseek"],
+        provider_aliases: &["deepseek"],
+        first_party_providers: &["deepseek"],
+    },
+    VendorSpec {
+        vendor: Vendor::SpaceXAI,
+        display_name: "SpaceXAI",
+        pricing_key: "spacexai",
+        model_aliases: &["grok"],
+        provider_aliases: &["xai", "spacexai", "space_xai"],
+        first_party_providers: &["xai", "spacexai", "space_xai"],
+    },
+    VendorSpec {
+        vendor: Vendor::Meta,
+        display_name: "Meta",
+        pricing_key: "meta",
+        model_aliases: &["llama", "codellama"],
+        provider_aliases: &["meta", "meta_llama"],
+        first_party_providers: &["meta"],
+    },
+    VendorSpec {
+        vendor: Vendor::MistralAI,
+        display_name: "Mistral AI",
+        pricing_key: "mistral",
+        model_aliases: &[
+            "mistral",
+            "mixtral",
+            "codestral",
+            "pixtral",
+            "ministral",
+            "magistral",
+        ],
+        provider_aliases: &["mistral"],
+        first_party_providers: &["mistral"],
+    },
+    VendorSpec {
+        vendor: Vendor::Alibaba,
+        display_name: "Alibaba",
+        pricing_key: "alibaba",
+        model_aliases: &["qwen", "qwq", "qvq"],
+        provider_aliases: &["alibaba", "dashscope", "qwen"],
+        first_party_providers: &["dashscope", "qwen"],
+    },
+    VendorSpec {
+        vendor: Vendor::Cohere,
+        display_name: "Cohere",
+        pricing_key: "cohere",
+        model_aliases: &["command", "aya"],
+        provider_aliases: &["cohere"],
+        first_party_providers: &["cohere"],
+    },
+    VendorSpec {
+        vendor: Vendor::Amazon,
+        display_name: "Amazon",
+        pricing_key: "amazon",
+        model_aliases: &["nova", "titan"],
+        provider_aliases: &["amazon"],
+        first_party_providers: &["amazon"],
+    },
+    VendorSpec {
+        vendor: Vendor::Microsoft,
+        display_name: "Microsoft",
+        pricing_key: "microsoft",
+        model_aliases: &["phi", "mai"],
+        provider_aliases: &["microsoft"],
+        first_party_providers: &["microsoft"],
+    },
+    VendorSpec {
+        vendor: Vendor::Nvidia,
+        display_name: "NVIDIA",
+        pricing_key: "nvidia",
+        model_aliases: &["nemotron"],
+        provider_aliases: &["nvidia"],
+        first_party_providers: &["nvidia"],
+    },
+    VendorSpec {
+        vendor: Vendor::MiniMax,
+        display_name: "MiniMax",
+        pricing_key: "minimax",
+        model_aliases: &["minimax"],
+        provider_aliases: &["minimax"],
+        first_party_providers: &["minimax"],
+    },
+    VendorSpec {
+        vendor: Vendor::Baidu,
+        display_name: "Baidu",
+        pricing_key: "baidu",
+        model_aliases: &["ernie"],
+        provider_aliases: &["baidu", "qianfan"],
+        first_party_providers: &["baidu", "qianfan"],
+    },
+    VendorSpec {
+        vendor: Vendor::Tencent,
+        display_name: "Tencent",
+        pricing_key: "tencent",
+        model_aliases: &["hunyuan"],
+        provider_aliases: &["tencent", "hunyuan"],
+        first_party_providers: &["tencent", "hunyuan"],
+    },
+    VendorSpec {
+        vendor: Vendor::ByteDance,
+        display_name: "ByteDance",
+        pricing_key: "bytedance",
+        model_aliases: &["doubao"],
+        provider_aliases: &["bytedance", "volcengine"],
+        first_party_providers: &["bytedance", "volcengine"],
+    },
+    VendorSpec {
+        vendor: Vendor::ZeroOneAI,
+        display_name: "01.AI",
+        pricing_key: "01ai",
+        model_aliases: &["yi"],
+        provider_aliases: &["01ai", "zeroone"],
+        first_party_providers: &["01ai", "zeroone"],
+    },
+    VendorSpec {
+        vendor: Vendor::AI21Labs,
+        display_name: "AI21 Labs",
+        pricing_key: "ai21",
+        model_aliases: &["jamba", "jurassic"],
+        provider_aliases: &["ai21"],
+        first_party_providers: &["ai21"],
+    },
+    VendorSpec {
+        vendor: Vendor::Ibm,
+        display_name: "IBM",
+        pricing_key: "ibm",
+        model_aliases: &["granite"],
+        provider_aliases: &["ibm", "watsonx"],
+        first_party_providers: &["ibm", "watsonx"],
+    },
+    VendorSpec {
+        vendor: Vendor::Databricks,
+        display_name: "Databricks",
+        pricing_key: "databricks",
+        model_aliases: &["dbrx"],
+        provider_aliases: &["databricks"],
+        first_party_providers: &["databricks"],
+    },
+    VendorSpec {
+        vendor: Vendor::Perplexity,
+        display_name: "Perplexity",
+        pricing_key: "perplexity",
+        model_aliases: &["sonar"],
+        provider_aliases: &["perplexity"],
+        first_party_providers: &["perplexity"],
+    },
+    VendorSpec {
+        vendor: Vendor::ShanghaiAILab,
+        display_name: "Shanghai AI Lab",
+        pricing_key: "internlm",
+        model_aliases: &["internlm"],
+        provider_aliases: &["internlm", "shanghai_ai_lab"],
+        first_party_providers: &["internlm", "shanghai_ai_lab"],
+    },
+    VendorSpec {
+        vendor: Vendor::AllenAI,
+        display_name: "Allen AI",
+        pricing_key: "allenai",
+        model_aliases: &["olmo"],
+        provider_aliases: &["allenai"],
+        first_party_providers: &["allenai"],
+    },
+    VendorSpec {
+        vendor: Vendor::Tii,
+        display_name: "TII",
+        pricing_key: "tii",
+        model_aliases: &["falcon"],
+        provider_aliases: &["tii"],
+        first_party_providers: &["tii"],
+    },
+    VendorSpec {
+        vendor: Vendor::Writer,
+        display_name: "Writer",
+        pricing_key: "writer",
+        model_aliases: &["palmyra"],
+        provider_aliases: &["writer"],
+        first_party_providers: &["writer"],
+    },
+];
+
 impl Vendor {
+    fn spec(self) -> Option<&'static VendorSpec> {
+        VENDOR_SPECS.iter().find(|spec| spec.vendor == self)
+    }
+
     /// Human-readable vendor name for table columns and group headers.
     pub fn display_name(self) -> &'static str {
-        match self {
-            Vendor::Anthropic => "Anthropic",
-            Vendor::OpenAI => "OpenAI",
-            Vendor::Google => "Google",
-            Vendor::Moonshot => "Moonshot",
-            Vendor::Zhipu => "Zhipu",
-            Vendor::Unknown => "Other",
-        }
+        self.spec().map_or("Other", |spec| spec.display_name)
     }
+
+    pub fn pricing_key(self) -> Option<&'static str> {
+        self.spec().map(|spec| spec.pricing_key)
+    }
+
+    pub fn is_first_party_provider(self, provider: &str) -> bool {
+        let normalized = normalize_identifier(provider);
+        self.spec().is_some_and(|spec| {
+            spec.first_party_providers
+                .iter()
+                .any(|alias| normalize_identifier(alias) == normalized)
+        })
+    }
+
+    pub fn from_display_name(name: &str) -> Vendor {
+        VENDOR_SPECS
+            .iter()
+            .find(|spec| spec.display_name == name)
+            .map_or(Vendor::Unknown, |spec| spec.vendor)
+    }
+
+    pub(crate) fn sort_rank(self) -> u32 {
+        VENDOR_SPECS
+            .iter()
+            .position(|spec| spec.vendor == self)
+            .map_or(VENDOR_SPECS.len() as u32, |rank| rank as u32)
+    }
+}
+
+fn identifier_words(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn normalize_identifier(value: &str) -> String {
+    identifier_words(value).join("-")
+}
+
+fn word_matches_alias(word: &str, alias: &str) -> bool {
+    if word == alias {
+        return true;
+    }
+    word.strip_prefix(alias).is_some_and(|suffix| {
+        suffix.starts_with(|c: char| c.is_ascii_digit())
+            || suffix
+                .strip_prefix('v')
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
+fn words_match_alias(words: &[String], alias: &str) -> bool {
+    let alias_words = identifier_words(alias);
+    if alias_words.len() == 1 {
+        return words
+            .iter()
+            .any(|word| word_matches_alias(word, &alias_words[0]));
+    }
+    words
+        .windows(alias_words.len())
+        .any(|window| window == alias_words)
+}
+
+fn infer_model_vendor(raw: &str) -> Vendor {
+    let (base, _) = split_effort(raw);
+    let leaf = strip_provider_prefix(base);
+    let words = identifier_words(leaf);
+
+    if words.first().is_some_and(|word| is_k_version_token(word)) {
+        return Vendor::Moonshot;
+    }
+    if words.first().is_some_and(|word| {
+        word.strip_prefix('o')
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    }) {
+        return Vendor::OpenAI;
+    }
+
+    VENDOR_SPECS
+        .iter()
+        .find(|spec| {
+            spec.model_aliases
+                .iter()
+                .any(|alias| words_match_alias(&words, alias))
+        })
+        .map_or(Vendor::Unknown, |spec| spec.vendor)
+}
+
+pub fn infer_vendor_with_provider(raw: &str, provider: Option<&str>) -> Vendor {
+    let model_vendor = infer_model_vendor(raw);
+    if model_vendor != Vendor::Unknown {
+        return model_vendor;
+    }
+
+    let Some(provider) = provider else {
+        return Vendor::Unknown;
+    };
+    let words = identifier_words(provider);
+    VENDOR_SPECS
+        .iter()
+        .find(|spec| {
+            spec.provider_aliases
+                .iter()
+                .any(|alias| words_match_alias(&words, alias))
+        })
+        .map_or(Vendor::Unknown, |spec| spec.vendor)
+}
+
+pub fn infer_vendor(raw: &str) -> Vendor {
+    infer_vendor_with_provider(raw, None)
+}
+
+fn exact_provider_vendor(provider: &str) -> Vendor {
+    let normalized = normalize_identifier(provider);
+    VENDOR_SPECS
+        .iter()
+        .find(|spec| {
+            spec.provider_aliases
+                .iter()
+                .any(|alias| normalize_identifier(alias) == normalized)
+        })
+        .map_or(Vendor::Unknown, |spec| spec.vendor)
 }
 
 /// Structured view of a model id. Parsing strips provider prefixes, date and
@@ -107,13 +485,24 @@ fn split_effort(s: &str) -> (&str, Option<String>) {
     (s, None)
 }
 
-/// Strip provider prefixes: anything before the last `/`, plus a leading
-/// `anthropic.` (Bedrock) segment.
+/// Strip slash prefixes and registered dotted provider namespaces.
 fn strip_provider_prefix(s: &str) -> &str {
     let after_slash = s.rsplit('/').next().unwrap_or(s);
+    for (index, _) in after_slash
+        .char_indices()
+        .rev()
+        .filter(|(_, ch)| *ch == '.')
+    {
+        if exact_provider_vendor(&after_slash[..index]) != Vendor::Unknown {
+            return &after_slash[index + 1..];
+        }
+    }
     after_slash
-        .strip_prefix("anthropic.")
-        .unwrap_or(after_slash)
+}
+
+pub fn canonical_model_leaf(raw: &str) -> String {
+    let (base, _) = split_effort(raw);
+    strip_provider_prefix(base).trim().to_ascii_lowercase()
 }
 
 /// Drop trailing date and preview tokens without eating single-digit version
@@ -172,51 +561,52 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
     strip_tail_tokens(&mut tokens);
     let normalized_id = tokens.join("-");
 
-    let has_claude_family = tokens.iter().any(|t| CLAUDE_FAMILIES.contains(&t.as_str()));
+    let inferred_vendor = infer_vendor(base);
     let is_o_series = tokens
         .first()
         .is_some_and(|t| t.starts_with('o') && t[1..].starts_with(|c: char| c.is_ascii_digit()));
 
-    let (vendor, family, version, version_key, modifiers) =
-        if stripped.starts_with("claude") || has_claude_family {
-            parse_claude(&tokens)
-        } else if is_o_series {
-            // o-series ids are rendered verbatim, but we still parse the series
-            // number and any size suffix so ordering and pricing fallback work.
-            let major = tokens[0][1..].parse::<u32>().unwrap_or(0);
-            let modifiers = collect_modifiers(tokens.get(1..).unwrap_or(&[]), OPENAI_MODIFIERS);
-            (
-                Vendor::OpenAI,
-                "o".to_string(),
-                String::new(),
-                (major, 0),
-                modifiers,
-            )
-        } else if tokens.first().is_some_and(|t| t == "gpt") {
-            parse_versioned(Vendor::OpenAI, "gpt", &tokens, OPENAI_MODIFIERS)
-        } else if tokens.first().is_some_and(|t| t == "codex") {
-            // `codex-mini-latest` etc.: no numeric version, modifiers follow.
-            let modifiers = collect_modifiers(&tokens[1..], OPENAI_MODIFIERS);
-            (
-                Vendor::OpenAI,
-                "codex".to_string(),
-                String::new(),
-                (0, 0),
-                modifiers,
-            )
-        } else if tokens.first().is_some_and(|t| t == "gemini") {
-            parse_versioned(Vendor::Google, "gemini", &tokens, GEMINI_MODIFIERS)
-        } else if tokens.first().is_some_and(|t| t == "glm") {
-            parse_versioned(Vendor::Zhipu, "glm", &tokens, ZHIPU_MODIFIERS)
-        } else if tokens
-            .first()
-            .is_some_and(|t| t == "kimi" || is_k_version_token(t))
-        {
-            parse_kimi(&tokens)
-        } else {
-            let family = tokens.first().cloned().unwrap_or_default();
-            (Vendor::Unknown, family, String::new(), (0, 0), Vec::new())
-        };
+    let (vendor, family, version, version_key, modifiers) = if inferred_vendor == Vendor::Anthropic
+    {
+        parse_claude(&tokens)
+    } else if inferred_vendor == Vendor::OpenAI && is_o_series {
+        // o-series ids are rendered verbatim, but we still parse the series
+        // number and any size suffix so ordering and pricing fallback work.
+        let major = tokens[0][1..].parse::<u32>().unwrap_or(0);
+        let modifiers = collect_modifiers(tokens.get(1..).unwrap_or(&[]), OPENAI_MODIFIERS);
+        (
+            Vendor::OpenAI,
+            "o".to_string(),
+            String::new(),
+            (major, 0),
+            modifiers,
+        )
+    } else if inferred_vendor == Vendor::OpenAI
+        && tokens.first().is_some_and(|t| t == "gpt" || t == "chatgpt")
+    {
+        parse_versioned(Vendor::OpenAI, "gpt", &tokens, OPENAI_MODIFIERS)
+    } else if inferred_vendor == Vendor::OpenAI && tokens.first().is_some_and(|t| t == "codex") {
+        // `codex-mini-latest` etc.: no numeric version, modifiers follow.
+        let modifiers = collect_modifiers(&tokens[1..], OPENAI_MODIFIERS);
+        (
+            Vendor::OpenAI,
+            "codex".to_string(),
+            String::new(),
+            (0, 0),
+            modifiers,
+        )
+    } else if inferred_vendor == Vendor::Google && tokens.first().is_some_and(|t| t == "gemini") {
+        parse_versioned(Vendor::Google, "gemini", &tokens, GEMINI_MODIFIERS)
+    } else if inferred_vendor == Vendor::Zhipu && tokens.first().is_some_and(|t| t == "glm") {
+        parse_versioned(Vendor::Zhipu, "glm", &tokens, ZHIPU_MODIFIERS)
+    } else if inferred_vendor == Vendor::Moonshot {
+        parse_kimi(&tokens)
+    } else if inferred_vendor != Vendor::Unknown {
+        parse_generic(inferred_vendor, &tokens)
+    } else {
+        let family = tokens.first().cloned().unwrap_or_default();
+        (Vendor::Unknown, family, String::new(), (0, 0), Vec::new())
+    };
 
     ModelIdentity {
         vendor,
@@ -231,11 +621,24 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
 }
 
 const OPENAI_MODIFIERS: &[&str] = &[
-    "mini", "nano", "max", "spark", "codex", "pro", "sol", "luna",
+    "mini", "nano", "max", "spark", "codex", "pro", "sol", "terra", "luna",
 ];
 const GEMINI_MODIFIERS: &[&str] = &["pro", "flash", "lite", "image", "ultra"];
 const KIMI_MODIFIERS: &[&str] = &["coding", "highspeed", "turbo"];
 const ZHIPU_MODIFIERS: &[&str] = &["air", "airx", "x", "flash", "flashx"];
+const GENERIC_MODIFIERS: &[&str] = &[
+    "pro",
+    "flash",
+    "lite",
+    "mini",
+    "small",
+    "large",
+    "turbo",
+    "plus",
+    "max",
+    "instruct",
+    "reasoning",
+];
 
 /// A bare `k<version>` token like `k3` or `k2.5` (the Kimi flagship line).
 fn is_k_version_token(t: &str) -> bool {
@@ -261,6 +664,50 @@ fn parse_kimi(tokens: &[String]) -> (Vendor, String, String, (u32, u32), Vec<Str
         Vendor::Moonshot,
         "kimi".to_string(),
         version,
+        version_key,
+        modifiers,
+    )
+}
+
+fn parse_generic(
+    vendor: Vendor,
+    tokens: &[String],
+) -> (Vendor, String, String, (u32, u32), Vec<String>) {
+    let spec = vendor.spec().expect("known vendor has a registry entry");
+    let words = identifier_words(&tokens.join("-"));
+    let family = spec
+        .model_aliases
+        .iter()
+        .find(|alias| words_match_alias(&words, alias))
+        .copied()
+        .unwrap_or("")
+        .to_string();
+    let version = tokens.iter().find_map(|token| {
+        let lower = token.to_ascii_lowercase();
+        let direct = lower.strip_prefix('v').unwrap_or(&lower);
+        if direct.starts_with(|c: char| c.is_ascii_digit()) {
+            return Some(direct.to_string());
+        }
+        spec.model_aliases.iter().find_map(|alias| {
+            let suffix = lower.strip_prefix(alias)?;
+            let suffix = suffix.strip_prefix('v').unwrap_or(suffix);
+            suffix
+                .starts_with(|c: char| c.is_ascii_digit())
+                .then(|| suffix.to_string())
+        })
+    });
+    let version_key = version
+        .as_deref()
+        .map(parse_dotted_version)
+        .unwrap_or((0, 0));
+    let modifiers = words
+        .into_iter()
+        .filter(|word| GENERIC_MODIFIERS.contains(&word.as_str()))
+        .collect();
+    (
+        vendor,
+        family,
+        version.unwrap_or_default(),
         version_key,
         modifiers,
     )
@@ -353,6 +800,31 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
+fn branded_title_case(s: &str) -> String {
+    s.split(['-', '_', '/'])
+        .filter(|token| !token.is_empty())
+        .map(|token| match token.to_ascii_lowercase().as_str() {
+            "deepseek" => "DeepSeek".to_string(),
+            other if other.starts_with("deepseek") => {
+                let suffix = &other[8..];
+                if let Some(version) = suffix.strip_prefix('v') {
+                    format!("DeepSeekV{version}")
+                } else {
+                    format!("DeepSeek{suffix}")
+                }
+            }
+            "minimax" => "MiniMax".to_string(),
+            "dbrx" => "DBRX".to_string(),
+            "olmo" => "OLMo".to_string(),
+            other if other.starts_with("internlm") => {
+                format!("InternLM{}", &other[8..])
+            }
+            _ => capitalize(token),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Abbreviation for the single most salient modifier, by vendor precedence.
 fn modifier_abbrev(vendor: Vendor, modifiers: &[String]) -> Option<&'static str> {
     let has = |needle: &str| modifiers.iter().any(|m| m == needle);
@@ -369,6 +841,8 @@ fn modifier_abbrev(vendor: Vendor, modifiers: &[String]) -> Option<&'static str>
                 Some("Sprk")
             } else if has("sol") {
                 Some("Sol")
+            } else if has("terra") {
+                Some("Terra")
             } else if has("luna") {
                 Some("Luna")
             } else if has("codex") {
@@ -502,6 +976,7 @@ pub fn short_label(id: &ModelIdentity) -> String {
                 title_case(&id.normalized_id)
             }
         }
+        _ => branded_title_case(&id.normalized_id),
     };
 
     if let Some(effort) = &id.effort {
@@ -519,11 +994,7 @@ fn family_rank(id: &ModelIdentity) -> u32 {
             "haiku" => 3,
             _ => 4,
         },
-        Vendor::OpenAI => 10,
-        Vendor::Google => 20,
-        Vendor::Moonshot => 25,
-        Vendor::Zhipu => 27,
-        Vendor::Unknown => 30,
+        _ => id.vendor.sort_rank() * 10,
     }
 }
 
@@ -595,6 +1066,7 @@ mod tests {
         assert_eq!(label("gpt-5.1-codex-mini"), "GPT-5.1 Mini");
         assert_eq!(label("gpt-5.3-codex-spark"), "GPT-5.3 Sprk");
         assert_eq!(label("gpt-5.6-sol"), "GPT-5.6 Sol");
+        assert_eq!(label("gpt-5.6-terra"), "GPT-5.6 Terra");
         assert_eq!(label("gpt-5.6-luna"), "GPT-5.6 Luna");
         assert_eq!(label("gpt-4.1-mini"), "GPT-4.1 Mini");
         assert_eq!(label("codex-mini-latest"), "Codex Mini");
@@ -682,6 +1154,8 @@ mod tests {
         assert_eq!(label("glm-4.5-x"), "GLM-4.5 X");
         assert_eq!(label("glm-4.5-airx"), "GLM-4.5 AirX");
         assert_eq!(label("zai-org/GLM-5.2"), "GLM-5.2");
+        assert_eq!(label("z.ai.GLM-5.1"), "GLM-5.1");
+        assert_eq!(canonical_model_leaf("z.ai.GLM-5.1"), "glm-5.1");
         assert_eq!(label("glm-5.2:high"), "GLM-5.2(H)");
     }
 
@@ -720,6 +1194,86 @@ mod tests {
         assert_eq!(vendor("k3"), Vendor::Moonshot);
         assert_eq!(vendor("glm-5.2"), Vendor::Zhipu);
         assert_eq!(vendor("mystery-model"), Vendor::Unknown);
+    }
+
+    #[test]
+    fn vendor_registry_recognizes_common_model_families_case_insensitively() {
+        let cases = [
+            ("DeepSeek-V4-Pro", Vendor::DeepSeek),
+            ("GROK-4.5", Vendor::SpaceXAI),
+            ("meta-llama/Llama-4-Maverick", Vendor::Meta),
+            ("mistral/Codestral-25.08", Vendor::MistralAI),
+            ("QWEN3.5-PLUS", Vendor::Alibaba),
+            ("command-a-plus-05-2026", Vendor::Cohere),
+            ("amazon.nova-pro-v1:0", Vendor::Amazon),
+            ("Phi-4", Vendor::Microsoft),
+            ("Nemotron-4", Vendor::Nvidia),
+            ("MiniMax-M2.5", Vendor::MiniMax),
+            ("ERNIE-5.0", Vendor::Baidu),
+            ("hunyuan-t1", Vendor::Tencent),
+            ("doubao-seed-2.0-pro", Vendor::ByteDance),
+            ("yi-large", Vendor::ZeroOneAI),
+            ("jamba-large", Vendor::AI21Labs),
+            ("granite-4.0", Vendor::Ibm),
+            ("dbrx-instruct", Vendor::Databricks),
+            ("sonar-pro", Vendor::Perplexity),
+            ("internlm3", Vendor::ShanghaiAILab),
+            ("olmo-3", Vendor::AllenAI),
+            ("falcon-3", Vendor::Tii),
+            ("palmyra-x5", Vendor::Writer),
+        ];
+
+        for (model, expected) in cases {
+            assert_eq!(parse_model_identity(model).vendor, expected, "{model}");
+        }
+    }
+
+    #[test]
+    fn vendor_matching_uses_boundaries_and_keeps_k_versions_narrow() {
+        let vendor = |s: &str| parse_model_identity(s).vendor;
+        assert_eq!(vendor("K3"), Vendor::Moonshot);
+        assert_eq!(vendor("k2.5"), Vendor::Moonshot);
+        assert_eq!(vendor("moonshot.k3"), Vendor::Moonshot);
+        assert_eq!(vendor("openai.o3"), Vendor::OpenAI);
+        assert_eq!(vendor("kappa-3"), Vendor::Unknown);
+        assert_eq!(vendor("sk3"), Vendor::Unknown);
+        assert_eq!(vendor("notgpt-5"), Vendor::Unknown);
+        assert_eq!(vendor("megrok-4"), Vendor::Unknown);
+    }
+
+    #[test]
+    fn generic_model_families_use_the_matched_alias() {
+        let cases = [
+            ("gemma-3-27b", "gemma"),
+            ("mistral-large", "mistral"),
+            ("mixtral-8x7b", "mixtral"),
+            ("codestral-25.08", "codestral"),
+            ("nova-pro", "nova"),
+            ("titan-text", "titan"),
+        ];
+
+        for (model, expected) in cases {
+            assert_eq!(parse_model_identity(model).family, expected, "{model}");
+        }
+    }
+
+    #[test]
+    fn model_family_precedes_provider_hint() {
+        assert_eq!(
+            infer_vendor_with_provider("openrouter/deepseek-v4-pro", Some("openai")),
+            Vendor::DeepSeek
+        );
+        assert_eq!(
+            infer_vendor_with_provider("private-model", Some("xai")),
+            Vendor::SpaceXAI
+        );
+    }
+
+    #[test]
+    fn generic_labels_preserve_vendor_brand_spelling() {
+        assert_eq!(label("deepseek-v4-pro"), "DeepSeek V4 Pro");
+        assert_eq!(label("DeepSeekV4-Pro"), "DeepSeekV4 Pro");
+        assert_eq!(label("grok-4.5"), "Grok 4.5");
     }
 
     #[test]

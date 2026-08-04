@@ -1,11 +1,32 @@
 {
   "_meta": {
     "description": "API pricing and subscription costs for AI services",
-    "last_updated": "2026-06-11",
-    "notes": "All prices are per million tokens (MTok) at standard API rates. Update this file when pricing changes."
+    "last_updated": "2026-08-04",
+    "notes": "All prices are per million tokens (MTok) at standard API rates. Provider-specific and whole-request long-context premiums require an exact matching entry.",
+    "sources": {
+      "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "openai": "https://developers.openai.com/api/docs/pricing",
+      "google": "https://ai.google.dev/gemini-api/docs/pricing",
+      "zhipu": "https://docs.z.ai/guides/overview/pricing",
+      "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
+      "spacexai": "https://docs.x.ai/developers/pricing"
+    }
   },
   "claude": {
     "models": {
+      "claude-opus-5": {
+        "input": 5.00,
+        "output": 25.00,
+        "cache_input": 0.50,
+        "cache_output": 6.25
+      },
+      "claude-sonnet-5": {
+        "input": 2.00,
+        "output": 10.00,
+        "cache_input": 0.20,
+        "cache_output": 2.50,
+        "_comment": "Introductory rate through 2026-08-31; the published standard rate begins 2026-09-01"
+      },
       "claude-fable-5": {
         "input": 10.00,
         "output": 50.00,
@@ -32,22 +53,14 @@
         "output": 25.00,
         "cache_input": 0.50,
         "cache_output": 6.25,
-        "input_above_200k": 10.00,
-        "output_above_200k": 50.00,
-        "cache_input_above_200k": 1.00,
-        "cache_output_above_200k": 12.50,
-        "_comment": "1M context model: 2x tier above 200k tokens per request"
+        "_comment": "1M context at standard pricing, no long-context premium tier"
       },
       "claude-opus-4-6": {
         "input": 5.00,
         "output": 25.00,
         "cache_input": 0.50,
         "cache_output": 6.25,
-        "input_above_200k": 10.00,
-        "output_above_200k": 50.00,
-        "cache_input_above_200k": 1.00,
-        "cache_output_above_200k": 12.50,
-        "_comment": "1M context model: 2x tier above 200k tokens per request"
+        "_comment": "1M context at standard pricing, no long-context premium tier"
       },
       "claude-opus-4-5-20251101": {
         "input": 5.00,
@@ -65,11 +78,7 @@
         "output": 15.00,
         "cache_input": 0.30,
         "cache_output": 3.75,
-        "input_above_200k": 6.00,
-        "output_above_200k": 22.50,
-        "cache_input_above_200k": 0.60,
-        "cache_output_above_200k": 7.50,
-        "_comment": "1M context model: 2x tier above 200k tokens per request"
+        "_comment": "1M context at standard pricing, no long-context premium tier"
       },
       "claude-sonnet-4-5-20250929": {
         "input": 3.00,
@@ -99,6 +108,37 @@
   },
   "codex": {
     "models": {
+      "gpt-5.6": {
+        "input": 5.00,
+        "output": 30.00,
+        "cache_input": 0.50,
+        "cache_output": 6.25,
+        "_comment": "Alias of gpt-5.6-sol"
+      },
+      "gpt-5.6-sol": {
+        "input": 5.00,
+        "output": 30.00,
+        "cache_input": 0.50,
+        "cache_output": 6.25
+      },
+      "gpt-5.6-terra": {
+        "input": 2.50,
+        "output": 15.00,
+        "cache_input": 0.25,
+        "cache_output": 3.125
+      },
+      "gpt-5.6-luna": {
+        "input": 1.00,
+        "output": 6.00,
+        "cache_input": 0.10,
+        "cache_output": 1.25
+      },
+      "gpt-5.5": {
+        "input": 5.00,
+        "output": 30.00,
+        "cache_input": 0.50,
+        "cache_output": 6.25
+      },
       "gpt-5.4": {
         "input": 2.50,
         "output": 15.00,
@@ -247,15 +287,33 @@
       }
     },
     "default": {
-      "input": 2.50,
-      "output": 15.00,
-      "cache_input": 0.25,
-      "cache_output": 0.0,
-      "_comment": "Fallback, using gpt-5.4 pricing"
+      "input": 5.00,
+      "output": 30.00,
+      "cache_input": 0.50,
+      "cache_output": 6.25,
+      "_comment": "Fallback, using the current flagship standard rate"
     }
   },
   "gemini": {
     "models": {
+      "gemini-3.6-flash": {
+        "input": 1.50,
+        "output": 7.50,
+        "cache_input": 0.15,
+        "cache_output": 0.0
+      },
+      "gemini-3.5-flash": {
+        "input": 1.50,
+        "output": 9.00,
+        "cache_input": 0.15,
+        "cache_output": 0.0
+      },
+      "gemini-3.5-flash-lite": {
+        "input": 0.30,
+        "output": 2.50,
+        "cache_input": 0.03,
+        "cache_output": 0.0
+      },
       "gemini-3.1-pro-preview": {
         "input": 2.00,
         "output": 12.00,
@@ -325,11 +383,11 @@
       }
     },
     "default": {
-      "input": 0.50,
-      "output": 3.00,
-      "cache_input": 0.05,
+      "input": 1.50,
+      "output": 7.50,
+      "cache_input": 0.15,
       "cache_output": 0.0,
-      "_comment": "Fallback, using Gemini 3 Flash pricing"
+      "_comment": "Fallback, using the current Flash standard rate"
     }
   },
   "kimi": {
@@ -380,6 +438,158 @@
       "cache_input": 0.30,
       "cache_output": 3.00,
       "_comment": "Fallback, unknown Kimi models assume flagship k3 rates"
+    }
+  },
+  "zhipu": {
+    "models": {
+      "glm-5.1": {
+        "input": 1.40,
+        "output": 4.40,
+        "cache_input": 0.26,
+        "cache_output": 1.40
+      },
+      "glm-5": {
+        "input": 1.00,
+        "output": 3.20,
+        "cache_input": 0.20,
+        "cache_output": 1.00
+      },
+      "glm-5-turbo": {
+        "input": 1.20,
+        "output": 4.00,
+        "cache_input": 0.24,
+        "cache_output": 1.20
+      },
+      "glm-4.7": {
+        "input": 0.60,
+        "output": 2.20,
+        "cache_input": 0.11,
+        "cache_output": 0.60
+      },
+      "glm-4.7-flashx": {
+        "input": 0.07,
+        "output": 0.40,
+        "cache_input": 0.01,
+        "cache_output": 0.07
+      }
+    },
+    "default": {
+      "input": 1.40,
+      "output": 4.40,
+      "cache_input": 0.26,
+      "cache_output": 1.40,
+      "_comment": "Fallback, using the current flagship standard rate"
+    }
+  },
+  "deepseek": {
+    "models": {
+      "deepseek-v4-flash": {
+        "input": 0.14,
+        "output": 0.28,
+        "cache_input": 0.0028,
+        "cache_output": 0.14
+      },
+      "deepseek-v4-pro": {
+        "input": 0.435,
+        "output": 0.87,
+        "cache_input": 0.003625,
+        "cache_output": 0.435
+      },
+      "deepseek-chat": {
+        "input": 0.14,
+        "output": 0.28,
+        "cache_input": 0.0028,
+        "cache_output": 0.14,
+        "_comment": "Legacy alias retained for historical transcripts"
+      },
+      "deepseek-reasoner": {
+        "input": 0.14,
+        "output": 0.28,
+        "cache_input": 0.0028,
+        "cache_output": 0.14,
+        "_comment": "Legacy alias retained for historical transcripts"
+      }
+    },
+    "default": {
+      "input": 0.14,
+      "output": 0.28,
+      "cache_input": 0.0028,
+      "cache_output": 0.14,
+      "_comment": "Fallback, using the current flash standard rate"
+    }
+  },
+  "spacexai": {
+    "models": {
+      "grok-4.5": {
+        "input": 2.00,
+        "output": 6.00,
+        "cache_input": 0.30,
+        "cache_output": 2.00,
+        "_comment": "Standard context rate; whole-request long-context pricing is not represented by the prorated tier fields"
+      },
+      "grok-4.5-latest": {
+        "input": 2.00,
+        "output": 6.00,
+        "cache_input": 0.30,
+        "cache_output": 2.00,
+        "_comment": "Published alias of grok-4.5 at the standard context rate"
+      },
+      "grok-build-latest": {
+        "input": 2.00,
+        "output": 6.00,
+        "cache_input": 0.30,
+        "cache_output": 2.00,
+        "_comment": "Published alias of grok-4.5 at the standard context rate"
+      },
+      "grok-4.3": {
+        "input": 1.25,
+        "output": 2.50,
+        "cache_input": 0.20,
+        "cache_output": 1.25,
+        "_comment": "Standard context rate; whole-request long-context pricing is not represented by the prorated tier fields"
+      },
+      "grok-4.20": {
+        "input": 1.25,
+        "output": 2.50,
+        "cache_input": 0.20,
+        "cache_output": 1.25,
+        "_comment": "Standard context rate; whole-request long-context pricing is not represented by the prorated tier fields"
+      },
+      "grok-4.20-multi-agent-0309": {
+        "input": 1.25,
+        "output": 2.50,
+        "cache_input": 0.20,
+        "cache_output": 1.25,
+        "_comment": "Published runtime ID at the standard context rate"
+      },
+      "grok-4.20-0309-reasoning": {
+        "input": 1.25,
+        "output": 2.50,
+        "cache_input": 0.20,
+        "cache_output": 1.25,
+        "_comment": "Published runtime ID at the standard context rate"
+      },
+      "grok-4.20-0309-non-reasoning": {
+        "input": 1.25,
+        "output": 2.50,
+        "cache_input": 0.20,
+        "cache_output": 1.25,
+        "_comment": "Published runtime ID at the standard context rate"
+      },
+      "grok-build-0.1": {
+        "input": 1.00,
+        "output": 2.00,
+        "cache_input": 0.20,
+        "cache_output": 1.00,
+        "_comment": "Standard context rate; whole-request long-context pricing is not represented by the prorated tier fields"
+      }
+    },
+    "default": {
+      "input": 2.00,
+      "output": 6.00,
+      "cache_input": 0.30,
+      "cache_output": 2.00,
+      "_comment": "Fallback, using the current flagship standard-context rate"
     }
   },
   "fast_tiers": {

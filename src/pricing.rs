@@ -1,44 +1,52 @@
 //! Layered pricing loader.
 //!
-//! Resolution order (later layers win per-model, never drop earlier layers):
-//!   1. Embedded `pricing.json` baseline (compile-time) — covers
-//!      project-specific or future model names that LiteLLM may not carry.
-//!   2. `~/.cache/ai-usage/pricing-cache.json` — last good LiteLLM snapshot.
-//!   3. Live LiteLLM remote (5s timeout, refreshed at most every 24h).
+//! Resolution order:
+//!   1. Embedded `pricing.json` release-verified rates.
+//!   2. A cached or live remote snapshot that only fills missing models.
+//!   3. User overrides, applied by the caller as the final authority.
 //!
 //! Any layer that fails (network timeout, parse error, missing file, missing
 //! `$HOME`) is silently skipped — the next layer takes over. The embedded
 //! baseline guarantees we always have *something*.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::constants::{AllPricing, ModelPricing, VendorTables};
+use crate::constants::{AllPricing, ModelPricing, VendorTables, replace_file};
+use crate::model_id::{canonical_model_leaf, infer_vendor_with_provider};
 
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const CACHE_SCHEMA_VERSION: u32 = 2;
 
-/// Load pricing with embedded → cache → live overlay. Always returns a valid
-/// `AllPricing`; degrades gracefully when offline.
+/// Load embedded authority plus a cached or live supplement. Always returns a
+/// valid `AllPricing`; degrades gracefully when offline.
 pub fn load_layered() -> AllPricing {
     let mut combined = AllPricing::load_raw();
 
-    if let Some(cached) = read_cache_file() {
-        combined.overlay(cached);
-    }
-
-    if cache_is_stale()
-        && let Some(live) = fetch_live(FETCH_TIMEOUT)
-    {
-        let _ = write_cache_file(&live);
-        combined.overlay(live);
+    let cached = read_cache_file();
+    let supplemental = match cached {
+        Some((tables, true)) => Some(tables),
+        Some((tables, false)) => match fetch_live(FETCH_TIMEOUT) {
+            Some(live) => {
+                let _ = write_cache_file(&live);
+                Some(live)
+            }
+            None => Some(tables),
+        },
+        None => fetch_live(FETCH_TIMEOUT).inspect(|live| {
+            let _ = write_cache_file(live);
+        }),
+    };
+    if let Some(tables) = supplemental {
+        combined.overlay(tables);
     }
 
     let mut finalized = combined.finalize();
@@ -61,38 +69,72 @@ fn cache_path() -> Option<PathBuf> {
     Some(cache_dir()?.join("pricing-cache.json"))
 }
 
-fn cache_is_stale() -> bool {
-    let Some(path) = cache_path() else {
-        return true;
-    };
-    let Ok(meta) = fs::metadata(&path) else {
-        return true;
-    };
-    let Ok(mtime) = meta.modified() else {
-        return true;
-    };
-    SystemTime::now()
-        .duration_since(mtime)
-        .map(|age| age > CACHE_TTL)
-        .unwrap_or(true)
+#[derive(Debug, Deserialize, Serialize)]
+struct PricingCache {
+    schema_version: u32,
+    fetched_at: u64,
+    tables: VendorTables,
 }
 
-fn read_cache_file() -> Option<VendorTables> {
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn decode_cache(content: &str) -> Option<PricingCache> {
+    let cache: PricingCache = serde_json::from_str(content).ok()?;
+    (cache.schema_version == CACHE_SCHEMA_VERSION).then_some(cache)
+}
+
+fn cache_is_fresh(cache: &PricingCache, now: u64) -> bool {
+    now.checked_sub(cache.fetched_at)
+        .is_some_and(|age| age <= CACHE_TTL.as_secs())
+}
+
+#[cfg(test)]
+fn parse_cache(content: &str, now: u64) -> Option<PricingCache> {
+    let cache = decode_cache(content)?;
+    cache_is_fresh(&cache, now).then_some(cache)
+}
+
+fn read_cache_file() -> Option<(VendorTables, bool)> {
     let path = cache_path()?;
     let content = fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    let cache = decode_cache(&content)?;
+    let fresh = cache_is_fresh(&cache, unix_timestamp());
+    Some((cache.tables, fresh))
 }
 
 fn write_cache_file(tables: &VendorTables) -> std::io::Result<()> {
-    let Some(dir) = cache_dir() else {
-        return Ok(());
-    };
-    fs::create_dir_all(&dir)?;
     let Some(path) = cache_path() else {
         return Ok(());
     };
-    let json = serde_json::to_string_pretty(tables).unwrap_or_else(|_| "{}".to_string());
-    fs::write(&path, json)
+    write_cache_file_at(&path, tables, unix_timestamp())
+}
+
+fn write_cache_file_at(path: &Path, tables: &VendorTables, fetched_at: u64) -> std::io::Result<()> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(directory)?;
+    let cache = PricingCache {
+        schema_version: CACHE_SCHEMA_VERSION,
+        fetched_at,
+        tables: tables.clone(),
+    };
+    let json = serde_json::to_vec_pretty(&cache)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = directory.join(format!(".pricing-cache-{}-{nonce}.tmp", std::process::id()));
+    fs::write(&temp_path, json)?;
+    if let Err(error) = replace_file(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 // ---- live fetch -----------------------------------------------------------
@@ -139,7 +181,7 @@ struct LiteLLMEntry {
 }
 
 fn parse_litellm_payload(s: &str) -> Option<VendorTables> {
-    let raw: HashMap<String, serde_json::Value> = serde_json::from_str(s).ok()?;
+    let raw: BTreeMap<String, serde_json::Value> = serde_json::from_str(s).ok()?;
 
     let mut tables = VendorTables::default();
     for (raw_name, value) in raw {
@@ -193,77 +235,44 @@ fn parse_litellm_payload(s: &str) -> Option<VendorTables> {
             _comment: Some(format!("Source: LiteLLM ({})", raw_name)),
         };
 
-        let canonical = canonical_key(&raw_name);
-        let Some(vendor) = classify_vendor(&canonical, entry.litellm_provider.as_deref()) else {
+        let vendor = infer_vendor_with_provider(&raw_name, entry.litellm_provider.as_deref());
+        let Some(pricing_key) = vendor.pricing_key() else {
             continue;
         };
-        let bucket = match vendor {
-            "claude" => &mut tables.claude,
-            "codex" => &mut tables.codex,
-            "gemini" => &mut tables.gemini,
-            "kimi" => &mut tables.kimi,
-            _ => continue,
+        let full_key = raw_name.trim().to_ascii_lowercase();
+        let leaf_key = canonical_key(&raw_name);
+        let first_party = entry
+            .litellm_provider
+            .as_deref()
+            .map_or(full_key == leaf_key, |provider| {
+                vendor.is_first_party_provider(provider)
+            });
+        let storage_key = if first_party {
+            leaf_key
+        } else if full_key != leaf_key || full_key.contains('/') {
+            full_key.clone()
+        } else {
+            format!(
+                "{}/{}",
+                entry.litellm_provider.as_deref().unwrap_or("remote"),
+                full_key
+            )
         };
-        bucket.insert(canonical, pricing);
+        tables.insert_model(pricing_key, storage_key, pricing);
     }
 
     Some(tables)
 }
 
-/// Strip LiteLLM's leading provider segments so the key matches ai-usage's
-/// flat naming (e.g. `anthropic/claude-...` and `vertex_ai/gemini-...`).
+/// Derive the unqualified model key used for first-party aliases.
 fn canonical_key(name: &str) -> String {
-    let after_slash = name.rsplit_once('/').map_or(name, |(_, s)| s);
-    after_slash
-        .strip_prefix("anthropic.")
-        .unwrap_or(after_slash)
-        .to_string()
+    canonical_model_leaf(name)
 }
 
-/// Map a model name (and optional `litellm_provider`) to one of the three
-/// vendor buckets ai-usage tracks. Returns `None` for anything irrelevant
-/// (Mistral, Cohere, image models, etc.) so we don't waste cache space.
+/// Expose registry classification to focused parser tests.
+#[cfg(test)]
 fn classify_vendor(name: &str, provider: Option<&str>) -> Option<&'static str> {
-    if let Some(p) = provider {
-        let pl = p.to_ascii_lowercase();
-        if pl.contains("anthropic") {
-            return Some("claude");
-        }
-        if pl.contains("openai") {
-            return Some("codex");
-        }
-        if pl.contains("gemini") || pl.contains("vertex_ai") || pl.contains("google") {
-            // Filter further by name to skip non-chat google models like Imagen.
-            if name.starts_with("gemini") || name.contains("gemini") {
-                return Some("gemini");
-            }
-        }
-        if pl.contains("moonshot") {
-            return Some("kimi");
-        }
-    }
-
-    let lower = name.to_ascii_lowercase();
-    if lower.starts_with("claude-") || lower.contains("claude") {
-        return Some("claude");
-    }
-    if lower.starts_with("gemini") || lower.starts_with("models/gemini") {
-        return Some("gemini");
-    }
-    if lower.starts_with("kimi-") {
-        return Some("kimi");
-    }
-    if lower.starts_with("gpt-")
-        || lower.starts_with("o1")
-        || lower.starts_with("o3")
-        || lower.starts_with("o4-")
-        || lower.starts_with("codex-")
-        || lower == "o1"
-        || lower == "o3"
-    {
-        return Some("codex");
-    }
-    None
+    infer_vendor_with_provider(name, provider).pricing_key()
 }
 
 #[cfg(test)]
@@ -283,7 +292,10 @@ mod tests {
         );
         assert_eq!(classify_vendor("o1", None), Some("codex"));
         assert_eq!(classify_vendor("claude-opus-4-7", None), Some("claude"));
-        assert_eq!(classify_vendor("mistral-large", Some("mistral")), None);
+        assert_eq!(
+            classify_vendor("mistral-large", Some("mistral")),
+            Some("mistral")
+        );
     }
 
     #[test]
@@ -306,7 +318,10 @@ mod tests {
             }
         }"#;
         let tables = parse_litellm_payload(payload).expect("parse");
-        let entry = tables.kimi.get("kimi-k2.5").expect("kimi entry present");
+        let entry = tables
+            .models("kimi")
+            .and_then(|models| models.get("kimi-k2.5"))
+            .expect("kimi entry present");
         assert!((entry.input - 0.6).abs() < 1e-9);
         assert!((entry.output - 3.0).abs() < 1e-9);
         assert!((entry.cache_input - 0.1).abs() < 1e-9);
@@ -321,6 +336,156 @@ mod tests {
         );
         assert_eq!(canonical_key("anthropic.claude-3"), "claude-3");
         assert_eq!(canonical_key("vertex_ai/gemini-2.5-pro"), "gemini-2.5-pro");
+    }
+
+    #[test]
+    fn remote_tables_keep_provider_keys_and_only_alias_first_party_models() {
+        let payload = r#"{
+            "gpt-5.6-sol": {
+                "input_cost_per_token": 0.000005,
+                "output_cost_per_token": 0.000030,
+                "litellm_provider": "openai",
+                "mode": "responses"
+            },
+            "azure/eu/gpt-5.6-sol": {
+                "input_cost_per_token": 0.0000055,
+                "output_cost_per_token": 0.000033,
+                "litellm_provider": "azure",
+                "mode": "responses"
+            },
+            "deepseek/deepseek-v4-pro": {
+                "input_cost_per_token": 0.000000435,
+                "output_cost_per_token": 0.00000087,
+                "litellm_provider": "deepseek",
+                "mode": "chat"
+            },
+            "bedrock/anthropic.claude-sonnet-4-6": {
+                "input_cost_per_token": 0.0000033,
+                "output_cost_per_token": 0.0000165,
+                "mode": "chat"
+            },
+            "google/gemini-4-flash": {
+                "input_cost_per_token": 0.000002,
+                "output_cost_per_token": 0.000010,
+                "litellm_provider": "google",
+                "mode": "chat"
+            },
+            "vertex_ai.gemini-4-hosted": {
+                "input_cost_per_token": 0.000009,
+                "output_cost_per_token": 0.000090,
+                "mode": "chat"
+            }
+        }"#;
+
+        let tables = parse_litellm_payload(payload).expect("parse");
+        let openai = tables.models("codex").expect("openai table");
+        assert!((openai["gpt-5.6-sol"].input - 5.0).abs() < 1e-9);
+        assert!((openai["azure/eu/gpt-5.6-sol"].input - 5.5).abs() < 1e-9);
+        let deepseek = tables.models("deepseek").expect("deepseek table");
+        assert!((deepseek["deepseek-v4-pro"].input - 0.435).abs() < 1e-9);
+        let anthropic = tables.models("claude").expect("anthropic table");
+        assert!(anthropic.contains_key("bedrock/anthropic.claude-sonnet-4-6"));
+        assert!(!anthropic.contains_key("claude-sonnet-4-6"));
+        let google = tables.models("gemini").expect("google table");
+        assert!(google.contains_key("gemini-4-flash"));
+        assert!(google.contains_key("vertex_ai.gemini-4-hosted"));
+        assert!(!google.contains_key("gemini-4-hosted"));
+    }
+
+    #[test]
+    fn embedded_rates_win_over_first_party_qualified_and_derived_remote_keys() {
+        let payload = r#"{
+            "deepseek/deepseek-v4-pro": {
+                "input_cost_per_token": 0.000099,
+                "output_cost_per_token": 0.000199,
+                "litellm_provider": "deepseek",
+                "mode": "chat"
+            },
+            "claude-sonnet-4-5": {
+                "input_cost_per_token": 0.000099,
+                "output_cost_per_token": 0.000199,
+                "litellm_provider": "anthropic",
+                "mode": "chat"
+            }
+        }"#;
+        let tables = parse_litellm_payload(payload).expect("parse");
+        let mut pricing = AllPricing::load_raw();
+        pricing.overlay(tables);
+        let pricing = pricing.finalize();
+
+        let deepseek = pricing.get_pricing("deepseek", "deepseek/deepseek-v4-pro");
+        assert!((deepseek.input - 0.435).abs() < 1e-9);
+        assert!((deepseek.output - 0.87).abs() < 1e-9);
+
+        let sonnet = pricing.get_pricing("claude", "claude-sonnet-4-5");
+        assert!((sonnet.input - 3.0).abs() < 1e-9);
+        assert!((sonnet.output - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_requires_current_schema_and_fresh_timestamp() {
+        let tables = VendorTables::default();
+        let cache = PricingCache {
+            schema_version: CACHE_SCHEMA_VERSION,
+            fetched_at: 1_000,
+            tables,
+        };
+        let json = serde_json::to_string(&cache).expect("serialize");
+
+        assert!(parse_cache(&json, 1_000 + CACHE_TTL.as_secs()).is_some());
+        assert!(parse_cache(&json, 1_001 + CACHE_TTL.as_secs()).is_none());
+        assert!(parse_cache("{not-json", 1_000).is_none());
+        assert!(parse_cache(r#"{"claude": {}}"#, 1_000).is_none());
+    }
+
+    #[test]
+    fn cache_write_replaces_an_existing_snapshot() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("temp")
+            .join(format!(
+                "pricing-cache-replace-{}-{nonce}",
+                std::process::id()
+            ));
+        let path = directory.join("pricing-cache.json");
+
+        let mut first = VendorTables::default();
+        first.insert_model("codex", "first-model".to_string(), sample_pricing(1.0));
+        write_cache_file_at(&path, &first, 1_000).expect("write first cache");
+
+        let mut second = VendorTables::default();
+        second.insert_model("deepseek", "second-model".to_string(), sample_pricing(2.0));
+        write_cache_file_at(&path, &second, 2_000).expect("replace cache");
+
+        let content = fs::read_to_string(&path).expect("read replaced cache");
+        let cache = decode_cache(&content).expect("decode replaced cache");
+        assert_eq!(cache.fetched_at, 2_000);
+        assert!(cache.tables.models("codex").is_none());
+        assert!(
+            cache
+                .tables
+                .models("deepseek")
+                .is_some_and(|models| models.contains_key("second-model"))
+        );
+
+        fs::remove_dir_all(directory).expect("remove cache test directory");
+    }
+
+    fn sample_pricing(input: f64) -> ModelPricing {
+        ModelPricing {
+            input,
+            output: input,
+            cache_input: input,
+            cache_output: input,
+            input_above_200k: None,
+            output_above_200k: None,
+            cache_input_above_200k: None,
+            cache_output_above_200k: None,
+            _comment: None,
+        }
     }
 
     #[test]
@@ -345,7 +510,8 @@ mod tests {
         }"#;
         let tables = parse_litellm_payload(payload).expect("parse");
         let entry = tables
-            .claude
+            .models("claude")
+            .expect("claude table")
             .get("claude-3-5-sonnet-20241022")
             .expect("claude sonnet present");
         assert!((entry.input - 3.0).abs() < 1e-9);
@@ -354,7 +520,7 @@ mod tests {
         assert!((entry.cache_output - 3.75).abs() < 1e-9);
         assert_eq!(entry.input_above_200k, Some(6.0));
         // Embedding model must be filtered out (mode != chat).
-        assert!(tables.codex.is_empty());
-        assert!(tables.gemini.is_empty());
+        assert!(tables.models("codex").is_none());
+        assert!(tables.models("gemini").is_none());
     }
 }

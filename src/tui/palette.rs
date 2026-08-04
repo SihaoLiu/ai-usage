@@ -19,12 +19,9 @@ pub(super) const SUBTOTAL_BG: Color = Color::Indexed(234);
 pub(super) const TOTAL_BG: Color = Color::Indexed(237);
 
 pub(super) fn vendor_color(vendor: Vendor) -> Color {
-    match vendor {
-        Vendor::Anthropic => Color::Indexed(208),
-        Vendor::OpenAI => Color::Indexed(255),
-        Vendor::Google => Color::Indexed(39),
-        Vendor::Moonshot => Color::Indexed(49),
-        Vendor::Zhipu => Color::Indexed(135),
-        Vendor::Unknown => Color::Indexed(245),
+    if vendor == Vendor::Unknown {
+        return Color::Indexed(245);
     }
+    const COLORS: [u8; 12] = [208, 255, 39, 49, 135, 44, 213, 75, 209, 220, 141, 214];
+    Color::Indexed(COLORS[vendor.sort_rank() as usize % COLORS.len()])
 }

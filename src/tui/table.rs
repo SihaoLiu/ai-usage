@@ -940,14 +940,7 @@ pub(super) fn draw_table(frame: &mut Frame, area: Rect, dash: &Dashboard) {
 }
 
 fn vendor_by_name(name: &str) -> Vendor {
-    match name {
-        "Anthropic" => Vendor::Anthropic,
-        "OpenAI" => Vendor::OpenAI,
-        "Google" => Vendor::Google,
-        "Moonshot" => Vendor::Moonshot,
-        "Zhipu" => Vendor::Zhipu,
-        _ => Vendor::Unknown,
-    }
+    Vendor::from_display_name(name)
 }
 
 #[cfg(test)]

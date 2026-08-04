@@ -13,25 +13,10 @@ use rayon::prelude::*;
 
 use crate::constants::{AllPricing, ModelPricing};
 use crate::data::UsageEntry;
-use crate::model_id::{Vendor, normalize_reasoning_effort, parse_model_identity};
+use crate::model_id::normalize_reasoning_effort;
 use crate::time_utils::{
     TokenFractions, distribute_tokens_to_intervals, parse_timestamp, to_interval,
 };
-
-pub(crate) fn pricing_provider_for_entry<'a>(tool: &'a str, entry: &'a UsageEntry) -> &'a str {
-    if tool != "omp" {
-        return tool;
-    }
-
-    match parse_model_identity(&entry.model).vendor {
-        Vendor::Anthropic => "claude",
-        Vendor::Google => "gemini",
-        Vendor::Moonshot => "kimi",
-        // No dedicated pricing table for Zhipu yet; unknown-vendor entries
-        // have always priced through the codex defaults.
-        Vendor::OpenAI | Vendor::Zhipu | Vendor::Unknown => "codex",
-    }
-}
 
 fn model_key_for_entry(entry: &UsageEntry, combine_effort: bool) -> String {
     if !combine_effort {
@@ -62,9 +47,8 @@ fn resolve_entry_pricing<'a>(
             .entry(entry.model.as_str())
             .or_insert_with(HashMap::new);
         tiers.entry(entry.fast_tier).or_insert_with(|| {
-            let provider = pricing_provider_for_entry(tool, entry);
             pricing
-                .pricing_for_entry(provider, &entry.model, entry.fast_tier)
+                .pricing_for_entry(tool, &entry.model, entry.fast_tier)
                 .into_owned()
         });
     }
@@ -693,19 +677,6 @@ mod tests {
         let timestamp = parse_timestamp("2026-06-15T12:00:00Z").expect("timestamp");
         let bucket = to_interval(&timestamp, 60);
         assert_eq!(comparison[&bucket]["Codex"], 3_200_000.0);
-    }
-
-    #[test]
-    fn omp_pricing_provider_comes_from_model_id() {
-        let claude = usage_entry("claude-sonnet-4-5-20250929", Some("rust-cat"), None);
-        let google = usage_entry("gemini-2.5-pro", Some("rust-cat"), None);
-        let open = usage_entry("gpt-5", Some("rust-cat"), None);
-        let kimi = usage_entry("kimi-k2.5", Some("rust-cat"), None);
-
-        assert_eq!(pricing_provider_for_entry("omp", &claude), "claude");
-        assert_eq!(pricing_provider_for_entry("omp", &google), "gemini");
-        assert_eq!(pricing_provider_for_entry("omp", &open), "codex");
-        assert_eq!(pricing_provider_for_entry("omp", &kimi), "kimi");
     }
 
     #[test]

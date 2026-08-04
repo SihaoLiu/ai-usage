@@ -129,6 +129,13 @@ pub struct MachineList {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncPolicy {
+    pub min_request_interval_ms: u64,
+    pub request_phase_ms: u64,
+    pub max_request_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub ok: bool,
     pub version: String,
@@ -136,6 +143,8 @@ pub struct HealthResponse {
     pub uptime_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_policy: Option<SyncPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,6 +666,29 @@ mod tests {
         .expect("deserialize legacy health response");
 
         assert_eq!(response.instance_id, None);
+        assert_eq!(response.sync_policy, None);
+    }
+
+    #[test]
+    fn health_response_round_trips_sync_policy() {
+        let response = HealthResponse {
+            ok: true,
+            version: "3.3.0".to_string(),
+            schema_version: SCHEMA_VERSION,
+            uptime_seconds: 42,
+            instance_id: Some("server-a".to_string()),
+            sync_policy: Some(SyncPolicy {
+                min_request_interval_ms: 1_500,
+                request_phase_ms: 250,
+                max_request_interval_ms: 60_000,
+            }),
+        };
+
+        let encoded = serde_json::to_string(&response).expect("serialize health response");
+        let decoded: HealthResponse =
+            serde_json::from_str(&encoded).expect("deserialize health response");
+
+        assert_eq!(decoded, response);
     }
 
     #[test]

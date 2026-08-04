@@ -83,7 +83,7 @@ Check the public health endpoint:
 curl https://usage.your-domain.example/v1/health
 ```
 
-The health response includes the running server `version`, `schema_version`, and `uptime_seconds`.
+The health response includes the running server `version`, `schema_version`, `uptime_seconds`, stable `instance_id`, and an optional request pacing policy. Current clients use that policy automatically; older clients ignore the additional fields.
 
 ## Client Setup
 
@@ -125,13 +125,17 @@ Normal monitor mode starts a background sync worker after local cache refreshes 
 
 Clients identify themselves to current servers with their configured `machine_id`. The server maintains a separate token bucket for each machine, so a busy client cannot consume another client's request allowance. A bounded aggregate bucket protects the whole service from request floods, and idle per-machine buckets are discarded so authenticated clients cannot grow the limiter indefinitely by rotating identifiers. Clients from older releases that do not send the identity header remain supported through a legacy bucket.
 
+The health response derives a sustained request interval from the per-machine limit, the aggregate limit, and the configured `allowed_hosts`. It also assigns each configured machine a stable phase within that interval. This spreads simultaneous client starts across the server's available capacity instead of relying on `429` responses after a burst. Clients increase the negotiated interval after timeouts, transient server errors, or rate limits, then reduce it toward the server baseline after consecutive successful requests. A malformed policy cannot make a client sleep for more than five minutes between requests.
+
 Normal uploads use snapshot reconciliation. An append-only cache change sends only new or changed fingerprints and records; a full manifest and finalization are reserved for deletions or missing local state. Request bodies are kept below approximately 700 KiB, and pull pages are capped at 5,000 records by both current clients and servers. The server cap also protects small deployments when an older client requests a 20,000-record page.
 
 Monitor mode applies a stable per-machine delay of up to 60 seconds after cache refreshes, preventing machines with similar schedules from synchronizing at once. A local file lock also prevents multiple `ai-usage` processes on one machine from running overlapping sync cycles.
 
-The client retries temporary transport failures and HTTP `408`, `425`, `429`, `500`, `502`, `503`, and `504` responses with exponential, per-machine jitter. A server `Retry-After` header is honored. If a whole background cycle still fails, the worker retries it automatically instead of waiting for the next monitor refresh.
+The client retries temporary transport failures and HTTP `408`, `425`, `429`, `500`, `502`, `503`, and `504` responses with exponential, per-machine jitter. A server `Retry-After` header is honored. Snapshot finalization has a two-minute minimum request budget because it may remove stale rows on a small server, while other requests retain the configured timeout. If a whole background cycle still fails, the worker retries it automatically with exponential backoff up to 30 minutes instead of waiting for the next monitor refresh.
 
 When the local vendor caches have not changed, a small upload receipt lets the upload path skip loading the full fingerprint state and rescanning every record. The receipt is scoped to the server instance, URL, machine ID, and project-hash policy. The client checks both the server's record count and per-host content revision before using it, so a replaced or restored database, missing host, or wire-affecting configuration change triggers reconciliation. A v3.0.0 server exposes neither instance IDs nor content revisions, so current clients force both a full upload reconciliation and a pull backfill at least every six hours while connected to one. The large fingerprint file is rebuildable state: corruption cannot strand the server, because the next local cache change falls back to a full manifest.
+
+Full reconciliation persists one attempt ID before sending its manifest. Retries and process restarts reuse that ID until the client confirms completion, while a later reconciliation receives a new ID. The client atomically stores the ready-to-finalize attempt ID, scope, and manifest separately from the last confirmed manifest, so a cache change during recovery cannot pair one attempt with another manifest or erase the deletion baseline. The server assigns a persistent arrival order to every snapshot attempt and permits only the latest attempt for a machine to write or finalize. Unknown and superseded attempts receive HTTP 409 across every snapshot endpoint, causing current clients to discard and rebuild them while remaining visibly unsuccessful to older clients. Retrying the latest completed finalize remains a no-op. Repeated manifests do not rewrite rows already marked with the same attempt ID, and machine record counts are maintained from transactional insert and delete deltas instead of rescanning every record after each batch.
 
 ## Integrity Checks
 

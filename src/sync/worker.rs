@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_PANICS: u32 = 3;
@@ -459,6 +459,16 @@ mod tests {
             next_backoff(Duration::from_secs(40), Duration::from_secs(60)),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn production_retry_backoff_reaches_a_low_pressure_ceiling() {
+        let mut backoff = INITIAL_BACKOFF;
+        for _ in 0..20 {
+            backoff = next_backoff(backoff, MAX_BACKOFF);
+        }
+
+        assert_eq!(backoff, Duration::from_secs(30 * 60));
     }
 
     #[test]

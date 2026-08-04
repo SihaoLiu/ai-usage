@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const SUPPORTED_PULL_VENDORS: [&str; 5] = ["claude", "codex", "gemini", "kimi", "omp"];
 const VENDORS: [&str; 5] = SUPPORTED_PULL_VENDORS;
@@ -36,6 +37,7 @@ const LEGACY_PULL_BACKFILL_INTERVAL: Duration = Duration::hours(6);
 const SNAPSHOT_UPLOAD_STATE_VERSION: u32 = state::SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION;
 const OMP_METADATA_REFRESH_LOG_VENDOR: &str = "omp-metadata-refresh";
 const PULL_SCOPE_ALL_HOSTS_MARKER: &str = "scope:all-hosts";
+static SNAPSHOT_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 struct UploadCandidate {
@@ -412,7 +414,6 @@ fn run_snapshot_upload_once_with_progress<F>(
 where
     F: FnMut(&SyncProgress),
 {
-    let snapshot_id = snapshot_id(&config.machine_id);
     let cache_generation =
         crate::sync::cache_generation::local_cache_generation(cache_root, &VENDORS);
     let server_instance_id = transport.server_instance_id()?;
@@ -420,6 +421,42 @@ where
         config,
         server_instance_id.as_deref(),
     );
+    if let Some(pending) =
+        state::pending_snapshot_upload(cache_root, &sync_scope, &cache_generation)
+    {
+        let record_count = pending.state.record_hashes.len();
+        on_progress(&SyncProgress::UploadPlanned {
+            total_records: 0,
+            total_batches: 0,
+            skipped_records: record_count,
+        });
+        finalize_snapshot_attempt(
+            cache_root,
+            transport,
+            &SnapshotFinalizeRequest {
+                host_id: config.machine_id.clone(),
+                snapshot_id: pending.snapshot_id,
+            },
+        )?;
+        let content_revision =
+            reconciled_snapshot_revision(transport, &config.machine_id, record_count)?;
+        state::commit_pending_snapshot_upload(
+            cache_root,
+            &pending.state,
+            &sync_scope,
+            content_revision,
+        )?;
+        on_progress(&SyncProgress::UploadFinished {
+            uploaded_records: 0,
+            total_records: 0,
+            accepted: 0,
+            ignored: 0,
+        });
+        return Ok(Some(UploadOutcome {
+            held_back_vendors: Vec::new(),
+            stable_data_changed: pending.stable_data_changed,
+        }));
+    }
     let receipt = state::snapshot_cache_receipt(cache_root, &sync_scope);
     let remote_status = receipt
         .as_ref()
@@ -478,6 +515,13 @@ where
             .record_hashes
             .keys()
             .any(|key| !snapshot.fingerprints.contains_key(key));
+    let candidate_snapshot_id = snapshot_id(&config.machine_id);
+    let snapshot_id = state::snapshot_attempt_id(
+        cache_root,
+        &sync_scope,
+        &cache_generation,
+        &candidate_snapshot_id,
+    )?;
     let manifest_count = snapshot
         .fingerprints
         .iter()
@@ -521,7 +565,7 @@ where
                 {
                     Ok(false)
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(snapshot_attempt_error(cache_root, "snapshot diff", error)),
             }
         };
         if requires_full_reconciliation && manifest_count == 0 && !submit(Vec::new())? {
@@ -564,33 +608,55 @@ where
         ));
     }
 
-    if requires_full_reconciliation {
-        transport.snapshot_finalize(&SnapshotFinalizeRequest {
-            host_id: config.machine_id.clone(),
-            snapshot_id,
-        })?;
-    }
-
-    let content_revision =
-        reconciled_snapshot_revision(transport, &config.machine_id, snapshot_record_count)?;
     let SnapshotManifest {
         fingerprints,
         full_hash,
     } = snapshot;
-    state::save_snapshot_upload_state(
-        cache_root,
-        &state::SnapshotUploadState {
-            schema_version: SNAPSHOT_UPLOAD_STATE_VERSION,
-            full_hash,
-            cache_generation,
-            record_hashes: fingerprints
-                .into_iter()
-                .map(|(key, record)| (key, record.record_hash))
-                .collect(),
-        },
-        &sync_scope,
-        content_revision,
-    )?;
+    let completed_state = state::SnapshotUploadState {
+        schema_version: SNAPSHOT_UPLOAD_STATE_VERSION,
+        full_hash,
+        cache_generation,
+        record_hashes: fingerprints
+            .into_iter()
+            .map(|(key, record)| (key, record.record_hash))
+            .collect(),
+    };
+
+    if requires_full_reconciliation {
+        state::save_pending_snapshot_upload(
+            cache_root,
+            &completed_state,
+            &sync_scope,
+            &snapshot_id,
+            stable_data_changed,
+        )?;
+        finalize_snapshot_attempt(
+            cache_root,
+            transport,
+            &SnapshotFinalizeRequest {
+                host_id: config.machine_id.clone(),
+                snapshot_id,
+            },
+        )?;
+    }
+
+    let content_revision =
+        reconciled_snapshot_revision(transport, &config.machine_id, snapshot_record_count)?;
+    if requires_full_reconciliation {
+        state::commit_pending_snapshot_upload(
+            cache_root,
+            &completed_state,
+            &sync_scope,
+            content_revision,
+        )?;
+    } else {
+        state::save_snapshot_upload_state(
+            cache_root,
+            &completed_state,
+            &sync_scope,
+            content_revision,
+        )?;
+    }
     on_progress(&SyncProgress::UploadFinished {
         uploaded_records: progress.uploaded_records,
         total_records: progress.total_records,
@@ -601,6 +667,29 @@ where
         held_back_vendors: Vec::new(),
         stable_data_changed,
     }))
+}
+
+fn finalize_snapshot_attempt(
+    cache_root: &Path,
+    transport: &impl SyncTransport,
+    request: &SnapshotFinalizeRequest,
+) -> Result<(), SyncError> {
+    transport
+        .snapshot_finalize(request)
+        .map(|_| ())
+        .map_err(|error| snapshot_attempt_error(cache_root, "snapshot finalize", error))
+}
+
+fn snapshot_attempt_error(cache_root: &Path, operation: &str, error: SyncError) -> SyncError {
+    if !error.to_string().starts_with("http status: 409") {
+        return SyncError::new(format!("{operation}: {error}"));
+    }
+    match state::discard_snapshot_attempt(cache_root) {
+        Ok(()) => SyncError::new(format!("{operation}: superseded")),
+        Err(discard_error) => SyncError::new(format!(
+            "{operation}: superseded; discard attempt: {discard_error}"
+        )),
+    }
 }
 
 fn remote_snapshot_status(
@@ -780,6 +869,7 @@ enum SnapshotBatchError {
 }
 
 fn send_snapshot_batch<F>(
+    cache_root: &Path,
     transport: &impl SyncTransport,
     host_id: &str,
     snapshot_id: &str,
@@ -804,7 +894,11 @@ where
             if is_unsupported_vendor_error(&error) {
                 SnapshotBatchError::Unsupported
             } else {
-                SnapshotBatchError::Sync(error)
+                SnapshotBatchError::Sync(snapshot_attempt_error(
+                    cache_root,
+                    "snapshot records",
+                    error,
+                ))
             }
         })?;
     progress.batch_index += 1;
@@ -905,6 +999,7 @@ where
                 && (batch.len() >= BATCH_SIZE || batch_bytes + record_bytes > UPLOAD_TARGET_BYTES)
             {
                 send_snapshot_batch(
+                    cache_root,
                     transport,
                     &config.machine_id,
                     snapshot_id,
@@ -935,6 +1030,7 @@ where
         ));
     }
     match send_snapshot_batch(
+        cache_root,
         transport,
         &config.machine_id,
         snapshot_id,
@@ -1006,7 +1102,12 @@ fn wire_record_fingerprint(record: &WireRecord) -> Result<(String, usize), SyncE
 }
 
 fn snapshot_id(machine_id: &str) -> String {
-    format!("{}:{}", machine_id, Utc::now().format("%Y%m%dT%H%M%SZ"))
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = SNAPSHOT_NONCE.fetch_add(1, Ordering::Relaxed);
+    format!("{machine_id}:{nanos:032x}{nonce:016x}")
 }
 
 fn is_unsupported_snapshot_error(err: &SyncError) -> bool {

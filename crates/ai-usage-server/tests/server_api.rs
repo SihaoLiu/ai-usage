@@ -1,6 +1,6 @@
 use ai_usage_proto::{
-    INTEGRITY_ALGORITHM, IntegrityReport, IntegrityReportList, IntegritySubmitResponse,
-    MachineList, PullResponse, SCHEMA_VERSION, UploadResponse, WireRecord,
+    HealthResponse, INTEGRITY_ALGORITHM, IntegrityReport, IntegrityReportList,
+    IntegritySubmitResponse, MachineList, PullResponse, SCHEMA_VERSION, UploadResponse, WireRecord,
 };
 use ai_usage_server::{AppState, AutoUpdateConfig, ServerConfig, build_app};
 use axum::body::{Body, to_bytes};
@@ -267,6 +267,53 @@ async fn health_is_public() {
 }
 
 #[tokio::test]
+async fn health_assigns_configured_clients_distinct_request_slots() {
+    let mut cfg = config("health-sync-policy");
+    cfg.allowed_hosts = Some(HashSet::from([
+        "client-a".to_string(),
+        "client-b".to_string(),
+        "client-c".to_string(),
+        "client-d".to_string(),
+        "client-e".to_string(),
+        "client-f".to_string(),
+    ]));
+    let app = build_app(AppState::new(cfg).expect("app state"));
+
+    let first: HealthResponse = read_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .header("x-ai-usage-client", "client-a")
+                    .body(Body::empty())
+                    .expect("first request"),
+            )
+            .await
+            .expect("first response"),
+    )
+    .await;
+    let second: HealthResponse = read_json(
+        app.oneshot(
+            Request::builder()
+                .uri("/v1/health")
+                .header("x-ai-usage-client", "client-b")
+                .body(Body::empty())
+                .expect("second request"),
+        )
+        .await
+        .expect("second response"),
+    )
+    .await;
+
+    let first = first.sync_policy.expect("first sync policy");
+    let second = second.sync_policy.expect("second sync policy");
+    assert_eq!(first.min_request_interval_ms, 1_500);
+    assert_eq!(second.min_request_interval_ms, 1_500);
+    assert_eq!(first.request_phase_ms, 0);
+    assert_eq!(second.request_phase_ms, 250);
+}
+
+#[tokio::test]
 async fn health_instance_id_tracks_the_database() {
     async fn instance_id(cfg: ServerConfig) -> String {
         let response = build_app(AppState::new(cfg).expect("app state"))
@@ -512,6 +559,261 @@ async fn snapshot_finalize_deletes_keys_missing_from_active_manifest() {
     let body: PullResponse = read_json(pull).await;
     assert_eq!(body.records.len(), 1);
     assert_eq!(body.records[0].record.dedup_key, active.dedup_key);
+}
+
+#[tokio::test]
+async fn completed_snapshot_finalize_is_idempotent() {
+    let app = app("snapshot-finalize-idempotent").await;
+    let active = record("laptop", "claude", "active", 10);
+    let stale = record("laptop", "claude", "stale", 20);
+    let upload = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/upload",
+            ndjson(&[active.clone(), stale]),
+        ))
+        .await
+        .expect("upload response");
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let keys = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/keys",
+            json!({
+                "host_id": "laptop",
+                "snapshot_id": "snapshot-idempotent",
+                "keys": [{"vendor": "claude", "dedup_key": "active"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("keys response");
+    assert_eq!(keys.status(), StatusCode::OK);
+
+    let first = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/finalize",
+            json!({
+                "host_id": "laptop",
+                "snapshot_id": "snapshot-idempotent"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("first finalize response");
+    let first_body: serde_json::Value = read_json(first).await;
+    assert_eq!(first_body["deleted"], json!(1));
+
+    let late = record("laptop", "codex", "late", 30);
+    let upload = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[late])))
+        .await
+        .expect("late upload response");
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let retry = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/finalize",
+            json!({
+                "host_id": "laptop",
+                "snapshot_id": "snapshot-idempotent"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("retry finalize response");
+    let retry_body: serde_json::Value = read_json(retry).await;
+    assert_eq!(retry_body["deleted"], json!(0));
+
+    let pull = app
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=claude,codex",
+            Body::empty(),
+        ))
+        .await
+        .expect("pull response");
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 2);
+    assert!(
+        body.records
+            .iter()
+            .any(|record| record.record.dedup_key == "late")
+    );
+}
+
+#[tokio::test]
+async fn stale_completed_snapshot_finalize_cannot_overwrite_a_newer_snapshot() {
+    let app = app("snapshot-finalize-stale-retry").await;
+    let first = record("laptop", "claude", "first", 10);
+    let upload = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[first])))
+        .await
+        .expect("first upload");
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    for (snapshot_id, keys) in [
+        ("snapshot-a", vec![("claude", "first")]),
+        ("snapshot-b", vec![("claude", "first"), ("codex", "second")]),
+    ] {
+        if snapshot_id == "snapshot-b" {
+            let second = record("laptop", "codex", "second", 20);
+            let upload = app
+                .clone()
+                .oneshot(authed_request("POST", "/v1/upload", ndjson(&[second])))
+                .await
+                .expect("second upload");
+            assert_eq!(upload.status(), StatusCode::OK);
+        }
+        let keys = keys
+            .into_iter()
+            .map(|(vendor, dedup_key)| json!({ "vendor": vendor, "dedup_key": dedup_key }))
+            .collect::<Vec<_>>();
+        let mark = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                "/v1/snapshot/keys",
+                json!({
+                    "host_id": "laptop",
+                    "snapshot_id": snapshot_id,
+                    "keys": keys
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("snapshot keys");
+        assert_eq!(mark.status(), StatusCode::OK);
+        let finalize = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                "/v1/snapshot/finalize",
+                json!({ "host_id": "laptop", "snapshot_id": snapshot_id }).to_string(),
+            ))
+            .await
+            .expect("snapshot finalize");
+        assert_eq!(finalize.status(), StatusCode::OK);
+    }
+
+    let stale_retry = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/finalize",
+            json!({ "host_id": "laptop", "snapshot_id": "snapshot-a" }).to_string(),
+        ))
+        .await
+        .expect("stale finalize retry");
+    assert_eq!(stale_retry.status(), StatusCode::CONFLICT);
+
+    let pull = app
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=claude,codex",
+            Body::empty(),
+        ))
+        .await
+        .expect("pull response");
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 2);
+}
+
+#[tokio::test]
+async fn unfinished_snapshot_finalize_cannot_overwrite_a_newer_snapshot() {
+    let app = app("snapshot-finalize-unfinished-stale").await;
+    let first = record("laptop", "claude", "first", 10);
+    let upload = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[first])))
+        .await
+        .expect("first upload");
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let mark_a = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/keys",
+            json!({
+                "host_id": "laptop",
+                "snapshot_id": "snapshot-a",
+                "keys": [{"vendor": "claude", "dedup_key": "first"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("first snapshot keys");
+    assert_eq!(mark_a.status(), StatusCode::OK);
+
+    let second = record("laptop", "codex", "second", 20);
+    let upload = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/upload", ndjson(&[second])))
+        .await
+        .expect("second upload");
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let mark_b = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/keys",
+            json!({
+                "host_id": "laptop",
+                "snapshot_id": "snapshot-b",
+                "keys": [
+                    {"vendor": "claude", "dedup_key": "first"},
+                    {"vendor": "codex", "dedup_key": "second"}
+                ]
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("second snapshot keys");
+    assert_eq!(mark_b.status(), StatusCode::OK);
+
+    let finalize_b = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/finalize",
+            json!({"host_id": "laptop", "snapshot_id": "snapshot-b"}).to_string(),
+        ))
+        .await
+        .expect("second snapshot finalize");
+    assert_eq!(finalize_b.status(), StatusCode::OK);
+
+    let finalize_a = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/snapshot/finalize",
+            json!({"host_id": "laptop", "snapshot_id": "snapshot-a"}).to_string(),
+        ))
+        .await
+        .expect("stale unfinished snapshot finalize");
+    assert_eq!(finalize_a.status(), StatusCode::CONFLICT);
+
+    let pull = app
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=claude,codex",
+            Body::empty(),
+        ))
+        .await
+        .expect("pull response");
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 2);
 }
 
 #[tokio::test]

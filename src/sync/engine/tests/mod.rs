@@ -45,6 +45,9 @@ struct DiffSnapshotTransport {
     server_instance_id: Option<String>,
     remote_snapshot_state: RemoteSnapshotState,
     after_first_diff: RefCell<Option<Box<dyn FnOnce()>>>,
+    diff_error: RefCell<Option<SyncError>>,
+    record_error: RefCell<Option<SyncError>>,
+    finalize_error: RefCell<Option<SyncError>>,
 }
 
 impl FakeTransport {
@@ -196,6 +199,9 @@ impl DiffSnapshotTransport {
             server_instance_id: None,
             remote_snapshot_state: RemoteSnapshotState::Unavailable,
             after_first_diff: RefCell::new(None),
+            diff_error: RefCell::new(None),
+            record_error: RefCell::new(None),
+            finalize_error: RefCell::new(None),
         }
     }
 
@@ -211,6 +217,21 @@ impl DiffSnapshotTransport {
 
     fn with_after_first_diff(self, action: impl FnOnce() + 'static) -> Self {
         *self.after_first_diff.borrow_mut() = Some(Box::new(action));
+        self
+    }
+
+    fn with_finalize_error(self, message: &str) -> Self {
+        *self.finalize_error.borrow_mut() = Some(SyncError::new(message));
+        self
+    }
+
+    fn with_diff_error(self, message: &str) -> Self {
+        *self.diff_error.borrow_mut() = Some(SyncError::new(message));
+        self
+    }
+
+    fn with_record_error(self, message: &str) -> Self {
+        *self.record_error.borrow_mut() = Some(SyncError::new(message));
         self
     }
 }
@@ -244,6 +265,9 @@ impl SyncTransport for DiffSnapshotTransport {
         request: &SnapshotDiffRequest,
     ) -> Result<SnapshotDiffResponse, SyncError> {
         self.snapshot_diffs.borrow_mut().push(request.clone());
+        if let Some(error) = self.diff_error.borrow_mut().take() {
+            return Err(error);
+        }
         if let Some(action) = self.after_first_diff.borrow_mut().take() {
             action();
         }
@@ -260,6 +284,9 @@ impl SyncTransport for DiffSnapshotTransport {
         self.snapshot_record_batches
             .borrow_mut()
             .push(batch.clone());
+        if let Some(error) = self.record_error.borrow_mut().take() {
+            return Err(error);
+        }
         Ok(UploadResponse {
             accepted: batch.records.len(),
             ignored: 0,
@@ -274,6 +301,9 @@ impl SyncTransport for DiffSnapshotTransport {
         self.snapshot_finalizations
             .borrow_mut()
             .push(request.clone());
+        if let Some(error) = self.finalize_error.borrow_mut().take() {
+            return Err(error);
+        }
         Ok(SnapshotFinalizeResponse {
             deleted: 0,
             max_seq: 0,

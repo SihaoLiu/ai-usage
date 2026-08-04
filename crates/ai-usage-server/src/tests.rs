@@ -20,6 +20,31 @@ fn test_state(name: &str) -> AppState {
     .expect("test state")
 }
 
+fn test_record() -> WireRecord {
+    WireRecord {
+        schema_version: SCHEMA_VERSION,
+        host_id: "workstation".to_string(),
+        vendor: "codex".to_string(),
+        dedup_key: "record-a".to_string(),
+        timestamp: "2026-08-04T12:00:00Z".to_string(),
+        session_start_time: "2026-08-04T12:00:00Z".to_string(),
+        session_end_time: "2026-08-04T12:01:00Z".to_string(),
+        model: "test-model".to_string(),
+        effort: None,
+        fast_tier: -1,
+        input_tokens: 10,
+        output_tokens: 20,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        reasoning_output_tokens: 0,
+        cost_input: None,
+        cost_output: None,
+        cost_cache_read: None,
+        cost_cache_creation: None,
+        project_path_sha256: None,
+    }
+}
+
 #[tokio::test]
 async fn write_gate_serializes_database_writers() {
     let state = test_state("serializes");
@@ -36,6 +61,58 @@ async fn write_gate_serializes_database_writers() {
         .await
         .expect("second writer should proceed")
         .expect("second writer task");
+}
+
+#[test]
+fn repeated_snapshot_marks_do_not_rewrite_records() {
+    let state = test_state("idempotent-snapshot-mark");
+    let mut conn = state.pool.get().expect("database connection");
+    let tx = conn.transaction().expect("transaction");
+    let record = test_record();
+    upsert_record(&tx, &record, "2026-08-04T12:01:00Z").expect("insert record");
+
+    let first = mark_snapshot_key(
+        &tx,
+        &record.host_id,
+        &record.vendor,
+        &record.dedup_key,
+        "snapshot-a",
+    )
+    .expect("first mark");
+    let repeated = mark_snapshot_key(
+        &tx,
+        &record.host_id,
+        &record.vendor,
+        &record.dedup_key,
+        "snapshot-a",
+    )
+    .expect("repeated mark");
+
+    assert_eq!(first, 1);
+    assert_eq!(repeated, 0);
+}
+
+#[test]
+fn upsert_outcome_distinguishes_insert_replace_and_noop() {
+    let state = test_state("upsert-outcome");
+    let mut conn = state.pool.get().expect("database connection");
+    let tx = conn.transaction().expect("transaction");
+    let record = test_record();
+
+    assert_eq!(
+        upsert_record(&tx, &record, "2026-08-04T12:01:00Z").expect("insert record"),
+        UpsertOutcome::Inserted
+    );
+    assert_eq!(
+        upsert_record(&tx, &record, "2026-08-04T12:02:00Z").expect("repeat record"),
+        UpsertOutcome::Unchanged
+    );
+    let mut replacement = record;
+    replacement.input_tokens += 1;
+    assert_eq!(
+        upsert_record(&tx, &replacement, "2026-08-04T12:03:00Z").expect("replace record"),
+        UpsertOutcome::Replaced
+    );
 }
 
 #[test]
@@ -138,4 +215,27 @@ fn configured_hosts_own_their_rate_limit_buckets() {
             .collect::<Vec<_>>(),
         vec![LEGACY_RATE_LIMIT_KEY.to_string()]
     );
+}
+
+#[test]
+fn negotiated_sync_policy_divides_global_capacity_into_stable_slots() {
+    let mut state = test_state("sync-policy-slots");
+    Arc::make_mut(&mut state.config).allowed_hosts = Some(HashSet::from([
+        "client-a".to_string(),
+        "client-b".to_string(),
+        "client-c".to_string(),
+        "client-d".to_string(),
+        "client-e".to_string(),
+        "client-f".to_string(),
+    ]));
+
+    let first = negotiated_sync_policy(&state.config, Some("client-a"));
+    let repeated = negotiated_sync_policy(&state.config, Some("client-a"));
+    let second = negotiated_sync_policy(&state.config, Some("client-b"));
+
+    assert_eq!(first.min_request_interval_ms, 1_500);
+    assert_eq!(first.request_phase_ms, 0);
+    assert_eq!(second.request_phase_ms, 250);
+    assert_eq!(first, repeated);
+    assert!(first.max_request_interval_ms >= first.min_request_interval_ms);
 }

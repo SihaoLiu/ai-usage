@@ -12,6 +12,8 @@ const SYNC_STATE_FILE: &str = "sync_state.json";
 const SYNC_UPLOAD_LOG_FILE: &str = "sync_upload_log.bin";
 const SYNC_SNAPSHOT_STATE_FILE: &str = "sync_snapshot_state.bin";
 const SYNC_SNAPSHOT_MARKER_FILE: &str = "sync_snapshot_marker.json";
+const SYNC_SNAPSHOT_ATTEMPT_FILE: &str = "sync_snapshot_attempt.json";
+const SYNC_SNAPSHOT_PENDING_FILE: &str = "sync_snapshot_pending.bin";
 const SNAPSHOT_MARKER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +59,30 @@ struct SnapshotCacheMarker {
     content_revision: Option<u64>,
     #[serde(default)]
     verified_at_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingSnapshotRecord {
+    schema_version: u32,
+    snapshot_id: String,
+    sync_scope: String,
+    stable_data_changed: bool,
+    state: SnapshotUploadState,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapshotAttemptMarker {
+    schema_version: u32,
+    snapshot_id: String,
+    sync_scope: String,
+    cache_generation: String,
+}
+
+#[derive(Debug)]
+pub struct PendingSnapshotUpload {
+    pub snapshot_id: String,
+    pub stable_data_changed: bool,
+    pub state: SnapshotUploadState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +170,90 @@ pub fn save_snapshot_upload_state(
     let path = cache_root.join(SYNC_SNAPSHOT_STATE_FILE);
     let content = bincode::serialize(state).map_err(io::Error::other)?;
     atomic_write(&path, &content)?;
-    save_snapshot_cache_marker(cache_root, state, sync_scope, content_revision)
+    save_snapshot_cache_marker(cache_root, state, sync_scope, content_revision)?;
+    remove_if_exists(&cache_root.join(SYNC_SNAPSHOT_ATTEMPT_FILE))?;
+    remove_if_exists(&cache_root.join(SYNC_SNAPSHOT_PENDING_FILE))
+}
+
+pub fn snapshot_attempt_id(
+    cache_root: &Path,
+    sync_scope: &str,
+    cache_generation: &str,
+    candidate: &str,
+) -> io::Result<String> {
+    let path = cache_root.join(SYNC_SNAPSHOT_ATTEMPT_FILE);
+    if let Ok(content) = fs::read(&path)
+        && let Ok(marker) = serde_json::from_slice::<SnapshotAttemptMarker>(&content)
+        && marker.schema_version == SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION
+        && marker.sync_scope == sync_scope
+        && marker.cache_generation == cache_generation
+    {
+        return Ok(marker.snapshot_id);
+    }
+    let marker = SnapshotAttemptMarker {
+        schema_version: SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION,
+        snapshot_id: candidate.to_string(),
+        sync_scope: sync_scope.to_string(),
+        cache_generation: cache_generation.to_string(),
+    };
+    atomic_write(&path, &serde_json::to_vec(&marker)?)?;
+    Ok(marker.snapshot_id)
+}
+
+pub fn save_pending_snapshot_upload(
+    cache_root: &Path,
+    state: &SnapshotUploadState,
+    sync_scope: &str,
+    snapshot_id: &str,
+    stable_data_changed: bool,
+) -> io::Result<()> {
+    let pending = PendingSnapshotRecord {
+        schema_version: SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION,
+        snapshot_id: snapshot_id.to_string(),
+        sync_scope: sync_scope.to_string(),
+        stable_data_changed,
+        state: state.clone(),
+    };
+    let content = bincode::serialize(&pending).map_err(io::Error::other)?;
+    atomic_write(&cache_root.join(SYNC_SNAPSHOT_PENDING_FILE), &content)
+}
+
+pub fn pending_snapshot_upload(
+    cache_root: &Path,
+    sync_scope: &str,
+    cache_generation: &str,
+) -> Option<PendingSnapshotUpload> {
+    let content = fs::read(cache_root.join(SYNC_SNAPSHOT_PENDING_FILE)).ok()?;
+    let pending = bincode::deserialize::<PendingSnapshotRecord>(&content).ok()?;
+    if pending.schema_version != SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION
+        || pending.sync_scope != sync_scope
+    {
+        return None;
+    }
+    if pending.state.schema_version != SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION
+        || pending.state.cache_generation != cache_generation
+    {
+        return None;
+    }
+    Some(PendingSnapshotUpload {
+        snapshot_id: pending.snapshot_id,
+        stable_data_changed: pending.stable_data_changed,
+        state: pending.state,
+    })
+}
+
+pub fn discard_snapshot_attempt(cache_root: &Path) -> io::Result<()> {
+    remove_if_exists(&cache_root.join(SYNC_SNAPSHOT_ATTEMPT_FILE))?;
+    remove_if_exists(&cache_root.join(SYNC_SNAPSHOT_PENDING_FILE))
+}
+
+pub fn commit_pending_snapshot_upload(
+    cache_root: &Path,
+    state: &SnapshotUploadState,
+    sync_scope: &str,
+    content_revision: Option<u64>,
+) -> io::Result<()> {
+    save_snapshot_upload_state(cache_root, state, sync_scope, content_revision)
 }
 
 fn save_snapshot_cache_marker(
@@ -195,6 +304,14 @@ fn unix_time_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -429,6 +546,38 @@ mod tests {
                 .record_count,
             0
         );
+    }
+
+    #[test]
+    fn torn_pending_snapshot_pair_is_rejected() {
+        let cache_root = unique_temp_dir("torn-pending-snapshot");
+        let first = SnapshotUploadState {
+            schema_version: SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION,
+            full_hash: "first".to_string(),
+            cache_generation: "generation-a".to_string(),
+            record_hashes: BTreeMap::new(),
+        };
+        save_pending_snapshot_upload(&cache_root, &first, "scope-a", "snapshot-a", true)
+            .expect("save first pending snapshot");
+
+        let second = SnapshotUploadState {
+            schema_version: SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION,
+            full_hash: "second".to_string(),
+            cache_generation: "generation-b".to_string(),
+            record_hashes: BTreeMap::new(),
+        };
+        let encoded = bincode::serialize(&second).expect("serialize second state");
+        atomic_write(
+            &cache_root.join("sync_snapshot_pending_state.bin"),
+            &encoded,
+        )
+        .expect("replace pending state only");
+
+        assert!(pending_snapshot_upload(&cache_root, "scope-a", "generation-b").is_none());
+        let pending = pending_snapshot_upload(&cache_root, "scope-a", "generation-a")
+            .expect("original pending snapshot");
+        assert_eq!(pending.snapshot_id, "snapshot-a");
+        assert_eq!(pending.state.full_hash, "first");
     }
 
     #[test]

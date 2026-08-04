@@ -13,7 +13,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "3.2.3"
+version = "3.3.0"
 
 [[bin]]
 name = "ai-usage"

@@ -3,17 +3,128 @@ use crate::sync::engine::{RemoteSnapshotState, SyncError, SyncTransport};
 use ai_usage_proto::{
     HealthResponse, IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineList,
     PullResponse, SnapshotDiffRequest, SnapshotDiffResponse, SnapshotFinalizeRequest,
-    SnapshotFinalizeResponse, SnapshotRecordBatch, UploadResponse, WireRecord,
+    SnapshotFinalizeResponse, SnapshotRecordBatch, SyncPolicy, UploadResponse, WireRecord,
 };
 use serde::de::DeserializeOwned;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_REQUEST_RETRIES: usize = 5;
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(1100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_JSON_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const CLIENT_ID_HEADER: &str = "x-ai-usage-client";
+const MIN_SNAPSHOT_FINALIZE_TIMEOUT: Duration = Duration::from_secs(120);
+const REQUEST_PACER_RECOVERY_SUCCESSES: u8 = 8;
+const MAX_ACCEPTED_REQUEST_INTERVAL_MS: u64 = 5 * 60 * 1_000;
+
+#[derive(Debug)]
+struct RequestPacer {
+    min_interval: Duration,
+    current_interval: Duration,
+    max_interval: Duration,
+    next_request_at: Option<Instant>,
+    consecutive_successes: u8,
+}
+
+impl Default for RequestPacer {
+    fn default() -> Self {
+        Self {
+            min_interval: Duration::ZERO,
+            current_interval: Duration::ZERO,
+            max_interval: Duration::ZERO,
+            next_request_at: None,
+            consecutive_successes: 0,
+        }
+    }
+}
+
+impl RequestPacer {
+    fn configure(&mut self, policy: SyncPolicy) {
+        let now = Instant::now();
+        let unix_elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        self.configure_at(policy, now, unix_elapsed);
+    }
+
+    fn configure_at(&mut self, policy: SyncPolicy, now: Instant, unix_elapsed: Duration) {
+        let min_ms = policy
+            .min_request_interval_ms
+            .min(MAX_ACCEPTED_REQUEST_INTERVAL_MS);
+        if min_ms == 0 {
+            *self = Self::default();
+            return;
+        }
+        let max_ms = policy
+            .max_request_interval_ms
+            .max(min_ms)
+            .min(MAX_ACCEPTED_REQUEST_INTERVAL_MS);
+        let min_interval = Duration::from_millis(min_ms);
+        let max_interval = Duration::from_millis(max_ms);
+        let keep_adaptive_interval = self.min_interval == min_interval
+            && self.max_interval == max_interval
+            && !self.current_interval.is_zero();
+        self.min_interval = min_interval;
+        self.max_interval = max_interval;
+        self.current_interval = if keep_adaptive_interval {
+            self.current_interval.clamp(min_interval, max_interval)
+        } else {
+            min_interval
+        };
+        let phase_ms = policy.request_phase_ms % min_ms;
+        let epoch_ms = unix_elapsed.as_millis().min(u64::MAX as u128) as u64;
+        let remainder_ms = epoch_ms % min_ms;
+        let phase_delay_ms = (phase_ms + min_ms - remainder_ms) % min_ms;
+        let phase_slot = now + Duration::from_millis(phase_delay_ms);
+        self.next_request_at = Some(
+            self.next_request_at
+                .map_or(phase_slot, |scheduled| scheduled.max(phase_slot)),
+        );
+    }
+
+    fn reserve_delay(&mut self, now: Instant) -> Duration {
+        if self.current_interval.is_zero() {
+            return Duration::ZERO;
+        }
+        let request_at = self.next_request_at.unwrap_or(now).max(now);
+        self.next_request_at = Some(request_at + self.current_interval);
+        request_at.saturating_duration_since(now)
+    }
+
+    fn record_congestion(&mut self, now: Instant) {
+        if self.current_interval.is_zero() {
+            return;
+        }
+        self.consecutive_successes = 0;
+        self.current_interval = self
+            .current_interval
+            .saturating_mul(2)
+            .min(self.max_interval);
+        let delayed = now + self.current_interval;
+        self.next_request_at = Some(
+            self.next_request_at
+                .map_or(delayed, |scheduled| scheduled.max(delayed)),
+        );
+    }
+
+    fn record_success(&mut self) {
+        if self.current_interval <= self.min_interval {
+            self.consecutive_successes = 0;
+            return;
+        }
+        self.consecutive_successes = self.consecutive_successes.saturating_add(1);
+        if self.consecutive_successes >= REQUEST_PACER_RECOVERY_SUCCESSES {
+            self.current_interval = (self.current_interval / 2).max(self.min_interval);
+            self.consecutive_successes = 0;
+        }
+    }
+
+    #[cfg(test)]
+    fn current_interval(&self) -> Duration {
+        self.current_interval
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpProgress {
@@ -28,10 +139,12 @@ type HttpProgressCallback = Arc<dyn Fn(&HttpProgress) + Send + Sync>;
 #[derive(Clone)]
 pub struct SyncHttpClient {
     agent: ureq::Agent,
+    finalize_agent: ureq::Agent,
     server_url: String,
     token: String,
     machine_id: String,
     progress: Option<HttpProgressCallback>,
+    pacer: Arc<Mutex<RequestPacer>>,
 }
 
 impl SyncHttpClient {
@@ -53,12 +166,19 @@ impl SyncHttpClient {
             .http_status_as_error(false)
             .build()
             .new_agent();
+        let finalize_agent = ureq::Agent::config_builder()
+            .timeout_global(Some(snapshot_finalize_timeout(timeout)))
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
         Self {
             agent,
+            finalize_agent,
             server_url: config.server_url.trim_end_matches('/').to_string(),
             token: config.token,
             machine_id: config.machine_id,
             progress,
+            pacer: Arc::new(Mutex::new(RequestPacer::default())),
         }
     }
 
@@ -71,9 +191,20 @@ impl SyncHttpClient {
     }
 
     pub fn health(&self) -> Result<HealthResponse, SyncError> {
-        let response =
-            self.call_with_retry(|| self.agent.get(&self.endpoint("/v1/health")).call())?;
-        read_json_response(response)
+        let response = self.call_with_retry(|| {
+            self.agent
+                .get(&self.endpoint("/v1/health"))
+                .header(CLIENT_ID_HEADER, &self.machine_id)
+                .call()
+        })?;
+        let health: HealthResponse = read_json_response(response)?;
+        if let Some(policy) = health.sync_policy.clone() {
+            self.pacer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .configure(policy);
+        }
+        Ok(health)
     }
 
     pub fn machines(&self) -> Result<MachineList, SyncError> {
@@ -152,7 +283,7 @@ impl SyncHttpClient {
     ) -> Result<SnapshotFinalizeResponse, SyncError> {
         let body = serde_json::to_string(request).map_err(|err| SyncError::new(err.to_string()))?;
         let response = self.call_with_retry(|| {
-            self.agent
+            self.finalize_agent
                 .post(&self.endpoint("/v1/snapshot/finalize"))
                 .header("Authorization", self.auth_header())
                 .header(CLIENT_ID_HEADER, &self.machine_id)
@@ -167,15 +298,27 @@ impl SyncHttpClient {
         F: FnMut() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     {
         for attempt in 0..=MAX_REQUEST_RETRIES {
+            self.pace_request();
             let response = match send() {
                 Ok(response) => response,
                 Err(err) if is_retryable_transport_error(&err) && attempt < MAX_REQUEST_RETRIES => {
+                    self.record_congestion();
                     std::thread::sleep(retry_delay(&self.machine_id, attempt + 1, None));
                     continue;
                 }
-                Err(err) => return Err(transport_error(err)),
+                Err(err) => {
+                    if is_retryable_transport_error(&err) {
+                        self.record_congestion();
+                    }
+                    return Err(transport_error(err));
+                }
             };
             let status = response.status().as_u16();
+            if is_retryable_status(status) {
+                self.record_congestion();
+            } else {
+                self.record_success();
+            }
             if is_retryable_status(status) && attempt < MAX_REQUEST_RETRIES {
                 let retry_after =
                     retry_delay(&self.machine_id, attempt + 1, server_retry_after(&response));
@@ -191,6 +334,31 @@ impl SyncHttpClient {
             return Ok(response);
         }
         unreachable!("rate limit retry loop always returns")
+    }
+
+    fn pace_request(&self) {
+        let delay = self
+            .pacer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reserve_delay(Instant::now());
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+
+    fn record_congestion(&self) {
+        self.pacer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_congestion(Instant::now());
+    }
+
+    fn record_success(&self) {
+        self.pacer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_success();
     }
 
     fn emit_progress(&self, event: HttpProgress) {
@@ -291,6 +459,10 @@ impl SyncTransport for SyncHttpClient {
 
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn snapshot_finalize_timeout(request_timeout: Duration) -> Duration {
+    request_timeout.max(MIN_SNAPSHOT_FINALIZE_TIMEOUT)
 }
 
 fn is_retryable_transport_error(err: &ureq::Error) -> bool {
@@ -727,6 +899,7 @@ mod tests {
                 schema_version: SCHEMA_VERSION,
                 uptime_seconds: attempt as u64,
                 instance_id: Some(format!("server-{attempt}")),
+                sync_policy: None,
             })
         }
 
@@ -750,6 +923,57 @@ mod tests {
         assert_eq!(
             SyncTransport::server_instance_id(&client).expect("refreshed identity"),
             Some("server-1".to_string())
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_negotiates_request_pacing_for_the_client_identity() {
+        async fn health(headers: HeaderMap) -> Json<HealthResponse> {
+            assert_eq!(
+                headers
+                    .get(CLIENT_ID_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("workstation")
+            );
+            Json(HealthResponse {
+                ok: true,
+                version: "3.3.0".to_string(),
+                schema_version: SCHEMA_VERSION,
+                uptime_seconds: 1,
+                instance_id: Some("server-a".to_string()),
+                sync_policy: Some(SyncPolicy {
+                    min_request_interval_ms: 125,
+                    request_phase_ms: 0,
+                    max_request_interval_ms: 1_000,
+                }),
+            })
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/health", get(health)))
+                .await
+                .expect("server");
+        });
+        let client = SyncHttpClient::new(client_config(format!("http://{addr}")));
+        let request_client = client.clone();
+
+        tokio::task::spawn_blocking(move || request_client.health())
+            .await
+            .expect("health join")
+            .expect("health response");
+
+        assert_eq!(
+            client
+                .pacer
+                .lock()
+                .expect("request pacer")
+                .current_interval(),
+            Duration::from_millis(125)
         );
         server.abort();
     }
@@ -1143,5 +1367,63 @@ mod tests {
 
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn request_pacer_applies_negotiated_phase_and_interval() {
+        let start = std::time::Instant::now();
+        let mut pacer = RequestPacer::default();
+        pacer.configure_at(
+            SyncPolicy {
+                min_request_interval_ms: 1_000,
+                request_phase_ms: 250,
+                max_request_interval_ms: 8_000,
+            },
+            start,
+            Duration::from_millis(1_100),
+        );
+
+        assert_eq!(pacer.reserve_delay(start), Duration::from_millis(150));
+        assert_eq!(
+            pacer.reserve_delay(start + Duration::from_millis(150)),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn request_pacer_backs_off_on_congestion_and_recovers_after_successes() {
+        let start = std::time::Instant::now();
+        let mut pacer = RequestPacer::default();
+        pacer.configure_at(
+            SyncPolicy {
+                min_request_interval_ms: 100,
+                request_phase_ms: 0,
+                max_request_interval_ms: 800,
+            },
+            start,
+            Duration::ZERO,
+        );
+        assert_eq!(pacer.reserve_delay(start), Duration::ZERO);
+
+        pacer.record_congestion(start);
+        assert_eq!(pacer.current_interval(), Duration::from_millis(200));
+        assert_eq!(pacer.reserve_delay(start), Duration::from_millis(200));
+
+        for _ in 0..REQUEST_PACER_RECOVERY_SUCCESSES {
+            pacer.record_success();
+        }
+        assert_eq!(pacer.current_interval(), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn snapshot_finalize_timeout_has_a_long_operation_budget() {
+        assert_eq!(
+            snapshot_finalize_timeout(Duration::from_secs(15)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            snapshot_finalize_timeout(Duration::from_secs(180)),
+            Duration::from_secs(180)
+        );
     }
 }

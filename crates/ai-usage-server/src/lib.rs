@@ -1,8 +1,8 @@
 use ai_usage_proto::{
     HealthResponse, IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineInfo,
     MachineList, PullResponse, RecordKey, SCHEMA_VERSION, SequencedWireRecord, SnapshotDiffRequest,
-    SnapshotDiffResponse, SnapshotRecordBatch, UploadResponse, WireRecord, is_valid_host_id,
-    is_valid_vendor,
+    SnapshotDiffResponse, SnapshotFinalizeResponse, SnapshotRecordBatch, SyncPolicy,
+    UploadResponse, WireRecord, is_valid_host_id, is_valid_vendor,
 };
 use axum::extract::{DefaultBodyLimit, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -16,13 +16,17 @@ use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex as AsyncMutex;
+
+mod snapshot_attempt;
+
+use snapshot_attempt::SnapshotAttemptState;
 
 type DbPool = Pool<SqliteConnectionManager>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -32,6 +36,7 @@ const GLOBAL_RATE_LIMIT_REFILL_PER_SECOND: f64 = 4.0;
 const GLOBAL_RATE_LIMIT_BURST: f64 = 60.0;
 const MAX_RATE_LIMIT_BUCKETS: usize = 256;
 const RATE_LIMIT_BUCKET_IDLE: Duration = Duration::from_secs(10 * 60);
+const MAX_NEGOTIATED_REQUEST_INTERVAL_MS: u64 = 60_000;
 const CLIENT_ID_HEADER: &str = "x-ai-usage-client";
 const LEGACY_RATE_LIMIT_KEY: &str = "legacy";
 const LEGACY_PULL_VENDORS: [&str; 3] = ["claude", "codex", "gemini"];
@@ -316,14 +321,50 @@ impl From<r2d2::Error> for AppError {
     }
 }
 
-async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>, headers: HeaderMap) -> Json<HealthResponse> {
+    let client_id = request_client_id(&headers).ok().flatten();
     Json(HealthResponse {
         ok: true,
         version: env!("CARGO_PKG_VERSION").to_string(),
         schema_version: SCHEMA_VERSION,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         instance_id: Some(state.instance_id.to_string()),
+        sync_policy: Some(negotiated_sync_policy(&state.config, client_id)),
     })
+}
+
+fn negotiated_sync_policy(config: &ServerConfig, client_id: Option<&str>) -> SyncPolicy {
+    let mut hosts = config
+        .allowed_hosts
+        .as_ref()
+        .map(|hosts| hosts.iter().map(String::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    hosts.sort_unstable();
+    let client_count = hosts.len().max(1) as u64;
+    let per_client_interval = (1_000.0 / RATE_LIMIT_REFILL_PER_SECOND).ceil() as u64;
+    let global_interval =
+        (client_count as f64 * 1_000.0 / GLOBAL_RATE_LIMIT_REFILL_PER_SECOND).ceil() as u64;
+    let min_request_interval_ms = per_client_interval.max(global_interval).max(1);
+    let slot = client_id
+        .and_then(|client_id| hosts.binary_search(&client_id).ok())
+        .map(|index| index as u64)
+        .unwrap_or_else(|| {
+            negotiated_policy_slot(client_id.unwrap_or(LEGACY_RATE_LIMIT_KEY), client_count)
+        });
+    let request_phase_ms = min_request_interval_ms.saturating_mul(slot) / client_count;
+
+    SyncPolicy {
+        min_request_interval_ms,
+        request_phase_ms,
+        max_request_interval_ms: MAX_NEGOTIATED_REQUEST_INTERVAL_MS.max(min_request_interval_ms),
+    }
+}
+
+fn negotiated_policy_slot(client_id: &str, client_count: u64) -> u64 {
+    let digest = Sha256::digest(client_id.as_bytes());
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(prefix) % client_count.max(1)
 }
 
 fn load_or_create_server_instance_id(
@@ -421,35 +462,27 @@ async fn upload(
     let uploaded_at = Utc::now().to_rfc3339();
     let mut accepted = 0usize;
     let mut ignored = 0usize;
-    let mut touched_hosts = BTreeSet::new();
+    let mut host_count_deltas = BTreeMap::<String, i64>::new();
 
     for record in &records {
         if uploaded_with_omp_alias(&tx, record)? {
             ignored += 1;
-            touched_hosts.insert(record.host_id.clone());
+            host_count_deltas.entry(record.host_id.clone()).or_default();
             continue;
         }
-        let accepted_record = upsert_record(&tx, record, &uploaded_at)?;
-        if accepted_record {
+        let outcome = upsert_record(&tx, record, &uploaded_at)?;
+        if outcome != UpsertOutcome::Unchanged {
             accepted += 1;
         } else {
             ignored += 1;
         }
-        if delete_omp_v220_aliases_for_stable_record(&tx, record)? {
-            touched_hosts.insert(record.host_id.clone());
-        }
-        touched_hosts.insert(record.host_id.clone());
+        let deleted_aliases = delete_omp_v220_aliases_for_stable_record(&tx, record)?;
+        *host_count_deltas.entry(record.host_id.clone()).or_default() +=
+            outcome.record_count_delta() - deleted_aliases as i64;
     }
 
-    for host_id in touched_hosts {
-        tx.execute(
-            "INSERT INTO machines (host_id, last_seen, record_count)
-             VALUES (?1, ?2, (SELECT COUNT(*) FROM records WHERE host_id = ?1))
-             ON CONFLICT(host_id) DO UPDATE SET
-                last_seen = excluded.last_seen,
-                record_count = (SELECT COUNT(*) FROM records WHERE host_id = ?1)",
-            params![host_id, uploaded_at],
-        )?;
+    for (host_id, record_count_delta) in host_count_deltas {
+        update_machine_count(&tx, &host_id, &uploaded_at, record_count_delta)?;
     }
 
     let max_seq = max_seq_in_tx(&tx)?;
@@ -479,18 +512,26 @@ async fn snapshot_keys(
             "batch exceeds max_batch_records",
         ));
     }
+    for key in &batch.keys {
+        validate_snapshot_key(key)?;
+    }
 
     let _write_guard = state.write_gate.lock().await;
     let mut conn = state.pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if snapshot_attempt::register(&tx, &batch.host_id, &batch.snapshot_id)?
+        != SnapshotAttemptState::Active
+    {
+        return Err(snapshot_attempt_conflict());
+    }
     let mut accepted = 0usize;
     let mut ignored = 0usize;
     for key in &batch.keys {
-        validate_snapshot_key(key)?;
         let changed = tx.execute(
             "UPDATE records
              SET snapshot_id = ?1
-             WHERE host_id = ?2 AND vendor = ?3 AND dedup_key = ?4",
+             WHERE host_id = ?2 AND vendor = ?3 AND dedup_key = ?4
+               AND snapshot_id IS NOT ?1",
             params![batch.snapshot_id, batch.host_id, key.vendor, key.dedup_key],
         )?;
         if changed > 0 {
@@ -526,6 +567,11 @@ async fn snapshot_diff(
     let _write_guard = state.write_gate.lock().await;
     let mut conn = state.pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if snapshot_attempt::register(&tx, &request.host_id, &request.snapshot_id)?
+        != SnapshotAttemptState::Active
+    {
+        return Err(snapshot_attempt_conflict());
+    }
     let mut needed = Vec::new();
     let mut matched = 0usize;
     for record in &request.records {
@@ -584,16 +630,23 @@ async fn snapshot_records(
     let _write_guard = state.write_gate.lock().await;
     let mut conn = state.pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if snapshot_attempt::register(&tx, &batch.host_id, &batch.snapshot_id)?
+        != SnapshotAttemptState::Active
+    {
+        return Err(snapshot_attempt_conflict());
+    }
     let uploaded_at = Utc::now().to_rfc3339();
     let mut accepted = 0usize;
     let mut ignored = 0usize;
+    let mut record_count_delta = 0i64;
     for record in &batch.records {
-        let accepted_record = upsert_record(&tx, record, &uploaded_at)?;
-        if accepted_record {
+        let outcome = upsert_record(&tx, record, &uploaded_at)?;
+        if outcome != UpsertOutcome::Unchanged {
             accepted += 1;
         } else {
             ignored += 1;
         }
+        record_count_delta += outcome.record_count_delta();
         mark_snapshot_key(
             &tx,
             &batch.host_id,
@@ -601,17 +654,10 @@ async fn snapshot_records(
             &record.dedup_key,
             &batch.snapshot_id,
         )?;
-        delete_omp_v220_aliases_for_stable_record(&tx, record)?;
+        record_count_delta -= delete_omp_v220_aliases_for_stable_record(&tx, record)? as i64;
     }
 
-    tx.execute(
-        "INSERT INTO machines (host_id, last_seen, record_count)
-         VALUES (?1, ?2, (SELECT COUNT(*) FROM records WHERE host_id = ?1))
-         ON CONFLICT(host_id) DO UPDATE SET
-            last_seen = excluded.last_seen,
-            record_count = (SELECT COUNT(*) FROM records WHERE host_id = ?1)",
-        params![batch.host_id, uploaded_at],
-    )?;
+    update_machine_count(&tx, &batch.host_id, &uploaded_at, record_count_delta)?;
     let max_seq = max_seq_in_tx(&tx)?;
     tx.commit()?;
 
@@ -626,7 +672,7 @@ async fn snapshot_finalize(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: String,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<SnapshotFinalizeResponse>, AppError> {
     authorize(&state, &headers)?;
     let request: SnapshotFinalizeRequest = serde_json::from_str(&body)
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))?;
@@ -637,6 +683,21 @@ async fn snapshot_finalize(
     let _write_guard = state.write_gate.lock().await;
     let mut conn = state.pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(attempt) = snapshot_attempt::lookup(&tx, &request.host_id, &request.snapshot_id)?
+    else {
+        return Err(snapshot_attempt_conflict());
+    };
+    if attempt == SnapshotAttemptState::Superseded {
+        return Err(snapshot_attempt_conflict());
+    }
+    if attempt == SnapshotAttemptState::Completed {
+        let max_seq = max_seq_in_tx(&tx)?;
+        tx.commit()?;
+        return Ok(Json(SnapshotFinalizeResponse {
+            deleted: 0,
+            max_seq,
+        }));
+    }
     let deleted = tx.execute(
         "DELETE FROM records
          WHERE host_id = ?1 AND (snapshot_id IS NULL OR snapshot_id != ?2)",
@@ -648,16 +709,18 @@ async fn snapshot_finalize(
          VALUES (?1, ?2, (SELECT COUNT(*) FROM records WHERE host_id = ?1))
          ON CONFLICT(host_id) DO UPDATE SET
             last_seen = excluded.last_seen,
-            record_count = (SELECT COUNT(*) FROM records WHERE host_id = ?1)",
-        params![request.host_id, finalized_at],
+            record_count = MAX(0, machines.record_count - ?3)",
+        params![request.host_id, finalized_at, deleted as i64],
     )?;
+    snapshot_attempt::complete(&tx, &request.host_id, &request.snapshot_id, &finalized_at)?;
     let max_seq = max_seq_in_tx(&tx)?;
     tx.commit()?;
 
-    Ok(Json(serde_json::json!({
-        "deleted": deleted,
-        "max_seq": max_seq,
-    })))
+    Ok(Json(SnapshotFinalizeResponse { deleted, max_seq }))
+}
+
+fn snapshot_attempt_conflict() -> AppError {
+    AppError::new(StatusCode::CONFLICT, "snapshot attempt is not current")
 }
 
 fn validate_snapshot_host(state: &AppState, host_id: &str) -> Result<(), AppError> {
@@ -713,7 +776,8 @@ fn mark_snapshot_key(
     tx.execute(
         "UPDATE records
          SET snapshot_id = ?1
-         WHERE host_id = ?2 AND vendor = ?3 AND dedup_key = ?4",
+         WHERE host_id = ?2 AND vendor = ?3 AND dedup_key = ?4
+           AND snapshot_id IS NOT ?1",
         params![snapshot_id, host_id, vendor, dedup_key],
     )
 }
@@ -744,20 +808,50 @@ fn wire_record_hash(record: &WireRecord) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpsertOutcome {
+    Inserted,
+    Replaced,
+    Unchanged,
+}
+
+impl UpsertOutcome {
+    fn record_count_delta(self) -> i64 {
+        i64::from(self == Self::Inserted)
+    }
+}
+
 fn upsert_record(
     tx: &rusqlite::Transaction<'_>,
     record: &WireRecord,
     uploaded_at: &str,
-) -> rusqlite::Result<bool> {
+) -> rusqlite::Result<UpsertOutcome> {
     let changed = insert_record(tx, record, uploaded_at)?;
     if changed == 1 {
-        return Ok(true);
+        return Ok(UpsertOutcome::Inserted);
     }
     if record_matches_existing(tx, record)? {
-        return Ok(false);
+        return Ok(UpsertOutcome::Unchanged);
     }
     replace_record(tx, record, uploaded_at)?;
-    Ok(true)
+    Ok(UpsertOutcome::Replaced)
+}
+
+fn update_machine_count(
+    tx: &rusqlite::Transaction<'_>,
+    host_id: &str,
+    last_seen: &str,
+    record_count_delta: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO machines (host_id, last_seen, record_count)
+         VALUES (?1, ?2, (SELECT COUNT(*) FROM records WHERE host_id = ?1))
+         ON CONFLICT(host_id) DO UPDATE SET
+            last_seen = excluded.last_seen,
+            record_count = MAX(0, machines.record_count + ?3)",
+        params![host_id, last_seen, record_count_delta],
+    )?;
+    Ok(())
 }
 
 fn insert_record(
@@ -1517,21 +1611,21 @@ fn uploaded_with_omp_alias(
 fn delete_omp_v220_aliases_for_stable_record(
     tx: &rusqlite::Transaction<'_>,
     record: &WireRecord,
-) -> rusqlite::Result<bool> {
+) -> rusqlite::Result<usize> {
     if record.vendor != "omp"
         || parse_omp_v220_key(&record.dedup_key).is_some()
         || !is_stable_omp_key(&record.dedup_key)
     {
-        return Ok(false);
+        return Ok(0);
     }
 
-    let mut deleted = false;
+    let mut deleted = 0;
     for legacy_key in omp_v220_key_candidates(record) {
         let changed = tx.execute(
             "DELETE FROM records WHERE host_id = ?1 AND vendor = 'omp' AND dedup_key = ?2",
             params![record.host_id, legacy_key],
         )?;
-        deleted |= changed > 0;
+        deleted += changed;
     }
     Ok(deleted)
 }

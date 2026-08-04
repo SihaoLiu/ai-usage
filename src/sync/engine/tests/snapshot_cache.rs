@@ -17,6 +17,50 @@ fn local_cache_generation_tracks_vendor_cache_changes() {
 }
 
 #[test]
+fn snapshot_attempt_reuses_an_id_until_the_upload_is_confirmed() {
+    let cache_root = unique_temp_dir("snapshot-attempt-id");
+    let first_candidate = snapshot_id("workstation");
+    let first = crate::sync::state::snapshot_attempt_id(
+        &cache_root,
+        "scope-a",
+        "generation-a",
+        &first_candidate,
+    )
+    .expect("first attempt");
+    let repeated = crate::sync::state::snapshot_attempt_id(
+        &cache_root,
+        "scope-a",
+        "generation-a",
+        &snapshot_id("workstation"),
+    )
+    .expect("repeated attempt");
+    assert_eq!(first, repeated);
+
+    crate::sync::state::save_snapshot_upload_state(
+        &cache_root,
+        &crate::sync::state::SnapshotUploadState {
+            schema_version: SNAPSHOT_UPLOAD_STATE_VERSION,
+            full_hash: "full".to_string(),
+            cache_generation: "generation-a".to_string(),
+            record_hashes: BTreeMap::new(),
+        },
+        "scope-a",
+        None,
+    )
+    .expect("confirm attempt");
+    let next = crate::sync::state::snapshot_attempt_id(
+        &cache_root,
+        "scope-a",
+        "generation-a",
+        &snapshot_id("workstation"),
+    )
+    .expect("next attempt");
+
+    assert_ne!(first, next);
+    assert!(next.len() <= 128);
+}
+
+#[test]
 fn snapshot_state_records_the_local_cache_generation() {
     let cache_root = unique_temp_dir("snapshot-state-generation");
     populate_vendor_cache(&cache_root, "claude", "first");
@@ -107,6 +151,178 @@ fn snapshot_upload_retries_when_the_cache_changes_between_scans() {
 }
 
 #[test]
+fn snapshot_finalize_retry_resumes_without_replaying_manifest() {
+    let cache_root = unique_temp_dir("snapshot-finalize-resume");
+    populate_vendor_cache(&cache_root, "claude", "first");
+    let first = DiffSnapshotTransport::new(Vec::new()).with_finalize_error("timeout: global");
+
+    let error =
+        run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &first, |_| {})
+            .expect_err("finalize timeout");
+    assert_eq!(error.to_string(), "snapshot finalize: timeout: global");
+    assert_eq!(first.snapshot_diffs.borrow().len(), 1);
+    assert_eq!(first.snapshot_finalizations.borrow().len(), 1);
+    let snapshot_id = first.snapshot_finalizations.borrow()[0].snapshot_id.clone();
+
+    let retry = DiffSnapshotTransport::new(Vec::new());
+    run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &retry, |_| {})
+        .expect("resume finalize");
+
+    assert!(retry.snapshot_diffs.borrow().is_empty());
+    assert!(retry.snapshot_record_batches.borrow().is_empty());
+    assert_eq!(retry.snapshot_finalizations.borrow().len(), 1);
+    assert_eq!(
+        retry.snapshot_finalizations.borrow()[0].snapshot_id,
+        snapshot_id
+    );
+}
+
+#[test]
+fn superseded_snapshot_finalize_discards_the_pending_attempt() {
+    let cache_root = unique_temp_dir("snapshot-finalize-superseded");
+    populate_vendor_cache(&cache_root, "claude", "first");
+    let superseded = DiffSnapshotTransport::new(Vec::new())
+        .with_finalize_error("http status: 409: snapshot attempt is not current");
+
+    let error = run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &superseded,
+        |_| {},
+    )
+    .expect_err("superseded finalize");
+    assert_eq!(error.to_string(), "snapshot finalize: superseded");
+    let stale_id = superseded.snapshot_finalizations.borrow()[0]
+        .snapshot_id
+        .clone();
+
+    let retry = DiffSnapshotTransport::new(Vec::new());
+    run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &retry, |_| {})
+        .expect("retry superseded snapshot");
+
+    assert_eq!(retry.snapshot_diffs.borrow().len(), 1);
+    assert_ne!(retry.snapshot_diffs.borrow()[0].snapshot_id, stale_id);
+}
+
+#[test]
+fn superseded_snapshot_diff_discards_the_attempt() {
+    let cache_root = unique_temp_dir("snapshot-diff-superseded");
+    populate_vendor_cache(&cache_root, "claude", "first");
+    let superseded = DiffSnapshotTransport::new(Vec::new())
+        .with_diff_error("http status: 409: snapshot attempt is not current");
+
+    let error = run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &superseded,
+        |_| {},
+    )
+    .expect_err("superseded diff");
+    assert_eq!(error.to_string(), "snapshot diff: superseded");
+    let stale_id = superseded.snapshot_diffs.borrow()[0].snapshot_id.clone();
+
+    let retry = DiffSnapshotTransport::new(Vec::new());
+    run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &retry, |_| {})
+        .expect("retry superseded snapshot");
+
+    assert_ne!(retry.snapshot_diffs.borrow()[0].snapshot_id, stale_id);
+}
+
+#[test]
+fn superseded_snapshot_record_batch_discards_the_attempt() {
+    let cache_root = unique_temp_dir("snapshot-records-superseded");
+    populate_vendor_cache(&cache_root, "claude", "first");
+    let key = RecordKey {
+        vendor: "claude".to_string(),
+        dedup_key: "first".to_string(),
+    };
+    let superseded = DiffSnapshotTransport::new(vec![key.clone()])
+        .with_record_error("http status: 409: snapshot attempt is not current");
+
+    let error = run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &superseded,
+        |_| {},
+    )
+    .expect_err("superseded record batch");
+    assert_eq!(error.to_string(), "snapshot records: superseded");
+    let stale_id = superseded.snapshot_diffs.borrow()[0].snapshot_id.clone();
+
+    let retry = DiffSnapshotTransport::new(vec![key]);
+    run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &retry, |_| {})
+        .expect("retry superseded snapshot");
+
+    assert_ne!(retry.snapshot_diffs.borrow()[0].snapshot_id, stale_id);
+}
+
+#[test]
+fn snapshot_diff_retry_reuses_the_incomplete_attempt_id() {
+    let cache_root = unique_temp_dir("snapshot-diff-attempt");
+    populate_vendor_cache(&cache_root, "claude", "first");
+    let first = DiffSnapshotTransport::new(Vec::new()).with_diff_error("timeout: global");
+
+    let error =
+        run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &first, |_| {})
+            .expect_err("diff timeout");
+    assert_eq!(error.to_string(), "snapshot diff: timeout: global");
+    let first_snapshot_id = first.snapshot_diffs.borrow()[0].snapshot_id.clone();
+
+    let retry = DiffSnapshotTransport::new(Vec::new());
+    run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &retry, |_| {})
+        .expect("retry diff");
+
+    assert_eq!(
+        retry.snapshot_diffs.borrow()[0].snapshot_id,
+        first_snapshot_id
+    );
+}
+
+#[test]
+fn cache_change_after_finalize_timeout_keeps_the_confirmed_manifest_baseline() {
+    let cache_root = unique_temp_dir("snapshot-pending-baseline");
+    populate_vendor_cache(&cache_root, "claude", "first");
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &DiffSnapshotTransport::new(Vec::new()),
+        |_| {},
+    )
+    .expect("initial upload");
+
+    populate_vendor_cache(&cache_root, "claude", "second");
+    let timed_out = DiffSnapshotTransport::new(Vec::new()).with_finalize_error("timeout: global");
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &timed_out,
+        |_| {},
+    )
+    .expect_err("finalize timeout");
+
+    populate_vendor_cache_with_records(
+        &cache_root,
+        "claude",
+        vec![
+            usage_record("second", "2026-05-18T12:00:00Z", 10),
+            usage_record("third", "2026-05-18T12:01:00Z", 20),
+        ],
+    );
+    let changed = DiffSnapshotTransport::new(Vec::new());
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &changed,
+        |_| {},
+    )
+    .expect("reconcile changed cache");
+
+    assert_eq!(changed.snapshot_diffs.borrow().len(), 1);
+    assert_eq!(changed.snapshot_diffs.borrow()[0].records.len(), 2);
+    assert_eq!(changed.snapshot_finalizations.borrow().len(), 1);
+}
+
+#[test]
 fn snapshot_cache_does_not_cross_machine_id_changes() {
     let cache_root = unique_temp_dir("snapshot-machine-scope");
     populate_vendor_cache(&cache_root, "claude", "first");
@@ -184,6 +400,10 @@ fn snapshot_cache_does_not_cross_server_instance_changes() {
 
     assert_eq!(next.snapshot_diffs.borrow().len(), 1);
     assert_eq!(next.snapshot_record_batches.borrow().len(), 1);
+    assert_ne!(
+        initial.snapshot_finalizations.borrow()[0].snapshot_id,
+        next.snapshot_finalizations.borrow()[0].snapshot_id
+    );
 }
 
 #[test]
@@ -244,6 +464,10 @@ fn snapshot_cache_reconciles_when_remote_content_revision_changes() {
 
     assert_eq!(next.snapshot_diffs.borrow().len(), 1);
     assert_eq!(next.snapshot_record_batches.borrow().len(), 1);
+    assert_ne!(
+        initial.snapshot_finalizations.borrow()[0].snapshot_id,
+        next.snapshot_finalizations.borrow()[0].snapshot_id
+    );
 }
 
 #[test]

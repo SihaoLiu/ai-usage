@@ -35,6 +35,17 @@ CREATE TABLE IF NOT EXISTS machines (
     record_count INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS snapshot_attempts (
+    attempt_order INTEGER PRIMARY KEY,
+    host_id       TEXT NOT NULL,
+    snapshot_id   TEXT NOT NULL,
+    completed_at  TEXT,
+    UNIQUE(host_id, snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_attempts_host_order
+    ON snapshot_attempts(host_id, attempt_order DESC);
+
 CREATE TABLE IF NOT EXISTS integrity_reports (
     host_id        TEXT NOT NULL,
     algorithm      TEXT NOT NULL,

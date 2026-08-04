@@ -600,14 +600,6 @@ where
     else {
         return Ok(None);
     };
-    if crate::sync::cache_generation::local_cache_generation(cache_root, &VENDORS)
-        != cache_generation
-    {
-        return Err(SyncError::new(
-            "cached records changed while preparing snapshot upload",
-        ));
-    }
-
     let SnapshotManifest {
         fingerprints,
         full_hash,

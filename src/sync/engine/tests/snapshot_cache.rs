@@ -151,6 +151,71 @@ fn snapshot_upload_retries_when_the_cache_changes_between_scans() {
 }
 
 #[test]
+fn snapshot_upload_commits_the_captured_generation_while_new_records_arrive() {
+    let cache_root = unique_temp_dir("snapshot-live-cache");
+    populate_vendor_cache(&cache_root, "claude", "first");
+    let captured_generation =
+        crate::sync::cache_generation::local_cache_generation(&cache_root, &VENDORS);
+    let changed_root = cache_root.clone();
+    let transport = DiffSnapshotTransport::new(vec![RecordKey {
+        vendor: "claude".to_string(),
+        dedup_key: "first".to_string(),
+    }])
+    .with_after_first_diff(move || {
+        populate_vendor_cache_with_records(
+            &changed_root,
+            "claude",
+            vec![
+                usage_record("first", "2026-05-18T12:00:00Z", 10),
+                usage_record("second", "2026-05-18T12:01:00Z", 20),
+            ],
+        );
+    });
+
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &transport,
+        |_| {},
+    )
+    .expect("captured snapshot upload");
+
+    assert_eq!(transport.snapshot_finalizations.borrow().len(), 1);
+    assert_eq!(transport.snapshot_record_batches.borrow().len(), 1);
+    assert_eq!(
+        transport.snapshot_record_batches.borrow()[0].records[0].dedup_key,
+        "first"
+    );
+    let completed = crate::sync::state::load_snapshot_upload_state(&cache_root);
+    assert_eq!(completed.cache_generation, captured_generation);
+    assert_ne!(
+        completed.cache_generation,
+        crate::sync::cache_generation::local_cache_generation(&cache_root, &VENDORS)
+    );
+
+    let catch_up = DiffSnapshotTransport::new(vec![RecordKey {
+        vendor: "claude".to_string(),
+        dedup_key: "second".to_string(),
+    }]);
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &catch_up,
+        |_| {},
+    )
+    .expect("incremental catch-up");
+
+    assert_eq!(catch_up.snapshot_diffs.borrow().len(), 1);
+    assert_eq!(catch_up.snapshot_diffs.borrow()[0].records.len(), 1);
+    assert_eq!(catch_up.snapshot_record_batches.borrow().len(), 1);
+    assert_eq!(
+        catch_up.snapshot_record_batches.borrow()[0].records[0].dedup_key,
+        "second"
+    );
+    assert!(catch_up.snapshot_finalizations.borrow().is_empty());
+}
+
+#[test]
 fn snapshot_finalize_retry_resumes_without_replaying_manifest() {
     let cache_root = unique_temp_dir("snapshot-finalize-resume");
     populate_vendor_cache(&cache_root, "claude", "first");

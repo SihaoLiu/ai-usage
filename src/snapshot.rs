@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::constants::AllPricing;
 use crate::raw_data::{AllToolData, RawDataCache, RawDataRange, filter_all_tool_data_borrowed};
 use crate::stats::ModelBreakdownRow;
-use crate::table_view::{DisplayRow, TableView, build_table, table_totals};
+use crate::table_view::{DisplayRow, TableMetric, TableView, build_table, table_totals};
 use crate::time_utils::TimeWindow;
 use crate::tool::Tool;
 
@@ -104,7 +104,7 @@ pub(crate) fn build_document(
     window_rows: &[ModelBreakdownRow],
     daily_rows: Vec<(NaiveDate, Vec<ModelBreakdownRow>)>,
 ) -> SnapshotDocument {
-    let top_models = build_table(window_rows, TableView::Model)
+    let top_models = build_table(window_rows, TableView::Flat, TableMetric::Messages)
         .into_iter()
         .filter_map(|row| match row {
             DisplayRow::Data(row) => Some(TopModel {

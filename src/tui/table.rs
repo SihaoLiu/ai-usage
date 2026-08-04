@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 
 use crate::formatting::{format_cost_per_mtok, format_number};
 use crate::model_id::Vendor;
-use crate::table_view::{CostSummary, DataRow, DisplayRow, RowMetrics, TableView};
+use crate::table_view::{CostSummary, DataRow, DisplayRow, RowMetrics, TableMetric, TableView};
 use crate::tui::data::Dashboard;
 use crate::tui::palette::{
     ACCENT, COL_PCT, DIM, GROUP_BG, ROW_PCT, SCALE_B, SCALE_K, SCALE_M, SCALE_T, SUBTOTAL_BG,
@@ -59,17 +59,6 @@ fn visible_cols(width: u16, show_harness: bool) -> Cols {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MetricKind {
-    Messages,
-    CacheHit,
-    Prefill,
-    Decode,
-    Total,
-    Cost,
-    Rate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PercentFields {
     None,
     Column,
@@ -86,19 +75,7 @@ impl PercentFields {
     }
 }
 
-impl MetricKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Messages => "Msgs",
-            Self::CacheHit => "Cache Hit",
-            Self::Prefill => "Prefill",
-            Self::Decode => "Decode",
-            Self::Total => "Total",
-            Self::Cost => "Cost",
-            Self::Rate => "$/MTok",
-        }
-    }
-
+impl TableMetric {
     fn min_width(self) -> u16 {
         match self {
             Self::Messages => 12,
@@ -156,18 +133,18 @@ impl MetricKind {
     }
 }
 
-fn metric_kinds(cols: &Cols) -> Vec<MetricKind> {
-    let mut kinds = vec![MetricKind::Messages];
+fn metric_kinds(cols: &Cols) -> Vec<TableMetric> {
+    let mut kinds = vec![TableMetric::Messages];
     if cols.strategy {
         kinds.extend([
-            MetricKind::CacheHit,
-            MetricKind::Prefill,
-            MetricKind::Decode,
+            TableMetric::CacheHit,
+            TableMetric::Prefill,
+            TableMetric::Decode,
         ]);
     }
-    kinds.extend([MetricKind::Total, MetricKind::Cost]);
+    kinds.extend([TableMetric::Total, TableMetric::Cost]);
     if cols.rate {
-        kinds.push(MetricKind::Rate);
+        kinds.push(TableMetric::Rate);
     }
     kinds
 }
@@ -217,7 +194,7 @@ fn table_column_widths(area_width: u16, rows: &[DisplayRow], cols: &Cols) -> Vec
 
     let mut metrics = metric_kinds(cols)
         .into_iter()
-        .map(MetricKind::min_width)
+        .map(TableMetric::min_width)
         .collect::<Vec<_>>();
 
     let column_count = descriptive.len() + metrics.len();
@@ -275,7 +252,7 @@ fn format_cost_exact(value: f64) -> String {
     format!("{sign}${}.{}", format_number(whole), fraction)
 }
 
-fn metric_exact_width(kind: MetricKind, dash: &Dashboard) -> usize {
+fn metric_exact_width(kind: TableMetric, dash: &Dashboard) -> usize {
     dash.rows
         .iter()
         .filter_map(display_row_metrics)
@@ -285,7 +262,7 @@ fn metric_exact_width(kind: MetricKind, dash: &Dashboard) -> usize {
         .unwrap_or(0)
 }
 
-fn metric_max_abs(kind: MetricKind, dash: &Dashboard) -> f64 {
+fn metric_max_abs(kind: TableMetric, dash: &Dashboard) -> f64 {
     dash.rows
         .iter()
         .filter_map(display_row_metrics)
@@ -314,7 +291,7 @@ struct NumericLayout {
 }
 
 impl NumericLayout {
-    fn new(kind: MetricKind, width: u16, exact_width: usize, max_abs: f64) -> Self {
+    fn new(kind: TableMetric, width: u16, exact_width: usize, max_abs: f64) -> Self {
         let width = width as usize;
         let desired = kind.percent_fields();
         let unit_slot = max_abs >= 1_000.0;
@@ -374,7 +351,7 @@ impl NumericLayout {
 
 #[derive(Debug, Clone, Copy)]
 struct MetricColumn {
-    kind: MetricKind,
+    kind: TableMetric,
     layout: NumericLayout,
 }
 
@@ -652,47 +629,47 @@ fn metric_cells(
         let row_percent =
             |value: i64| (row_total > 0).then_some(value as f64 / row_total as f64 * 100.0);
         let cell = match column.kind {
-            MetricKind::Messages => quantity_cell(
+            TableMetric::Messages => quantity_cell(
                 column,
                 m.count,
                 column_percent(m.count as f64, totals.count as f64),
                 None,
             ),
-            MetricKind::CacheHit => quantity_cell(
+            TableMetric::CacheHit => quantity_cell(
                 column,
                 m.cache_hit,
                 column_percent(m.cache_hit as f64, totals.cache_hit as f64),
                 row_percent(m.cache_hit),
             ),
-            MetricKind::Prefill => quantity_cell(
+            TableMetric::Prefill => quantity_cell(
                 column,
                 m.prefill,
                 column_percent(m.prefill as f64, totals.prefill as f64),
                 row_percent(m.prefill),
             ),
-            MetricKind::Decode => quantity_cell(
+            TableMetric::Decode => quantity_cell(
                 column,
                 m.decoding,
                 column_percent(m.decoding as f64, totals.decoding as f64),
                 row_percent(m.decoding),
             ),
-            MetricKind::Total => quantity_cell(
+            TableMetric::Total => quantity_cell(
                 column,
                 row_total,
                 column_percent(row_total as f64, totals.tokens() as f64),
                 None,
             ),
-            MetricKind::Cost => {
+            TableMetric::Cost => {
                 cost_cell(column, m.cost(), column_percent(m.cost(), totals.cost()))
             }
-            MetricKind::Rate => rate_cell(column, m.cost_per_mtok()),
+            TableMetric::Rate => rate_cell(column, m.cost_per_mtok()),
         };
         cells.push(cell);
     }
 }
 
-fn model_cell_text(d: &DataRow, cols: &Cols, show_harness: bool, view: TableView) -> String {
-    if !cols.vendor && show_harness && view != TableView::Model {
+fn model_cell_text(d: &DataRow, cols: &Cols, show_harness: bool) -> String {
+    if !cols.vendor && show_harness {
         format!("{}:{}", d.harness_short, d.model_label)
     } else {
         d.model_label.clone()
@@ -729,10 +706,19 @@ fn percentage_legend(columns: &[MetricColumn]) -> Vec<Span<'static>> {
     spans
 }
 
-fn title_layout(view: TableView, area_width: u16, legend_width: usize) -> (String, bool) {
+fn title_layout(
+    view: TableView,
+    sort_metric: TableMetric,
+    area_width: u16,
+    legend_width: usize,
+) -> (String, bool) {
     let inner_width = area_width.saturating_sub(2) as usize;
-    let full = format!(" Usage / API Cost ({}) ", view.description());
-    let short = " Usage / API Cost ".to_string();
+    let full = format!(
+        " Usage / API Cost ({} · {}↓) ",
+        view.description(),
+        sort_metric.label()
+    );
+    let short = format!(" Usage / API Cost ({}↓) ", sort_metric.label());
     let gap = usize::from(legend_width > 0);
     if full.chars().count() + legend_width + gap <= inner_width {
         (full, true)
@@ -794,8 +780,19 @@ pub(super) fn draw_table(frame: &mut Frame, area: Rect, dash: &Dashboard) {
         header_cells.push(Cell::from("Harness"));
     }
     for column in &metric_columns {
+        let selected = column.kind == dash.sort_metric;
+        let label = if selected {
+            format!("{} ↓", column.kind.label())
+        } else {
+            column.kind.label().to_string()
+        };
+        let style = if selected {
+            Style::default().fg(ACCENT).bold()
+        } else {
+            Style::default()
+        };
         header_cells.push(Cell::from(
-            Line::from(column.kind.label()).alignment(Alignment::Center),
+            Line::from(Span::styled(label, style)).alignment(Alignment::Center),
         ));
     }
     let widths = column_widths
@@ -832,12 +829,7 @@ pub(super) fn draw_table(frame: &mut Frame, area: Rect, dash: &Dashboard) {
                         Style::default().fg(vendor_color(d.vendor)).bold(),
                     )));
                 }
-                cells.push(Cell::from(model_cell_text(
-                    d,
-                    &cols,
-                    show_harness,
-                    dash.view,
-                )));
+                cells.push(Cell::from(model_cell_text(d, &cols, show_harness)));
                 if cols.raw {
                     cells.push(Cell::from(Span::styled(
                         d.model_raw.clone(),
@@ -904,7 +896,7 @@ pub(super) fn draw_table(frame: &mut Frame, area: Rect, dash: &Dashboard) {
         .iter()
         .map(|span| span.content.chars().count())
         .sum::<usize>();
-    let (title, show_legend) = title_layout(dash.view, area.width, legend_width);
+    let (title, show_legend) = title_layout(dash.view, dash.sort_metric, area.width, legend_width);
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM))

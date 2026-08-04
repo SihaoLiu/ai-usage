@@ -1,6 +1,5 @@
 use crate::constants::SubscriptionFees;
-use crate::stats::ModelBreakdownRow;
-use crate::table_view::{DataRow, DisplayRow, RowMetrics, TableView, build_table, table_totals};
+use crate::table_view::{DataRow, DisplayRow, RowMetrics, TableMetric, TableView};
 
 fn fit_text_to_width(text: &str, width: usize) -> String {
     if text.len() <= width {
@@ -359,9 +358,9 @@ fn dual_pct_legend(table_width: usize) -> String {
 pub fn get_table_display_mode(
     terminal_width: u16,
     terminal_height: u16,
-    num_models: usize,
+    rows: &[DisplayRow],
 ) -> &'static str {
-    let min_table_height = 10 + num_models;
+    let min_table_height = 10 + rows.len();
     if (terminal_height as usize) < min_table_height + 20 {
         return "hidden";
     }
@@ -456,8 +455,8 @@ fn compose_name(l: &NameLayout, vendor: &str, model: &str, harness: &str) -> Str
 
 /// Single-column row label for the narrow (compact/minimal) layouts: the
 /// harness tag is folded into the label because there is no room for columns.
-fn narrow_name(row: &DataRow, show_harness: bool, view: TableView) -> String {
-    if show_harness && view != TableView::Model {
+fn narrow_name(row: &DataRow, show_harness: bool) -> String {
+    if show_harness {
         format!("{}:{}", row.harness_short, row.model_label)
     } else {
         row.model_label.clone()
@@ -467,33 +466,36 @@ fn narrow_name(row: &DataRow, show_harness: bool, view: TableView) -> String {
 /// Print the usage breakdown table with responsive formatting.
 /// Returns true if the table was printed, false if hidden.
 pub fn print_model_breakdown(
-    model_stats: &[ModelBreakdownRow],
+    rows: &[DisplayRow],
     days_in_data: f64,
-    terminal_width: Option<u16>,
-    terminal_height: Option<u16>,
+    terminal_size: Option<(u16, u16)>,
     tool: &str,
     subscription_fees: &SubscriptionFees,
     view: TableView,
+    sort_metric: TableMetric,
 ) -> bool {
     let show_harness = tool == "all";
-    let rows = build_table(model_stats, view);
-    let totals = table_totals(model_stats);
+    let mut totals = RowMetrics::default();
+    for row in data_rows(rows) {
+        totals.add(&row.metrics);
+    }
 
-    let mode = match (terminal_width, terminal_height) {
-        (Some(w), Some(h)) => get_table_display_mode(w, h, rows.len()),
-        _ => "full",
-    };
+    let mode = terminal_size.map_or("full", |(width, height)| {
+        get_table_display_mode(width, height, rows)
+    });
     if mode == "hidden" {
         return false;
     }
 
     let subscription_price = subscription_fees.get(tool);
-    let tw = terminal_width.unwrap_or(200) as usize;
+    let tw = terminal_size.map_or(200, |(width, _)| width) as usize;
 
     match mode {
-        "full" | "medium" => print_table_rich(mode, &rows, &totals, show_harness, view, tw),
-        "compact" => print_table_compact(&rows, &totals, show_harness, view, tw),
-        "minimal" => print_table_minimal(&rows, &totals, show_harness, view, tw),
+        "full" | "medium" => {
+            print_table_rich(mode, rows, &totals, show_harness, view, sort_metric, tw)
+        }
+        "compact" => print_table_compact(rows, &totals, show_harness, sort_metric, tw),
+        "minimal" => print_table_minimal(rows, &totals, show_harness, sort_metric, tw),
         _ => {}
     }
 
@@ -512,7 +514,7 @@ pub fn print_model_breakdown(
             format_cost_per_mtok(summary.subscription_rate)
         );
         println!("{}{}", cost_pad, line);
-        if let Some(line) = top_model_insight_line(&rows, summary.total_cost, show_harness) {
+        if let Some(line) = top_model_insight_line(rows, summary.total_cost, show_harness) {
             println!("{}{}", cost_pad, fit_text_to_width(&line, table_width));
         }
     } else {
@@ -625,6 +627,7 @@ fn print_table_rich(
     totals: &RowMetrics,
     show_harness: bool,
     view: TableView,
+    sort_metric: TableMetric,
     terminal_width: usize,
 ) {
     let l = rich_layout(mode, show_harness);
@@ -678,7 +681,11 @@ fn print_table_rich(
     println!(
         "{}{:^width$}",
         p,
-        format!("Usage / API Cost ({})", view.description()),
+        format!(
+            "Usage / API Cost ({} · {}↓)",
+            view.description(),
+            sort_metric.label()
+        ),
         width = l.table_width
     );
     println!("{}{}", p, "=".repeat(l.table_width));
@@ -801,7 +808,7 @@ fn print_table_compact(
     rows: &[DisplayRow],
     totals: &RowMetrics,
     show_harness: bool,
-    view: TableView,
+    sort_metric: TableMetric,
     terminal_width: usize,
 ) {
     let w_name = 12;
@@ -812,7 +819,12 @@ fn print_table_compact(
     let p = center_pad(terminal_width, table_width);
 
     println!();
-    println!("{}{:^width$}", p, "Usage / API Cost", width = table_width);
+    println!(
+        "{}{:^width$}",
+        p,
+        format!("Usage / API Cost ({}↓)", sort_metric.label()),
+        width = table_width
+    );
     println!("{}{}", p, "=".repeat(table_width));
 
     println!(
@@ -855,7 +867,7 @@ fn print_table_compact(
                 println!("{}| {:<w$} |", p, vendor, w = table_width - 4);
             }
             DisplayRow::Data(d) => {
-                let name = fit_text_to_width(&narrow_name(d, show_harness, view), w_name);
+                let name = fit_text_to_width(&narrow_name(d, show_harness), w_name);
                 metric_row(name, &d.metrics);
             }
             DisplayRow::Subtotal { vendor, metrics } => {
@@ -888,7 +900,7 @@ fn print_table_minimal(
     rows: &[DisplayRow],
     totals: &RowMetrics,
     show_harness: bool,
-    view: TableView,
+    sort_metric: TableMetric,
     terminal_width: usize,
 ) {
     let w_name = 12;
@@ -900,7 +912,12 @@ fn print_table_minimal(
     let p = center_pad(terminal_width, table_width);
 
     println!();
-    println!("{}{:^width$}", p, "Usage / Cost", width = table_width);
+    println!(
+        "{}{:^width$}",
+        p,
+        format!("Usage / Cost ({}↓)", sort_metric.label()),
+        width = table_width
+    );
     println!("{}{}", p, "=".repeat(table_width));
 
     println!(
@@ -940,7 +957,7 @@ fn print_table_minimal(
                 println!("{}| {:<w$} |", p, vendor, w = table_width - 4);
             }
             DisplayRow::Data(d) => {
-                let name = fit_text_to_width(&narrow_name(d, show_harness, view), w_name);
+                let name = fit_text_to_width(&narrow_name(d, show_harness), w_name);
                 metric_row(name, &d.metrics);
             }
             DisplayRow::Subtotal { vendor, metrics } => {
@@ -971,8 +988,29 @@ fn print_table_minimal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table_view::display_model_name;
+    use crate::stats::ModelBreakdownRow;
+    use crate::table_view::{TableMetric, TableView, build_table, display_model_name};
     use std::time::Duration;
+
+    fn breakdown_row(tool: &str, model: &str) -> ModelBreakdownRow {
+        ModelBreakdownRow {
+            model: model.to_string(),
+            tool: tool.to_string(),
+            count: 1,
+            input: 100,
+            output: 10,
+            cache_creation: 0,
+            cache_read: 50,
+            reasoning: 0,
+            thinking: 0,
+            total: 110,
+            total_with_cache: 160,
+            input_cost: 1.0,
+            output_cost: 2.0,
+            cache_read_cost: 0.5,
+            cache_creation_cost: 0.0,
+        }
+    }
 
     fn visible_len(text: &str) -> usize {
         let mut len = 0;
@@ -1033,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_name_folds_harness_tag_only_outside_model_view() {
+    fn narrow_name_folds_harness_tag_for_all_harnesses() {
         let row = DataRow {
             vendor: crate::model_id::Vendor::OpenAI,
             vendor_label: "OpenAI".to_string(),
@@ -1043,9 +1081,8 @@ mod tests {
             harness_short: "Cdx".to_string(),
             metrics: RowMetrics::default(),
         };
-        assert_eq!(narrow_name(&row, true, TableView::Flat), "Cdx:GPT-5.5");
-        assert_eq!(narrow_name(&row, true, TableView::Model), "GPT-5.5");
-        assert_eq!(narrow_name(&row, false, TableView::Flat), "GPT-5.5");
+        assert_eq!(narrow_name(&row, true), "Cdx:GPT-5.5");
+        assert_eq!(narrow_name(&row, false), "GPT-5.5");
     }
 
     #[test]
@@ -1085,5 +1122,38 @@ mod tests {
 
         let cell = format_model_cost_with_col_pct(metrics.cost(), 20.0, 16);
         assert_eq!(visible_len(&cell), 16);
+    }
+
+    #[test]
+    fn display_mode_counts_flat_rows_after_model_merge() {
+        let stats = [
+            breakdown_row("omp", "claude-opus-4-8"),
+            breakdown_row("omp", "anthropic/claude-opus-4-8"),
+            breakdown_row("claude", "claude-opus-4-8"),
+            breakdown_row("claude", "anthropic/claude-opus-4-8"),
+            breakdown_row("kimi", "claude-opus-4-8"),
+            breakdown_row("kimi", "anthropic/claude-opus-4-8"),
+        ];
+        let rows = build_table(&stats, TableView::Flat, TableMetric::Messages);
+
+        assert_eq!(stats.len(), 6);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(get_table_display_mode(205, 35, &rows), "full");
+    }
+
+    #[test]
+    fn display_mode_counts_vendor_headers_and_subtotals() {
+        let stats = [
+            breakdown_row("codex", "gpt-5.1"),
+            breakdown_row("codex", "gpt-5.2"),
+            breakdown_row("codex", "gpt-5.3"),
+            breakdown_row("codex", "gpt-5.4"),
+            breakdown_row("codex", "gpt-5.5"),
+        ];
+        let rows = build_table(&stats, TableView::Vendor, TableMetric::Messages);
+
+        assert_eq!(stats.len(), 5);
+        assert_eq!(rows.len(), 7);
+        assert_eq!(get_table_display_mode(205, 35, &rows), "hidden");
     }
 }

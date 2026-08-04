@@ -15,6 +15,7 @@ fn state_with_cache(cache: RawDataCache, window: TimeWindow) -> AppState {
     AppState {
         tool: "all".to_string(),
         table_view: TableView::Flat,
+        sort_metric: crate::table_view::TableMetric::Messages,
         host: None,
         session_id: None,
         local_host_id: None,

@@ -99,14 +99,19 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui) {
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
     let mut spans: Vec<Span> = vec![
-        Span::styled(" ai-usage ", Style::default().fg(ACCENT).bold()),
+        Span::styled("AI-Usage", Style::default().fg(ACCENT).bold()),
         Span::styled(
-            format!("v{} ", env!("CARGO_PKG_VERSION")),
+            format!("(v{}) ", env!("CARGO_PKG_VERSION")),
             Style::default().fg(DIM),
         ),
     ];
     for tool in Tool::ROTATION {
-        let label = format!(" {} ", tool.display_name());
+        let name = if tool.is_all() {
+            "All Harnesses"
+        } else {
+            tool.display_name()
+        };
+        let label = format!(" {name} ");
         if tool.key() == ui.state.tool {
             spans.push(Span::styled(
                 label,
@@ -806,6 +811,7 @@ mod tests {
         Dashboard {
             tool: Tool::All,
             view,
+            sort_metric: crate::table_view::TableMetric::Messages,
             window_label: String::new(),
             window_complete: true,
             has_visible_data: true,
@@ -863,6 +869,7 @@ mod tests {
         let state = AppState {
             tool: "all".to_string(),
             table_view: TableView::Flat,
+            sort_metric: crate::table_view::TableMetric::Messages,
             host: None,
             session_id: None,
             local_host_id: None,
@@ -908,7 +915,11 @@ mod tests {
         let text = buffer_text(&terminal);
         let title = line_containing(&text, "ai-usage CPU: 12.3%");
         let status = line_containing(&text, "integrity: ok (8.5s)");
-        assert!(title.contains(env!("CARGO_PKG_VERSION")), "{title}");
+        let expected_tabs = format!(
+            "AI-Usage(v{})  All Harnesses   Claude Code   Codex   Gemini CLI   Kimi Code   Oh My Pi",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(title.starts_with(&expected_tabs), "{title}");
         assert!(
             title.ends_with("ai-usage CPU: 12.3%  |  Mem: 1.24 GiB"),
             "{title}"
@@ -990,6 +1001,40 @@ mod tests {
             cache_arrow,
             "{total_line}\n{alpha_line}"
         );
+    }
+
+    #[test]
+    fn selected_sort_metric_is_visible_in_the_header_or_table_title() {
+        let metrics = row_metrics(1_000);
+        let mut dash = dashboard(
+            TableView::Flat,
+            vec![data_row("Alpha", Vendor::Anthropic, "Anthropic", metrics)],
+            metrics,
+        );
+        dash.sort_metric = crate::table_view::TableMetric::Cost;
+
+        let terminal = render_table(180, 6, &dash);
+        let text = buffer_text(&terminal);
+        let header = line_containing(&text, "Msgs");
+        let top = text.lines().next().expect("table title");
+        assert!(header.contains("Cost ↓"), "{header}");
+        assert_eq!(header.matches('↓').count(), 1, "{header}");
+        assert!(top.contains("Flat · Cost↓"), "{top}");
+
+        let header_y = line_index_containing(&text, "Msgs");
+        let arrow_x = char_index(&header, "Cost ↓") + "Cost ".chars().count();
+        assert_eq!(
+            terminal.backend().buffer()[(arrow_x as u16, header_y)].fg,
+            ACCENT
+        );
+
+        dash.sort_metric = crate::table_view::TableMetric::Rate;
+        let terminal = render_table(68, 6, &dash);
+        let text = buffer_text(&terminal);
+        let top = text.lines().next().expect("narrow table title");
+        let header = line_containing(&text, "Msgs");
+        assert!(top.contains("$/MTok↓"), "{top}");
+        assert!(!header.contains("$/MTok"), "{header}");
     }
 
     #[test]
@@ -1127,6 +1172,7 @@ mod tests {
         let dash = Dashboard {
             tool: Tool::All,
             view: TableView::Flat,
+            sort_metric: crate::table_view::TableMetric::Messages,
             window_label: String::new(),
             window_complete: true,
             has_visible_data: true,

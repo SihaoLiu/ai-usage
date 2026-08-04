@@ -12,7 +12,8 @@ use chrono::{DateTime, Local};
 use crate::charts::{self, ChartGranularity};
 use crate::stats;
 use crate::table_view::{
-    CostSummary, DisplayRow, RowMetrics, TableView, build_table, cost_summary, table_totals,
+    CostSummary, DisplayRow, RowMetrics, TableMetric, TableView, build_table, cost_summary,
+    table_totals,
 };
 use crate::time_utils::{generate_interval_times, to_interval};
 use crate::tool::Tool;
@@ -49,6 +50,7 @@ pub struct ChartData {
 pub struct Dashboard {
     pub tool: Tool,
     pub view: TableView,
+    pub sort_metric: TableMetric,
     pub window_label: String,
     pub window_complete: bool,
     pub has_visible_data: bool,
@@ -294,11 +296,11 @@ fn comparison_chart(
     chart
 }
 
-/// Reshape the table for a new view from the cached aggregation. This is the
-/// hot path for the `v` toggle: no data rescan, just regrouping.
-pub fn rebuild_view(dash: &mut Dashboard, view: TableView) {
+/// Reshape the table from the cached aggregation without rescanning data.
+pub fn rebuild_table(dash: &mut Dashboard, view: TableView, sort_metric: TableMetric) {
     dash.view = view;
-    dash.rows = build_table(&dash.model_stats, view);
+    dash.sort_metric = sort_metric;
+    dash.rows = build_table(&dash.model_stats, view, sort_metric);
     dash.insight =
         formatting::top_model_insight_line(&dash.rows, dash.summary.total_cost, dash.tool.is_all());
 }
@@ -313,6 +315,7 @@ pub fn build(state: &mut AppState) -> Dashboard {
         (!version.is_empty()).then_some(version)
     };
     let view = state.table_view;
+    let sort_metric = state.sort_metric;
     let (range_start, range_end) = state.time_window.bounds(now);
     let projection_days = state.time_window.projection_days(now);
     let window_label = crate::showing_data_line(&state.time_window, now);
@@ -385,7 +388,7 @@ pub fn build(state: &mut AppState) -> Dashboard {
         (model_stats, vec![io, cache], single_tool_headline)
     };
 
-    let rows = build_table(&model_stats, view);
+    let rows = build_table(&model_stats, view, sort_metric);
     let totals = table_totals(&model_stats);
     let model_stats_kept = model_stats;
     let subscription_price = state.subscription_fees.get(tool.key());
@@ -404,6 +407,7 @@ pub fn build(state: &mut AppState) -> Dashboard {
     Dashboard {
         tool,
         view,
+        sort_metric,
         window_label,
         window_complete,
         has_visible_data,

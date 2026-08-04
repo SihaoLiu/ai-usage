@@ -31,7 +31,7 @@ use crossterm::terminal;
 use constants::{AllPricing, SubscriptionFees, load_subscription_fees, prompt_subscription_fees};
 use data::UsageEntry;
 use formatting::print_model_breakdown;
-use table_view::TableView;
+use table_view::{TableMetric, TableView, build_table};
 use time_utils::TimeWindow;
 use tool::Tool;
 
@@ -74,6 +74,7 @@ impl VersionCacheEntry {
 struct AppState {
     tool: String,
     table_view: TableView,
+    sort_metric: TableMetric,
     host: Option<String>,
     session_id: Option<String>,
     local_host_id: Option<String>,
@@ -110,10 +111,13 @@ struct Args {
     #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "kimi", "omp", "all"])]
     tool: String,
 
-    /// Breakdown table shape: flat (Vendor/Model/Harness columns),
-    /// vendor (grouped by vendor), or model (merged across harnesses)
-    #[arg(long, default_value = "flat", value_parser = ["flat", "vendor", "model"])]
-    view: String,
+    /// Breakdown table shape: flat models or models grouped by vendor
+    #[arg(long, default_value = "flat", value_name = "VIEW")]
+    view: TableView,
+
+    /// Descending sort key: msgs, cache, prefill, decode, total, cost, or rate
+    #[arg(long, default_value = "msgs", value_name = "KEY")]
+    sort: TableMetric,
 
     /// Filter usage to a single machine id
     #[arg(long)]
@@ -452,18 +456,18 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         "omp" => stats::calculate_omp_model_breakdown(&filtered, &state.pricing),
         _ => stats::calculate_claude_model_breakdown(&filtered, &state.pricing),
     };
+    let table_rows = build_table(&model_stats, state.table_view, state.sort_metric);
+    let table_row_count = table_rows.len();
 
-    // Pre-check whether table will be displayed and total height fits
-    let table_mode = formatting::get_table_display_mode(width, height, model_stats.len());
+    let table_mode = formatting::get_table_display_mode(width, height, &table_rows);
     let mut will_print_table = table_mode != "hidden";
 
     let target_width = get_chart_target_width();
     let (mut chart_height, mut fits) =
-        calculate_chart_height(!once, will_print_table, model_stats.len(), false);
-    // If it doesn't fit with table, try without
+        calculate_chart_height(!once, will_print_table, table_row_count, false);
     if !fits && will_print_table {
         will_print_table = false;
-        let result = calculate_chart_height(!once, false, model_stats.len(), false);
+        let result = calculate_chart_height(!once, false, table_row_count, false);
         chart_height = result.0;
         fits = result.1;
     }
@@ -485,16 +489,15 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         );
     }
 
-    // Only print table if height allows it
     let effective_height = if will_print_table { height } else { 0 };
     print_model_breakdown(
-        &model_stats,
+        &table_rows,
         projection_days,
-        Some(width),
-        Some(effective_height),
+        Some((width, effective_height)),
         tool,
         &state.subscription_fees,
         state.table_view,
+        state.sort_metric,
     );
 
     let granularity = display_chart_granularity(&range_start, &range_end);
@@ -521,11 +524,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
     let included_models: HashSet<String> = model_stats.iter().map(|s| s.model.clone()).collect();
 
     let table_w = if will_print_table {
-        formatting::get_table_width(formatting::get_table_display_mode(
-            width,
-            height,
-            model_stats.len(),
-        ))
+        formatting::get_table_width(table_mode)
     } else {
         0
     };
@@ -600,6 +599,8 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
     }
 
     let all_model_stats = calculate_all_model_breakdown(&all_data, &state.pricing);
+    let table_rows = build_table(&all_model_stats, state.table_view, state.sort_metric);
+    let table_row_count = table_rows.len();
 
     // Compute and cache the weighted cost prompt for show_prompt reuse
     let (weighted_cost, total_savings) = calculate_weighted_cost_per_mtok(
@@ -629,17 +630,14 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
         return Some(false);
     }
 
-    // Pre-check whether table will be displayed
-    let table_mode = formatting::get_table_display_mode(width, height, all_model_stats.len());
+    let table_mode = formatting::get_table_display_mode(width, height, &table_rows);
     let mut will_print_table = table_mode != "hidden";
 
-    // Check total height fits before printing anything
     let (mut chart_height, mut fits) =
-        calculate_chart_height(!once, will_print_table, all_model_stats.len(), true);
-    // If it doesn't fit with table, try without
+        calculate_chart_height(!once, will_print_table, table_row_count, true);
     if !fits && will_print_table {
         will_print_table = false;
-        let result = calculate_chart_height(!once, false, all_model_stats.len(), true);
+        let result = calculate_chart_height(!once, false, table_row_count, true);
         chart_height = result.0;
         fits = result.1;
     }
@@ -659,21 +657,17 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
 
     let effective_height = if will_print_table { height } else { 0 };
     print_model_breakdown(
-        &all_model_stats,
+        &table_rows,
         projection_days,
-        Some(width),
-        Some(effective_height),
+        Some((width, effective_height)),
         "all",
         &state.subscription_fees,
         state.table_view,
+        state.sort_metric,
     );
 
     let table_w = if will_print_table {
-        formatting::get_table_width(formatting::get_table_display_mode(
-            width,
-            height,
-            all_model_stats.len(),
-        ))
+        formatting::get_table_width(table_mode)
     } else {
         0
     };
@@ -980,7 +974,8 @@ fn main() {
 
     let mut state = AppState {
         tool: args.tool.clone(),
-        table_view: TableView::from_key(&args.view).unwrap_or_default(),
+        table_view: args.view,
+        sort_metric: args.sort,
         host: args.host.clone(),
         session_id: args.session.filter(|id| !id.trim().is_empty()),
         local_host_id,
@@ -1220,6 +1215,38 @@ mod tests {
         let args = Args::try_parse_from(["ai-usage", "--tool", "omp"]).expect("tool flag parses");
 
         assert_eq!(args.tool, "omp");
+    }
+
+    #[test]
+    fn sort_flag_defaults_to_messages_and_selects_a_metric() {
+        let default_args = Args::try_parse_from(["ai-usage"]).expect("default args parse");
+        assert_eq!(default_args.sort, TableMetric::Messages);
+
+        let cost_args =
+            Args::try_parse_from(["ai-usage", "--sort", "cost"]).expect("sort flag parses");
+        assert_eq!(cost_args.sort, TableMetric::Cost);
+
+        let error = Args::try_parse_from(["ai-usage", "--sort", "bogus"])
+            .expect_err("unknown sort metric is rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn view_flag_has_two_states_and_accepts_the_legacy_model_alias() {
+        let default_args = Args::try_parse_from(["ai-usage"]).expect("default args parse");
+        assert_eq!(default_args.view, TableView::Flat);
+
+        let vendor_args =
+            Args::try_parse_from(["ai-usage", "--view", "vendor"]).expect("vendor view parses");
+        assert_eq!(vendor_args.view, TableView::Vendor);
+
+        let legacy_args = Args::try_parse_from(["ai-usage", "--view", "model"])
+            .expect("legacy model view parses");
+        assert_eq!(legacy_args.view, TableView::Flat);
+
+        let error = Args::try_parse_from(["ai-usage", "--view", "bogus"])
+            .expect_err("unknown table view is rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

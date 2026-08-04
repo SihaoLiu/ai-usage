@@ -9,13 +9,16 @@ Options:
   --once              Show stats once and exit (no monitor loop)
   --days <N>          Number of days to analyze (default: 3)
   --tool <TOOL>       Filter to a single tool: claude, codex, gemini, kimi, or omp
+  --view <VIEW>       Table shape: flat or vendor (default: flat)
+  --sort <KEY>        Descending sort key: msgs, cache, prefill, decode, total,
+                      cost, or rate (default: msgs)
   --host <HOST>       Filter to a single machine id
   --auto-update       Periodically check GitHub Releases in monitor mode
   --auto-update-interval-seconds <N>
                       Seconds between automatic release checks (default: 3600)
 ```
 
-Default behavior (no flags) enters monitor mode showing all vendors for the last 3 days.
+Default behavior (no flags) enters monitor mode showing all harnesses for the last 3 days.
 
 ## JSON Snapshots
 
@@ -38,19 +41,22 @@ The document contains `schema_version`, `generated_at`, `timezone`, `range`,
 | Key | Action |
 |-----|--------|
 | `q` / `Esc` | Quit |
-| `n` | Cycle to next vendor |
+| `n` | Cycle to the next harness |
 | `r` | Refresh now |
 | `t claude` / `t codex` / `t gemini` / `t kimi` / `t omp` / `t all` | Switch tool (also `tool <name>`) |
 | `host all` / `host <HOST>` | Switch between all machines and one machine |
 | `d <N>` | Change days range |
-| `a` | Switch to all vendors |
+| `a` | Switch to all harnesses |
+| `v` / `view flat` / `view vendor` | Toggle or select the table view |
+| `s` | Select the next descending sort key |
+| `sort <KEY>` | Sort by `msgs`, `cache`, `prefill`, `decode`, `total`, `cost`, or `rate` |
 | `d` / `w` / `m` | Switch to 1 day / 7 days / 30 days |
 | `date YYYY-MM-DD` | Show one complete local day |
 | `range YYYY-MM-DD YYYY-MM-DD` | Show an inclusive local date span |
 | `range YYYY-MM-DDTHH:MM YYYY-MM-DDTHH:MM` | Show an explicit local date-time span |
 | `latest` / `last` | Return to the current rolling days range |
-| `cost` / `cost all` / `cost <VENDOR>` | Show all monthly fixed costs or one vendor's cost |
-| `cost <VENDOR> <AMOUNT>` | Save a non-negative monthly fixed cost and redraw |
+| `cost` / `cost all` / `cost <HARNESS>` | Show all monthly fixed costs or one harness's cost |
+| `cost <HARNESS> <AMOUNT>` | Save a non-negative monthly fixed cost and redraw |
 | Up / Down arrows | Recall previous / next typed command (shell-style history) |
 | Left / Right arrows | Empty prompt: slide newer / older by one chart interval; text prompt: move cursor |
 | PgUp / PgDn | Slide the time window backward / forward by its width (PgDn snaps to the present) |
@@ -64,9 +70,9 @@ Automatic updates are disabled unless `--auto-update` is provided. When enabled,
 
 ## Data Sources
 
-The tool reads local usage data written by each vendor's CLI:
+The tool reads local usage data written by each harness:
 
-| Vendor | Directory | File Pattern |
+| Harness | Directory | File Pattern |
 |--------|-----------|--------------|
 | Claude | `~/.claude/projects/` | `**/*.jsonl` |
 | Codex | `~/.codex/sessions/` | `YYYY/MM/DD/*.jsonl` |
@@ -97,7 +103,7 @@ The table layout adapts to terminal width:
 
 ## Subscription Fees
 
-On first run, you will be prompted to enter your monthly subscription fees for each vendor. These are saved to `.fee.env` and used to calculate monthly savings estimates.
+On first run, you will be prompted to enter your monthly subscription fees for each harness. These are saved to `.fee.env` and used to calculate monthly savings estimates.
 
 In monitor mode, `cost` or `cost all` shows all current values, while `cost claude`, `cost codex`, `cost gemini`, or `cost kimi` shows one value. Set a fee with a command such as `cost claude 200` or `cost gemini 19.99`. The amount must be a non-negative integer or decimal. A valid change is written to the active `.fee.env` file before the dashboard updates; if the write fails, the in-memory value remains unchanged.
 

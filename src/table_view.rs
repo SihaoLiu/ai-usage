@@ -1,12 +1,11 @@
 //! Renderer-agnostic view model for the usage breakdown table.
 //!
-//! The breakdown has three axes: Vendor (the model maker, derived from the
-//! model id by `model_id`), Harness (the CLI tool that logged the usage), and
-//! Model. Aggregation produces one `ModelBreakdownRow` per (harness, model)
-//! pair; this module reshapes those rows into one of three user-selectable
-//! table forms so the plain-text and ratatui renderers share a single source
-//! of truth for grouping, merging, ordering, and labels.
+//! Aggregation produces one `ModelBreakdownRow` per (harness, model) pair.
+//! This module merges those rows by model, then either presents the flat list
+//! or groups it by model vendor so every renderer shares one source of truth
+//! for grouping, ordering, and labels.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::model_id::{ModelIdentity, Vendor, parse_model_identity, short_label, sort_key};
@@ -17,14 +16,11 @@ use crate::tool::Tool;
 /// The shape of the breakdown table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TableView {
-    /// One row per (model, harness); Vendor / Model / Harness as columns,
-    /// vendor label suppressed on consecutive rows of the same vendor.
+    /// One row per model, merged across harnesses.
     #[default]
     Flat,
     /// Rows grouped under a vendor header, with per-vendor subtotals.
     Vendor,
-    /// One row per model, merged across harnesses; harnesses listed as tags.
-    Model,
 }
 
 impl TableView {
@@ -32,7 +28,7 @@ impl TableView {
         match value {
             "flat" => Some(TableView::Flat),
             "vendor" => Some(TableView::Vendor),
-            "model" => Some(TableView::Model),
+            "model" => Some(TableView::Flat),
             _ => None,
         }
     }
@@ -41,18 +37,96 @@ impl TableView {
     pub fn next(self) -> Self {
         match self {
             TableView::Flat => TableView::Vendor,
-            TableView::Vendor => TableView::Model,
-            TableView::Model => TableView::Flat,
+            TableView::Vendor => TableView::Flat,
         }
     }
 
     /// Human description used in table titles and command feedback.
     pub fn description(self) -> &'static str {
         match self {
-            TableView::Flat => "Vendor / Model / Harness",
+            TableView::Flat => "Flat",
             TableView::Vendor => "grouped by Vendor",
-            TableView::Model => "by Model (harnesses merged)",
         }
+    }
+}
+
+impl std::str::FromStr for TableView {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_key(value).ok_or_else(|| format!("unknown table view: {value}"))
+    }
+}
+
+/// Numeric table column used as the descending sort key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableMetric {
+    #[default]
+    Messages,
+    CacheHit,
+    Prefill,
+    Decode,
+    Total,
+    Cost,
+    Rate,
+}
+
+impl TableMetric {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Messages => "Msgs",
+            Self::CacheHit => "Cache Hit",
+            Self::Prefill => "Prefill",
+            Self::Decode => "Decode",
+            Self::Total => "Total",
+            Self::Cost => "Cost",
+            Self::Rate => "$/MTok",
+        }
+    }
+
+    pub fn from_key(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "msg" | "msgs" | "message" | "messages" => Some(Self::Messages),
+            "cache" | "cache-hit" | "cache_hit" | "cachehit" => Some(Self::CacheHit),
+            "prefill" => Some(Self::Prefill),
+            "decode" | "decoding" => Some(Self::Decode),
+            "total" | "tokens" => Some(Self::Total),
+            "cost" => Some(Self::Cost),
+            "rate" | "$/mtok" => Some(Self::Rate),
+            _ => None,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Messages => Self::CacheHit,
+            Self::CacheHit => Self::Prefill,
+            Self::Prefill => Self::Decode,
+            Self::Decode => Self::Total,
+            Self::Total => Self::Cost,
+            Self::Cost => Self::Rate,
+            Self::Rate => Self::Messages,
+        }
+    }
+
+    fn compare_desc(self, left: &RowMetrics, right: &RowMetrics) -> Ordering {
+        match self {
+            Self::Messages => right.count.cmp(&left.count),
+            Self::CacheHit => right.cache_hit.cmp(&left.cache_hit),
+            Self::Prefill => right.prefill.cmp(&left.prefill),
+            Self::Decode => right.decoding.cmp(&left.decoding),
+            Self::Total => right.tokens().cmp(&left.tokens()),
+            Self::Cost => right.cost().total_cmp(&left.cost()),
+            Self::Rate => right.cost_per_mtok().total_cmp(&left.cost_per_mtok()),
+        }
+    }
+}
+
+impl std::str::FromStr for TableMetric {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_key(value).ok_or_else(|| format!("unknown sort metric: {value}"))
     }
 }
 
@@ -267,79 +341,80 @@ fn sorted_entries(rows: &[ModelBreakdownRow]) -> Vec<Entry> {
         sort_key(&a.identity)
             .cmp(&sort_key(&b.identity))
             .then(a.harness_rank.cmp(&b.harness_rank))
+            .then_with(|| a.harness_tag.cmp(&b.harness_tag))
+            .then_with(|| a.identity.effort.cmp(&b.identity.effort))
+            .then_with(|| a.model_raw.cmp(&b.model_raw))
     });
     entries
 }
 
-fn data_row(entry: &Entry, vendor_label: String) -> DisplayRow {
-    DisplayRow::Data(Box::new(DataRow {
-        vendor: entry.identity.vendor,
-        vendor_label,
-        model_label: entry.model_label.clone(),
-        model_raw: entry.model_raw.clone(),
-        harness_label: entry.harness_name.clone(),
-        harness_short: entry.harness_tag.clone(),
-        metrics: entry.metrics,
-    }))
-}
-
 /// Build the display rows for the requested view.
-pub fn build_table(rows: &[ModelBreakdownRow], view: TableView) -> Vec<DisplayRow> {
+pub fn build_table(
+    rows: &[ModelBreakdownRow],
+    view: TableView,
+    sort_metric: TableMetric,
+) -> Vec<DisplayRow> {
     match view {
-        TableView::Flat => build_flat(rows),
-        TableView::Vendor => build_vendor(rows),
-        TableView::Model => build_model(rows),
+        TableView::Flat => build_flat(rows, sort_metric),
+        TableView::Vendor => build_vendor(rows, sort_metric),
     }
 }
 
-fn build_flat(rows: &[ModelBreakdownRow]) -> Vec<DisplayRow> {
-    let mut out = Vec::new();
-    let mut prev_vendor: Option<Vendor> = None;
-    for entry in sorted_entries(rows) {
-        let vendor = entry.identity.vendor;
-        let label = if prev_vendor == Some(vendor) {
-            String::new()
-        } else {
-            vendor.display_name().to_string()
-        };
-        prev_vendor = Some(vendor);
-        out.push(data_row(&entry, label));
+fn build_vendor(rows: &[ModelBreakdownRow], sort_metric: TableMetric) -> Vec<DisplayRow> {
+    struct Group {
+        vendor: Vendor,
+        rows: Vec<DataRow>,
+        metrics: RowMetrics,
     }
-    out
-}
 
-fn build_vendor(rows: &[ModelBreakdownRow]) -> Vec<DisplayRow> {
-    let entries = sorted_entries(rows);
-    let mut out = Vec::new();
-    let mut idx = 0;
-    while idx < entries.len() {
-        let vendor = entries[idx].identity.vendor;
-        let group_end = entries[idx..]
-            .iter()
-            .position(|e| e.identity.vendor != vendor)
-            .map_or(entries.len(), |off| idx + off);
-        let group = &entries[idx..group_end];
-
-        out.push(DisplayRow::GroupHeader {
-            vendor: vendor.display_name().to_string(),
-        });
-        let mut subtotal = RowMetrics::default();
-        for entry in group {
-            subtotal.add(&entry.metrics);
-            out.push(data_row(entry, String::new()));
+    let mut groups: Vec<Group> = Vec::new();
+    for mut row in merged_model_rows(rows, sort_metric) {
+        row.vendor_label.clear();
+        match groups.iter_mut().find(|group| group.vendor == row.vendor) {
+            Some(group) => {
+                group.metrics.add(&row.metrics);
+                group.rows.push(row);
+            }
+            None => groups.push(Group {
+                vendor: row.vendor,
+                metrics: row.metrics,
+                rows: vec![row],
+            }),
         }
-        if group.len() >= 2 {
+    }
+    groups.sort_by(|left, right| {
+        sort_metric
+            .compare_desc(&left.metrics, &right.metrics)
+            .then_with(|| left.vendor.cmp(&right.vendor))
+    });
+
+    let mut out = Vec::new();
+    for group in groups {
+        out.push(DisplayRow::GroupHeader {
+            vendor: group.vendor.display_name().to_string(),
+        });
+        let row_count = group.rows.len();
+        for row in group.rows {
+            out.push(DisplayRow::Data(Box::new(row)));
+        }
+        if row_count >= 2 {
             out.push(DisplayRow::Subtotal {
-                vendor: vendor.display_name().to_string(),
-                metrics: subtotal,
+                vendor: group.vendor.display_name().to_string(),
+                metrics: group.metrics,
             });
         }
-        idx = group_end;
     }
     out
 }
 
-fn build_model(rows: &[ModelBreakdownRow]) -> Vec<DisplayRow> {
+fn build_flat(rows: &[ModelBreakdownRow], sort_metric: TableMetric) -> Vec<DisplayRow> {
+    merged_model_rows(rows, sort_metric)
+        .into_iter()
+        .map(|row| DisplayRow::Data(Box::new(row)))
+        .collect()
+}
+
+fn merged_model_rows(rows: &[ModelBreakdownRow], sort_metric: TableMetric) -> Vec<DataRow> {
     struct Merged {
         first: usize,
         sources: Vec<usize>,
@@ -371,11 +446,9 @@ fn build_model(rows: &[ModelBreakdownRow]) -> Vec<DisplayRow> {
         }
     }
 
-    // Busiest models first, model order as tie-breaker for stability.
     merged.sort_by(|a, b| {
-        b.metrics
-            .count
-            .cmp(&a.metrics.count)
+        sort_metric
+            .compare_desc(&a.metrics, &b.metrics)
             .then_with(|| a.first.cmp(&b.first))
     });
 
@@ -392,18 +465,29 @@ fn build_model(rows: &[ModelBreakdownRow]) -> Vec<DisplayRow> {
             } else {
                 first.identity.normalized_id.clone()
             };
-            let tags: Vec<&str> = m
-                .sources
-                .iter()
-                .map(|&i| entries[i].harness_tag.as_str())
-                .collect();
-            let (harness_label, harness_short) = if m.sources.len() == 1 {
-                (first.harness_name.clone(), first.harness_tag.clone())
+            let mut harnesses: Vec<&Entry> = Vec::new();
+            for &source in &m.sources {
+                let entry = &entries[source];
+                if !harnesses.iter().any(|seen| {
+                    seen.harness_rank == entry.harness_rank && seen.harness_tag == entry.harness_tag
+                }) {
+                    harnesses.push(entry);
+                }
+            }
+            let (harness_label, harness_short) = if harnesses.len() == 1 {
+                (
+                    harnesses[0].harness_name.clone(),
+                    harnesses[0].harness_tag.clone(),
+                )
             } else {
-                let joined = tags.join(",");
+                let joined = harnesses
+                    .iter()
+                    .map(|entry| entry.harness_tag.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 (joined.clone(), joined)
             };
-            DisplayRow::Data(Box::new(DataRow {
+            DataRow {
                 vendor: first.identity.vendor,
                 vendor_label: first.identity.vendor.display_name().to_string(),
                 model_label: first.model_label.clone(),
@@ -411,7 +495,7 @@ fn build_model(rows: &[ModelBreakdownRow]) -> Vec<DisplayRow> {
                 harness_label,
                 harness_short,
                 metrics: m.metrics,
-            }))
+            }
         })
         .collect()
 }
@@ -440,6 +524,30 @@ mod tests {
         }
     }
 
+    fn metric_row(
+        model: &str,
+        count: i64,
+        cache_hit: i64,
+        prefill: i64,
+        decoding: i64,
+        cost: f64,
+    ) -> ModelBreakdownRow {
+        let mut item = row("codex", model, count);
+        item.input = prefill;
+        item.output = decoding;
+        item.cache_creation = 0;
+        item.cache_read = cache_hit;
+        item.reasoning = 0;
+        item.thinking = 0;
+        item.total = prefill + decoding;
+        item.total_with_cache = cache_hit + prefill + decoding;
+        item.input_cost = cost;
+        item.output_cost = 0.0;
+        item.cache_read_cost = 0.0;
+        item.cache_creation_cost = 0.0;
+        item
+    }
+
     fn data_rows(rows: &[DisplayRow]) -> Vec<&DataRow> {
         rows.iter()
             .filter_map(|r| match r {
@@ -450,13 +558,75 @@ mod tests {
     }
 
     #[test]
-    fn view_cycle_covers_all_forms() {
+    fn view_cycle_has_two_forms_and_keeps_model_as_a_flat_alias() {
         assert_eq!(TableView::Flat.next(), TableView::Vendor);
-        assert_eq!(TableView::Vendor.next(), TableView::Model);
-        assert_eq!(TableView::Model.next(), TableView::Flat);
+        assert_eq!(TableView::Vendor.next(), TableView::Flat);
+        assert_eq!(TableView::from_key("model"), Some(TableView::Flat));
         assert_eq!(TableView::from_key("vendor"), Some(TableView::Vendor));
         assert_eq!(TableView::from_key("bogus"), None);
         assert_eq!(TableView::default(), TableView::Flat);
+    }
+
+    #[test]
+    fn table_metric_parses_and_cycles_all_sortable_columns() {
+        assert_eq!(TableMetric::default(), TableMetric::Messages);
+        assert_eq!(TableMetric::from_key("MSGS"), Some(TableMetric::Messages));
+        assert_eq!(
+            TableMetric::from_key("cache-hit"),
+            Some(TableMetric::CacheHit)
+        );
+        assert_eq!(TableMetric::from_key("prefill"), Some(TableMetric::Prefill));
+        assert_eq!(TableMetric::from_key("decoding"), Some(TableMetric::Decode));
+        assert_eq!(TableMetric::from_key("tokens"), Some(TableMetric::Total));
+        assert_eq!(TableMetric::from_key("cost"), Some(TableMetric::Cost));
+        assert_eq!(TableMetric::from_key("$/MTok"), Some(TableMetric::Rate));
+        assert_eq!(TableMetric::from_key("bogus"), None);
+
+        let mut metric = TableMetric::default();
+        let mut visited = Vec::new();
+        for _ in 0..7 {
+            visited.push(metric);
+            metric = metric.next();
+        }
+        assert_eq!(
+            visited,
+            [
+                TableMetric::Messages,
+                TableMetric::CacheHit,
+                TableMetric::Prefill,
+                TableMetric::Decode,
+                TableMetric::Total,
+                TableMetric::Cost,
+                TableMetric::Rate,
+            ]
+        );
+        assert_eq!(metric, TableMetric::Messages);
+    }
+
+    #[test]
+    fn flat_view_sorts_descending_by_every_table_metric() {
+        let rows = vec![
+            metric_row("gpt-msgs", 100, 1, 1, 1, 1.0),
+            metric_row("claude-cache", 1, 10_000, 1, 1, 1.0),
+            metric_row("gemini-prefill", 1, 1, 10_000, 1, 1.0),
+            metric_row("glm-decode", 1, 1, 1, 10_000, 1.0),
+            metric_row("deepseek-total", 1, 4_000, 4_000, 4_000, 1.0),
+            metric_row("grok-cost", 1, 300, 300, 300, 10_000.0),
+            metric_row("k3-rate", 1, 0, 1, 0, 1_000.0),
+        ];
+
+        for (metric, expected) in [
+            (TableMetric::Messages, "gpt-msgs"),
+            (TableMetric::CacheHit, "claude-cache"),
+            (TableMetric::Prefill, "gemini-prefill"),
+            (TableMetric::Decode, "glm-decode"),
+            (TableMetric::Total, "deepseek-total"),
+            (TableMetric::Cost, "grok-cost"),
+            (TableMetric::Rate, "k3-rate"),
+        ] {
+            let table = build_table(&rows, TableView::Flat, metric);
+            assert_eq!(data_rows(&table)[0].model_raw, expected, "{metric:?}");
+        }
     }
 
     #[test]
@@ -488,16 +658,16 @@ mod tests {
     }
 
     #[test]
-    fn flat_view_orders_vendor_contiguously_and_suppresses_repeats() {
+    fn flat_view_merges_harnesses_and_orders_models_by_messages() {
         let rows = vec![
             row("codex", "gpt-5.5", 9),
             row("claude", "claude-opus-4-8", 5),
             row("omp", "anthropic/claude-opus-4-8", 3),
             row("claude", "glm-5.2", 2),
         ];
-        let table = build_table(&rows, TableView::Flat);
+        let table = build_table(&rows, TableView::Flat, TableMetric::Messages);
         let data = data_rows(&table);
-        assert_eq!(table.len(), 4);
+        assert_eq!(table.len(), 3);
 
         let summary: Vec<(String, String, String)> = data
             .iter()
@@ -513,19 +683,14 @@ mod tests {
             summary,
             vec![
                 (
-                    "Anthropic".to_string(),
-                    "Opus 4.8".to_string(),
-                    "Claude Code".to_string()
-                ),
-                (
-                    String::new(),
-                    "Opus 4.8".to_string(),
-                    "Oh My Pi".to_string()
-                ),
-                (
                     "OpenAI".to_string(),
                     "GPT-5.5".to_string(),
                     "Codex".to_string()
+                ),
+                (
+                    "Anthropic".to_string(),
+                    "Opus 4.8".to_string(),
+                    "CC,OMP".to_string()
                 ),
                 (
                     "Zhipu".to_string(),
@@ -534,42 +699,85 @@ mod tests {
                 ),
             ]
         );
+        assert_eq!(data[1].metrics.count, 8);
     }
 
     #[test]
-    fn vendor_view_emits_headers_and_multi_row_subtotals() {
+    fn vendor_view_groups_the_same_merged_model_rows_as_flat() {
         let rows = vec![
             row("codex", "gpt-5.5", 9),
             row("claude", "claude-opus-4-8", 5),
             row("omp", "anthropic/claude-opus-4-8", 3),
         ];
-        let table = build_table(&rows, TableView::Vendor);
+        let table = build_table(&rows, TableView::Vendor, TableMetric::Messages);
+        let data = data_rows(&table);
 
-        match &table[0] {
-            DisplayRow::GroupHeader { vendor } => assert_eq!(vendor, "Anthropic"),
-            other => panic!("expected header, got {:?}", other),
-        }
-        assert!(matches!(&table[1], DisplayRow::Data(d) if d.vendor_label.is_empty()));
-        assert!(matches!(&table[2], DisplayRow::Data(_)));
-        match &table[3] {
-            DisplayRow::Subtotal { vendor, metrics } => {
-                assert_eq!(vendor, "Anthropic");
-                assert_eq!(metrics.count, 8);
-                assert_eq!(metrics.prefill, 210);
-            }
-            other => panic!("expected subtotal, got {:?}", other),
-        }
-        match &table[4] {
-            DisplayRow::GroupHeader { vendor } => assert_eq!(vendor, "OpenAI"),
-            other => panic!("expected header, got {:?}", other),
-        }
-        assert!(matches!(&table[5], DisplayRow::Data(_)));
-        // Single-row group: no subtotal.
-        assert_eq!(table.len(), 6);
+        assert_eq!(data.len(), 2);
+        let opus = data
+            .iter()
+            .find(|row| row.model_label == "Opus 4.8")
+            .expect("merged Anthropic row");
+        assert_eq!(opus.harness_label, "CC,OMP");
+        assert_eq!(opus.metrics.count, 8);
+        assert_eq!(opus.metrics.prefill, 210);
+        assert!(data.iter().all(|row| row.vendor_label.is_empty()));
+        assert!(
+            !table
+                .iter()
+                .any(|row| matches!(row, DisplayRow::Subtotal { .. }))
+        );
     }
 
     #[test]
-    fn model_view_merges_across_harnesses_with_tag_list() {
+    fn vendor_view_sorts_groups_by_aggregate_and_models_by_the_same_metric() {
+        let rows = vec![
+            row("codex", "gpt-5.4", 5),
+            row("codex", "gpt-5.5", 6),
+            row("claude", "claude-opus-4-8", 10),
+        ];
+
+        let table = build_table(&rows, TableView::Vendor, TableMetric::Messages);
+
+        assert!(matches!(
+            &table[0],
+            DisplayRow::GroupHeader { vendor } if vendor == "OpenAI"
+        ));
+        assert!(matches!(&table[1], DisplayRow::Data(row) if row.metrics.count == 6));
+        assert!(matches!(&table[2], DisplayRow::Data(row) if row.metrics.count == 5));
+        assert!(matches!(
+            &table[3],
+            DisplayRow::Subtotal { metrics, .. } if metrics.count == 11
+        ));
+        assert!(matches!(
+            &table[4],
+            DisplayRow::GroupHeader { vendor } if vendor == "Anthropic"
+        ));
+    }
+
+    #[test]
+    fn vendor_rate_sort_uses_aggregate_cost_over_aggregate_tokens() {
+        let rows = vec![
+            metric_row("gpt-high-rate", 1, 0, 1, 0, 10.0),
+            metric_row("gpt-volume", 1, 0, 999, 0, 0.0),
+            metric_row("claude-balanced", 1, 0, 100, 0, 2.0),
+        ];
+
+        let table = build_table(&rows, TableView::Vendor, TableMetric::Rate);
+
+        assert!(matches!(
+            &table[0],
+            DisplayRow::GroupHeader { vendor } if vendor == "Anthropic"
+        ));
+        assert!(matches!(&table[1], DisplayRow::Data(row) if row.model_raw == "claude-balanced"));
+        assert!(matches!(
+            &table[2],
+            DisplayRow::GroupHeader { vendor } if vendor == "OpenAI"
+        ));
+        assert!(matches!(&table[3], DisplayRow::Data(row) if row.model_raw == "gpt-high-rate"));
+    }
+
+    #[test]
+    fn normalized_model_ids_merge_across_harnesses_with_tag_list() {
         let mut codex = row("codex", "gpt-5.5", 9);
         codex.reasoning = 7;
         let rows = vec![
@@ -577,7 +785,7 @@ mod tests {
             row("claude", "claude-opus-4-8", 5),
             row("omp", "anthropic/claude-opus-4-8", 3),
         ];
-        let table = build_table(&rows, TableView::Model);
+        let table = build_table(&rows, TableView::Flat, TableMetric::Messages);
         let data = data_rows(&table);
         assert_eq!(data.len(), 2);
 
@@ -598,6 +806,50 @@ mod tests {
         assert_eq!(opus.metrics.prefill, 210);
         assert_eq!(opus.metrics.cache_hit, 100);
         assert_eq!(opus.metrics.decoding, 20);
+    }
+
+    #[test]
+    fn normalized_aliases_from_one_harness_show_one_harness_label() {
+        let rows = vec![
+            row("omp", "claude-opus-4-8", 5),
+            row("omp", "anthropic/claude-opus-4-8", 3),
+        ];
+
+        let table = build_table(&rows, TableView::Flat, TableMetric::Messages);
+        let data = data_rows(&table);
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].harness_label, "Oh My Pi");
+        assert_eq!(data[0].harness_short, "OMP");
+        assert_eq!(data[0].metrics.count, 8);
+    }
+
+    #[test]
+    fn tied_rows_have_stable_order_across_effort_and_raw_aliases() {
+        let rows = vec![
+            row("codex", "gpt-5.5 (low)", 1),
+            row("codex", "openai/gpt-5.5 (high)", 1),
+            row("codex", "gpt-5.5 (high)", 1),
+            row("codex", "openai/gpt-5.5 (low)", 1),
+        ];
+        let shuffled = vec![
+            rows[1].clone(),
+            rows[0].clone(),
+            rows[3].clone(),
+            rows[2].clone(),
+        ];
+
+        let ordered = build_table(&rows, TableView::Flat, TableMetric::Messages);
+        let reordered = build_table(&shuffled, TableView::Flat, TableMetric::Messages);
+
+        assert_eq!(ordered, reordered);
+        assert_eq!(
+            data_rows(&ordered)
+                .iter()
+                .map(|row| row.model_label.as_str())
+                .collect::<Vec<_>>(),
+            ["GPT-5.5(H)", "GPT-5.5(L)"]
+        );
     }
 
     #[test]

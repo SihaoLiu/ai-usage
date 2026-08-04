@@ -7,7 +7,7 @@
 use chrono::Local;
 
 use crate::constants::save_subscription_fees;
-use crate::table_view::TableView;
+use crate::table_view::{TableMetric, TableView};
 use crate::time_utils::TimeWindow;
 use crate::tool::Tool;
 use crate::{
@@ -26,8 +26,8 @@ pub enum Effect {
     /// State changed and the raw cache is stale; kick a background reload
     /// and rebuild.
     ReloadRefresh,
-    /// Only the table view changed; reshape the table from cached data.
-    ViewChanged,
+    /// Only table presentation changed; reshape it from cached data.
+    TableChanged,
     /// The refresh interval changed; reschedule timers.
     IntervalChanged,
     /// Toggle the help index overlay.
@@ -247,8 +247,16 @@ fn format_host_usage_totals(totals: std::collections::HashMap<String, u128>) -> 
 fn set_view(state: &mut AppState, view: TableView) -> Outcome {
     state.table_view = view;
     Outcome::message(
-        Effect::ViewChanged,
+        Effect::TableChanged,
         format!("Table view: {}", view.description()),
+    )
+}
+
+fn set_sort(state: &mut AppState, sort_metric: TableMetric) -> Outcome {
+    state.sort_metric = sort_metric;
+    Outcome::message(
+        Effect::TableChanged,
+        format!("Sort: {} (descending)", sort_metric.label()),
     )
 }
 
@@ -393,6 +401,7 @@ pub fn execute(state: &mut AppState, raw: &str) -> Outcome {
             }
         }
         "v" | "view" => set_view(state, state.table_view.next()),
+        "s" | "sort" => set_sort(state, state.sort_metric.next()),
         "d" | "day" | "days" => switch_days_preset(state, DAY_PRESET_DAYS),
         "w" | "week" => switch_days_preset(state, WEEK_PRESET_DAYS),
         "m" | "month" => switch_days_preset(state, MONTH_PRESET_DAYS),
@@ -464,7 +473,14 @@ pub fn execute(state: &mut AppState, raw: &str) -> Outcome {
                 },
                 "v" | "view" => match TableView::from_key(arg) {
                     Some(view) => set_view(state, view),
-                    None => Outcome::message(Effect::None, "Usage: v, view [flat|vendor|model]"),
+                    None => Outcome::message(Effect::None, "Usage: v, view [flat|vendor]"),
+                },
+                "s" | "sort" => match TableMetric::from_key(arg) {
+                    Some(metric) => set_sort(state, metric),
+                    None => Outcome::message(
+                        Effect::None,
+                        "Usage: s, sort [msgs|cache|prefill|decode|total|cost|rate]",
+                    ),
                 },
                 "t" | "tool" => switch_tool(state, arg),
                 "host" => switch_host(state, arg),
@@ -522,7 +538,7 @@ static HELP_TOPICS: &[HelpTopic] = &[
             "       cost <vendor>        show one vendor's monthly cost",
             "       cost <vendor> <fee>  save a new fee and redraw",
             "",
-            "Vendors: claude, codex, gemini, kimi",
+            "Harnesses: claude, codex, gemini, kimi",
             "Fees must be non-negative integers or decimals. Successful",
             "changes are persisted to the active .fee.env file.",
         ],
@@ -576,19 +592,33 @@ static HELP_TOPICS: &[HelpTopic] = &[
         name: "view",
         invocation: "v | view <X>",
         keys: &["v"],
-        summary: "Cycle or set table shape (flat|vendor|model)",
+        summary: "Cycle or set table shape (flat|vendor)",
         detail: &[
-            "Usage: v                cycle flat -> vendor -> model",
-            "       view <flat|vendor|model>",
+            "Usage: v                     toggle flat <-> vendor",
+            "       view <flat|vendor>",
             "",
-            "flat:   one row per model x harness; Vendor / Model / Harness as",
-            "        columns, vendor shown once per group.",
-            "vendor: rows grouped under a vendor heading with per-vendor",
-            "        subtotal rows.",
-            "model:  one row per model, merged across harnesses; the Harness",
+            "flat:   one row per model, merged across harnesses; the Harness",
             "        column lists tags like CC,OMP.",
+            "vendor: the same model rows grouped under vendor headings, with",
+            "        subtotal rows for vendors that have multiple models.",
             "",
-            "Also available at startup: --view <flat|vendor|model>.",
+            "Also available at startup: --view <flat|vendor>.",
+        ],
+    },
+    HelpTopic {
+        name: "sort",
+        invocation: "s | sort <KEY>",
+        keys: &["s"],
+        summary: "Sort the table by a numeric column",
+        detail: &[
+            "Usage: s                     select the next sort key",
+            "       sort <KEY>            select one sort key directly",
+            "",
+            "Keys: msgs, cache, prefill, decode, total, cost, rate",
+            "All sorting is descending. Vendor view sorts groups by their",
+            "aggregate value, then models within each group by the same key.",
+            "",
+            "Also available at startup: --sort <KEY>.",
         ],
     },
     HelpTopic {
@@ -749,6 +779,7 @@ mod tests {
         AppState {
             tool: "all".to_string(),
             table_view: TableView::Flat,
+            sort_metric: crate::table_view::TableMetric::Messages,
             host: None,
             session_id: None,
             local_host_id: None,
@@ -893,16 +924,48 @@ mod tests {
     fn view_command_cycles_and_sets() {
         let mut state = test_state();
         let outcome = execute(&mut state, "v");
-        assert_eq!(outcome.effect, Effect::ViewChanged);
+        assert_eq!(outcome.effect, Effect::TableChanged);
         assert_eq!(state.table_view, TableView::Vendor);
 
+        let outcome = execute(&mut state, "v");
+        assert_eq!(outcome.effect, Effect::TableChanged);
+        assert_eq!(state.table_view, TableView::Flat);
+
         let outcome = execute(&mut state, "view model");
-        assert_eq!(outcome.effect, Effect::ViewChanged);
-        assert_eq!(state.table_view, TableView::Model);
+        assert_eq!(outcome.effect, Effect::TableChanged);
+        assert_eq!(state.table_view, TableView::Flat);
 
         let outcome = execute(&mut state, "view bogus");
         assert_eq!(outcome.effect, Effect::None);
-        assert_eq!(state.table_view, TableView::Model);
+        assert_eq!(state.table_view, TableView::Flat);
+    }
+
+    #[test]
+    fn sort_command_cycles_selects_and_rejects_unknown_keys() {
+        use crate::table_view::TableMetric;
+
+        let mut state = test_state();
+        let outcome = execute(&mut state, "s");
+        assert_eq!(outcome.effect, Effect::TableChanged);
+        assert_eq!(state.sort_metric, TableMetric::CacheHit);
+        assert_eq!(outcome.messages, ["Sort: Cache Hit (descending)"]);
+
+        let outcome = execute(&mut state, "sort cost");
+        assert_eq!(outcome.effect, Effect::TableChanged);
+        assert_eq!(state.sort_metric, TableMetric::Cost);
+        assert_eq!(outcome.messages, ["Sort: Cost (descending)"]);
+
+        let outcome = execute(&mut state, "sort RATE");
+        assert_eq!(outcome.effect, Effect::TableChanged);
+        assert_eq!(state.sort_metric, TableMetric::Rate);
+
+        let outcome = execute(&mut state, "sort bogus");
+        assert_eq!(outcome.effect, Effect::None);
+        assert_eq!(state.sort_metric, TableMetric::Rate);
+        assert_eq!(
+            outcome.messages,
+            ["Usage: s, sort [msgs|cache|prefill|decode|total|cost|rate]"]
+        );
     }
 
     #[test]
@@ -1152,6 +1215,12 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("cost all"))
         );
+        assert!(
+            help_topics()[cost_idx]
+                .detail
+                .iter()
+                .any(|line| line.starts_with("Harnesses:"))
+        );
 
         let outcome = execute(&mut state, "h nonsense");
         assert_eq!(outcome.effect, Effect::None);
@@ -1162,6 +1231,16 @@ mod tests {
             assert!(!topic.summary.is_empty());
             assert!(!topic.detail.is_empty(), "topic {}", topic.name);
         }
+    }
+
+    #[test]
+    fn sort_help_is_discoverable_by_name_and_alias() {
+        let index = find_help_topic("s").expect("sort help alias");
+        let topic = &help_topics()[index];
+
+        assert_eq!(topic.name, "sort");
+        assert!(topic.detail.iter().any(|line| line.contains("descending")));
+        assert!(topic.detail.iter().any(|line| line.contains("--sort")));
     }
 
     #[test]

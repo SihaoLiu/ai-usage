@@ -28,17 +28,16 @@ cargo build --release
 ./target/release/ai-usage --tool kimi
 ./target/release/ai-usage --tool omp
 
-# Breakdown table shape (also cycled with `v` in monitor mode)
-./target/release/ai-usage --view flat    # Vendor / Model / Harness columns
-./target/release/ai-usage --view vendor  # grouped by vendor with subtotals
-./target/release/ai-usage --view model   # one row per model, harnesses merged
+# Breakdown table shape and descending sort key
+./target/release/ai-usage --view flat --sort msgs    # one row per model, harnesses merged
+./target/release/ai-usage --view vendor --sort cost  # merged models grouped by vendor
 ```
 
 ## Data Sources
 
-| Vendor | Directory | File Pattern |
-|--------|-----------|--------------|
-| Claude | `~/.claude/projects/` | `**/*.jsonl` |
+| Harness | Directory | File Pattern |
+|---------|-----------|--------------|
+| Claude Code | `~/.claude/projects/` | `**/*.jsonl` |
 | Codex | `~/.codex/sessions/` | `YYYY/MM/DD/*.jsonl` |
 | Gemini | `~/.gemini/tmp/` | `<hash>/chats/session-*.json` |
 | Kimi Code | `~/.kimi-code/sessions/` | `**/agents/*/wire.jsonl` |
@@ -59,8 +58,8 @@ src/
   tool.rs            # Tool enum = the Harness axis (keys, names, rotation)
   model_id.rs        # Algorithmic model-id parser; Vendor enum = model maker
                      # (Anthropic/OpenAI/Google/Moonshot/Zhipu) inferred from id
-  table_view.rs      # Renderer-agnostic breakdown table views: flat / vendor /
-                     # model (three shapes over the Vendor x Harness x Model axes)
+  table_view.rs      # Renderer-agnostic Flat and Vendor table shapes over the
+                     # Vendor x Harness x Model axes, including sort semantics
   raw_data.rs        # Raw entry cache, host filtering, cross-tool aggregation
   window_nav.rs      # Time-window navigation and chart interval sizing
   sync_status.rs     # Sync worker polling and status-line formatting
@@ -108,7 +107,8 @@ pricing.json         # API pricing data for all vendors
 - Display adapts to terminal width (Full/Medium/Compact/Minimal modes)
 - The display model has three axes: Vendor (model maker, derived from the model
   id by `model_id::Vendor`), Harness (the CLI tool, `tool::Tool`), and Model.
-  `table_view.rs` is the single source of truth for grouping/merging them.
+  Flat merges harness rows by normalized Model; Vendor groups those same merged
+  rows by model maker. `table_view.rs` owns grouping, merging, and sorting.
   Note: the data/sync layer historically says "vendor" where it means harness
   (`data/<vendor>.rs`, `is_valid_vendor`); do not confuse the two.
 - Monitor mode is a ratatui alternate-screen app (`src/tui/`); `--once` prints

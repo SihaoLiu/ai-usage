@@ -653,8 +653,8 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                         rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
                         next_refresh = Instant::now() + monitor_interval(state);
                     }
-                    Effect::ViewChanged => {
-                        data::rebuild_view(&mut dashboard, state.table_view);
+                    Effect::TableChanged => {
+                        data::rebuild_table(&mut dashboard, state.table_view, state.sort_metric);
                     }
                     Effect::ReloadRefresh => {
                         rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
@@ -834,6 +834,7 @@ mod tests {
         AppState {
             tool: "all".to_string(),
             table_view: TableView::Flat,
+            sort_metric: crate::table_view::TableMetric::Messages,
             host: None,
             session_id: None,
             local_host_id: None,

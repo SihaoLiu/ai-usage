@@ -46,6 +46,7 @@ The document contains `schema_version`, `generated_at`, `timezone`, `range`,
 | `t claude` / `t codex` / `t gemini` / `t kimi` / `t omp` / `t all` | Switch tool (also `tool <name>`) |
 | `host all` / `host <HOST>` | Switch between all machines and one machine |
 | `d <N>` | Change days range |
+| `i <N>` / `i auto` | Set the refresh cadence in seconds, or follow the chart interval (also `interval <N\|auto>`) |
 | `a` | Switch to all harnesses |
 | `v` / `view flat` / `view vendor` | Toggle or select the table view |
 | `s` | Select the next descending sort key |
@@ -65,6 +66,8 @@ The document contains `schema_version`, `generated_at`, `timezone`, `range`,
 | `e` / `exit` | Exit monitor mode |
 
 Monitor mode date and date-time inputs are interpreted in the running machine's local timezone. For date-only ranges, the ending date is included for the full local day. For example, `range 2026-05-01 2026-05-07` covers local time from `2026-05-01 00:00:00` through the end of `2026-05-07`. The two arguments to `range` may be supplied in any order; the earlier instant is treated as the start and the later one as the end.
+
+Monitor mode starts with an automatic refresh cadence: it reloads on the chart interval shown in the span line, clamped to between 1 minute and 1 hour, so it speeds up when you zoom into a short window and slows down on long ones. `i <seconds>` pins an explicit cadence between 1 and 86400 seconds, and `i auto` returns to the automatic one. Sync, when configured, is paced at one third of the active cadence with a one-minute floor.
 
 Automatic updates are disabled unless `--auto-update` is provided. When enabled, monitor mode checks the latest GitHub release on the configured interval, downloads the matching `ai-usage-<target>` asset when a newer version exists, replaces the current executable, and restarts in place.
 

@@ -454,15 +454,34 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
     let initial_range = crate::raw_cache_visible_range(&state.time_window, Local::now());
     request_background_reload_to(state, &mut refresh_tracker, initial_range);
 
-    let monitor_interval = |state: &AppState| Duration::from_secs(state.monitor_interval);
-    let (mut next_refresh, mut next_sync) =
-        crate::monitor_deadlines_on_start(Instant::now(), state.monitor_interval);
+    // The refresh deadline is derived from its anchor on every pass, so an
+    // automatic cadence follows the window's chart interval as it changes.
+    let monitor_interval =
+        |state: &AppState| crate::effective_refresh_interval(state, Local::now());
+    let mut refresh_anchor = Instant::now();
+    let mut next_sync = Instant::now();
+    // Cadence the pending sync was paced against, so an automatic change
+    // reschedules sync exactly like an explicit `i` command does.
+    let mut synced_interval = monitor_interval(state);
     let machine_id = state.local_host_id.clone().unwrap_or_default();
     let mut next_auto_update = config.auto_update.then(Instant::now);
     let mut initial_load_pending = true;
     let mut initial_source_refresh_pending = true;
 
     'monitor: loop {
+        // One cadence per pass: the refresh deadline, the countdown, and the
+        // sync pacing all agree within an iteration.
+        let interval = monitor_interval(state);
+        if interval != synced_interval {
+            synced_interval = interval;
+            next_sync = crate::monitor_sync_deadline_after_interval_change(
+                Instant::now(),
+                next_sync,
+                interval,
+                &machine_id,
+            );
+        }
+
         crate::retire_idle_raw_cache_at(state, Instant::now(), Local::now());
 
         if crate::poll_version_cache(state) {
@@ -525,7 +544,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                     next_sync = crate::monitor_sync_deadline_after_refresh(
                         Instant::now(),
                         next_sync,
-                        monitor_interval(state),
+                        interval,
                         &machine_id,
                     );
                 }
@@ -567,18 +586,19 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
             ));
         }
 
-        if Instant::now() >= next_refresh {
+        if Instant::now() >= refresh_anchor + interval {
             source_refresh_tracker.request(state);
-            next_refresh = Instant::now() + monitor_interval(state);
+            refresh_anchor = Instant::now();
         }
 
         if let Some(worker) = sync_worker.as_ref()
             && Instant::now() >= next_sync
         {
             worker.request_sync();
-            next_sync = Instant::now() + crate::monitor_sync_interval(monitor_interval(state));
+            next_sync = Instant::now() + crate::monitor_sync_interval(interval);
         }
 
+        let next_refresh = refresh_anchor + interval;
         let refresh_in = next_refresh.saturating_duration_since(Instant::now());
         {
             let ui = render::Ui {
@@ -651,7 +671,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                     }
                     Effect::Refresh => {
                         rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
-                        next_refresh = Instant::now() + monitor_interval(state);
+                        refresh_anchor = Instant::now();
                     }
                     Effect::TableChanged => {
                         data::rebuild_table(&mut dashboard, state.table_view, state.sort_metric);
@@ -659,17 +679,11 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                     Effect::ReloadRefresh => {
                         rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
                         source_refresh_tracker.request(state);
-                        next_refresh = Instant::now() + monitor_interval(state);
+                        refresh_anchor = Instant::now();
                     }
-                    Effect::IntervalChanged => {
-                        let (refresh_at, sync_at) = crate::monitor_deadlines_after_interval_change(
-                            Instant::now(),
-                            state.monitor_interval,
-                            &machine_id,
-                        );
-                        next_refresh = refresh_at;
-                        next_sync = sync_at;
-                    }
+                    // Sync follows from the cadence check at the top of the
+                    // loop; only the refresh countdown restarts here.
+                    Effect::IntervalChanged => refresh_anchor = Instant::now(),
                     Effect::None => {}
                 }
                 if !outcome.messages.is_empty() {
@@ -684,7 +698,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 let outcome = commands::rotate_tool(state, step);
                 if outcome.effect == Effect::Refresh {
                     rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
-                    next_refresh = Instant::now() + monitor_interval(state);
+                    refresh_anchor = Instant::now();
                 }
                 notice = make_notice(outcome.messages);
             }
@@ -713,7 +727,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 if let Some(new_window) = state.time_window.slide_back(now) {
                     state.time_window = new_window;
                     rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
-                    next_refresh = Instant::now() + monitor_interval(state);
+                    refresh_anchor = Instant::now();
                 }
             }
             Event::Key(KeyEvent {
@@ -724,7 +738,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 if let Some(new_window) = state.time_window.slide_forward(now) {
                     state.time_window = new_window;
                     rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
-                    next_refresh = Instant::now() + monitor_interval(state);
+                    refresh_anchor = Instant::now();
                 }
             }
             Event::Key(KeyEvent {
@@ -748,7 +762,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                     ) {
                         state.time_window = new_window;
                         rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
-                        next_refresh = Instant::now() + monitor_interval(state);
+                        refresh_anchor = Instant::now();
                     }
                 } else if code == KeyCode::Left {
                     input.move_left();
@@ -770,7 +784,7 @@ pub fn run_monitor(state: &mut AppState, sync_worker: Option<SyncWorker>, config
                 if let Some(new_window) = new_window {
                     state.time_window = new_window;
                     rebuild_or_reload_window(state, &mut dashboard, &mut refresh_tracker);
-                    next_refresh = Instant::now() + monitor_interval(state);
+                    refresh_anchor = Instant::now();
                 }
             }
             Event::Key(KeyEvent {
@@ -840,7 +854,7 @@ mod tests {
             local_host_id: None,
             days: 3,
             time_window: TimeWindow::rolling_days(3),
-            monitor_interval: 3600,
+            refresh_interval: crate::refresh::RefreshInterval::Manual(3600),
             pricing: AllPricing::load_raw().finalize(),
             subscription_fees: SubscriptionFees::default(),
             fee_env_path: std::path::PathBuf::from(".fee.env"),

@@ -7,6 +7,7 @@ mod model_overrides;
 mod pricing;
 mod process_usage;
 mod raw_data;
+mod refresh;
 mod snapshot;
 mod stats;
 mod sync;
@@ -36,6 +37,7 @@ use time_utils::TimeWindow;
 use tool::Tool;
 
 pub(crate) use raw_data::*;
+pub(crate) use refresh::*;
 pub(crate) use sync_status::*;
 pub(crate) use window_nav::*;
 
@@ -80,7 +82,7 @@ struct AppState {
     local_host_id: Option<String>,
     days: i64,
     time_window: TimeWindow,
-    monitor_interval: u64,
+    refresh_interval: RefreshInterval,
     pricing: AllPricing,
     subscription_fees: SubscriptionFees,
     fee_env_path: PathBuf,
@@ -103,7 +105,8 @@ struct Args {
     #[arg(long, default_value = "3")]
     days: i64,
 
-    /// Run once and exit (default: monitor mode with 1 hour refresh)
+    /// Run once and exit (default: monitor mode, refreshing on the chart
+    /// interval between 1 minute and 1 hour)
     #[arg(long)]
     once: bool,
 
@@ -482,12 +485,6 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
 
     println!("Calculating {} usage...", tool_name);
     println!("{}", showing_data_line(&state.time_window, now));
-    if !once {
-        println!(
-            "Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)",
-            state.monitor_interval
-        );
-    }
 
     let effective_height = if will_print_table { height } else { 0 };
     print_model_breakdown(
@@ -648,12 +645,6 @@ fn print_stats_all(state: &mut AppState, once: bool) -> Option<bool> {
 
     println!("Calculating usage across all tools...");
     println!("{}", showing_data_line(&state.time_window, now));
-    if !once {
-        println!(
-            "Monitor mode: Refreshing every {} seconds (Press Ctrl+C to exit)",
-            state.monitor_interval
-        );
-    }
 
     let effective_height = if will_print_table { height } else { 0 };
     print_model_breakdown(
@@ -981,7 +972,7 @@ fn main() {
         local_host_id,
         days: args.days,
         time_window: TimeWindow::rolling_days(args.days),
-        monitor_interval: 3600,
+        refresh_interval: RefreshInterval::default(),
         pricing,
         subscription_fees,
         fee_env_path,

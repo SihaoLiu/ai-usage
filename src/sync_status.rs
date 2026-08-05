@@ -84,26 +84,17 @@ pub(crate) fn monitor_sync_deadline_after_refresh(
     current_deadline.min(triggered_deadline)
 }
 
-pub(crate) fn monitor_deadlines_on_start(
+/// Sync deadline after the refresh cadence changed. The refresh deadline is
+/// derived from its own anchor, so only the staggered sync needs rescheduling.
+/// Rescheduling only ever pulls the deadline earlier: an automatic cadence can
+/// change repeatedly, and postponing each time would starve sync entirely.
+pub(crate) fn monitor_sync_deadline_after_interval_change(
     now: std::time::Instant,
-    monitor_interval_seconds: u64,
-) -> (std::time::Instant, std::time::Instant) {
-    (
-        now + std::time::Duration::from_secs(monitor_interval_seconds),
-        now,
-    )
-}
-
-pub(crate) fn monitor_deadlines_after_interval_change(
-    now: std::time::Instant,
-    monitor_interval_seconds: u64,
+    current_deadline: std::time::Instant,
+    monitor_interval: std::time::Duration,
     machine_id: &str,
-) -> (std::time::Instant, std::time::Instant) {
-    let monitor_interval = std::time::Duration::from_secs(monitor_interval_seconds);
-    (
-        now + monitor_interval,
-        now + monitor_sync_delay(monitor_interval, machine_id),
-    )
+) -> std::time::Instant {
+    current_deadline.min(now + monitor_sync_delay(monitor_interval, machine_id))
 }
 
 pub(crate) fn auto_update_deadline_after(
@@ -433,27 +424,45 @@ mod tests {
     }
 
     #[test]
-    fn interval_change_reschedules_refresh_and_sync_deadlines() {
+    fn interval_change_reschedules_the_staggered_sync_deadline() {
         let now = std::time::Instant::now();
+        let far_future = now + std::time::Duration::from_secs(86_400);
 
-        let (next_refresh, next_sync) =
-            monitor_deadlines_after_interval_change(now, 3600, "workstation");
+        let next_sync = monitor_sync_deadline_after_interval_change(
+            now,
+            far_future,
+            std::time::Duration::from_secs(3600),
+            "workstation",
+        );
 
-        assert_eq!(next_refresh, now + std::time::Duration::from_secs(3600));
         assert_eq!(
             next_sync,
             now + monitor_sync_delay(std::time::Duration::from_secs(3600), "workstation")
         );
     }
 
+    /// An automatic cadence can change on every window or resize event.
+    /// Rescheduling must never postpone a sync that is already due, or a run
+    /// of changes would starve sync for as long as the user keeps navigating.
     #[test]
-    fn monitor_start_makes_initial_sync_immediately_due() {
+    fn interval_change_never_postpones_a_pending_sync() {
         let now = std::time::Instant::now();
+        let lengthened = std::time::Duration::from_secs(3600);
 
-        let (next_refresh, next_sync) = monitor_deadlines_on_start(now, 3600);
+        let due_now =
+            monitor_sync_deadline_after_interval_change(now, now, lengthened, "workstation");
+        assert_eq!(due_now, now);
 
-        assert_eq!(next_refresh, now + std::time::Duration::from_secs(3600));
-        assert_eq!(next_sync, now);
+        let mut deadline = now + std::time::Duration::from_secs(90);
+        for _ in 0..10 {
+            deadline = monitor_sync_deadline_after_interval_change(
+                now,
+                deadline,
+                lengthened,
+                "workstation",
+            );
+        }
+        assert_eq!(deadline, now + std::time::Duration::from_secs(90));
     }
 
     #[test]

@@ -320,15 +320,14 @@ pub fn build(state: &mut AppState) -> Dashboard {
     let projection_days = state.time_window.projection_days(now);
     let window_label = crate::showing_data_line(&state.time_window, now);
 
-    let target_width = crate::get_chart_target_width();
     let granularity = crate::display_chart_granularity(&range_start, &range_end);
-    let optimal = crate::calculate_optimal_interval_minutes(
-        &range_start,
-        &range_end,
-        target_width,
-        granularity,
+    // Same value the automatic refresh cadence is derived from, so the
+    // interval shown in the span line is the one being paced against.
+    let interval_minutes = crate::display_interval_minutes_for_window(
+        &state.time_window,
+        now,
+        crate::get_chart_target_width(),
     );
-    let interval_minutes = crate::round_to_nice_interval(optimal);
     let times = interval_times(&range_start, &range_end, interval_minutes);
 
     let window_complete = crate::raw_cache_covers_window(state, now);

@@ -21,7 +21,7 @@ fn state_with_cache(cache: RawDataCache, window: TimeWindow) -> AppState {
         local_host_id: None,
         days: 3,
         time_window: window,
-        monitor_interval: 3600,
+        refresh_interval: crate::refresh::RefreshInterval::Manual(3600),
         pricing: AllPricing::load_raw().finalize(),
         subscription_fees: SubscriptionFees::default(),
         fee_env_path: std::path::PathBuf::from(".fee.env"),

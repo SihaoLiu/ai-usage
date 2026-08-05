@@ -7,6 +7,7 @@
 use chrono::Local;
 
 use crate::constants::save_subscription_fees;
+use crate::refresh::RefreshInterval;
 use crate::table_view::{TableMetric, TableView};
 use crate::time_utils::TimeWindow;
 use crate::tool::Tool;
@@ -260,6 +261,27 @@ fn set_sort(state: &mut AppState, sort_metric: TableMetric) -> Outcome {
     )
 }
 
+fn set_refresh_interval(state: &mut AppState, arg: &str) -> Outcome {
+    match RefreshInterval::parse(arg) {
+        Ok(interval) => {
+            state.refresh_interval = interval;
+            let described = crate::describe_refresh_interval(state, Local::now());
+            Outcome::message(
+                Effect::IntervalChanged,
+                match interval {
+                    RefreshInterval::Auto => {
+                        format!("Refresh interval follows the chart interval: {described}.")
+                    }
+                    RefreshInterval::Manual(_) => {
+                        format!("Refresh interval changed to {described}.")
+                    }
+                },
+            )
+        }
+        Err(message) => Outcome::message(Effect::None, message),
+    }
+}
+
 fn set_session(state: &mut AppState, session_id: Option<&str>) -> Outcome {
     let Some(session_id) = session_id else {
         return Outcome {
@@ -434,8 +456,11 @@ pub fn execute(state: &mut AppState, raw: &str) -> Outcome {
         }
         "i" | "interval" => Outcome {
             messages: vec![
-                format!("Current interval: {} seconds", state.monitor_interval),
-                "Usage: i <N> or interval <N>".to_string(),
+                format!(
+                    "Current interval: {}",
+                    crate::describe_refresh_interval(state, Local::now())
+                ),
+                "Usage: i <N|auto> or interval <N|auto>".to_string(),
             ],
             effect: Effect::None,
         },
@@ -495,17 +520,7 @@ pub fn execute(state: &mut AppState, raw: &str) -> Outcome {
                     Ok(_) => Outcome::message(Effect::None, "Days must be at least 1."),
                     Err(_) => Outcome::message(Effect::None, "Invalid days value."),
                 },
-                "i" | "interval" => match arg.parse::<u64>() {
-                    Ok(n) if n >= 1 => {
-                        state.monitor_interval = n;
-                        Outcome::message(
-                            Effect::IntervalChanged,
-                            format!("Refresh interval changed to {} seconds.", n),
-                        )
-                    }
-                    Ok(_) => Outcome::message(Effect::None, "Interval must be at least 1 second."),
-                    Err(_) => Outcome::message(Effect::None, "Invalid interval value."),
-                },
+                "i" | "interval" => set_refresh_interval(state, arg),
                 _ => Outcome::message(
                     Effect::None,
                     format!("Unknown command: '{}'. Type h for help.", command),
@@ -689,15 +704,24 @@ static HELP_TOPICS: &[HelpTopic] = &[
     },
     HelpTopic {
         name: "interval",
-        invocation: "i, interval <N>",
+        invocation: "i, interval <N|auto>",
         keys: &["i"],
         summary: "Change the auto-refresh interval (seconds)",
         detail: &[
-            "Usage: i <seconds> | interval <seconds>",
+            "Usage: i <seconds> | interval <seconds>   1 to 86400 seconds",
+            "       i auto | interval auto",
             "",
             "Sets how often the dashboard reloads data automatically; the",
             "countdown is shown in the header. Sync (when configured) runs at",
-            "one third of this interval. Bare `i` prints the current value.",
+            "one third of this interval but never faster than once a minute,",
+            "offset by a per-machine delay so machines do not all sync at the",
+            "same instant. Bare `i` prints the current value.",
+            "",
+            "auto is the startup mode: the cadence follows the chart interval",
+            "shown in the span line, clamped to between 1 minute and 1 hour.",
+            "It changes with the window, so zooming to a 5m chart refreshes",
+            "every minute while a 1d chart refreshes hourly. An explicit value",
+            "is kept until `i auto` restores automatic pacing.",
         ],
     },
     HelpTopic {
@@ -785,7 +809,7 @@ mod tests {
             local_host_id: None,
             days: 3,
             time_window: TimeWindow::rolling_days(3),
-            monitor_interval: 3600,
+            refresh_interval: crate::refresh::RefreshInterval::Manual(3600),
             pricing: AllPricing::load_raw().finalize(),
             subscription_fees: SubscriptionFees::default(),
             fee_env_path: PathBuf::from(".fee.env"),
@@ -973,14 +997,49 @@ mod tests {
         let mut state = test_state();
         let outcome = execute(&mut state, "i 30");
         assert_eq!(outcome.effect, Effect::IntervalChanged);
-        assert_eq!(state.monitor_interval, 30);
+        assert_eq!(state.refresh_interval, RefreshInterval::Manual(30));
 
         let outcome = execute(&mut state, "i 0");
         assert_eq!(outcome.effect, Effect::None);
-        assert_eq!(state.monitor_interval, 30);
+        assert_eq!(state.refresh_interval, RefreshInterval::Manual(30));
 
         let outcome = execute(&mut state, "i abc");
         assert_eq!(outcome.effect, Effect::None);
+        assert_eq!(state.refresh_interval, RefreshInterval::Manual(30));
+
+        let outcome = execute(&mut state, &format!("i {}", u64::MAX));
+        assert_eq!(outcome.effect, Effect::None);
+        assert_eq!(state.refresh_interval, RefreshInterval::Manual(30));
+    }
+
+    #[test]
+    fn interval_auto_restores_the_window_derived_cadence() {
+        let mut state = test_state();
+        state.refresh_interval = RefreshInterval::Manual(30);
+
+        let outcome = execute(&mut state, "interval auto");
+
+        assert_eq!(outcome.effect, Effect::IntervalChanged);
+        assert_eq!(state.refresh_interval, RefreshInterval::Auto);
+        assert!(
+            outcome.messages[0].contains("chart interval"),
+            "{:?}",
+            outcome.messages
+        );
+    }
+
+    #[test]
+    fn bare_interval_reports_the_active_mode() {
+        let mut state = test_state();
+        state.refresh_interval = RefreshInterval::Auto;
+
+        let auto = execute(&mut state, "i");
+        assert_eq!(auto.effect, Effect::None);
+        assert!(auto.messages[0].starts_with("Current interval: auto ("));
+
+        state.refresh_interval = RefreshInterval::Manual(45);
+        let manual = execute(&mut state, "i");
+        assert_eq!(manual.messages[0], "Current interval: 45 seconds");
     }
 
     #[test]

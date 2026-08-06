@@ -33,7 +33,7 @@ const SNAPSHOT_DIFF_TARGET_BYTES: usize = 700_000;
 const UPLOAD_TARGET_BYTES: usize = 700_000;
 const INTEGRITY_RECHECK_INTERVAL: Duration = Duration::hours(6);
 const LEGACY_SNAPSHOT_RECEIPT_MAX_AGE_SECS: u64 = 6 * 60 * 60;
-const LEGACY_PULL_BACKFILL_INTERVAL: Duration = Duration::hours(6);
+const FULL_PULL_INTERVAL: Duration = Duration::hours(6);
 const SNAPSHOT_UPLOAD_STATE_VERSION: u32 = state::SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION;
 const OMP_METADATA_REFRESH_LOG_VENDOR: &str = "omp-metadata-refresh";
 const PULL_SCOPE_EXCLUDE_HOST_PREFIX: &str = "scope:exclude-host:";
@@ -1274,9 +1274,10 @@ where
         server_instance_id.as_deref(),
     );
     let scope_changed = sync_state.pull_scope != pull_scope;
-    let legacy_backfill_due = server_instance_id.is_none()
-        && legacy_pull_backfill_due(sync_state.last_full_pull.as_deref(), pull_started_at);
-    let requires_full_backfill = scope_changed || legacy_backfill_due;
+    let periodic_full_pull_due = server_instance_id.is_none()
+        && !sync_state.full_pull_in_progress
+        && full_pull_due(sync_state.last_full_pull.as_deref(), pull_started_at);
+    let requires_full_backfill = scope_changed || periodic_full_pull_due;
     let mut request_state = sync_state.clone();
     if requires_full_backfill {
         request_state.last_seen_seq = 0;
@@ -1298,14 +1299,14 @@ where
     // Commit the vendor-set migration only after the server has accepted the
     // set: an older server rejecting the new vendor must never wipe the
     // existing remote cache.
-    let mut performed_full_backfill = false;
     if requires_full_backfill {
         cache::clear_remote_cache(cache_root)?;
         stable_data_changed = true;
-        performed_full_backfill = true;
         sync_state.last_seen_seq = 0;
         sync_state.pull_vendors = fingerprint;
         sync_state.pull_scope = pull_scope;
+        sync_state.full_pull_in_progress = true;
+        sync_state.integrity_check = None;
     } else if sync_state.pull_vendors != fingerprint {
         if is_fingerprint_subset(&fingerprint, &sync_state.pull_vendors) {
             // Downgrade (server rollback): cursor and cache stay valid for a
@@ -1316,9 +1317,10 @@ where
         } else {
             cache::clear_remote_cache(cache_root)?;
             stable_data_changed = true;
-            performed_full_backfill = true;
             sync_state.last_seen_seq = 0;
             sync_state.pull_vendors = fingerprint;
+            sync_state.full_pull_in_progress = true;
+            sync_state.integrity_check = None;
         }
     }
     let mut page_index = 0;
@@ -1352,8 +1354,9 @@ where
         )?;
     }
 
-    if performed_full_backfill {
-        sync_state.last_full_pull = Some(pull_started_at.to_rfc3339());
+    if sync_state.full_pull_in_progress {
+        sync_state.last_full_pull = Some(Utc::now().to_rfc3339());
+        sync_state.full_pull_in_progress = false;
     }
     sync_state.last_successful_sync = Some(Utc::now().to_rfc3339());
     sync_state.last_error = None;
@@ -1369,14 +1372,14 @@ where
     })
 }
 
-fn legacy_pull_backfill_due(last_full_pull: Option<&str>, now: DateTime<Utc>) -> bool {
+fn full_pull_due(last_full_pull: Option<&str>, now: DateTime<Utc>) -> bool {
     let Some(last_full_pull) = last_full_pull
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
         .map(|value| value.with_timezone(&Utc))
     else {
         return true;
     };
-    last_full_pull > now || now - last_full_pull >= LEGACY_PULL_BACKFILL_INTERVAL
+    last_full_pull > now || now - last_full_pull >= FULL_PULL_INTERVAL
 }
 
 fn timestamp_precedes_integrity_range(timestamp: &str, range_end: DateTime<Utc>) -> bool {
@@ -1413,8 +1416,13 @@ where
 {
     let checked_at = Utc::now();
     let server_instance_id = transport.server_instance_id()?;
-    let verification =
-        run_integrity_once_with_repair_result(cache_root, config, transport, &mut on_progress)?;
+    let verification = run_integrity_once_with_repair_result(
+        cache_root,
+        config,
+        server_instance_id.as_deref(),
+        transport,
+        &mut on_progress,
+    )?;
     persist_successful_integrity_check(
         cache_root,
         config,
@@ -1428,6 +1436,7 @@ where
 fn run_integrity_once_with_repair_result<F>(
     cache_root: &Path,
     config: &EnabledSyncConfig,
+    server_instance_id: Option<&str>,
     transport: &impl SyncTransport,
     mut on_progress: F,
 ) -> Result<Option<crate::sync::integrity::IntegrityVerification>, SyncError>
@@ -1440,12 +1449,46 @@ where
         verification,
         Some(crate::sync::integrity::IntegrityVerification::Failed { .. })
     ) {
-        cache::clear_remote_cache(cache_root)?;
-        state::clear_sync_state(cache_root)?;
-        run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+        state::invalidate_integrity_check(cache_root)?;
+        let sync_state = state::load_sync_state(cache_root);
+        if !full_pull_repair_due(&sync_state, config, server_instance_id, Utc::now()) {
+            return Ok(verification);
+        }
+        let current_identity =
+            full_pull_identity_is_current(&sync_state, config, server_instance_id);
+        if current_identity && !sync_state.full_pull_in_progress {
+            cache::clear_remote_cache(cache_root)?;
+            state::clear_sync_state(cache_root)?;
+        }
+        let pull = run_pull_once_with_progress(cache_root, config, transport, &mut on_progress)?;
+        if !pull.used_full_vendor_set {
+            return Ok(verification);
+        }
         return run_integrity_once_with_progress(cache_root, config, transport, &mut on_progress);
     }
     Ok(verification)
+}
+
+fn full_pull_identity_is_current(
+    sync_state: &state::SyncState,
+    config: &EnabledSyncConfig,
+    server_instance_id: Option<&str>,
+) -> bool {
+    sync_state.pull_scope
+        == crate::sync::cache_generation::server_scope_fingerprint(config, server_instance_id)
+        && sync_state.pull_vendors
+            == pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS, &config.machine_id)
+}
+
+fn full_pull_repair_due(
+    sync_state: &state::SyncState,
+    config: &EnabledSyncConfig,
+    server_instance_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> bool {
+    sync_state.full_pull_in_progress
+        || !full_pull_identity_is_current(sync_state, config, server_instance_id)
+        || full_pull_due(sync_state.last_full_pull.as_deref(), now)
 }
 
 fn reusable_integrity_check(

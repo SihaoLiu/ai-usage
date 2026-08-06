@@ -26,6 +26,8 @@ pub struct SyncState {
     pub pull_scope: String,
     #[serde(default)]
     pub last_full_pull: Option<String>,
+    #[serde(default)]
+    pub full_pull_in_progress: bool,
     pub last_successful_sync: Option<String>,
     pub last_error: Option<String>,
     #[serde(default)]
@@ -101,6 +103,7 @@ impl Default for SyncState {
             pull_vendors: Vec::new(),
             pull_scope: String::new(),
             last_full_pull: None,
+            full_pull_in_progress: false,
             last_successful_sync: None,
             last_error: None,
             integrity_check: None,
@@ -374,6 +377,7 @@ mod tests {
                 pull_vendors: Vec::new(),
                 pull_scope: String::new(),
                 last_full_pull: None,
+                full_pull_in_progress: false,
                 last_successful_sync: None,
                 last_error: None,
                 integrity_check: None,
@@ -390,6 +394,7 @@ mod tests {
             pull_vendors: vec!["claude".to_string(), "codex".to_string()],
             pull_scope: "server-a".to_string(),
             last_full_pull: Some("2026-05-18T12:00:00Z".to_string()),
+            full_pull_in_progress: true,
             last_successful_sync: Some("2026-05-18T12:34:56Z".to_string()),
             last_error: Some("temporary network error".to_string()),
             integrity_check: None,
@@ -411,6 +416,7 @@ mod tests {
             pull_vendors: vec!["claude".to_string(), "codex".to_string()],
             pull_scope: "server-a".to_string(),
             last_full_pull: Some("2026-05-18T12:00:00Z".to_string()),
+            full_pull_in_progress: true,
             last_successful_sync: Some("2026-05-18T12:34:56Z".to_string()),
             last_error: Some("temporary network error".to_string()),
             integrity_check: Some(IntegrityCheckState {
@@ -485,6 +491,7 @@ mod tests {
 
         let state = load_sync_state(&cache_root);
 
+        assert!(!state.full_pull_in_progress);
         assert_eq!(
             state
                 .integrity_check
@@ -640,6 +647,7 @@ mod tests {
                 pull_vendors: Vec::new(),
                 pull_scope: String::new(),
                 last_full_pull: None,
+                full_pull_in_progress: false,
                 last_successful_sync: Some("2026-05-20T00:00:00Z".to_string()),
                 last_error: None,
                 integrity_check: None,
@@ -663,6 +671,7 @@ mod tests {
             pull_vendors: Vec::new(),
             pull_scope: String::new(),
             last_full_pull: None,
+            full_pull_in_progress: false,
             last_successful_sync: None,
             last_error: None,
             integrity_check: None,

@@ -22,6 +22,7 @@ struct FakeTransport {
     pull_requests: RefCell<Vec<PullRequestLog>>,
     integrity_submissions: RefCell<Vec<IntegrityReport>>,
     integrity_reports: RefCell<Vec<IntegrityReport>>,
+    pull_error_request: Option<usize>,
     /// When set, pull() rejects any request whose vendor list contains
     /// this vendor, imitating an older server's "invalid vendor" 400.
     reject_pull_vendor: Option<&'static str>,
@@ -58,6 +59,7 @@ impl FakeTransport {
             pull_requests: RefCell::new(Vec::new()),
             integrity_submissions: RefCell::new(Vec::new()),
             integrity_reports: RefCell::new(Vec::new()),
+            pull_error_request: None,
             reject_pull_vendor: None,
             reject_upload_vendor: None,
             server_instance_id: None,
@@ -80,6 +82,11 @@ impl FakeTransport {
 
     fn with_server_instance(mut self, instance_id: &str) -> Self {
         self.server_instance_id = Some(instance_id.to_string());
+        self
+    }
+
+    fn with_pull_error_on_request(mut self, request_index: usize) -> Self {
+        self.pull_error_request = Some(request_index);
         self
     }
 }
@@ -106,15 +113,22 @@ impl SyncTransport for FakeTransport {
         limit: usize,
         supported_vendors: &[&str],
     ) -> Result<PullResponse, SyncError> {
-        self.pull_requests.borrow_mut().push((
-            after_seq,
-            exclude_host.to_string(),
-            limit,
-            supported_vendors
-                .iter()
-                .map(|vendor| (*vendor).to_string())
-                .collect(),
-        ));
+        let request_index = {
+            let mut requests = self.pull_requests.borrow_mut();
+            requests.push((
+                after_seq,
+                exclude_host.to_string(),
+                limit,
+                supported_vendors
+                    .iter()
+                    .map(|vendor| (*vendor).to_string())
+                    .collect(),
+            ));
+            requests.len()
+        };
+        if self.pull_error_request == Some(request_index) {
+            return Err(SyncError::new("temporary pull failure"));
+        }
         if let Some(rejected) = self.reject_pull_vendor
             && supported_vendors.contains(&rejected)
         {
@@ -1322,7 +1336,8 @@ fn integrity_failure_clears_remote_cache_and_rechecks_after_repull() {
                 &enabled_config("workstation"),
                 None,
             ),
-            last_full_pull: Some(Utc::now().to_rfc3339()),
+            last_full_pull: None,
+            full_pull_in_progress: false,
             last_successful_sync: None,
             last_error: None,
             integrity_check: None,
@@ -1339,23 +1354,16 @@ fn integrity_failure_clears_remote_cache_and_rechecks_after_repull() {
     .expect("owner report");
     let pulled = sequenced_remote_record(1, correct);
     let transport = FakeTransport::new_with_integrity(
-        vec![
-            PullResponse {
-                records: vec![pulled.clone()],
-                max_seq: 1,
-                truncated: false,
-            },
-            PullResponse {
-                records: vec![pulled],
-                max_seq: 1,
-                truncated: false,
-            },
-        ],
+        vec![PullResponse {
+            records: vec![pulled],
+            max_seq: 1,
+            truncated: false,
+        }],
         vec![owner_report],
     );
     let mut events = Vec::new();
 
-    run_sync_cycle_with_progress(
+    run_integrity_once_with_repair(
         &cache_root,
         &enabled_config("workstation"),
         &transport,
@@ -1363,8 +1371,8 @@ fn integrity_failure_clears_remote_cache_and_rechecks_after_repull() {
     )
     .expect("sync cycle");
 
-    assert_eq!(transport.pull_requests.borrow().len(), 2);
-    assert!(matches!(transport.pull_requests.borrow()[1].0, 0));
+    assert_eq!(transport.pull_requests.borrow().len(), 1);
+    assert!(matches!(transport.pull_requests.borrow()[0].0, 0));
     let integrity_events = events
         .iter()
         .filter_map(|event| match event {
@@ -1403,9 +1411,10 @@ fn pull_integrity_repair_clears_stale_cache_after_incremental_pull_failure() {
             pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS, "workstation"),
             pull_scope: crate::sync::cache_generation::server_scope_fingerprint(
                 &enabled_config("workstation"),
-                None,
+                Some("server-a"),
             ),
-            last_full_pull: Some(Utc::now().to_rfc3339()),
+            last_full_pull: Some((Utc::now() - Duration::hours(7)).to_rfc3339()),
+            full_pull_in_progress: false,
             last_successful_sync: None,
             last_error: None,
             integrity_check: None,
@@ -1435,7 +1444,8 @@ fn pull_integrity_repair_clears_stale_cache_after_incremental_pull_failure() {
             },
         ],
         vec![owner_report],
-    );
+    )
+    .with_server_instance("server-a");
     let mut events = Vec::new();
 
     run_pull_and_integrity_once_with_progress(

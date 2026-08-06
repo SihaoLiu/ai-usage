@@ -10,6 +10,7 @@ fn populated_pull_state() -> crate::sync::state::SyncState {
             .collect(),
         pull_scope: "server-a".to_string(),
         last_full_pull: Some("2026-05-18T12:00:00Z".to_string()),
+        full_pull_in_progress: false,
         last_successful_sync: Some("2026-05-18T12:34:56Z".to_string()),
         last_error: None,
         integrity_check: None,

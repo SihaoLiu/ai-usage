@@ -427,20 +427,14 @@ pub(crate) fn merge_remote_records_into_raw_cache(
         let Some(host_id) = record.entry.host_id.as_deref() else {
             continue;
         };
+        if cache.local_host_id.as_deref() == Some(host_id) {
+            continue;
+        }
         let Some(tool) = Tool::from_key(&record.vendor) else {
             continue;
         };
         let globally_stable = collapse_globally_stable_keys
             && is_globally_stable_usage_key(&record.vendor, &record.dedup_key);
-        if cache.local_host_id.as_deref() == Some(host_id)
-            && cache
-                .local_record_keys
-                .get(&tool)
-                .is_some_and(|keys| keys.contains_key(&record.dedup_key))
-            && !globally_stable
-        {
-            continue;
-        }
         if globally_stable {
             let existing = globally_seen
                 .get(&tool)

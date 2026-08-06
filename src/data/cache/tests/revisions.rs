@@ -7,7 +7,7 @@ fn hot_snapshot_with_previous_projection_magic_is_rejected() {
         .expect("write current hot snapshot");
     let path = cache_root.join(crate::data::cache::HOT_SNAPSHOT_FILE);
     let mut content = fs::read(&path).expect("read hot snapshot");
-    content[..8].copy_from_slice(b"AIUHOT01");
+    content[..8].copy_from_slice(b"AIUHOT02");
     fs::write(&path, content).expect("write previous hot snapshot");
 
     let error =

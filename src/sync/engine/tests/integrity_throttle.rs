@@ -19,7 +19,7 @@ fn save_recent_integrity_check(cache_root: &Path, range_end_utc: String) {
         &crate::sync::state::SyncState {
             schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 0,
-            pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS),
+            pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS, "workstation"),
             pull_scope: crate::sync::cache_generation::server_scope_fingerprint(&config, None),
             last_full_pull: Some(Utc::now().to_rfc3339()),
             last_successful_sync: None,
@@ -242,7 +242,7 @@ fn background_cycle_rechecks_after_remote_cache_reset() {
         crate::sync::integrity::integrity_range_end_utc(Utc::now()).to_rfc3339(),
     );
     let mut sync_state = crate::sync::state::load_sync_state(&cache_root);
-    sync_state.pull_vendors = pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS);
+    sync_state.pull_vendors = pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS, "workstation");
     crate::sync::state::save_sync_state(&cache_root, &sync_state).expect("save previous vendors");
     crate::data::cache::merge_remote_records(
         &cache_root,

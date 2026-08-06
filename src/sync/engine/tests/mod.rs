@@ -1202,6 +1202,11 @@ fn pull_progress_reports_pages_and_record_totals() {
             },
         ]
     );
+    let requests = transport.pull_requests.borrow();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0, 0);
+    assert_eq!(requests[1].0, 7);
+    assert!(requests.iter().all(|request| request.1 == "workstation"));
 }
 
 #[test]
@@ -1312,7 +1317,7 @@ fn integrity_failure_clears_remote_cache_and_rechecks_after_repull() {
         &crate::sync::state::SyncState {
             schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 0,
-            pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS),
+            pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS, "workstation"),
             pull_scope: crate::sync::cache_generation::server_scope_fingerprint(
                 &enabled_config("workstation"),
                 None,
@@ -1395,7 +1400,7 @@ fn pull_integrity_repair_clears_stale_cache_after_incremental_pull_failure() {
         &crate::sync::state::SyncState {
             schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 10,
-            pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS),
+            pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS, "workstation"),
             pull_scope: crate::sync::cache_generation::server_scope_fingerprint(
                 &enabled_config("workstation"),
                 None,
@@ -1625,7 +1630,7 @@ fn sync_pull_resets_cursor_when_pull_vendor_set_changes() {
 }
 
 #[test]
-fn sync_pull_resets_legacy_exclude_self_cursor_and_requests_all_hosts() {
+fn sync_pull_resets_legacy_cursor_and_excludes_the_local_host() {
     let cache_root = unique_temp_dir("pull-include-self");
     std::fs::write(
         cache_root.join("sync_state.json"),
@@ -1653,7 +1658,10 @@ fn sync_pull_resets_legacy_exclude_self_cursor_and_requests_all_hosts() {
     .expect("pull");
 
     let (after_seq, exclude_host, limit, _) = transport.pull_requests.borrow()[0].clone();
-    assert_eq!((after_seq, exclude_host, limit), (0, String::new(), 5_000));
+    assert_eq!(
+        (after_seq, exclude_host, limit),
+        (0, "workstation".to_string(), 5_000)
+    );
     assert_eq!(
         crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
         123

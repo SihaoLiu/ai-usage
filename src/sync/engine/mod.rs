@@ -36,7 +36,7 @@ const LEGACY_SNAPSHOT_RECEIPT_MAX_AGE_SECS: u64 = 6 * 60 * 60;
 const LEGACY_PULL_BACKFILL_INTERVAL: Duration = Duration::hours(6);
 const SNAPSHOT_UPLOAD_STATE_VERSION: u32 = state::SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION;
 const OMP_METADATA_REFRESH_LOG_VENDOR: &str = "omp-metadata-refresh";
-const PULL_SCOPE_ALL_HOSTS_MARKER: &str = "scope:all-hosts";
+const PULL_SCOPE_EXCLUDE_HOST_PREFIX: &str = "scope:exclude-host:";
 static SNAPSHOT_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -1116,9 +1116,9 @@ fn is_unsupported_vendor_error(err: &SyncError) -> bool {
     message.contains("invalid vendor") || message.contains("unsupported vendor")
 }
 
-fn pull_state_fingerprint_for(vendors: &[&str]) -> Vec<String> {
+fn pull_state_fingerprint_for(vendors: &[&str], excluded_host: &str) -> Vec<String> {
     let mut fingerprint: Vec<String> = vendors.iter().map(|vendor| (*vendor).to_string()).collect();
-    fingerprint.push(PULL_SCOPE_ALL_HOSTS_MARKER.to_string());
+    fingerprint.push(format!("{PULL_SCOPE_EXCLUDE_HOST_PREFIX}{excluded_host}"));
     fingerprint
 }
 
@@ -1133,15 +1133,16 @@ fn is_fingerprint_subset(subset: &[String], superset: &[String]) -> bool {
 fn try_first_pull_page(
     transport: &impl SyncTransport,
     sync_state: &state::SyncState,
+    excluded_host: &str,
     vendors: &'static [&'static str],
 ) -> Result<(&'static [&'static str], Vec<String>, PullResponse), SyncError> {
-    let fingerprint = pull_state_fingerprint_for(vendors);
+    let fingerprint = pull_state_fingerprint_for(vendors, excluded_host);
     let start_seq = if is_fingerprint_subset(&fingerprint, &sync_state.pull_vendors) {
         sync_state.last_seen_seq
     } else {
         0
     };
-    let response = transport.pull(start_seq, "", PULL_LIMIT, vendors)?;
+    let response = transport.pull(start_seq, excluded_host, PULL_LIMIT, vendors)?;
     Ok((vendors, fingerprint, response))
 }
 
@@ -1153,10 +1154,16 @@ fn try_first_pull_page(
 fn negotiate_first_pull_page(
     transport: &impl SyncTransport,
     sync_state: &state::SyncState,
+    excluded_host: &str,
 ) -> Result<(&'static [&'static str], Vec<String>, PullResponse), SyncError> {
-    match try_first_pull_page(transport, sync_state, &SUPPORTED_PULL_VENDORS) {
+    match try_first_pull_page(
+        transport,
+        sync_state,
+        excluded_host,
+        &SUPPORTED_PULL_VENDORS,
+    ) {
         Err(err) if is_unsupported_vendor_error(&err) => {
-            try_first_pull_page(transport, sync_state, &PREVIOUS_PULL_VENDORS)
+            try_first_pull_page(transport, sync_state, excluded_host, &PREVIOUS_PULL_VENDORS)
         }
         result => result,
     }
@@ -1275,7 +1282,7 @@ where
         request_state.last_seen_seq = 0;
     }
     let (vendors, fingerprint, mut response) =
-        negotiate_first_pull_page(transport, &request_state)?;
+        negotiate_first_pull_page(transport, &request_state, &config.machine_id)?;
     let mut stable_data_changed = false;
     if vendors != SUPPORTED_PULL_VENDORS {
         let unavailable: Vec<String> = SUPPORTED_PULL_VENDORS
@@ -1337,7 +1344,12 @@ where
         if !response.truncated {
             break;
         }
-        response = transport.pull(sync_state.last_seen_seq, "", PULL_LIMIT, vendors)?;
+        response = transport.pull(
+            sync_state.last_seen_seq,
+            &config.machine_id,
+            PULL_LIMIT,
+            vendors,
+        )?;
     }
 
     if performed_full_backfill {

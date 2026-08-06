@@ -12,7 +12,7 @@ fn pull_downgrade_after_rollback_keeps_cached_records_and_cursor() {
         &crate::sync::state::SyncState {
             schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 10,
-            pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS),
+            pull_vendors: pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS, "workstation"),
             pull_scope: crate::sync::cache_generation::server_scope_fingerprint(
                 &enabled_config("workstation"),
                 None,
@@ -44,13 +44,14 @@ fn pull_downgrade_after_rollback_keeps_cached_records_and_cursor() {
     let requests = transport.pull_requests.borrow();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].0, 10);
+    assert!(requests.iter().all(|request| request.1 == "workstation"));
     let remote = crate::data::cache::load_remote_entries(&cache_root, None);
     assert_eq!(remote.len(), 1);
     assert_eq!(remote[0].dedup_key, "remote-kimi");
     let state = crate::sync::state::load_sync_state(&cache_root);
     assert_eq!(
         state.pull_vendors,
-        pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS)
+        pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS, "workstation")
     );
 }
 
@@ -65,7 +66,7 @@ fn pull_preserves_cache_and_downgrades_when_older_server_rejects_new_vendor() {
         &crate::sync::state::SyncState {
             schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 10,
-            pull_vendors: pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS),
+            pull_vendors: pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS, "workstation"),
             pull_scope: crate::sync::cache_generation::server_scope_fingerprint(
                 &enabled_config("workstation"),
                 None,
@@ -102,6 +103,7 @@ fn pull_preserves_cache_and_downgrades_when_older_server_rejects_new_vendor() {
     assert!(requests[0].3.contains(&"kimi".to_string()));
     assert!(!requests[1].3.contains(&"kimi".to_string()));
     assert_eq!(requests[1].0, 10);
+    assert!(requests.iter().all(|request| request.1 == "workstation"));
     assert!(events.iter().any(|event| matches!(
         event,
         SyncProgress::PullVendorsUnavailable { vendors }
@@ -116,7 +118,7 @@ fn pull_preserves_cache_and_downgrades_when_older_server_rejects_new_vendor() {
     let state = crate::sync::state::load_sync_state(&cache_root);
     assert_eq!(
         state.pull_vendors,
-        pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS)
+        pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS, "workstation")
     );
 }
 
@@ -131,7 +133,7 @@ fn pull_migrates_vendor_fingerprint_once_server_accepts_new_vendor() {
         &crate::sync::state::SyncState {
             schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 10,
-            pull_vendors: pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS),
+            pull_vendors: pull_state_fingerprint_for(&PREVIOUS_PULL_VENDORS, "workstation"),
             pull_scope: crate::sync::cache_generation::server_scope_fingerprint(
                 &enabled_config("workstation"),
                 None,
@@ -162,12 +164,13 @@ fn pull_migrates_vendor_fingerprint_once_server_accepts_new_vendor() {
     let requests = transport.pull_requests.borrow();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].0, 0);
+    assert_eq!(requests[0].1, "workstation");
     let remote = crate::data::cache::load_remote_entries(&cache_root, None);
     assert_eq!(remote.len(), 1);
     assert_eq!(remote[0].dedup_key, "remote-kimi");
     let state = crate::sync::state::load_sync_state(&cache_root);
     assert_eq!(
         state.pull_vendors,
-        pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS)
+        pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS, "workstation")
     );
 }

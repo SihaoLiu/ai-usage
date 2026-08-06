@@ -1070,7 +1070,7 @@ fn remote_records_merge_into_tool_buckets() {
 }
 
 #[test]
-fn remote_records_from_local_host_fill_missing_keys_without_duplicates() {
+fn remote_records_from_local_host_never_compete_with_canonical_local_cache() {
     let timestamp = "2026-05-18T12:00:00Z";
     let center = time_utils::parse_timestamp(timestamp).expect("timestamp");
     let mut cache = RawDataCache {
@@ -1140,7 +1140,7 @@ fn remote_records_from_local_host_fill_missing_keys_without_duplicates() {
         false,
     );
 
-    assert_eq!(cache.claude.len(), 2);
+    assert_eq!(cache.claude.len(), 1);
     assert!(
         cache
             .claude
@@ -1148,16 +1148,16 @@ fn remote_records_from_local_host_fill_missing_keys_without_duplicates() {
             .any(|entry| entry.model == "local-model")
     );
     assert!(
-        cache
+        !cache
             .claude
             .iter()
-            .any(|entry| entry.model == "missing-model")
+            .any(|entry| entry.model == "duplicate-model")
     );
     assert!(
         !cache
             .claude
             .iter()
-            .any(|entry| entry.model == "duplicate-model")
+            .any(|entry| entry.model == "missing-model")
     );
 }
 
@@ -1244,7 +1244,7 @@ fn all_host_projection_is_independent_of_cache_prefetch_range() {
 }
 
 #[test]
-fn all_host_projection_keeps_visible_same_host_copy_across_prefetch_ranges() {
+fn all_host_projection_does_not_resurrect_same_host_remote_copy() {
     let cache_root = unique_temp_dir("all-host-same-host-prefetch-range");
     let local_timestamp = "2026-05-17T12:00:00Z";
     let remote_timestamp = "2026-05-18T12:00:00Z";
@@ -1281,11 +1281,8 @@ fn all_host_projection_keeps_visible_same_host_copy_across_prefetch_ranges() {
     let narrow_visible = filter_all_tool_data_borrowed(&narrow, &window, None, now);
     let wide_visible = filter_all_tool_data_borrowed(&wide, &window, None, now);
 
-    assert_eq!(narrow_visible.codex.len(), 1);
-    assert_eq!(wide_visible.codex.len(), 1);
-    assert_eq!(narrow_visible.codex[0].usage.input_tokens, 99);
-    assert_eq!(wide_visible.codex[0].usage.input_tokens, 99);
-    assert_eq!(wide_visible.codex[0].host_id.as_deref(), Some("local-host"));
+    assert!(narrow_visible.codex.is_empty());
+    assert!(wide_visible.codex.is_empty());
 }
 
 #[test]

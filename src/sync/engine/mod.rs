@@ -440,7 +440,7 @@ where
         )?;
         let content_revision =
             reconciled_snapshot_revision(transport, &config.machine_id, record_count)?;
-        state::invalidate_pull_state(cache_root)?;
+        state::invalidate_integrity_check(cache_root)?;
         state::commit_pending_snapshot_upload(
             cache_root,
             &pending.state,
@@ -636,7 +636,7 @@ where
     let content_revision =
         reconciled_snapshot_revision(transport, &config.machine_id, snapshot_record_count)?;
     if requires_full_reconciliation {
-        state::invalidate_pull_state(cache_root)?;
+        state::invalidate_integrity_check(cache_root)?;
         state::commit_pending_snapshot_upload(
             cache_root,
             &completed_state,

@@ -98,25 +98,51 @@ fn snapshot_state_records_the_local_cache_generation() {
 }
 
 #[test]
-fn full_snapshot_reconciliation_invalidates_the_pull_cursor() {
-    let cache_root = unique_temp_dir("snapshot-invalidates-pull");
+fn full_snapshot_reconciliation_preserves_the_peer_pull_cursor() {
+    let cache_root = unique_temp_dir("snapshot-preserves-peer-pull");
+    let config = enabled_config("workstation");
+    let server_instance = "server-instance";
     populate_vendor_cache(&cache_root, "claude", "first");
-    crate::sync::state::save_sync_state(&cache_root, &populated_pull_state())
-        .expect("save pull state");
+    let mut pull_state = populated_pull_state();
+    pull_state.pull_vendors = pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS, "workstation");
+    pull_state.pull_scope =
+        crate::sync::cache_generation::server_scope_fingerprint(&config, Some(server_instance));
+    pull_state.integrity_check = Some(crate::sync::state::IntegrityCheckState {
+        checked_at: "2026-05-18T12:34:56Z".to_string(),
+        range_end_utc: "2026-05-18T00:00:00Z".to_string(),
+        checked_hosts: 2,
+        sync_scope: "scope-a".to_string(),
+    });
+    crate::sync::state::save_sync_state(&cache_root, &pull_state).expect("save pull state");
 
     run_upload_once_with_progress(
         &cache_root,
-        &enabled_config("workstation"),
-        &DiffSnapshotTransport::new(Vec::new()),
+        &config,
+        &DiffSnapshotTransport::new(Vec::new()).with_server_instance(server_instance),
         |_| {},
     )
     .expect("full snapshot upload");
 
     let state = crate::sync::state::load_sync_state(&cache_root);
-    assert_eq!(state.last_seen_seq, 0);
-    assert!(state.pull_vendors.is_empty());
-    assert!(state.pull_scope.is_empty());
-    assert!(state.last_full_pull.is_none());
+    assert_eq!(
+        state,
+        crate::sync::state::SyncState {
+            integrity_check: None,
+            ..pull_state
+        }
+    );
+
+    let transport = FakeTransport::new(vec![PullResponse {
+        records: Vec::new(),
+        max_seq: 42,
+        truncated: false,
+    }])
+    .with_server_instance(server_instance);
+    run_pull_once_with_progress(&cache_root, &config, &transport, |_| {})
+        .expect("incremental peer pull");
+    let request = &transport.pull_requests.borrow()[0];
+    assert_eq!(request.0, 42);
+    assert_eq!(request.1, "workstation");
 }
 
 #[test]
@@ -347,14 +373,22 @@ fn snapshot_upload_commits_the_captured_generation_while_new_records_arrive() {
 #[test]
 fn snapshot_finalize_retry_resumes_without_replaying_manifest() {
     let cache_root = unique_temp_dir("snapshot-finalize-resume");
+    let config = enabled_config("workstation");
     populate_vendor_cache(&cache_root, "claude", "first");
-    let pull_state = populated_pull_state();
+    let mut pull_state = populated_pull_state();
+    pull_state.pull_vendors = pull_state_fingerprint_for(&SUPPORTED_PULL_VENDORS, "workstation");
+    pull_state.pull_scope = crate::sync::cache_generation::server_scope_fingerprint(&config, None);
+    pull_state.integrity_check = Some(crate::sync::state::IntegrityCheckState {
+        checked_at: "2026-05-18T12:34:56Z".to_string(),
+        range_end_utc: "2026-05-18T00:00:00Z".to_string(),
+        checked_hosts: 2,
+        sync_scope: "scope-a".to_string(),
+    });
     crate::sync::state::save_sync_state(&cache_root, &pull_state).expect("save pull state");
     let first = DiffSnapshotTransport::new(Vec::new()).with_finalize_error("timeout: global");
 
-    let error =
-        run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &first, |_| {})
-            .expect_err("finalize timeout");
+    let error = run_upload_once_with_progress(&cache_root, &config, &first, |_| {})
+        .expect_err("finalize timeout");
     assert_eq!(error.to_string(), "snapshot finalize: timeout: global");
     assert_eq!(first.snapshot_diffs.borrow().len(), 1);
     assert_eq!(first.snapshot_finalizations.borrow().len(), 1);
@@ -362,8 +396,7 @@ fn snapshot_finalize_retry_resumes_without_replaying_manifest() {
     let snapshot_id = first.snapshot_finalizations.borrow()[0].snapshot_id.clone();
 
     let retry = DiffSnapshotTransport::new(Vec::new());
-    run_upload_once_with_progress(&cache_root, &enabled_config("workstation"), &retry, |_| {})
-        .expect("resume finalize");
+    run_upload_once_with_progress(&cache_root, &config, &retry, |_| {}).expect("resume finalize");
 
     assert!(retry.snapshot_diffs.borrow().is_empty());
     assert!(retry.snapshot_record_batches.borrow().is_empty());
@@ -373,8 +406,11 @@ fn snapshot_finalize_retry_resumes_without_replaying_manifest() {
         snapshot_id
     );
     assert_eq!(
-        crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
-        0
+        crate::sync::state::load_sync_state(&cache_root),
+        crate::sync::state::SyncState {
+            integrity_check: None,
+            ..pull_state
+        }
     );
 }
 

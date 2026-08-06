@@ -129,12 +129,8 @@ pub fn save_sync_state(cache_root: &Path, state: &SyncState) -> io::Result<()> {
     atomic_write(&path, &content)
 }
 
-pub fn invalidate_pull_state(cache_root: &Path) -> io::Result<()> {
+pub fn invalidate_integrity_check(cache_root: &Path) -> io::Result<()> {
     let mut state = load_sync_state(cache_root);
-    state.last_seen_seq = 0;
-    state.pull_vendors.clear();
-    state.pull_scope.clear();
-    state.last_full_pull = None;
     state.integrity_check = None;
     save_sync_state(cache_root, &state)
 }
@@ -407,8 +403,8 @@ mod tests {
     }
 
     #[test]
-    fn pull_invalidation_preserves_upload_and_diagnostic_state() {
-        let cache_root = unique_temp_dir("invalidate-pull");
+    fn integrity_invalidation_preserves_pull_and_diagnostic_state() {
+        let cache_root = unique_temp_dir("invalidate-integrity");
         let state = SyncState {
             schema_version: SYNC_STATE_SCHEMA_VERSION,
             last_seen_seq: 42,
@@ -437,14 +433,13 @@ mod tests {
         save_snapshot_upload_state(&cache_root, &snapshot, "scope-a", Some(9))
             .expect("save snapshot state");
 
-        invalidate_pull_state(&cache_root).expect("invalidate pull state");
+        invalidate_integrity_check(&cache_root).expect("invalidate integrity check");
 
         assert_eq!(
             load_sync_state(&cache_root),
             SyncState {
-                last_successful_sync: state.last_successful_sync,
-                last_error: state.last_error,
-                ..SyncState::default()
+                integrity_check: None,
+                ..state
             }
         );
         assert_eq!(load_snapshot_upload_state(&cache_root), snapshot);

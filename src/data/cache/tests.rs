@@ -311,7 +311,7 @@ fn cache_before_session_ids_remains_readable() {
 }
 
 #[test]
-fn manifest_marks_session_metadata_stale_until_current_parser_revision() {
+fn manifest_marks_parser_revision_stale_until_current() {
     let cache_root = unique_temp_dir("session-metadata-revision");
     let source = cache_root.join("source.jsonl");
     write_source(&source, "first");
@@ -319,7 +319,7 @@ fn manifest_marks_session_metadata_stale_until_current_parser_revision() {
     let _ = super::load_or_update_vendor_cache(&cache_root, "claude", vec![source], -1, |_| {
         vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
     });
-    assert!(super::vendor_session_metadata_is_current(
+    assert!(super::vendor_parser_revision_is_current(
         &cache_root,
         "claude"
     ));
@@ -335,7 +335,7 @@ fn manifest_marks_session_metadata_stale_until_current_parser_revision() {
     )
     .expect("write stale manifest");
 
-    assert!(!super::vendor_session_metadata_is_current(
+    assert!(!super::vendor_parser_revision_is_current(
         &cache_root,
         "claude"
     ));
@@ -347,14 +347,14 @@ fn manifest_marks_session_metadata_stale_until_current_parser_revision() {
     )
     .expect("write empty manifest");
 
-    assert!(!super::vendor_session_metadata_is_current(
+    assert!(!super::vendor_parser_revision_is_current(
         &cache_root,
         "claude"
     ));
 }
 
 #[test]
-fn retained_inactive_sources_do_not_keep_session_metadata_stale() {
+fn retained_inactive_sources_do_not_keep_parser_revision_stale() {
     let cache_root = unique_temp_dir("inactive-session-metadata");
     let active = cache_root.join("active.jsonl");
     let retired = cache_root.join("retired.jsonl");
@@ -385,14 +385,30 @@ fn retained_inactive_sources_do_not_keep_session_metadata_stale() {
     .expect("write stale manifest");
     fs::remove_file(&retired).expect("remove retired source");
 
+    assert!(!super::vendor_parser_revision_is_current(
+        &cache_root,
+        "claude"
+    ));
+
     super::refresh_retaining_vendor_cache(&cache_root, "claude", vec![active], -1, |_| {
         vec![usage_record("stable-key", "2026-05-01T00:00:00Z", 42)]
     });
 
-    assert!(super::vendor_session_metadata_is_current(
+    assert!(super::vendor_parser_revision_is_current(
         &cache_root,
         "claude"
     ));
+    let records = super::load_vendor_cached_records(&cache_root, "claude");
+    assert_eq!(records.len(), 1);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.source_path != retired_key)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(manifest_path).expect("read refreshed manifest"))
+            .expect("parse refreshed manifest");
+    assert!(manifest["vendors"]["claude"]["files"][retired_key].is_null());
 }
 
 #[test]
@@ -1712,4 +1728,70 @@ fn retaining_refresh_keeps_records_for_deleted_sources_in_cache() {
     let snapshot = super::load_vendor_cached_snapshot(&cache_root, "test");
 
     assert_eq!(entry_tokens(&snapshot), vec![1, 2]);
+}
+
+#[test]
+fn claude_parser_change_reparses_active_sources_and_drops_stale_inactive_records() {
+    let cache_root = unique_temp_dir("claude-parser-migration");
+    let active_source = cache_root.join("active.jsonl");
+    let retired_source = cache_root.join("retired.jsonl");
+    write_source(&active_source, "active");
+    write_source(&retired_source, "retired");
+    super::refresh_retaining_vendor_cache(
+        &cache_root,
+        "claude",
+        vec![active_source.clone(), retired_source.clone()],
+        1,
+        |path| {
+            if path == active_source {
+                vec![
+                    usage_record("", "2026-05-01T00:00:00Z", 5),
+                    usage_record("", "2026-05-01T00:01:00Z", 10),
+                    usage_record("stable-key", "2026-05-01T00:03:00Z", 20),
+                ]
+            } else {
+                vec![usage_record("retired-old", "2026-05-01T00:02:00Z", 2)]
+            }
+        },
+    );
+    let retired_key = fs::canonicalize(&retired_source)
+        .expect("canonical retired source")
+        .to_string_lossy()
+        .into_owned();
+    let manifest_path = cache_root.join(super::MANIFEST_FILE);
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
+            .expect("manifest json");
+    manifest["vendors"]["claude"]["session_metadata_revision"] = serde_json::json!(0);
+    manifest["vendors"]["claude"]["files"]
+        .as_object_mut()
+        .expect("manifest files")
+        .values_mut()
+        .for_each(|meta| meta["parser_revision"] = serde_json::json!(0));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write old manifest");
+    fs::remove_file(&retired_source).expect("remove retired source");
+    super::refresh_retaining_vendor_cache(&cache_root, "claude", vec![active_source], 0, |_| {
+        vec![
+            usage_record("stable-key", "2026-05-01T00:03:00Z", 20),
+            usage_record("new-key", "2026-05-01T00:03:00Z", 20),
+            usage_record("claude:message:message-a", "2026-05-01T00:01:00Z", 10),
+        ]
+    });
+    let snapshot = super::load_vendor_cached_snapshot(&cache_root, "claude");
+    assert_eq!(entry_tokens(&snapshot), vec![20, 20, 10]);
+    assert_eq!(
+        snapshot
+            .iter()
+            .map(|entry| entry.fast_tier)
+            .collect::<Vec<_>>(),
+        vec![1, 0, 1]
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(manifest_path).expect("read new manifest"))
+            .expect("new manifest json");
+    assert!(manifest["vendors"]["claude"]["files"][retired_key].is_null());
 }

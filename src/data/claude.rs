@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -41,6 +42,10 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("~"))
 }
 
+fn claude_response_key(message_id: &str) -> String {
+    format!("claude:message:{message_id}")
+}
+
 /// Collect all JSONL file paths under the given directory,
 /// optionally filtering by mtime (files modified within `max_age_days`).
 fn collect_jsonl_files(dir: &Path, max_age_days: Option<i64>) -> Vec<PathBuf> {
@@ -75,6 +80,7 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
         .filter(|name| !name.is_empty())
         .map(str::to_string);
     let mut entries = Vec::new();
+    let mut response_positions = HashMap::new();
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -107,14 +113,11 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
             .unwrap_or("unknown")
             .to_string();
 
-        // Build dedup key from message_id:request_id
         let message_id = message.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let request_id = data.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
-
-        let dedup_key = if !message_id.is_empty() && !request_id.is_empty() {
-            format!("{}:{}", message_id, request_id)
-        } else {
+        let dedup_key = if message_id.is_empty() {
             String::new()
+        } else {
+            claude_response_key(message_id)
         };
 
         let parsed_ts = parse_timestamp(&timestamp);
@@ -126,7 +129,7 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
             .map(str::to_string)
             .or_else(|| fallback_session_id.clone());
 
-        entries.push(SourceUsageRecord {
+        let record = SourceUsageRecord {
             dedup_key,
             entry: UsageEntry {
                 host_id: None,
@@ -159,7 +162,15 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
                 },
                 costs: None,
             },
-        });
+        };
+        if message_id.is_empty() {
+            entries.push(record);
+        } else if let Some(index) = response_positions.get(message_id) {
+            entries[*index] = record;
+        } else {
+            response_positions.insert(message_id.to_string(), entries.len());
+            entries.push(record);
+        }
     }
 
     entries
@@ -168,23 +179,132 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
-    #[test]
-    fn usage_records_keep_the_claude_session_id() {
-        let path = std::env::temp_dir().join("ai-usage-claude-session-test.jsonl");
-        fs::write(
-            &path,
-            r#"{"sessionId":"claude-session","timestamp":"2026-07-23T00:00:00Z","requestId":"request","message":{"id":"message","model":"claude-test","usage":{"input_tokens":1,"output_tokens":2}}}"#,
-        )
-        .expect("write fixture");
+    fn read_fixture(name: &str, content: &str) -> Vec<SourceUsageRecord> {
+        let path = std::env::temp_dir().join(format!(
+            "ai-usage-claude-{name}-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(&path, content).expect("write fixture");
 
         let records = read_jsonl_file_records(&path);
         fs::remove_file(&path).ok();
+        records
+    }
+
+    #[test]
+    fn usage_records_keep_the_claude_session_id() {
+        let records = read_fixture(
+            "session",
+            r#"{"sessionId":"claude-session","timestamp":"2026-07-23T00:00:00Z","requestId":"request","message":{"id":"message","model":"claude-test","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        );
 
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].entry.session_id.as_deref(),
             Some("claude-session")
         );
+    }
+
+    #[test]
+    fn repeated_content_blocks_count_one_claude_response() {
+        let records = read_fixture(
+            "content-blocks",
+            concat!(
+                r#"{"sessionId":"session-a","timestamp":"2026-08-05T16:43:13Z","message":{"id":"message-a","model":"claude-first","usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":4}}}"#,
+                "\n",
+                r#"{"sessionId":"session-b","timestamp":"2026-08-05T16:43:14Z","message":{"id":"message-a","model":"claude-middle","usage":{"input_tokens":5,"output_tokens":5,"cache_read_input_tokens":6,"cache_creation_input_tokens":7}}}"#,
+                "\n",
+                r#"{"sessionId":"session-c","timestamp":"2026-08-05T16:43:15Z","message":{"id":"message-a","model":"claude-final","usage":{"input_tokens":9,"output_tokens":8,"cache_read_input_tokens":10,"cache_creation_input_tokens":11}}}"#,
+            ),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].dedup_key, "claude:message:message-a");
+        assert_eq!(records[0].entry.session_id.as_deref(), Some("session-c"));
+        assert_eq!(records[0].entry.timestamp, "2026-08-05T16:43:15Z");
+        assert_eq!(records[0].entry.session_start_time, "2026-08-05T16:43:15Z");
+        assert_eq!(records[0].entry.session_end_time, "2026-08-05T16:43:15Z");
+        assert_eq!(records[0].entry.model, "claude-final");
+        assert_eq!(records[0].entry.usage.input_tokens, 9);
+        assert_eq!(records[0].entry.usage.output_tokens, 8);
+        assert_eq!(records[0].entry.usage.cache_read_input_tokens, 10);
+        assert_eq!(records[0].entry.usage.cache_creation_input_tokens, 11);
+    }
+
+    #[test]
+    fn request_id_does_not_split_one_claude_response() {
+        let records = read_fixture(
+            "request-id",
+            concat!(
+                r#"{"timestamp":"2026-08-05T16:43:13Z","requestId":"request-a","message":{"id":"message-a","model":"claude-test","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-05T16:43:14Z","requestId":"request-b","message":{"id":"message-a","model":"claude-test","usage":{"input_tokens":1,"output_tokens":5}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-05T16:43:15Z","message":{"id":"message-a","model":"claude-test","usage":{"input_tokens":1,"output_tokens":8}}}"#,
+            ),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].dedup_key, "claude:message:message-a");
+        assert_eq!(records[0].entry.usage.output_tokens, 8);
+    }
+
+    #[test]
+    fn repeated_response_keeps_final_timestamp_across_dst_fallback() {
+        let records = read_fixture(
+            "dst-fallback",
+            concat!(
+                r#"{"timestamp":"2026-11-01T08:59:59Z","message":{"id":"message-a","model":"claude-test","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-11-01T09:00:01Z","message":{"id":"message-a","model":"claude-test","usage":{"input_tokens":1,"output_tokens":8}}}"#,
+            ),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry.timestamp, "2026-11-01T09:00:01Z");
+        assert_eq!(records[0].entry.usage.output_tokens, 8);
+        assert_eq!(
+            records[0]
+                .entry
+                .parsed_timestamp
+                .expect("parsed final timestamp")
+                .with_timezone(&Utc),
+            chrono::DateTime::parse_from_rfc3339("2026-11-01T09:00:01Z")
+                .expect("fixed timestamp")
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn distinct_message_ids_remain_distinct() {
+        let records = read_fixture(
+            "distinct-ids",
+            concat!(
+                r#"{"timestamp":"2026-08-05T16:43:13Z","message":{"id":"message-a","model":"claude-test","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-05T16:43:14Z","message":{"id":"message-b","model":"claude-test","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+            ),
+        );
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].dedup_key, "claude:message:message-a");
+        assert_eq!(records[1].dedup_key, "claude:message:message-b");
+    }
+
+    #[test]
+    fn missing_message_ids_remain_separate_fallback_candidates() {
+        let records = read_fixture(
+            "missing-ids",
+            concat!(
+                r#"{"timestamp":"2026-08-05T16:43:13Z","message":{"model":"claude-test","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-05T16:43:14Z","message":{"id":"","model":"claude-test","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+            ),
+        );
+
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.dedup_key.is_empty()));
     }
 }

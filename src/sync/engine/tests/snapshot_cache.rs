@@ -1,5 +1,21 @@
 use super::*;
 
+fn populated_pull_state() -> crate::sync::state::SyncState {
+    crate::sync::state::SyncState {
+        schema_version: crate::sync::state::SYNC_STATE_SCHEMA_VERSION,
+        last_seen_seq: 42,
+        pull_vendors: SUPPORTED_PULL_VENDORS
+            .iter()
+            .map(|vendor| (*vendor).to_string())
+            .collect(),
+        pull_scope: "server-a".to_string(),
+        last_full_pull: Some("2026-05-18T12:00:00Z".to_string()),
+        last_successful_sync: Some("2026-05-18T12:34:56Z".to_string()),
+        last_error: None,
+        integrity_check: None,
+    }
+}
+
 #[test]
 fn local_cache_generation_tracks_vendor_cache_changes() {
     let cache_root = unique_temp_dir("snapshot-cache-generation");
@@ -79,6 +95,119 @@ fn snapshot_state_records_the_local_cache_generation() {
         state.cache_generation,
         crate::sync::cache_generation::local_cache_generation(&cache_root, &VENDORS)
     );
+}
+
+#[test]
+fn full_snapshot_reconciliation_invalidates_the_pull_cursor() {
+    let cache_root = unique_temp_dir("snapshot-invalidates-pull");
+    populate_vendor_cache(&cache_root, "claude", "first");
+    crate::sync::state::save_sync_state(&cache_root, &populated_pull_state())
+        .expect("save pull state");
+
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &DiffSnapshotTransport::new(Vec::new()),
+        |_| {},
+    )
+    .expect("full snapshot upload");
+
+    let state = crate::sync::state::load_sync_state(&cache_root);
+    assert_eq!(state.last_seen_seq, 0);
+    assert!(state.pull_vendors.is_empty());
+    assert!(state.pull_scope.is_empty());
+    assert!(state.last_full_pull.is_none());
+}
+
+#[test]
+fn reconciled_snapshot_rebuilds_remote_cache_without_stale_self_records() {
+    let cache_root = unique_temp_dir("snapshot-rebuilds-remote");
+    let config = enabled_config("workstation");
+    populate_vendor_cache(&cache_root, "claude", "claude:message:response-a");
+    crate::data::cache::merge_remote_records(
+        &cache_root,
+        "workstation",
+        vec![remote_usage_record(
+            "workstation",
+            "claude",
+            "fallback:v1:response-a:0",
+            "2026-05-18T12:00:00Z",
+            10,
+        )],
+    )
+    .expect("seed stale remote cache");
+    let mut pull_state = populated_pull_state();
+    pull_state.pull_scope = crate::sync::cache_generation::server_scope_fingerprint(&config, None);
+    crate::sync::state::save_sync_state(&cache_root, &pull_state).expect("save pull state");
+
+    run_upload_once_with_progress(
+        &cache_root,
+        &config,
+        &DiffSnapshotTransport::new(Vec::new()),
+        |_| {},
+    )
+    .expect("full snapshot upload");
+
+    let canonical = sequenced_remote_record(
+        7,
+        remote_usage_record(
+            "workstation",
+            "claude",
+            "claude:message:response-a",
+            "2026-05-18T12:00:00Z",
+            10,
+        ),
+    );
+    let transport = FakeTransport::new(vec![PullResponse {
+        records: vec![canonical],
+        max_seq: 7,
+        truncated: false,
+    }]);
+    run_pull_once_with_progress(&cache_root, &config, &transport, |_| {})
+        .expect("full pull after reconciliation");
+
+    assert_eq!(transport.pull_requests.borrow()[0].0, 0);
+    let remote = crate::data::cache::load_remote_entries(&cache_root, None);
+    assert_eq!(remote.len(), 1);
+    assert_eq!(remote[0].dedup_key, "claude:message:response-a");
+}
+
+#[test]
+fn incremental_snapshot_keeps_the_pull_cursor() {
+    let cache_root = unique_temp_dir("snapshot-keeps-pull");
+    populate_vendor_cache(&cache_root, "claude", "first");
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &DiffSnapshotTransport::new(Vec::new()),
+        |_| {},
+    )
+    .expect("initial snapshot upload");
+    let pull_state = populated_pull_state();
+    crate::sync::state::save_sync_state(&cache_root, &pull_state).expect("save pull state");
+    populate_vendor_cache_with_records(
+        &cache_root,
+        "claude",
+        vec![
+            usage_record("first", "2026-05-18T12:00:00Z", 10),
+            usage_record("second", "2026-05-18T12:01:00Z", 20),
+        ],
+    );
+    let transport = DiffSnapshotTransport::new(vec![RecordKey {
+        vendor: "claude".to_string(),
+        dedup_key: "second".to_string(),
+    }]);
+
+    run_upload_once_with_progress(
+        &cache_root,
+        &enabled_config("workstation"),
+        &transport,
+        |_| {},
+    )
+    .expect("incremental snapshot upload");
+
+    assert!(transport.snapshot_finalizations.borrow().is_empty());
+    assert_eq!(crate::sync::state::load_sync_state(&cache_root), pull_state);
 }
 
 #[test]
@@ -219,6 +348,8 @@ fn snapshot_upload_commits_the_captured_generation_while_new_records_arrive() {
 fn snapshot_finalize_retry_resumes_without_replaying_manifest() {
     let cache_root = unique_temp_dir("snapshot-finalize-resume");
     populate_vendor_cache(&cache_root, "claude", "first");
+    let pull_state = populated_pull_state();
+    crate::sync::state::save_sync_state(&cache_root, &pull_state).expect("save pull state");
     let first = DiffSnapshotTransport::new(Vec::new()).with_finalize_error("timeout: global");
 
     let error =
@@ -227,6 +358,7 @@ fn snapshot_finalize_retry_resumes_without_replaying_manifest() {
     assert_eq!(error.to_string(), "snapshot finalize: timeout: global");
     assert_eq!(first.snapshot_diffs.borrow().len(), 1);
     assert_eq!(first.snapshot_finalizations.borrow().len(), 1);
+    assert_eq!(crate::sync::state::load_sync_state(&cache_root), pull_state);
     let snapshot_id = first.snapshot_finalizations.borrow()[0].snapshot_id.clone();
 
     let retry = DiffSnapshotTransport::new(Vec::new());
@@ -239,6 +371,10 @@ fn snapshot_finalize_retry_resumes_without_replaying_manifest() {
     assert_eq!(
         retry.snapshot_finalizations.borrow()[0].snapshot_id,
         snapshot_id
+    );
+    assert_eq!(
+        crate::sync::state::load_sync_state(&cache_root).last_seen_seq,
+        0
     );
 }
 

@@ -874,7 +874,7 @@ mod tests {
                 local_host_id: None,
                 local_record_keys: HashMap::new(),
                 persistent_generation: String::new(),
-                local_session_metadata_current: true,
+                local_parser_revision_current: true,
             }),
             raw_cache_last_used_at: None,
             raw_refresh: None,

@@ -123,11 +123,9 @@ pub(crate) struct RawDataCache {
     pub(crate) local_record_keys: HashMap<Tool, HashSet<String>>,
     #[serde(default)]
     pub(crate) persistent_generation: String,
-    /// True when cached local records were parsed by the session-id-aware
-    /// parser. An absent requested id is then a valid result, not a reason to
-    /// rescan every source log.
+    /// True when cached local records use the current parser revisions.
     #[serde(default)]
-    pub(crate) local_session_metadata_current: bool,
+    pub(crate) local_parser_revision_current: bool,
 }
 
 pub(crate) enum BackgroundRawLoad {
@@ -189,7 +187,7 @@ fn prepare_hot_raw_snapshot(source: &RawDataCache, captured_at: DateTime<Local>)
             local_host_id: source.local_host_id.clone(),
             local_record_keys: HashMap::new(),
             persistent_generation: source.persistent_generation.clone(),
-            local_session_metadata_current: source.local_session_metadata_current,
+            local_parser_revision_current: source.local_parser_revision_current,
         },
     }
 }
@@ -214,6 +212,7 @@ fn load_hot_raw_snapshot(
     if !(snapshot.cache.local_host_id.as_deref() == local_host_id
         && snapshot.cache.persistent_generation
             == crate::sync::cache_generation::raw_data_generation(cache_root)
+        && data::cache::local_parser_revisions_are_current(cache_root)
         && snapshot.cache.range.covers(required_range))
     {
         return None;
@@ -393,8 +392,8 @@ pub(crate) fn load_local_tool_cached_records(
         range.start(),
         range.end(),
     );
-    let session_metadata_current =
-        !has_cached_records || data::cache::vendor_session_metadata_is_current(cache_root, tool);
+    let parser_revision_current =
+        !has_cached_records || data::cache::vendor_parser_revision_is_current(cache_root, tool);
     let mut entries = Vec::with_capacity(records.len());
     let mut keys = HashSet::with_capacity(records.len());
     for (dedup_key, entry) in records {
@@ -403,7 +402,7 @@ pub(crate) fn load_local_tool_cached_records(
         }
         entries.push(entry);
     }
-    (entries, keys, session_metadata_current, has_cached_records)
+    (entries, keys, parser_revision_current, has_cached_records)
 }
 
 pub(crate) fn local_cached_raw_cache(
@@ -433,7 +432,7 @@ pub(crate) fn local_cached_raw_cache(
         }
         std::mem::take(&mut slot.0)
     };
-    let local_session_metadata_current = loaded.iter().all(|slot| slot.2);
+    let local_parser_revision_current = loaded.iter().all(|slot| slot.2);
     let has_source_data = loaded.iter().any(|slot| slot.3);
     let claude = take(Tool::Claude, &mut loaded[0]);
     let codex = take(Tool::Codex, &mut loaded[1]);
@@ -452,7 +451,7 @@ pub(crate) fn local_cached_raw_cache(
         local_host_id: local_host_id.map(str::to_string),
         local_record_keys,
         persistent_generation: String::new(),
-        local_session_metadata_current,
+        local_parser_revision_current,
     }
 }
 

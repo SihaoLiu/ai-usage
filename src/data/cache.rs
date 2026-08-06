@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -16,6 +16,7 @@ use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageCost, U
 use crate::model_id::{Vendor, is_reasoning_effort, parse_model_identity};
 use crate::time_utils::parse_timestamp;
 
+mod fast_tier;
 mod index;
 mod persistence;
 mod scan;
@@ -45,6 +46,7 @@ const MANIFEST_FILE: &str = "manifest.json";
 const ENTRIES_DIR: &str = "entries";
 const REMOTE_DIR: &str = "remote";
 const SESSION_ID_PARSER_REVISION: u32 = 1;
+const CLAUDE_PARSER_REVISION: u32 = 2;
 const OMP_PARSER_REVISION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,11 +67,11 @@ impl Default for CacheManifest {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct VendorManifest {
     files: BTreeMap<String, SourceFileMeta>,
-    /// Revision of session metadata after the current active source set was
-    /// parsed. Retained inactive records are intentionally excluded: their
-    /// source files no longer exist and cannot be refreshed.
-    #[serde(default)]
-    session_metadata_revision: u32,
+    /// Parser revision after the current active source set was parsed.
+    /// Retained inactive records are intentionally excluded: their source
+    /// files no longer exist and cannot be refreshed.
+    #[serde(default, rename = "session_metadata_revision")]
+    parser_revision: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,24 +119,45 @@ impl SourceFileMeta {
 fn parser_revision(vendor: &str) -> u32 {
     match vendor {
         "omp" => OMP_PARSER_REVISION,
-        "claude" | "codex" | "gemini" | "kimi" => SESSION_ID_PARSER_REVISION,
+        "claude" => CLAUDE_PARSER_REVISION,
+        "codex" | "gemini" | "kimi" => SESSION_ID_PARSER_REVISION,
         _ => 0,
     }
 }
 
-/// Whether a nonempty active-source manifest for a vendor was parsed by the
-/// current session-id-aware parser. This is intentionally manifest-based: an
-/// absent conversation is a valid query result and must not force a source
-/// rescan.
-pub(crate) fn vendor_session_metadata_is_current(cache_root: &Path, vendor: &str) -> bool {
-    let required_revision = parser_revision(vendor);
-    if required_revision == 0 {
-        return true;
-    }
+/// Whether a nonempty active-source manifest uses the current parser revision.
+pub(crate) fn vendor_parser_revision_is_current(cache_root: &Path, vendor: &str) -> bool {
     let manifest = read_manifest(&cache_root.join(MANIFEST_FILE));
-    manifest.vendors.get(vendor).is_some_and(|vendor_manifest| {
-        vendor_manifest.session_metadata_revision == required_revision
-    })
+    manifest_vendor_parser_revision_is_current(&manifest, vendor)
+}
+
+pub(crate) fn local_parser_revisions_are_current(cache_root: &Path) -> bool {
+    let manifest = read_manifest(&cache_root.join(MANIFEST_FILE));
+    ["claude", "codex", "gemini", "kimi", "omp"]
+        .into_iter()
+        .all(|vendor| {
+            !vendor_entries_path(cache_root, vendor).exists()
+                || manifest_vendor_parser_revision_is_current(&manifest, vendor)
+        })
+}
+
+fn manifest_vendor_parser_revision_is_current(manifest: &CacheManifest, vendor: &str) -> bool {
+    let required_revision = parser_revision(vendor);
+    required_revision == 0
+        || manifest.vendors.get(vendor).is_some_and(|vendor_manifest| {
+            vendor_manifest_uses_parser_revision(vendor_manifest, required_revision)
+        })
+}
+
+fn vendor_manifest_uses_parser_revision(
+    vendor_manifest: &VendorManifest,
+    required_revision: u32,
+) -> bool {
+    vendor_manifest.parser_revision == required_revision
+        && vendor_manifest
+            .files
+            .values()
+            .all(|meta| meta.parser_revision == required_revision)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,35 +442,6 @@ pub struct CachedUsageRecord {
     pub source_path: String,
     pub dedup_key: String,
     pub entry: UsageEntry,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SourceRecordFingerprint {
-    dedup_key: String,
-    timestamp: String,
-    session_start_time: String,
-    session_end_time: String,
-    model: String,
-    effort: Option<String>,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_input_tokens: i64,
-    cache_creation_input_tokens: i64,
-    reasoning_output_tokens: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SourceRecordFingerprintWithoutEffort {
-    dedup_key: String,
-    timestamp: String,
-    session_start_time: String,
-    session_end_time: String,
-    model: String,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_input_tokens: i64,
-    cache_creation_input_tokens: i64,
-    reasoning_output_tokens: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1426,7 +1420,7 @@ fn retaining_vendor_cache_is_current(
     };
     let required_revision = parser_revision(vendor);
     index::matches_source_generation(&entries_path, ENTRY_FILE_MAGIC, ENTRY_INDEX_MAGIC)
-        && vendor_manifest.session_metadata_revision == required_revision
+        && vendor_manifest_uses_parser_revision(vendor_manifest, required_revision)
         && active_sources.iter().all(|source| {
             vendor_manifest.files.get(&source.key).is_some_and(|meta| {
                 meta.parser_revision == required_revision && meta.matches_stat(&source.stat)
@@ -1488,7 +1482,7 @@ where
     let mut active_keys = HashSet::new();
     let mut cache_changed = false;
     let parser_revision = parser_revision(vendor);
-    if parser_revision != 0 && next_vendor_manifest.session_metadata_revision != parser_revision {
+    if parser_revision != 0 && next_vendor_manifest.parser_revision != parser_revision {
         cache_changed = true;
     }
 
@@ -1511,24 +1505,16 @@ where
         } else {
             cache_changed = true;
             let previous_records = records_by_path.remove(&source.key).unwrap_or_default();
-            let mut fast_tiers = fast_tiers_by_fingerprint(&previous_records);
-            let mut fast_tiers_without_effort =
-                fast_tiers_by_fingerprint_without_effort(&previous_records);
+            let identity_may_change = next_vendor_manifest
+                .files
+                .get(&source.key)
+                .is_some_and(|meta| meta.parser_revision != parser_revision);
+            let mut fast_tiers =
+                fast_tier::FastTierMatcher::new(&previous_records, identity_may_change);
             parse_file(&source.path)
                 .into_iter()
                 .map(|record| {
-                    let fingerprint = source_record_fingerprint(&record);
-                    let fingerprint_without_effort =
-                        source_record_fingerprint_without_effort(&record);
-                    let fast_tier = fast_tiers
-                        .get_mut(&fingerprint)
-                        .and_then(|tiers| tiers.pop_front())
-                        .or_else(|| {
-                            fast_tiers_without_effort
-                                .get_mut(&fingerprint_without_effort)
-                                .and_then(|tiers| tiers.pop_front())
-                        })
-                        .unwrap_or(current_fast_tier);
+                    let fast_tier = fast_tiers.take(&record).unwrap_or(current_fast_tier);
                     PersistedSourceRecord::from_source_record(source.key.clone(), record, fast_tier)
                 })
                 .collect()
@@ -1558,14 +1544,26 @@ where
 
     if retain_inactive_sources {
         for (source_path, records) in records_by_path {
-            if !active_keys.contains(&source_path) {
+            if next_vendor_manifest
+                .files
+                .get(&source_path)
+                .is_some_and(|meta| meta.parser_revision == parser_revision)
+            {
                 active_records.extend(records);
+            } else {
+                cache_changed = true;
+                next_vendor_manifest.files.remove(&source_path);
             }
         }
+        let manifest_file_count = next_vendor_manifest.files.len();
+        next_vendor_manifest.files.retain(|source_path, meta| {
+            active_keys.contains(source_path) || meta.parser_revision == parser_revision
+        });
+        cache_changed |= next_vendor_manifest.files.len() != manifest_file_count;
     }
 
     if parser_revision != 0 {
-        next_vendor_manifest.session_metadata_revision = parser_revision;
+        next_vendor_manifest.parser_revision = parser_revision;
     }
     if !retain_inactive_sources {
         next_vendor_manifest
@@ -1606,98 +1604,6 @@ fn records_by_path(
         }
     }
     result
-}
-
-fn fast_tiers_by_fingerprint(
-    records: &[PersistedSourceRecord],
-) -> HashMap<SourceRecordFingerprint, VecDeque<i8>> {
-    let mut tiers = HashMap::new();
-    for record in records {
-        tiers
-            .entry(persisted_record_fingerprint(record))
-            .or_insert_with(VecDeque::new)
-            .push_back(record.fast_tier);
-    }
-    tiers
-}
-
-fn fast_tiers_by_fingerprint_without_effort(
-    records: &[PersistedSourceRecord],
-) -> HashMap<SourceRecordFingerprintWithoutEffort, VecDeque<i8>> {
-    let mut tiers = HashMap::new();
-    for record in records {
-        tiers
-            .entry(persisted_record_fingerprint_without_effort(record))
-            .or_insert_with(VecDeque::new)
-            .push_back(record.fast_tier);
-    }
-    tiers
-}
-
-fn source_record_fingerprint(record: &SourceUsageRecord) -> SourceRecordFingerprint {
-    SourceRecordFingerprint {
-        dedup_key: record.dedup_key.clone(),
-        timestamp: record.entry.timestamp.clone(),
-        session_start_time: record.entry.session_start_time.clone(),
-        session_end_time: record.entry.session_end_time.clone(),
-        model: record.entry.model.clone(),
-        effort: record.entry.effort.clone(),
-        input_tokens: record.entry.usage.input_tokens,
-        output_tokens: record.entry.usage.output_tokens,
-        cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
-        cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
-        reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
-    }
-}
-
-fn source_record_fingerprint_without_effort(
-    record: &SourceUsageRecord,
-) -> SourceRecordFingerprintWithoutEffort {
-    SourceRecordFingerprintWithoutEffort {
-        dedup_key: record.dedup_key.clone(),
-        timestamp: record.entry.timestamp.clone(),
-        session_start_time: record.entry.session_start_time.clone(),
-        session_end_time: record.entry.session_end_time.clone(),
-        model: record.entry.model.clone(),
-        input_tokens: record.entry.usage.input_tokens,
-        output_tokens: record.entry.usage.output_tokens,
-        cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
-        cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
-        reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
-    }
-}
-
-fn persisted_record_fingerprint(record: &PersistedSourceRecord) -> SourceRecordFingerprint {
-    SourceRecordFingerprint {
-        dedup_key: record.dedup_key.clone(),
-        timestamp: record.timestamp.clone(),
-        session_start_time: record.session_start_time.clone(),
-        session_end_time: record.session_end_time.clone(),
-        model: record.model.clone(),
-        effort: record.effort.clone(),
-        input_tokens: record.input_tokens,
-        output_tokens: record.output_tokens,
-        cache_read_input_tokens: record.cache_read_input_tokens,
-        cache_creation_input_tokens: record.cache_creation_input_tokens,
-        reasoning_output_tokens: record.reasoning_output_tokens,
-    }
-}
-
-fn persisted_record_fingerprint_without_effort(
-    record: &PersistedSourceRecord,
-) -> SourceRecordFingerprintWithoutEffort {
-    SourceRecordFingerprintWithoutEffort {
-        dedup_key: record.dedup_key.clone(),
-        timestamp: record.timestamp.clone(),
-        session_start_time: record.session_start_time.clone(),
-        session_end_time: record.session_end_time.clone(),
-        model: record.model.clone(),
-        input_tokens: record.input_tokens,
-        output_tokens: record.output_tokens,
-        cache_read_input_tokens: record.cache_read_input_tokens,
-        cache_creation_input_tokens: record.cache_creation_input_tokens,
-        reasoning_output_tokens: record.reasoning_output_tokens,
-    }
 }
 
 fn record_stats_by_path(records: &[PersistedSourceRecord]) -> HashMap<String, RecordStats> {

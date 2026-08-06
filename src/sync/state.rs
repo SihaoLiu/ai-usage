@@ -129,6 +129,16 @@ pub fn save_sync_state(cache_root: &Path, state: &SyncState) -> io::Result<()> {
     atomic_write(&path, &content)
 }
 
+pub fn invalidate_pull_state(cache_root: &Path) -> io::Result<()> {
+    let mut state = load_sync_state(cache_root);
+    state.last_seen_seq = 0;
+    state.pull_vendors.clear();
+    state.pull_scope.clear();
+    state.last_full_pull = None;
+    state.integrity_check = None;
+    save_sync_state(cache_root, &state)
+}
+
 /// Delete the persisted sync cursor. Returns whether a file was removed.
 pub fn clear_sync_state(cache_root: &Path) -> io::Result<bool> {
     let path = cache_root.join(SYNC_STATE_FILE);
@@ -394,6 +404,50 @@ mod tests {
         assert_eq!(load_sync_state(&cache_root), state);
         let raw = fs::read_to_string(cache_root.join("sync_state.json")).expect("read json");
         assert!(raw.contains("\"last_seen_seq\": 42"));
+    }
+
+    #[test]
+    fn pull_invalidation_preserves_upload_and_diagnostic_state() {
+        let cache_root = unique_temp_dir("invalidate-pull");
+        let state = SyncState {
+            schema_version: SYNC_STATE_SCHEMA_VERSION,
+            last_seen_seq: 42,
+            pull_vendors: vec!["claude".to_string(), "codex".to_string()],
+            pull_scope: "server-a".to_string(),
+            last_full_pull: Some("2026-05-18T12:00:00Z".to_string()),
+            last_successful_sync: Some("2026-05-18T12:34:56Z".to_string()),
+            last_error: Some("temporary network error".to_string()),
+            integrity_check: Some(IntegrityCheckState {
+                checked_at: "2026-05-18T12:34:56Z".to_string(),
+                range_end_utc: "2026-05-18T00:00:00Z".to_string(),
+                checked_hosts: 2,
+                sync_scope: "scope-a".to_string(),
+            }),
+        };
+        let snapshot = SnapshotUploadState {
+            schema_version: SNAPSHOT_UPLOAD_STATE_SCHEMA_VERSION,
+            full_hash: "full-hash".to_string(),
+            cache_generation: "generation-a".to_string(),
+            record_hashes: BTreeMap::from([(
+                ("claude".to_string(), "response-a".to_string()),
+                "record-hash".to_string(),
+            )]),
+        };
+        save_sync_state(&cache_root, &state).expect("save sync state");
+        save_snapshot_upload_state(&cache_root, &snapshot, "scope-a", Some(9))
+            .expect("save snapshot state");
+
+        invalidate_pull_state(&cache_root).expect("invalidate pull state");
+
+        assert_eq!(
+            load_sync_state(&cache_root),
+            SyncState {
+                last_successful_sync: state.last_successful_sync,
+                last_error: state.last_error,
+                ..SyncState::default()
+            }
+        );
+        assert_eq!(load_snapshot_upload_state(&cache_root), snapshot);
     }
 
     #[test]

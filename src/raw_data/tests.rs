@@ -168,7 +168,7 @@ fn hot_snapshot_round_trip_keeps_only_recent_entries() {
         local_host_id: Some("workstation".to_string()),
         local_record_keys: HashMap::new(),
         persistent_generation: crate::sync::cache_generation::raw_data_generation(&cache_root),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     sort_raw_cache(&mut source);
 
@@ -182,7 +182,7 @@ fn hot_snapshot_round_trip_keeps_only_recent_entries() {
     assert_eq!(snapshot.codex.len(), 1);
     assert_eq!(snapshot.codex[0].usage.input_tokens, 22);
     assert_eq!(snapshot.range, hot_cache_range(now));
-    assert!(snapshot.local_session_metadata_current);
+    assert!(snapshot.local_parser_revision_current);
     assert!(load_hot_raw_snapshot(&cache_root, Some("other-host"), required).is_none());
 
     fs::create_dir_all(cache_root.join("remote")).expect("create remote cache");
@@ -190,6 +190,57 @@ fn hot_snapshot_round_trip_keeps_only_recent_entries() {
         .expect("change persistent cache generation");
     assert!(load_hot_raw_snapshot(&cache_root, Some("workstation"), required).is_none());
 
+    fs::remove_dir_all(cache_root).expect("remove cache root");
+}
+
+#[test]
+fn hot_snapshot_is_rejected_when_the_live_parser_revision_is_stale() {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = Local
+        .with_ymd_and_hms(2026, 7, 23, 12, 0, 0)
+        .single()
+        .expect("fixed now");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let cache_root = std::env::temp_dir().join(format!("ai-usage-stale-hot-cache-{stamp}"));
+    fs::create_dir_all(cache_root.join("entries")).expect("create entries directory");
+    fs::write(cache_root.join("entries").join("claude.bin"), b"old-cache")
+        .expect("write old entry cache");
+    fs::write(
+        cache_root.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "vendors": {
+                "claude": {
+                    "files": {},
+                    "session_metadata_revision": 1
+                }
+            }
+        }))
+        .expect("serialize stale manifest"),
+    )
+    .expect("write stale manifest");
+    let source = RawDataCache {
+        claude: Vec::new(),
+        codex: Vec::new(),
+        gemini: Vec::new(),
+        kimi: Vec::new(),
+        omp: Vec::new(),
+        range: hot_cache_range(now),
+        has_source_data: true,
+        local_host_id: None,
+        local_record_keys: HashMap::new(),
+        persistent_generation: crate::sync::cache_generation::raw_data_generation(&cache_root),
+        local_parser_revision_current: true,
+    };
+    write_hot_raw_snapshot(&cache_root, &source, now).expect("write stale hot snapshot");
+    let required = raw_cache_visible_range(&TimeWindow::rolling_days(3), now);
+
+    assert!(load_hot_raw_snapshot(&cache_root, None, required).is_none());
     fs::remove_dir_all(cache_root).expect("remove cache root");
 }
 
@@ -230,7 +281,7 @@ fn background_hot_snapshot_is_derived_from_the_resident_cache() {
         local_host_id: Some("workstation".to_string()),
         local_record_keys: HashMap::new(),
         persistent_generation: "generation".to_string(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     sort_raw_cache(&mut source);
 
@@ -486,7 +537,7 @@ fn resident_window_reuses_cache_storage_without_cloning() {
         local_host_id: None,
         local_record_keys: HashMap::new(),
         persistent_generation: String::new(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     let state = state_with_cache(cache, TimeWindow::rolling_days(3));
     let cached_ptr = std::ptr::from_ref(&state.raw_cache.as_ref().unwrap().claude[1]);
@@ -523,7 +574,7 @@ fn idle_historical_cache_keeps_the_adjacent_window_on_each_side() {
         local_host_id: None,
         local_record_keys: HashMap::new(),
         persistent_generation: String::new(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     let mut state = state_with_cache(cache, window);
     let accessed_at = std::time::Instant::now();
@@ -581,7 +632,7 @@ fn idle_latest_cache_keeps_only_the_previous_window_and_ages_it_forward() {
         local_host_id: None,
         local_record_keys: HashMap::new(),
         persistent_generation: String::new(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     let mut state = state_with_cache(cache, TimeWindow::rolling_days(3));
     let accessed_at = std::time::Instant::now();
@@ -638,7 +689,7 @@ fn dashboard_build_does_not_count_as_cache_activity() {
         local_host_id: None,
         local_record_keys: HashMap::new(),
         persistent_generation: String::new(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     let mut state = state_with_cache(cache, TimeWindow::rolling_days(3));
     assert!(state.raw_cache_last_used_at.is_none());
@@ -662,7 +713,7 @@ fn cache_activity_is_recorded_before_the_cache_arrives() {
         local_host_id: None,
         local_record_keys: HashMap::new(),
         persistent_generation: String::new(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     let mut state = state_with_cache(cache, TimeWindow::rolling_days(3));
     state.raw_cache = None;
@@ -687,7 +738,7 @@ fn background_cache(now: DateTime<Local>) -> RawDataCache {
         local_host_id: Some("workstation".to_string()),
         local_record_keys: HashMap::from([(Tool::Claude, HashSet::from(["key".to_string()]))]),
         persistent_generation: String::new(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     }
 }
 
@@ -766,7 +817,7 @@ fn idle_background_replacement_reclaims_after_the_old_cache_drops() {
         local_host_id: None,
         local_record_keys: HashMap::new(),
         persistent_generation: String::new(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     let (tx, rx) = mpsc::channel();
     tx.send(BackgroundRawLoad::Refreshed(Box::new(incoming)))
@@ -806,7 +857,7 @@ fn undersized_background_result_preserves_resident_prefetch_headroom() {
         local_host_id: None,
         local_record_keys: HashMap::new(),
         persistent_generation: String::new(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     let mut state = state_with_cache(cache(resident_range), TimeWindow::rolling_days(3));
     state.raw_cache_last_used_at = Some(std::time::Instant::now());
@@ -861,7 +912,7 @@ fn remote_records_merge_into_tool_buckets() {
         local_host_id: None,
         local_record_keys: HashMap::new(),
         persistent_generation: String::new(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     merge_remote_records_into_raw_cache(
         &mut cache,
@@ -935,7 +986,7 @@ fn remote_records_from_local_host_fill_missing_keys_without_duplicates() {
         local_host_id: Some("laptop".to_string()),
         local_record_keys: HashMap::from([(Tool::Claude, HashSet::from(["a".to_string()]))]),
         persistent_generation: String::new(),
-        local_session_metadata_current: true,
+        local_parser_revision_current: true,
     };
     merge_remote_records_into_raw_cache(
         &mut cache,

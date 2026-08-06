@@ -1151,7 +1151,7 @@ mod tests {
             local_host_id: state.local_host_id.clone(),
             local_record_keys: HashMap::new(),
             persistent_generation: String::new(),
-            local_session_metadata_current: true,
+            local_parser_revision_current: true,
         });
 
         let labels = known_host_usage_labels(

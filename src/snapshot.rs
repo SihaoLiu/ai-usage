@@ -282,6 +282,45 @@ mod tests {
         }
     }
 
+    fn local_timestamp(value: &str) -> DateTime<Local> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("fixed timestamp")
+            .with_timezone(&Local)
+    }
+
+    fn claude_snapshot(now: DateTime<Local>, timestamps: &[&str]) -> SnapshotDocument {
+        let cache = RawDataCache {
+            claude: timestamps
+                .iter()
+                .enumerate()
+                .map(|(index, timestamp)| {
+                    usage_entry(
+                        local_timestamp(timestamp),
+                        "claude-test",
+                        (index + 1) as i64 * 10,
+                    )
+                })
+                .collect(),
+            codex: Vec::new(),
+            gemini: Vec::new(),
+            kimi: Vec::new(),
+            omp: Vec::new(),
+            range: RawDataRange::from_bounds(now - Duration::days(2), now + Duration::days(1)),
+            has_source_data: true,
+            local_host_id: None,
+            local_record_keys: HashMap::new(),
+            persistent_generation: String::new(),
+            local_parser_revision_current: true,
+        };
+        let query = SnapshotQuery {
+            days: 1,
+            tool: Tool::Claude,
+            session_id: None,
+        };
+
+        build_from_cache(&cache, &query, &AllPricing::load_raw().finalize(), now)
+    }
+
     #[test]
     fn aggregate_metrics_reuses_inference_strategy_semantics() {
         let mut codex = row("codex");
@@ -329,6 +368,51 @@ mod tests {
         for pair in dates.windows(2) {
             assert_eq!(pair[1].signed_duration_since(pair[0]).num_days(), 1);
         }
+    }
+
+    #[test]
+    fn daily_token_totals_cover_both_dst_transition_days() {
+        const CHILD_MARKER: &str = "AI_USAGE_SNAPSHOT_DST_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args([
+                "--exact",
+                "snapshot::tests::daily_token_totals_cover_both_dst_transition_days",
+                "--nocapture",
+            ])
+            .env("TZ", "America/Los_Angeles")
+            .env(CHILD_MARKER, "1")
+            .output()
+            .expect("run DST regression test in an isolated process");
+
+            assert!(
+                output.status.success(),
+                "DST regression subprocess failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let spring = claude_snapshot(
+            local_timestamp("2026-03-08T23:59:59-07:00"),
+            &["2026-03-08T01:59:59-08:00", "2026-03-08T03:00:00-07:00"],
+        );
+        assert_eq!(spring.range.start, "2026-03-08T00:00:00-08:00");
+        assert_eq!(spring.window.request_count, 2);
+        assert_eq!(spring.window.tokens.total, 60);
+        assert_eq!(spring.daily[0].usage, spring.window);
+
+        let fall = claude_snapshot(
+            local_timestamp("2026-11-01T23:59:59-08:00"),
+            &["2026-11-01T01:30:00-07:00", "2026-11-01T01:30:00-08:00"],
+        );
+        assert_eq!(fall.range.start, "2026-11-01T00:00:00-07:00");
+        assert_eq!(fall.window.request_count, 2);
+        assert_eq!(fall.window.tokens.total, 60);
+        assert_eq!(fall.daily[0].usage, fall.window);
     }
 
     #[test]
@@ -385,7 +469,7 @@ mod tests {
             local_host_id: None,
             local_record_keys: HashMap::new(),
             persistent_generation: String::new(),
-            local_session_metadata_current: true,
+            local_parser_revision_current: true,
         };
         let query = SnapshotQuery {
             days: 2,

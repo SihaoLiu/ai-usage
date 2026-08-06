@@ -242,8 +242,8 @@ fn host_label(host: Option<&str>) -> &str {
     host.unwrap_or("all")
 }
 
-fn needs_session_metadata(session_id: Option<&str>, cache: &RawDataCache) -> bool {
-    session_id.is_some() && !cache.local_session_metadata_current
+fn needs_cache_refresh(cache: &RawDataCache) -> bool {
+    !cache.has_source_data || !cache.local_parser_revision_current
 }
 
 fn parse_host_selection(selection: &str) -> Result<Option<String>, &'static str> {
@@ -721,8 +721,7 @@ fn run_cli_command(command: CliCommand, sync_config: sync::config::SyncConfig) -
                 required_range,
                 now,
             );
-            if !cache.has_source_data || needs_session_metadata(query.session_id.as_deref(), &cache)
-            {
+            if needs_cache_refresh(&cache) {
                 refresh_all_tool_caches();
                 cache = load_persistent_raw_data_for_window(
                     host.as_deref(),
@@ -997,12 +996,9 @@ fn main() {
             required_range,
             now,
         );
-        // A missing cache must still bootstrap from the canonical source logs.
-        // A session query does the same only when the loaded cache predates
-        // session metadata, so its first run after an upgrade is accurate.
-        let needs_session_metadata =
-            needs_session_metadata(state.session_id.as_deref(), &refreshed);
-        if !refreshed.has_source_data || needs_session_metadata {
+        // A missing or parser-stale cache must bootstrap from the canonical
+        // source logs before a one-shot result is emitted.
+        if needs_cache_refresh(&refreshed) {
             refresh_all_tool_caches();
             refreshed = load_persistent_raw_data_for_window(
                 state.host.as_deref(),
@@ -1071,7 +1067,7 @@ mod tests {
             local_host_id: None,
             local_record_keys: HashMap::new(),
             persistent_generation: String::new(),
-            local_session_metadata_current: true,
+            local_parser_revision_current: true,
         }
     }
 
@@ -1176,21 +1172,18 @@ mod tests {
     }
 
     #[test]
-    fn session_query_does_not_refresh_a_cache_with_session_metadata() {
+    fn current_parser_revision_does_not_require_a_source_refresh() {
         let cache = cache_with_session(Some("another-conversation"));
 
-        assert!(!needs_session_metadata(
-            Some("missing-conversation"),
-            &cache
-        ));
+        assert!(!needs_cache_refresh(&cache));
     }
 
     #[test]
-    fn session_query_refreshes_a_cache_with_stale_metadata() {
+    fn stale_parser_revision_requires_refresh_without_a_session_filter() {
         let mut cache = cache_with_session(None);
-        cache.local_session_metadata_current = false;
+        cache.local_parser_revision_current = false;
 
-        assert!(needs_session_metadata(Some("conversation-42"), &cache));
+        assert!(needs_cache_refresh(&cache));
     }
 
     #[test]

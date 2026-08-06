@@ -14,7 +14,7 @@ where
 {
     let active_records = parse_active_sources(&active_sources, current_fast_tier, parse_file);
     let mut vendor_manifest = VendorManifest {
-        session_metadata_revision: parser_revision(vendor),
+        parser_revision: parser_revision(vendor),
         ..Default::default()
     };
     let stats = record_stats_by_path(&active_records);

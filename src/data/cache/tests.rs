@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
 
+mod revisions;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedVendorRecordsWithFastTier {
     format_version: u32,

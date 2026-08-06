@@ -873,6 +873,7 @@ mod tests {
                 has_source_data: false,
                 local_host_id: None,
                 local_record_keys: HashMap::new(),
+                stable_record_groups: Vec::new(),
                 persistent_generation: String::new(),
                 local_parser_revision_current: true,
             }),

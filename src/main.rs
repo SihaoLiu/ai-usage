@@ -1,5 +1,6 @@
 mod charts;
 mod constants;
+mod cpu_budget;
 mod data;
 mod formatting;
 mod model_id;
@@ -708,9 +709,9 @@ fn run_cli_command(command: CliCommand, sync_config: sync::config::SyncConfig) -
                 days,
                 tool: Tool::from_key(&tool).expect("clap validates snapshot tools"),
                 session_id: session.filter(|id| !id.trim().is_empty()),
+                captured_at: Local::now(),
             };
-            let now = Local::now();
-            let required_range = snapshot::required_range(&query, now);
+            let required_range = snapshot::required_range(&query);
             let local_host_id = match &sync_config {
                 sync::config::SyncConfig::Enabled(config) => Some(config.machine_id.as_str()),
                 sync::config::SyncConfig::Disabled => None,
@@ -719,7 +720,7 @@ fn run_cli_command(command: CliCommand, sync_config: sync::config::SyncConfig) -
                 host.as_deref(),
                 local_host_id,
                 required_range,
-                now,
+                query.captured_at,
             );
             if needs_cache_refresh(&cache) {
                 refresh_all_tool_caches();
@@ -727,7 +728,7 @@ fn run_cli_command(command: CliCommand, sync_config: sync::config::SyncConfig) -
                     host.as_deref(),
                     local_host_id,
                     required_range,
-                    Local::now(),
+                    query.captured_at,
                 );
             }
             if !cache.has_source_data {
@@ -735,8 +736,7 @@ fn run_cli_command(command: CliCommand, sync_config: sync::config::SyncConfig) -
                 return 1;
             }
 
-            let document =
-                snapshot::build_from_cache(&cache, &query, &pricing::load_layered(), Local::now());
+            let document = snapshot::build_from_cache(&cache, &query, &pricing::load_layered());
             let stdout = std::io::stdout();
             let output = std::io::BufWriter::new(stdout.lock());
             match snapshot::write_json(output, &document) {
@@ -937,6 +937,7 @@ fn sync_command_name(command: SyncCommand) -> &'static str {
 }
 
 fn main() {
+    cpu_budget::initialize();
     let args = Args::parse();
 
     let sync_config = sync::config::load_sync_config(false);
@@ -1066,6 +1067,7 @@ mod tests {
             has_source_data: true,
             local_host_id: None,
             local_record_keys: HashMap::new(),
+            stable_record_groups: Vec::new(),
             persistent_generation: String::new(),
             local_parser_revision_current: true,
         }

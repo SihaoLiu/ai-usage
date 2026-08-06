@@ -41,13 +41,15 @@ const REMOTE_FILE_MAGIC: &[u8; 8] = b"AIUREMT1";
 const ENTRY_INDEX_MAGIC: &[u8; 8] = b"AIUIDX01";
 const REMOTE_INDEX_MAGIC: &[u8; 8] = b"AIURIDX1";
 const HOT_SNAPSHOT_FILE: &str = "hot-snapshot.bin";
-const HOT_SNAPSHOT_MAGIC: &[u8; 8] = b"AIUHOT01";
+const HOT_SNAPSHOT_MAGIC: &[u8; 8] = b"AIUHOT02";
 const MANIFEST_FILE: &str = "manifest.json";
 const ENTRIES_DIR: &str = "entries";
 const REMOTE_DIR: &str = "remote";
-const SESSION_ID_PARSER_REVISION: u32 = 1;
-const CLAUDE_PARSER_REVISION: u32 = 2;
-const OMP_PARSER_REVISION: u32 = 3;
+const CLAUDE_PARSER_REVISION: u32 = 3;
+const CODEX_PARSER_REVISION: u32 = 3;
+const GEMINI_PARSER_REVISION: u32 = 3;
+const KIMI_PARSER_REVISION: u32 = 4;
+const OMP_PARSER_REVISION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheManifest {
@@ -120,25 +122,26 @@ fn parser_revision(vendor: &str) -> u32 {
     match vendor {
         "omp" => OMP_PARSER_REVISION,
         "claude" => CLAUDE_PARSER_REVISION,
-        "codex" | "gemini" | "kimi" => SESSION_ID_PARSER_REVISION,
+        "codex" => CODEX_PARSER_REVISION,
+        "gemini" => GEMINI_PARSER_REVISION,
+        "kimi" => KIMI_PARSER_REVISION,
         _ => 0,
     }
 }
 
-/// Whether a nonempty active-source manifest uses the current parser revision.
+/// Whether an existing vendor cache uses the current parser revision.
 pub(crate) fn vendor_parser_revision_is_current(cache_root: &Path, vendor: &str) -> bool {
+    if !vendor_entries_path(cache_root, vendor).exists() {
+        return true;
+    }
     let manifest = read_manifest(&cache_root.join(MANIFEST_FILE));
     manifest_vendor_parser_revision_is_current(&manifest, vendor)
 }
 
 pub(crate) fn local_parser_revisions_are_current(cache_root: &Path) -> bool {
-    let manifest = read_manifest(&cache_root.join(MANIFEST_FILE));
     ["claude", "codex", "gemini", "kimi", "omp"]
         .into_iter()
-        .all(|vendor| {
-            !vendor_entries_path(cache_root, vendor).exists()
-                || manifest_vendor_parser_revision_is_current(&manifest, vendor)
-        })
+        .all(|vendor| vendor_parser_revision_is_current(cache_root, vendor))
 }
 
 fn manifest_vendor_parser_revision_is_current(manifest: &CacheManifest, vendor: &str) -> bool {

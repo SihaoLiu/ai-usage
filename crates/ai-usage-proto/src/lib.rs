@@ -345,6 +345,101 @@ pub fn is_valid_vendor(vendor: &str) -> bool {
     matches!(vendor, "claude" | "codex" | "gemini" | "kimi" | "omp")
 }
 
+pub fn is_globally_stable_usage_key(vendor: &str, dedup_key: &str) -> bool {
+    match vendor {
+        "claude" => has_nonempty_suffix(dedup_key, "claude:message:"),
+        "codex" => is_codex_cumulative_transition_key(dedup_key),
+        "gemini" => dedup_key
+            .strip_prefix("gemini:")
+            .and_then(|suffix| suffix.split_once(':'))
+            .is_some_and(|(session_id, message_id)| {
+                !session_id.is_empty()
+                    && !matches!(session_id, "file" | "msg")
+                    && !message_id.is_empty()
+            }),
+        "kimi" => has_nonempty_suffix(dedup_key, "kimi:response:"),
+        "omp" => {
+            if let Some(message_id) = dedup_key.strip_prefix("omp:message:") {
+                match message_id.split_once(":response:") {
+                    Some((message_id, response_id)) => {
+                        !message_id.is_empty() && !response_id.is_empty()
+                    }
+                    None => !message_id.is_empty(),
+                }
+            } else {
+                has_nonempty_suffix(dedup_key, "omp:response:")
+            }
+        }
+        _ => false,
+    }
+}
+
+pub fn is_valid_codex_usage_snapshot(
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+    total_tokens: i64,
+) -> bool {
+    if [
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+    ]
+    .into_iter()
+    .any(|value| value < 0)
+    {
+        return false;
+    }
+
+    cached_input_tokens
+        .checked_add(cache_write_input_tokens)
+        .is_some_and(|cached| cached <= input_tokens)
+        && input_tokens.checked_add(output_tokens) == Some(total_tokens)
+        && reasoning_output_tokens <= output_tokens
+}
+
+fn is_codex_cumulative_transition_key(dedup_key: &str) -> bool {
+    let Some((turn_id, transition)) = dedup_key
+        .strip_prefix("codex:turn:")
+        .and_then(|suffix| suffix.rsplit_once(":cumulative:"))
+    else {
+        return false;
+    };
+    let Some((previous, current)) = transition.split_once("->") else {
+        return false;
+    };
+
+    !turn_id.is_empty()
+        && (previous == "start" || is_codex_cumulative_snapshot(previous))
+        && is_codex_cumulative_snapshot(current)
+}
+
+fn is_codex_cumulative_snapshot(snapshot: &str) -> bool {
+    let mut values = snapshot.split(',');
+    let mut parsed = [0_i64; 6];
+    for value in &mut parsed {
+        let Some(next) = values.next().and_then(|value| value.parse::<i64>().ok()) else {
+            return false;
+        };
+        *value = next;
+    }
+    values.next().is_none()
+        && is_valid_codex_usage_snapshot(
+            parsed[0], parsed[1], parsed[2], parsed[3], parsed[4], parsed[5],
+        )
+}
+
+fn has_nonempty_suffix(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|suffix| !suffix.is_empty())
+}
+
 fn validate_host_id(host_id: &str) -> Result<(), ValidationError> {
     if is_valid_host_id(host_id) {
         Ok(())
@@ -517,6 +612,203 @@ mod tests {
 
             assert!(record.validate().is_ok(), "vendor={vendor:?}");
         }
+    }
+
+    #[test]
+    fn globally_stable_usage_keys_match_semantic_identities() {
+        let cases = [
+            ("claude message", "claude", "claude:message:message-a", true),
+            (
+                "claude file fallback",
+                "claude",
+                "claude:file:/workspace/session.jsonl:12",
+                false,
+            ),
+            (
+                "obsolete codex single total",
+                "codex",
+                "codex:turn:turn-a:total:10,2,3,4,5,24",
+                false,
+            ),
+            (
+                "codex cumulative transition",
+                "codex",
+                "codex:turn:turn-a:cumulative:10,2,0,3,1,13->20,4,1,6,2,26",
+                true,
+            ),
+            (
+                "first codex cumulative transition",
+                "codex",
+                "codex:turn:turn-a:cumulative:start->10,2,0,3,1,13",
+                true,
+            ),
+            (
+                "gemini session message",
+                "gemini",
+                "gemini:session-a:message-a",
+                true,
+            ),
+            (
+                "gemini message fallback",
+                "gemini",
+                "gemini:msg:message-a",
+                false,
+            ),
+            ("kimi response", "kimi", "kimi:response:response-a", true),
+            ("omp message", "omp", "omp:message:message-a", true),
+            (
+                "omp message response",
+                "omp",
+                "omp:message:message-a:response:response-a",
+                true,
+            ),
+            ("omp response", "omp", "omp:response:response-a", true),
+            ("empty key", "claude", "", false),
+            (
+                "vendor prefix mismatch",
+                "claude",
+                "codex:turn:turn-a:cumulative:start->10,2,0,3,1,13",
+                false,
+            ),
+            (
+                "unknown vendor",
+                "unknown",
+                "claude:message:message-a",
+                false,
+            ),
+            (
+                "legacy codex tuple",
+                "codex",
+                r#"["turn-a",10,2,3,1]"#,
+                false,
+            ),
+            (
+                "kimi timestamp ordinal",
+                "kimi",
+                "kimi:session-a:agent-a:1785000000000:0",
+                false,
+            ),
+            (
+                "gemini file fallback",
+                "gemini",
+                "gemini:file:/sessions/a.json:0",
+                false,
+            ),
+            (
+                "kimi file fallback",
+                "kimi",
+                "kimi:file:/sessions/a.jsonl:0",
+                false,
+            ),
+            (
+                "omp file fallback",
+                "omp",
+                "omp:file:/sessions/a.jsonl:0",
+                false,
+            ),
+            ("empty claude message", "claude", "claude:message:", false),
+            (
+                "empty codex turn",
+                "codex",
+                "codex:turn::cumulative:start->10,2,0,3,1,13",
+                false,
+            ),
+            (
+                "missing codex previous snapshot",
+                "codex",
+                "codex:turn:turn-a:cumulative:->10,2,0,3,1,13",
+                false,
+            ),
+            (
+                "missing codex current snapshot",
+                "codex",
+                "codex:turn:turn-a:cumulative:10,2,0,3,1,13->",
+                false,
+            ),
+            (
+                "codex sentinel as current snapshot",
+                "codex",
+                "codex:turn:turn-a:cumulative:10,2,0,3,1,13->start",
+                false,
+            ),
+            (
+                "short codex previous snapshot",
+                "codex",
+                "codex:turn:turn-a:cumulative:1,2,3,4,5->10,2,0,3,1,13",
+                false,
+            ),
+            (
+                "long codex current snapshot",
+                "codex",
+                "codex:turn:turn-a:cumulative:10,2,0,3,1,13->20,4,1,6,2,26,27",
+                false,
+            ),
+            (
+                "non-decimal codex snapshot value",
+                "codex",
+                "codex:turn:turn-a:cumulative:10,2,0,3,1,13->20,4,1,6,2,nope",
+                false,
+            ),
+            (
+                "negative codex snapshot value",
+                "codex",
+                "codex:turn:turn-a:cumulative:start->10,2,0,3,-1,13",
+                false,
+            ),
+            (
+                "codex total mismatch",
+                "codex",
+                "codex:turn:turn-a:cumulative:start->10,2,0,3,1,99",
+                false,
+            ),
+            (
+                "codex cache exceeds input",
+                "codex",
+                "codex:turn:turn-a:cumulative:start->10,8,3,3,1,13",
+                false,
+            ),
+            (
+                "codex reasoning exceeds output",
+                "codex",
+                "codex:turn:turn-a:cumulative:start->10,2,0,3,4,13",
+                false,
+            ),
+            ("empty gemini session", "gemini", "gemini::message-a", false),
+            ("empty gemini message", "gemini", "gemini:session-a:", false),
+            ("empty gemini msg", "gemini", "gemini:msg:", false),
+            ("empty kimi response", "kimi", "kimi:response:", false),
+            ("empty omp message", "omp", "omp:message:", false),
+            ("empty omp response", "omp", "omp:response:", false),
+            (
+                "empty omp paired message",
+                "omp",
+                "omp:message::response:response-a",
+                false,
+            ),
+            (
+                "empty omp paired response",
+                "omp",
+                "omp:message:message-a:response:",
+                false,
+            ),
+        ];
+
+        for (name, vendor, dedup_key, expected) in cases {
+            assert_eq!(
+                is_globally_stable_usage_key(vendor, dedup_key),
+                expected,
+                "case={name:?}, vendor={vendor:?}, dedup_key={dedup_key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_usage_snapshot_requires_consistent_nonnegative_totals() {
+        assert!(is_valid_codex_usage_snapshot(10, 2, 1, 3, 1, 13));
+        assert!(!is_valid_codex_usage_snapshot(10, 2, 1, 3, 4, 13));
+        assert!(!is_valid_codex_usage_snapshot(10, 8, 3, 3, 1, 13));
+        assert!(!is_valid_codex_usage_snapshot(10, 2, 1, 3, 1, 99));
+        assert!(!is_valid_codex_usage_snapshot(10, 2, -1, 3, 1, 13));
     }
 
     #[test]

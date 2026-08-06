@@ -3,6 +3,20 @@ use crate::constants::{AllPricing, SubscriptionFees};
 use crate::table_view::TableView;
 use chrono::{Duration, TimeZone};
 use std::collections::HashMap;
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("temp")
+        .join(format!("ai-usage-raw-data-test-{name}-{stamp}"));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
 
 fn test_range(center: DateTime<Local>) -> RawDataRange {
     RawDataRange::from_bounds(
@@ -50,6 +64,34 @@ fn usage_entry_at(timestamp: DateTime<Local>) -> UsageEntry {
         fast_tier: -1,
         usage: data::TokenUsage::default(),
         costs: None,
+    }
+}
+
+fn remote_usage_record(
+    vendor: &str,
+    dedup_key: &str,
+    timestamp: &str,
+    input_tokens: i64,
+) -> data::cache::RemoteUsageRecord {
+    data::cache::RemoteUsageRecord {
+        vendor: vendor.to_string(),
+        dedup_key: dedup_key.to_string(),
+        entry: UsageEntry {
+            host_id: None,
+            session_id: None,
+            timestamp: timestamp.to_string(),
+            parsed_timestamp: time_utils::parse_timestamp(timestamp),
+            session_start_time: timestamp.to_string(),
+            session_end_time: timestamp.to_string(),
+            model: "test-model".to_string(),
+            effort: None,
+            fast_tier: -1,
+            usage: data::TokenUsage {
+                input_tokens,
+                ..Default::default()
+            },
+            costs: None,
+        },
     }
 }
 
@@ -167,6 +209,14 @@ fn hot_snapshot_round_trip_keeps_only_recent_entries() {
         has_source_data: true,
         local_host_id: Some("workstation".to_string()),
         local_record_keys: HashMap::new(),
+        stable_record_groups: vec![StableRecordGroup {
+            vendor: "codex".to_string(),
+            dedup_key: "codex:turn:hot:cumulative:start->3,0,0,0,0,3".to_string(),
+            candidates: vec![
+                entry(now - Duration::days(HOT_CACHE_HORIZON_DAYS + 1), 77),
+                entry(now - Duration::days(1), 33),
+            ],
+        }],
         persistent_generation: crate::sync::cache_generation::raw_data_generation(&cache_root),
         local_parser_revision_current: true,
     };
@@ -181,6 +231,16 @@ fn hot_snapshot_round_trip_keeps_only_recent_entries() {
     assert_eq!(snapshot.claude[0].usage.input_tokens, 11);
     assert_eq!(snapshot.codex.len(), 1);
     assert_eq!(snapshot.codex[0].usage.input_tokens, 22);
+    let visible = filter_all_tool_data_borrowed(&snapshot, &TimeWindow::rolling_days(3), None, now);
+    assert_eq!(visible.codex.len(), 2);
+    assert_eq!(
+        visible
+            .codex
+            .iter()
+            .map(|entry| entry.usage.input_tokens)
+            .sum::<i64>(),
+        55
+    );
     assert_eq!(snapshot.range, hot_cache_range(now));
     assert!(snapshot.local_parser_revision_current);
     assert!(load_hot_raw_snapshot(&cache_root, Some("other-host"), required).is_none());
@@ -234,6 +294,7 @@ fn hot_snapshot_is_rejected_when_the_live_parser_revision_is_stale() {
         has_source_data: true,
         local_host_id: None,
         local_record_keys: HashMap::new(),
+        stable_record_groups: Vec::new(),
         persistent_generation: crate::sync::cache_generation::raw_data_generation(&cache_root),
         local_parser_revision_current: true,
     };
@@ -242,6 +303,53 @@ fn hot_snapshot_is_rejected_when_the_live_parser_revision_is_stale() {
 
     assert!(load_hot_raw_snapshot(&cache_root, None, required).is_none());
     fs::remove_dir_all(cache_root).expect("remove cache root");
+}
+
+#[test]
+fn stale_empty_harness_cache_requires_refresh_when_other_data_exists() {
+    let cache_root = unique_temp_dir("stale-empty-harness");
+    let timestamp = time_utils::parse_timestamp("2026-07-23T12:00:00Z").expect("timestamp");
+    let kimi_source = cache_root.join("kimi.jsonl");
+    let claude_source = cache_root.join("claude.jsonl");
+    fs::write(&kimi_source, "empty").expect("write empty source");
+    fs::write(&claude_source, "usage").expect("write populated source");
+    data::cache::load_or_update_vendor_cache(&cache_root, "kimi", vec![kimi_source], -1, |_| {
+        Vec::new()
+    });
+    data::cache::load_or_update_vendor_cache(
+        &cache_root,
+        "claude",
+        vec![claude_source],
+        -1,
+        |_| {
+            vec![data::SourceUsageRecord {
+                dedup_key: "claude:message:one".to_string(),
+                entry: usage_entry_at(timestamp),
+            }]
+        },
+    );
+    let manifest_path = cache_root.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
+            .expect("parse manifest");
+    manifest["vendors"]["kimi"]["session_metadata_revision"] = serde_json::json!(1);
+    manifest["vendors"]["kimi"]["files"]
+        .as_object_mut()
+        .expect("Kimi files")
+        .values_mut()
+        .for_each(|metadata| metadata["parser_revision"] = serde_json::json!(1));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write stale manifest");
+
+    let cache = local_cached_raw_cache(&cache_root, true, None, test_range(timestamp));
+
+    assert!(cache.has_source_data);
+    assert_eq!(cache.claude.len(), 1);
+    assert!(cache.kimi.is_empty());
+    assert!(!cache.local_parser_revision_current);
 }
 
 #[test]
@@ -280,6 +388,7 @@ fn background_hot_snapshot_is_derived_from_the_resident_cache() {
         has_source_data: true,
         local_host_id: Some("workstation".to_string()),
         local_record_keys: HashMap::new(),
+        stable_record_groups: Vec::new(),
         persistent_generation: "generation".to_string(),
         local_parser_revision_current: true,
     };
@@ -499,15 +608,6 @@ fn prefetch_runway_exceeds_held_arrow_navigation() {
 }
 
 #[test]
-fn background_source_scan_leaves_cpu_capacity_for_interaction() {
-    assert_eq!(background_refresh_parallelism(1), 1);
-    assert_eq!(background_refresh_parallelism(2), 1);
-    assert_eq!(background_refresh_parallelism(4), 1);
-    assert_eq!(background_refresh_parallelism(8), 2);
-    assert_eq!(background_refresh_parallelism(64), 4);
-}
-
-#[test]
 fn resident_window_reuses_cache_storage_without_cloning() {
     let now = Local::now();
     let entry = |timestamp: DateTime<Local>| UsageEntry {
@@ -536,6 +636,7 @@ fn resident_window_reuses_cache_storage_without_cloning() {
         has_source_data: true,
         local_host_id: None,
         local_record_keys: HashMap::new(),
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current: true,
     };
@@ -573,6 +674,7 @@ fn idle_historical_cache_keeps_the_adjacent_window_on_each_side() {
         has_source_data: true,
         local_host_id: None,
         local_record_keys: HashMap::new(),
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current: true,
     };
@@ -631,6 +733,7 @@ fn idle_latest_cache_keeps_only_the_previous_window_and_ages_it_forward() {
         has_source_data: true,
         local_host_id: None,
         local_record_keys: HashMap::new(),
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current: true,
     };
@@ -688,6 +791,7 @@ fn dashboard_build_does_not_count_as_cache_activity() {
         has_source_data: true,
         local_host_id: None,
         local_record_keys: HashMap::new(),
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current: true,
     };
@@ -712,6 +816,7 @@ fn cache_activity_is_recorded_before_the_cache_arrives() {
         has_source_data: true,
         local_host_id: None,
         local_record_keys: HashMap::new(),
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current: true,
     };
@@ -736,7 +841,8 @@ fn background_cache(now: DateTime<Local>) -> RawDataCache {
         range: test_range(now),
         has_source_data: true,
         local_host_id: Some("workstation".to_string()),
-        local_record_keys: HashMap::from([(Tool::Claude, HashSet::from(["key".to_string()]))]),
+        local_record_keys: HashMap::from([(Tool::Claude, HashMap::from([("key".to_string(), 0)]))]),
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current: true,
     }
@@ -816,6 +922,7 @@ fn idle_background_replacement_reclaims_after_the_old_cache_drops() {
         has_source_data: true,
         local_host_id: None,
         local_record_keys: HashMap::new(),
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current: true,
     };
@@ -856,6 +963,7 @@ fn undersized_background_result_preserves_resident_prefetch_headroom() {
         has_source_data: false,
         local_host_id: None,
         local_record_keys: HashMap::new(),
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current: true,
     };
@@ -911,6 +1019,7 @@ fn remote_records_merge_into_tool_buckets() {
         has_source_data: true,
         local_host_id: None,
         local_record_keys: HashMap::new(),
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current: true,
     };
@@ -952,6 +1061,7 @@ fn remote_records_merge_into_tool_buckets() {
                 },
             },
         ],
+        false,
     );
 
     assert_eq!(cache.claude.len(), 1);
@@ -984,7 +1094,8 @@ fn remote_records_from_local_host_fill_missing_keys_without_duplicates() {
         range: test_range(center),
         has_source_data: true,
         local_host_id: Some("laptop".to_string()),
-        local_record_keys: HashMap::from([(Tool::Claude, HashSet::from(["a".to_string()]))]),
+        local_record_keys: HashMap::from([(Tool::Claude, HashMap::from([("a".to_string(), 0)]))]),
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current: true,
     };
@@ -1026,6 +1137,7 @@ fn remote_records_from_local_host_fill_missing_keys_without_duplicates() {
                 },
             },
         ],
+        false,
     );
 
     assert_eq!(cache.claude.len(), 2);
@@ -1047,4 +1159,270 @@ fn remote_records_from_local_host_fill_missing_keys_without_duplicates() {
             .iter()
             .any(|entry| entry.model == "duplicate-model")
     );
+}
+
+#[test]
+fn all_host_projection_prefers_local_copy_of_a_globally_stable_response() {
+    let cache_root = unique_temp_dir("all-host-local-wins");
+    let timestamp = "2026-05-18T12:00:00Z";
+    let stable_key = "codex:turn:turn-a:cumulative:start->10,2,0,3,1,13";
+    let source = cache_root.join("local.jsonl");
+    fs::write(&source, "local").expect("write local source");
+    data::cache::refresh_retaining_vendor_cache(&cache_root, "codex", vec![source], -1, |_| {
+        vec![data::SourceUsageRecord {
+            dedup_key: stable_key.to_string(),
+            entry: remote_usage_record("codex", stable_key, timestamp, 10).entry,
+        }]
+    });
+    data::cache::merge_remote_records(
+        &cache_root,
+        "remote-host",
+        vec![remote_usage_record("codex", stable_key, timestamp, 99)],
+    )
+    .expect("write remote cache");
+    let center = time_utils::parse_timestamp(timestamp).expect("timestamp");
+
+    let cache = load_scoped_persistent_raw_data_from(
+        &cache_root,
+        None,
+        Some("local-host"),
+        test_range(center),
+    );
+    let window = TimeWindow::from_date("2026-05-18").expect("valid date window");
+    let visible = filter_all_tool_data_borrowed(&cache, &window, None, center);
+
+    assert_eq!(visible.codex.len(), 1);
+    assert_eq!(visible.codex[0].usage.input_tokens, 10);
+}
+
+#[test]
+fn all_host_projection_is_independent_of_cache_prefetch_range() {
+    let cache_root = unique_temp_dir("all-host-prefetch-range");
+    let local_timestamp = "2026-05-17T12:00:00Z";
+    let remote_timestamp = "2026-05-18T12:00:00Z";
+    let stable_key = "codex:turn:turn-a:cumulative:start->10,2,0,3,1,13";
+    let source = cache_root.join("local.jsonl");
+    fs::write(&source, "local").expect("write local source");
+    data::cache::refresh_retaining_vendor_cache(&cache_root, "codex", vec![source], -1, |_| {
+        vec![data::SourceUsageRecord {
+            dedup_key: stable_key.to_string(),
+            entry: remote_usage_record("codex", stable_key, local_timestamp, 10).entry,
+        }]
+    });
+    data::cache::merge_remote_records(
+        &cache_root,
+        "remote-host",
+        vec![remote_usage_record(
+            "codex",
+            stable_key,
+            remote_timestamp,
+            99,
+        )],
+    )
+    .expect("write remote cache");
+    let window = TimeWindow::from_date("2026-05-18").expect("valid date window");
+    let now = time_utils::parse_timestamp(remote_timestamp).expect("timestamp");
+    let (visible_start, visible_end) = window.bounds(now);
+    let narrow_range = RawDataRange::from_bounds(visible_start, visible_end);
+    let wide_range = RawDataRange::from_bounds(visible_start - Duration::days(2), visible_end);
+
+    let narrow =
+        load_scoped_persistent_raw_data_from(&cache_root, None, Some("local-host"), narrow_range);
+    let wide =
+        load_scoped_persistent_raw_data_from(&cache_root, None, Some("local-host"), wide_range);
+    let narrow_visible = filter_all_tool_data_borrowed(&narrow, &window, None, now);
+    let wide_visible = filter_all_tool_data_borrowed(&wide, &window, None, now);
+
+    assert_eq!(narrow_visible.codex.len(), 1);
+    assert_eq!(wide_visible.codex.len(), 1);
+    assert_eq!(narrow_visible.codex[0].usage.input_tokens, 99);
+    assert_eq!(wide_visible.codex[0].usage.input_tokens, 99);
+    assert_eq!(
+        wide_visible.codex[0].host_id.as_deref(),
+        Some("remote-host")
+    );
+}
+
+#[test]
+fn all_host_projection_keeps_visible_same_host_copy_across_prefetch_ranges() {
+    let cache_root = unique_temp_dir("all-host-same-host-prefetch-range");
+    let local_timestamp = "2026-05-17T12:00:00Z";
+    let remote_timestamp = "2026-05-18T12:00:00Z";
+    let stable_key = "codex:turn:turn-a:cumulative:start->10,2,0,3,1,13";
+    let source = cache_root.join("local.jsonl");
+    fs::write(&source, "local").expect("write local source");
+    data::cache::refresh_retaining_vendor_cache(&cache_root, "codex", vec![source], -1, |_| {
+        vec![data::SourceUsageRecord {
+            dedup_key: stable_key.to_string(),
+            entry: remote_usage_record("codex", stable_key, local_timestamp, 10).entry,
+        }]
+    });
+    data::cache::merge_remote_records(
+        &cache_root,
+        "local-host",
+        vec![remote_usage_record(
+            "codex",
+            stable_key,
+            remote_timestamp,
+            99,
+        )],
+    )
+    .expect("write same-host remote cache");
+    let window = TimeWindow::from_date("2026-05-18").expect("valid date window");
+    let now = time_utils::parse_timestamp(remote_timestamp).expect("timestamp");
+    let (visible_start, visible_end) = window.bounds(now);
+    let narrow_range = RawDataRange::from_bounds(visible_start, visible_end);
+    let wide_range = RawDataRange::from_bounds(visible_start - Duration::days(2), visible_end);
+
+    let narrow =
+        load_scoped_persistent_raw_data_from(&cache_root, None, Some("local-host"), narrow_range);
+    let wide =
+        load_scoped_persistent_raw_data_from(&cache_root, None, Some("local-host"), wide_range);
+    let narrow_visible = filter_all_tool_data_borrowed(&narrow, &window, None, now);
+    let wide_visible = filter_all_tool_data_borrowed(&wide, &window, None, now);
+
+    assert_eq!(narrow_visible.codex.len(), 1);
+    assert_eq!(wide_visible.codex.len(), 1);
+    assert_eq!(narrow_visible.codex[0].usage.input_tokens, 99);
+    assert_eq!(wide_visible.codex[0].usage.input_tokens, 99);
+    assert_eq!(wide_visible.codex[0].host_id.as_deref(), Some("local-host"));
+}
+
+#[test]
+fn all_host_projection_uses_lexicographically_first_remote_copy() {
+    let cache_root = unique_temp_dir("all-host-remote-winner");
+    let timestamp = "2026-05-18T12:00:00Z";
+    let stable_key = "codex:turn:turn-a:cumulative:start->10,2,0,3,1,13";
+    data::cache::merge_remote_records(
+        &cache_root,
+        "z-host",
+        vec![remote_usage_record("codex", stable_key, timestamp, 99)],
+    )
+    .expect("write later host first");
+    data::cache::merge_remote_records(
+        &cache_root,
+        "a-host",
+        vec![remote_usage_record("codex", stable_key, timestamp, 10)],
+    )
+    .expect("write earlier host second");
+    let center = time_utils::parse_timestamp(timestamp).expect("timestamp");
+
+    let cache = load_scoped_persistent_raw_data_from(&cache_root, None, None, test_range(center));
+    let window = TimeWindow::from_date("2026-05-18").expect("valid date window");
+    let visible = filter_all_tool_data_borrowed(&cache, &window, None, center);
+
+    assert_eq!(visible.codex.len(), 1);
+    assert_eq!(visible.codex[0].host_id.as_deref(), Some("a-host"));
+    assert_eq!(visible.codex[0].usage.input_tokens, 10);
+}
+
+#[test]
+fn explicit_host_projection_preserves_each_host_owned_copy() {
+    let cache_root = unique_temp_dir("host-filter-stable-copy");
+    let timestamp = "2026-05-18T12:00:00Z";
+    let stable_key = "codex:turn:turn-a:cumulative:start->10,2,0,3,1,13";
+    for (host, tokens) in [("a-host", 10), ("z-host", 99)] {
+        data::cache::merge_remote_records(
+            &cache_root,
+            host,
+            vec![remote_usage_record("codex", stable_key, timestamp, tokens)],
+        )
+        .expect("write host cache");
+    }
+    let center = time_utils::parse_timestamp(timestamp).expect("timestamp");
+
+    let a_host =
+        load_scoped_persistent_raw_data_from(&cache_root, Some("a-host"), None, test_range(center));
+    let z_host =
+        load_scoped_persistent_raw_data_from(&cache_root, Some("z-host"), None, test_range(center));
+
+    assert_eq!(a_host.codex.len(), 1);
+    assert_eq!(a_host.codex[0].usage.input_tokens, 10);
+    assert_eq!(z_host.codex.len(), 1);
+    assert_eq!(z_host.codex[0].usage.input_tokens, 99);
+}
+
+#[test]
+fn all_host_projection_preserves_host_scoped_fallback_keys() {
+    let cache_root = unique_temp_dir("all-host-fallbacks");
+    let timestamp = "2026-05-18T12:00:00Z";
+    let fallback_key = "codex:file:/sessions/a.jsonl:0";
+    for host in ["a-host", "z-host"] {
+        data::cache::merge_remote_records(
+            &cache_root,
+            host,
+            vec![remote_usage_record("codex", fallback_key, timestamp, 10)],
+        )
+        .expect("write host cache");
+    }
+    let center = time_utils::parse_timestamp(timestamp).expect("timestamp");
+
+    let cache = load_scoped_persistent_raw_data_from(&cache_root, None, None, test_range(center));
+
+    assert_eq!(cache.codex.len(), 2);
+}
+
+#[test]
+fn all_host_identity_dedup_is_independent_of_dst_offsets() {
+    let cache_root = unique_temp_dir("all-host-dst-identity");
+    let copied_key = "codex:turn:copied:cumulative:start->10,2,0,3,1,13";
+    let first_hour_key = "codex:turn:first-hour:cumulative:start->10,2,0,3,1,13";
+    let second_hour_key = "codex:turn:second-hour:cumulative:start->10,2,0,3,1,13";
+    data::cache::merge_remote_records(
+        &cache_root,
+        "a-host",
+        vec![
+            remote_usage_record("codex", copied_key, "2026-11-01T01:30:00-07:00", 10),
+            remote_usage_record("codex", first_hour_key, "2026-11-01T01:30:00-07:00", 20),
+        ],
+    )
+    .expect("write first host cache");
+    data::cache::merge_remote_records(
+        &cache_root,
+        "z-host",
+        vec![
+            remote_usage_record("codex", copied_key, "2026-11-01T08:30:00Z", 10),
+            remote_usage_record("codex", second_hour_key, "2026-11-01T01:30:00-08:00", 30),
+        ],
+    )
+    .expect("write second host cache");
+    let center = time_utils::parse_timestamp("2026-11-01T09:00:00Z").expect("timestamp");
+
+    let cache = load_scoped_persistent_raw_data_from(&cache_root, None, None, test_range(center));
+    let window = TimeWindow::from_date("2026-11-01").expect("valid date window");
+    let visible = filter_all_tool_data_borrowed(&cache, &window, None, center);
+
+    assert_eq!(visible.codex.len(), 3);
+    assert_eq!(
+        visible
+            .codex
+            .iter()
+            .map(|entry| entry.usage.input_tokens)
+            .sum::<i64>(),
+        60
+    );
+}
+
+#[test]
+fn aggregate_tool_series_counts_codex_inclusive_output_once() {
+    let timestamp = time_utils::parse_timestamp("2026-05-18T12:00:00Z").expect("timestamp");
+    let mut entry = usage_entry_at(timestamp);
+    entry.usage = data::TokenUsage {
+        input_tokens: 20,
+        output_tokens: 10,
+        cache_read_input_tokens: 80,
+        cache_creation_input_tokens: 5,
+        reasoning_output_tokens: 4,
+    };
+    let data = AllToolData {
+        claude: Cow::Borrowed(&[]),
+        codex: Cow::Owned(vec![entry]),
+        gemini: Cow::Borrowed(&[]),
+        kimi: Cow::Borrowed(&[]),
+        omp: Cow::Borrowed(&[]),
+    };
+
+    let series = calculate_tool_aggregate_time_series(&data, 60);
+
+    assert_eq!(series.values().next().expect("bucket")["Codex"], 115.0);
 }

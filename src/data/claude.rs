@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
+use crate::data::{
+    SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry, file_fallback_key,
+};
 use crate::time_utils::parse_timestamp;
 
 /// Get Claude configuration directories.
@@ -81,7 +83,7 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
         .map(str::to_string);
     let mut entries = Vec::new();
     let mut response_positions = HashMap::new();
-    for line in content.lines() {
+    for (line_index, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -115,7 +117,7 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
 
         let message_id = message.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let dedup_key = if message_id.is_empty() {
-            String::new()
+            file_fallback_key("claude", path, line_index)
         } else {
             claude_response_key(message_id)
         };
@@ -294,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_message_ids_remain_separate_fallback_candidates() {
+    fn missing_message_ids_use_host_scoped_file_line_keys() {
         let records = read_fixture(
             "missing-ids",
             concat!(
@@ -305,6 +307,10 @@ mod tests {
         );
 
         assert_eq!(records.len(), 2);
-        assert!(records.iter().all(|record| record.dedup_key.is_empty()));
+        assert!(records[0].dedup_key.starts_with("claude:file:"));
+        assert!(records[0].dedup_key.ends_with(":0"));
+        assert!(records[1].dedup_key.starts_with("claude:file:"));
+        assert!(records[1].dedup_key.ends_with(":1"));
+        assert_ne!(records[0].dedup_key, records[1].dedup_key);
     }
 }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::data::{
     SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageCost, UsageEntry, as_i64,
+    file_fallback_key,
 };
 use crate::model_id::normalize_reasoning_effort;
 use crate::time_utils::parse_timestamp;
@@ -182,7 +183,7 @@ fn build_dedup_key(
     } else if !message_id.is_empty() {
         format!("omp:message:{message_id}")
     } else {
-        format!("omp:file:{}:{message_index}", path.to_string_lossy())
+        file_fallback_key("omp", path, message_index)
     }
 }
 

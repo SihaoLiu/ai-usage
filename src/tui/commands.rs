@@ -207,7 +207,7 @@ fn known_host_usage_labels(
                 continue;
             };
             *totals.entry(host.to_string()).or_default() +=
-                crate::stats::entry_total_with_cache(entry, tool.key());
+                crate::stats::entry_total_with_cache(entry);
         }
     }
 
@@ -1150,6 +1150,7 @@ mod tests {
             has_source_data: true,
             local_host_id: state.local_host_id.clone(),
             local_record_keys: HashMap::new(),
+            stable_record_groups: Vec::new(),
             persistent_generation: String::new(),
             local_parser_revision_current: true,
         });
@@ -1167,11 +1168,11 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "alpha(67.9%)",
-                "bravo(20%)",
-                "charlie(7.9%)",
-                "delta(3.2%)",
-                "echo(1%)",
+                "bravo(59.5%)",
+                "alpha(34.4%)",
+                "charlie(4%)",
+                "delta(1.6%)",
+                "echo(0.5%)",
                 "foxtrot(0%)",
                 "golf(0%)",
             ]

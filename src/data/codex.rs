@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::data::{SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry};
+use crate::data::{
+    SourceUsageRecord, TokenUsage, UNKNOWN_FAST_TIER, UsageEntry, file_fallback_key,
+};
 use crate::time_utils::parse_timestamp;
 
 /// When a Codex session is resumed via `--fork`, the new rollout file replays every
@@ -70,25 +72,97 @@ fn parse_top_level_service_tier(content: &str) -> Option<String> {
     None
 }
 
-/// Key used for cross-file deduplication. A turn_id (when available) together with
-/// the usage tuple uniquely identifies a Codex billing event: a single turn may emit
-/// many `token_count` events (one per sub-inference call), each with a distinct
-/// `last_token_usage`, so the usage tuple is required to avoid collapsing them. When
-/// turn_id is unavailable we fall back to the event timestamp which, within a single
-/// session, is unique per event.
-type DedupKey = (String, i64, i64, i64, i64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CodexTokenUsageSnapshot {
+    input: i64,
+    cached_input: i64,
+    cache_write_input: i64,
+    output: i64,
+    reasoning_output: i64,
+    total: i64,
+}
+
+impl CodexTokenUsageSnapshot {
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        value.as_object()?;
+        let snapshot = Self {
+            input: required_token_field(value, "input_tokens")?,
+            cached_input: required_token_field(value, "cached_input_tokens")?,
+            cache_write_input: optional_token_field(value, "cache_write_input_tokens")?,
+            output: required_token_field(value, "output_tokens")?,
+            reasoning_output: required_token_field(value, "reasoning_output_tokens")?,
+            total: required_token_field(value, "total_tokens")?,
+        };
+        ai_usage_proto::is_valid_codex_usage_snapshot(
+            snapshot.input,
+            snapshot.cached_input,
+            snapshot.cache_write_input,
+            snapshot.output,
+            snapshot.reasoning_output,
+            snapshot.total,
+        )
+        .then_some(snapshot)
+    }
+
+    fn key_component(self) -> String {
+        format!(
+            "{},{},{},{},{},{}",
+            self.input,
+            self.cached_input,
+            self.cache_write_input,
+            self.output,
+            self.reasoning_output,
+            self.total
+        )
+    }
+
+    fn is_zero(self) -> bool {
+        self.input == 0
+            && self.cached_input == 0
+            && self.cache_write_input == 0
+            && self.output == 0
+            && self.reasoning_output == 0
+    }
+}
+
+fn required_token_field(value: &serde_json::Value, name: &str) -> Option<i64> {
+    value.get(name)?.as_i64()
+}
+
+fn optional_token_field(value: &serde_json::Value, name: &str) -> Option<i64> {
+    match value.get(name) {
+        Some(value) => value.as_i64(),
+        None => Some(0),
+    }
+}
+
+fn cumulative_transition_key(
+    path: &Path,
+    line_index: usize,
+    turn_id: &str,
+    previous: Option<CodexTokenUsageSnapshot>,
+    current: CodexTokenUsageSnapshot,
+) -> String {
+    if turn_id.is_empty() {
+        return file_fallback_key("codex", path, line_index);
+    }
+    let previous = previous.map_or_else(|| "start".to_string(), |usage| usage.key_component());
+    format!(
+        "codex:turn:{turn_id}:cumulative:{previous}->{}",
+        current.key_component()
+    )
+}
 
 /// An entry produced by a single file, paired with its cross-file dedup key.
 struct RawEntry {
     entry: UsageEntry,
-    dedup_key: DedupKey,
+    dedup_key: String,
 }
 
 /// Parse one Codex rollout file.
 ///
-/// Events flagged as replayed (from a forked-from session) are dropped before they
-/// are summed. Consecutive duplicates are also skipped to guard against a future
-/// codex build emitting the same `token_count` twice in a row.
+/// Cumulative usage transitions identify completed responses. Repeated emissions
+/// with an unchanged cumulative snapshot are ignored.
 fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
@@ -102,10 +176,10 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
     let mut current_effort = "unknown".to_string();
     let mut current_turn_id: String = String::new();
     let mut current_turn_started_ms: i64 = 0;
-    let mut last_usage_key: Option<(i64, i64, i64, i64)> = None;
+    let mut previous_total_usage: Option<CodexTokenUsageSnapshot> = None;
     let mut results: Vec<RawEntry> = Vec::new();
 
-    for line in content.lines() {
+    for (line_index, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -138,8 +212,8 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
 
                 match payload_type {
                     "task_started" => {
+                        current_turn_id.clear();
                         if let Some(tid) = payload.get("turn_id").and_then(|v| v.as_str()) {
-                            current_turn_id.clear();
                             current_turn_id.push_str(tid);
                         }
                         if let Some(sa) = payload.get("started_at").and_then(|v| v.as_i64()) {
@@ -152,61 +226,48 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                         let entry_timestamp =
                             data.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
                         let parsed_ts = parse_timestamp(entry_timestamp);
-
-                        if is_replayed_event(
-                            fork_boundary_ms,
-                            parsed_ts.map(|t| t.timestamp_millis()),
-                            current_turn_started_ms,
-                        ) {
-                            continue;
-                        }
-
                         let info = match payload.get("info") {
                             Some(i) => i,
                             None => continue,
                         };
-                        let token_usage = match info.get("last_token_usage") {
-                            Some(t) => t,
-                            None => continue,
+                        let Some(current_total) = info
+                            .get("total_token_usage")
+                            .and_then(CodexTokenUsageSnapshot::from_json)
+                        else {
+                            continue;
                         };
-
-                        let input_tokens = token_usage
-                            .get("input_tokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                        let cached_input = token_usage
-                            .get("cached_input_tokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                        let output_tokens = token_usage
-                            .get("output_tokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                        let reasoning_output = token_usage
-                            .get("reasoning_output_tokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-
-                        let usage_key =
-                            (input_tokens, cached_input, output_tokens, reasoning_output);
-                        if Some(usage_key) == last_usage_key {
+                        let previous_total = previous_total_usage.replace(current_total);
+                        if previous_total == Some(current_total) {
                             continue;
                         }
-                        last_usage_key = Some(usage_key);
 
-                        let non_cached_input = input_tokens.saturating_sub(cached_input).max(0);
-
-                        let dedup_id = if !current_turn_id.is_empty() {
-                            current_turn_id.clone()
-                        } else {
-                            entry_timestamp.to_string()
+                        let Some(last_usage) = info
+                            .get("last_token_usage")
+                            .and_then(CodexTokenUsageSnapshot::from_json)
+                        else {
+                            continue;
                         };
-                        let dedup_key = (
-                            dedup_id,
-                            input_tokens,
-                            cached_input,
-                            output_tokens,
-                            reasoning_output,
+                        if last_usage.is_zero()
+                            || is_replayed_event(
+                                fork_boundary_ms,
+                                parsed_ts.map(|t| t.timestamp_millis()),
+                                current_turn_started_ms,
+                            )
+                        {
+                            continue;
+                        }
+
+                        let non_cached_input = last_usage
+                            .input
+                            .saturating_sub(last_usage.cached_input)
+                            .saturating_sub(last_usage.cache_write_input)
+                            .max(0);
+                        let dedup_key = cumulative_transition_key(
+                            path,
+                            line_index,
+                            &current_turn_id,
+                            previous_total,
+                            current_total,
                         );
 
                         let ts_owned = entry_timestamp.to_string();
@@ -223,10 +284,10 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                                 fast_tier: UNKNOWN_FAST_TIER,
                                 usage: TokenUsage {
                                     input_tokens: non_cached_input,
-                                    output_tokens,
-                                    cache_read_input_tokens: cached_input,
-                                    cache_creation_input_tokens: 0,
-                                    reasoning_output_tokens: reasoning_output,
+                                    output_tokens: last_usage.output,
+                                    cache_read_input_tokens: last_usage.cached_input,
+                                    cache_creation_input_tokens: last_usage.cache_write_input,
+                                    reasoning_output_tokens: last_usage.reasoning_output,
                                 },
                                 costs: None,
                             },
@@ -292,7 +353,7 @@ fn is_replayed_event(
         return false;
     };
     if turn_started_ms > 0 {
-        return turn_started_ms < fork_ms;
+        return turn_started_ms.div_euclid(1000) < fork_ms.div_euclid(1000);
     }
     match event_ts_ms {
         Some(ts_ms) => ts_ms <= fork_ms + FORK_REPLAY_FALLBACK_WINDOW_MS,
@@ -308,7 +369,7 @@ pub fn read_codex_file_records(path: &Path) -> Vec<SourceUsageRecord> {
     read_single_codex_file(path)
         .into_iter()
         .map(|raw| SourceUsageRecord {
-            dedup_key: serde_json::to_string(&raw.dedup_key).unwrap_or_default(),
+            dedup_key: raw.dedup_key,
             entry: raw.entry,
         })
         .collect()
@@ -366,6 +427,14 @@ mod tests {
     }
 
     #[test]
+    fn started_at_in_same_second_as_fork_is_fresh() {
+        let fork = 10_957_i64;
+
+        assert!(!is_replayed_event(Some(fork), Some(fork + 10_000), 10_000));
+        assert!(is_replayed_event(Some(fork), Some(fork + 10_000), 9_000));
+    }
+
+    #[test]
     fn timestamp_fallback_when_no_task_started() {
         let fork = 10_000_000_i64;
         assert!(is_replayed_event(Some(fork), Some(fork), 0));
@@ -414,22 +483,190 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_output_does_not_make_visible_output_negative() {
+    fn reasoning_larger_than_output_is_rejected() {
         let path = unique_temp_file("reasoning-output");
         fs::write(
             &path,
             r#"{"timestamp":"2026-05-19T12:00:00Z","type":"turn_context","payload":{"model":"gpt-5.5","effort":"high"}}
 {"timestamp":"2026-05-19T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779192001}}
-{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":150,"output_tokens":25,"reasoning_output_tokens":64}}}}"#,
+{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":0,"output_tokens":25,"reasoning_output_tokens":64,"total_tokens":125},"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":0,"output_tokens":25,"reasoning_output_tokens":64,"total_tokens":125}}}}"#,
+        )
+        .expect("write codex fixture");
+
+        let records = read_codex_file_records(&path);
+
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn same_last_usage_with_new_cumulative_total_is_counted() {
+        let path = unique_temp_file("advancing-cumulative-total");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-19T12:00:00Z","type":"turn_context","payload":{"model":"gpt-5.5","effort":"high"}}
+{"timestamp":"2026-05-19T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779192001}}
+{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}
+{"timestamp":"2026-05-19T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":4,"cache_write_input_tokens":0,"output_tokens":6,"reasoning_output_tokens":2,"total_tokens":26},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}"#,
+        )
+        .expect("write codex fixture");
+
+        let records = read_codex_file_records(&path);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].entry.usage.input_tokens, 8);
+        assert_eq!(
+            records[0].dedup_key,
+            "codex:turn:turn-a:cumulative:start->10,2,0,3,1,13"
+        );
+        assert_eq!(
+            records[1].dedup_key,
+            "codex:turn:turn-a:cumulative:10,2,0,3,1,13->20,4,0,6,2,26"
+        );
+    }
+
+    #[test]
+    fn unchanged_cumulative_total_suppresses_duplicate_emission() {
+        let path = unique_temp_file("unchanged-cumulative-total");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-19T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779192001}}
+{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}
+{"timestamp":"2026-05-19T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":99,"cached_input_tokens":5,"cache_write_input_tokens":0,"output_tokens":9,"reasoning_output_tokens":2,"total_tokens":108}}}}"#,
         )
         .expect("write codex fixture");
 
         let records = read_codex_file_records(&path);
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].entry.usage.input_tokens, 0);
-        assert_eq!(records[0].entry.usage.cache_read_input_tokens, 150);
-        assert_eq!(records[0].entry.usage.output_tokens, 25);
-        assert_eq!(records[0].entry.usage.reasoning_output_tokens, 64);
+        assert_eq!(records[0].entry.usage.input_tokens, 8);
+    }
+
+    #[test]
+    fn cumulative_transition_continues_across_turns() {
+        let path = unique_temp_file("cross-turn-cumulative-total");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-19T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779192001}}
+{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}
+{"timestamp":"2026-05-19T12:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-b","started_at":1779192003}}
+{"timestamp":"2026-05-19T12:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":4,"output_tokens":6,"reasoning_output_tokens":2,"total_tokens":26},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}"#,
+        )
+        .expect("write codex fixture");
+
+        let records = read_codex_file_records(&path);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[1].dedup_key,
+            "codex:turn:turn-b:cumulative:10,2,0,3,1,13->20,4,0,6,2,26"
+        );
+    }
+
+    #[test]
+    fn zero_component_update_advances_transition_without_counting_a_message() {
+        let path = unique_temp_file("zero-transition");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-19T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779192001}}
+{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0}}}}
+{"timestamp":"2026-05-19T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}"#,
+        )
+        .expect("write codex fixture");
+
+        let records = read_codex_file_records(&path);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry.usage.input_tokens, 7);
+        assert_eq!(records[0].entry.usage.cache_creation_input_tokens, 1);
+        assert_eq!(
+            records[0].dedup_key,
+            "codex:turn:turn-a:cumulative:0,0,0,0,0,0->10,2,1,3,1,13"
+        );
+    }
+
+    #[test]
+    fn missing_cumulative_total_is_not_a_usage_record() {
+        let path = unique_temp_file("missing-cumulative-total");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-19T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779192001}}
+{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}"#,
+        )
+        .expect("write codex fixture");
+
+        assert!(read_codex_file_records(&path).is_empty());
+    }
+
+    #[test]
+    fn missing_turn_id_uses_a_host_scoped_file_key() {
+        let path = unique_temp_file("missing-turn-id");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}"#,
+        )
+        .expect("write codex fixture");
+
+        let records = read_codex_file_records(&path);
+
+        assert_eq!(records.len(), 1);
+        assert!(records[0].dedup_key.starts_with("codex:file:"));
+        assert!(!ai_usage_proto::is_globally_stable_usage_key(
+            "codex",
+            &records[0].dedup_key
+        ));
+    }
+
+    #[test]
+    fn malformed_or_inconsistent_token_snapshots_are_skipped() {
+        let path = unique_temp_file("invalid-token-snapshots");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-19T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779192001}}
+{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":null,"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}
+{"timestamp":"2026-05-19T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":9223372036854775808,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}
+{"timestamp":"2026-05-19T12:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":-1,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}
+{"timestamp":"2026-05-19T12:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":99},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}
+{"timestamp":"2026-05-19T12:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":11,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}"#,
+        )
+        .expect("write codex fixture");
+
+        assert!(read_codex_file_records(&path).is_empty());
+    }
+
+    #[test]
+    fn malformed_last_usage_advances_a_valid_cumulative_snapshot() {
+        let path = unique_temp_file("malformed-last-usage");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-19T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779192001}}
+{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":null}}}
+{"timestamp":"2026-05-19T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}"#,
+        )
+        .expect("write codex fixture");
+
+        assert!(read_codex_file_records(&path).is_empty());
+    }
+
+    #[test]
+    fn copied_transitions_have_identical_keys() {
+        let first_path = unique_temp_file("copied-transition-a");
+        let second_path = unique_temp_file("copied-transition-b");
+        let first = r#"{"timestamp":"2026-05-19T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779192001}}
+{"timestamp":"2026-05-19T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}"#;
+        let second = r#"{"timestamp":"2026-05-20T13:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1779282001}}
+{"timestamp":"2026-05-20T13:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}"#;
+        fs::write(&first_path, first).expect("write first copy");
+        fs::write(&second_path, second).expect("write second copy");
+
+        let first_keys: Vec<String> = read_codex_file_records(&first_path)
+            .into_iter()
+            .map(|record| record.dedup_key)
+            .collect();
+        let second_keys: Vec<String> = read_codex_file_records(&second_path)
+            .into_iter()
+            .map(|record| record.dedup_key)
+            .collect();
+
+        assert_eq!(first_keys, second_keys);
     }
 }

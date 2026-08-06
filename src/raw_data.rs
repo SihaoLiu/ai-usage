@@ -4,13 +4,15 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{OnceLock, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, Local};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+
+use ai_usage_proto::is_globally_stable_usage_key;
 
 use std::path::Path;
 
@@ -39,28 +41,8 @@ pub(crate) const RAW_CACHE_IDLE_TTL: StdDuration = StdDuration::from_secs(5 * 60
 #[cfg(test)]
 static IDLE_RECLAIM_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn background_refresh_parallelism(available: usize) -> usize {
-    (available / 4).clamp(1, 4)
-}
-
-fn background_refresh_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let available = thread::available_parallelism().map_or(1, usize::from);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(background_refresh_parallelism(available))
-            .thread_name(|index| format!("usage-refresh-{index}"))
-            .build()
-            .ok()
-    })
-    .as_ref()
-}
-
 fn refresh_all_tool_caches_in_background() {
-    match background_refresh_pool() {
-        Some(pool) => pool.install(refresh_all_tool_caches),
-        None => refresh_all_tool_caches(),
-    }
+    refresh_all_tool_caches();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,12 +102,21 @@ pub(crate) struct RawDataCache {
     pub(crate) has_source_data: bool,
     pub(crate) local_host_id: Option<String>,
     #[serde(skip)]
-    pub(crate) local_record_keys: HashMap<Tool, HashSet<String>>,
+    pub(crate) local_record_keys: HashMap<Tool, HashMap<String, usize>>,
+    #[serde(default)]
+    pub(crate) stable_record_groups: Vec<StableRecordGroup>,
     #[serde(default)]
     pub(crate) persistent_generation: String,
     /// True when cached local records use the current parser revisions.
     #[serde(default)]
     pub(crate) local_parser_revision_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StableRecordGroup {
+    vendor: String,
+    dedup_key: String,
+    candidates: Vec<UsageEntry>,
 }
 
 pub(crate) enum BackgroundRawLoad {
@@ -173,6 +164,33 @@ fn recent_entries(entries: &[UsageEntry], now: DateTime<Local>) -> Vec<UsageEntr
     sorted_range_slice(entries, hot_cache_range(now)).to_vec()
 }
 
+fn record_groups_in_range(
+    groups: &[StableRecordGroup],
+    range: RawDataRange,
+) -> Vec<StableRecordGroup> {
+    let start = range.start();
+    let end = range.end();
+    groups
+        .iter()
+        .filter_map(|group| {
+            let candidates = group
+                .candidates
+                .iter()
+                .filter(|entry| {
+                    entry_timestamp(entry)
+                        .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (!candidates.is_empty()).then(|| StableRecordGroup {
+                vendor: group.vendor.clone(),
+                dedup_key: group.dedup_key.clone(),
+                candidates,
+            })
+        })
+        .collect()
+}
+
 fn prepare_hot_raw_snapshot(source: &RawDataCache, captured_at: DateTime<Local>) -> HotRawSnapshot {
     let range = hot_cache_range(captured_at);
     HotRawSnapshot {
@@ -186,6 +204,7 @@ fn prepare_hot_raw_snapshot(source: &RawDataCache, captured_at: DateTime<Local>)
             has_source_data: source.has_source_data,
             local_host_id: source.local_host_id.clone(),
             local_record_keys: HashMap::new(),
+            stable_record_groups: record_groups_in_range(&source.stable_record_groups, range),
             persistent_generation: source.persistent_generation.clone(),
             local_parser_revision_current: source.local_parser_revision_current,
         },
@@ -337,6 +356,28 @@ fn sort_raw_cache(cache: &mut RawDataCache) {
     sort(&mut cache.omp);
 }
 
+fn tool_entries(cache: &RawDataCache, tool: Tool) -> &[UsageEntry] {
+    match tool {
+        Tool::Claude => &cache.claude,
+        Tool::Codex => &cache.codex,
+        Tool::Gemini => &cache.gemini,
+        Tool::Kimi => &cache.kimi,
+        Tool::Omp => &cache.omp,
+        Tool::All => unreachable!("all is not a source tool"),
+    }
+}
+
+fn tool_entries_mut(cache: &mut RawDataCache, tool: Tool) -> &mut Vec<UsageEntry> {
+    match tool {
+        Tool::Claude => &mut cache.claude,
+        Tool::Codex => &mut cache.codex,
+        Tool::Gemini => &mut cache.gemini,
+        Tool::Kimi => &mut cache.kimi,
+        Tool::Omp => &mut cache.omp,
+        Tool::All => unreachable!("all is not a source tool"),
+    }
+}
+
 pub(crate) fn include_local_for_host_filter(
     host_filter: Option<&str>,
     local_host_id: Option<&str>,
@@ -350,7 +391,38 @@ pub(crate) fn include_local_for_host_filter(
 pub(crate) fn merge_remote_records_into_raw_cache(
     cache: &mut RawDataCache,
     records: Vec<data::cache::RemoteUsageRecord>,
+    collapse_globally_stable_keys: bool,
 ) {
+    #[derive(Clone, Copy)]
+    enum StableLocation {
+        Entry(usize),
+        Group(usize),
+    }
+
+    let mut globally_seen: HashMap<Tool, HashMap<String, StableLocation>> = HashMap::new();
+    if collapse_globally_stable_keys {
+        for (tool, positions) in &cache.local_record_keys {
+            let stable = positions
+                .iter()
+                .filter(|(key, _)| is_globally_stable_usage_key(tool.key(), key))
+                .map(|(key, position)| (key.clone(), StableLocation::Entry(*position)))
+                .collect::<HashMap<_, _>>();
+            if !stable.is_empty() {
+                globally_seen.insert(*tool, stable);
+            }
+        }
+        for (group_index, group) in cache.stable_record_groups.iter().enumerate() {
+            if let Some(tool) = Tool::from_key(&group.vendor) {
+                globally_seen
+                    .entry(tool)
+                    .or_default()
+                    .insert(group.dedup_key.clone(), StableLocation::Group(group_index));
+            }
+        }
+    }
+
+    let mut grouped_entry_positions: HashMap<Tool, HashSet<usize>> = HashMap::new();
+
     for record in records {
         let Some(host_id) = record.entry.host_id.as_deref() else {
             continue;
@@ -358,28 +430,124 @@ pub(crate) fn merge_remote_records_into_raw_cache(
         let Some(tool) = Tool::from_key(&record.vendor) else {
             continue;
         };
+        let globally_stable = collapse_globally_stable_keys
+            && is_globally_stable_usage_key(&record.vendor, &record.dedup_key);
         if cache.local_host_id.as_deref() == Some(host_id)
             && cache
                 .local_record_keys
                 .get(&tool)
-                .is_some_and(|keys| keys.contains(&record.dedup_key))
+                .is_some_and(|keys| keys.contains_key(&record.dedup_key))
+            && !globally_stable
         {
             continue;
         }
-        match tool {
-            Tool::Claude => cache.claude.push(record.entry),
-            Tool::Codex => cache.codex.push(record.entry),
-            Tool::Gemini => cache.gemini.push(record.entry),
-            Tool::Kimi => cache.kimi.push(record.entry),
-            Tool::Omp => cache.omp.push(record.entry),
-            Tool::All => {}
+        if globally_stable {
+            let existing = globally_seen
+                .get(&tool)
+                .and_then(|seen| seen.get(&record.dedup_key))
+                .copied();
+            match existing {
+                Some(StableLocation::Entry(position)) => {
+                    let Some(first) = tool_entries(cache, tool).get(position).cloned() else {
+                        continue;
+                    };
+                    grouped_entry_positions
+                        .entry(tool)
+                        .or_default()
+                        .insert(position);
+                    let group_index = cache.stable_record_groups.len();
+                    cache.stable_record_groups.push(StableRecordGroup {
+                        vendor: record.vendor.clone(),
+                        dedup_key: record.dedup_key.clone(),
+                        candidates: vec![first, record.entry],
+                    });
+                    globally_seen
+                        .entry(tool)
+                        .or_default()
+                        .insert(record.dedup_key, StableLocation::Group(group_index));
+                }
+                Some(StableLocation::Group(group_index)) => {
+                    if let Some(group) = cache.stable_record_groups.get_mut(group_index) {
+                        group.candidates.push(record.entry);
+                    }
+                }
+                None => {
+                    let position = tool_entries(cache, tool).len();
+                    globally_seen
+                        .entry(tool)
+                        .or_default()
+                        .insert(record.dedup_key, StableLocation::Entry(position));
+                    tool_entries_mut(cache, tool).push(record.entry);
+                }
+            }
+            continue;
         }
+
+        tool_entries_mut(cache, tool).push(record.entry);
     }
+
+    for (tool, positions) in grouped_entry_positions {
+        let mut index = 0;
+        tool_entries_mut(cache, tool).retain(|_| {
+            let keep = !positions.contains(&index);
+            index += 1;
+            keep
+        });
+    }
+}
+
+fn stable_group_winners<'a>(
+    groups: &'a [StableRecordGroup],
+    tool: Tool,
+    window: &TimeWindow,
+    session_id: Option<&str>,
+    now: DateTime<Local>,
+) -> Vec<&'a UsageEntry> {
+    let (start, end) = window.bounds(now);
+    groups
+        .iter()
+        .filter(|group| group.vendor == tool.key())
+        .filter_map(|group| {
+            group
+                .candidates
+                .iter()
+                .filter(|entry| {
+                    entry_timestamp(entry)
+                        .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+                        && session_id
+                            .is_none_or(|selected| entry.session_id.as_deref() == Some(selected))
+                })
+                .min_by(|left, right| {
+                    left.host_id
+                        .cmp(&right.host_id)
+                        .then_with(|| entry_timestamp(left).cmp(&entry_timestamp(right)))
+                })
+        })
+        .collect()
+}
+
+fn cached_window_with_stable_groups<'a>(
+    cache: &'a RawDataCache,
+    tool: Tool,
+    window: &TimeWindow,
+    session_id: Option<&str>,
+    now: DateTime<Local>,
+) -> Cow<'a, [UsageEntry]> {
+    let winners = stable_group_winners(&cache.stable_record_groups, tool, window, session_id, now);
+    let entries = tool_entries(cache, tool);
+    if winners.is_empty() {
+        return cached_window(entries, window, session_id, now);
+    }
+
+    let mut visible = cached_window(entries, window, session_id, now).into_owned();
+    visible.extend(winners.into_iter().cloned());
+    visible.sort_unstable_by_key(entry_timestamp);
+    Cow::Owned(visible)
 }
 
 /// Entries, dedup identities, metadata currency, and global presence for one
 /// vendor cache.
-type LoadedVendorCache = (Vec<UsageEntry>, HashSet<String>, bool, bool);
+type LoadedVendorCache = (Vec<UsageEntry>, HashMap<String, usize>, bool, bool);
 
 pub(crate) fn load_local_tool_cached_records(
     cache_root: &Path,
@@ -392,13 +560,12 @@ pub(crate) fn load_local_tool_cached_records(
         range.start(),
         range.end(),
     );
-    let parser_revision_current =
-        !has_cached_records || data::cache::vendor_parser_revision_is_current(cache_root, tool);
+    let parser_revision_current = data::cache::vendor_parser_revision_is_current(cache_root, tool);
     let mut entries = Vec::with_capacity(records.len());
-    let mut keys = HashSet::with_capacity(records.len());
+    let mut keys = HashMap::with_capacity(records.len());
     for (dedup_key, entry) in records {
         if !dedup_key.is_empty() {
-            keys.insert(dedup_key);
+            keys.entry(dedup_key).or_insert(entries.len());
         }
         entries.push(entry);
     }
@@ -419,7 +586,7 @@ pub(crate) fn local_cached_raw_cache(
             if include_local {
                 load_local_tool_cached_records(cache_root, tool, range)
             } else {
-                (Vec::new(), HashSet::new(), true, false)
+                (Vec::new(), HashMap::new(), true, false)
             }
         })
         .collect();
@@ -450,6 +617,7 @@ pub(crate) fn local_cached_raw_cache(
         has_source_data,
         local_host_id: local_host_id.map(str::to_string),
         local_record_keys,
+        stable_record_groups: Vec::new(),
         persistent_generation: String::new(),
         local_parser_revision_current,
     }
@@ -472,7 +640,7 @@ fn load_scoped_persistent_raw_data_from(
         range.end(),
     );
     cache.has_source_data |= has_remote_source_data;
-    merge_remote_records_into_raw_cache(&mut cache, remote_records);
+    merge_remote_records_into_raw_cache(&mut cache, remote_records, host_filter.is_none());
     cache.local_record_keys = HashMap::new();
     cache.persistent_generation = persistent_generation;
     sort_raw_cache(&mut cache);
@@ -767,6 +935,42 @@ fn take_entries_outside_range(
     std::mem::replace(entries, retained)
 }
 
+fn take_group_entries_outside_range(
+    groups: &mut Vec<StableRecordGroup>,
+    range: RawDataRange,
+) -> Vec<StableRecordGroup> {
+    let start = range.start();
+    let end = range.end();
+    let mut retained_groups = Vec::with_capacity(groups.len());
+    let mut retired_groups = Vec::new();
+    for mut group in groups.drain(..) {
+        let mut retained = Vec::with_capacity(group.candidates.len());
+        let mut retired = Vec::new();
+        for entry in group.candidates {
+            if entry_timestamp(&entry)
+                .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+            {
+                retained.push(entry);
+            } else {
+                retired.push(entry);
+            }
+        }
+        if !retained.is_empty() {
+            retained_groups.push(StableRecordGroup {
+                vendor: group.vendor.clone(),
+                dedup_key: group.dedup_key.clone(),
+                candidates: retained,
+            });
+        }
+        if !retired.is_empty() {
+            group.candidates = retired;
+            retired_groups.push(group);
+        }
+    }
+    *groups = retained_groups;
+    retired_groups
+}
+
 pub(crate) fn retire_idle_raw_cache_at(
     state: &mut AppState,
     idle_now: Instant,
@@ -809,9 +1013,14 @@ fn compact_resident_raw_cache(
         take_entries_outside_range(&mut cache.kimi, retained_range),
         take_entries_outside_range(&mut cache.omp, retained_range),
     ];
+    let retired_groups =
+        take_group_entries_outside_range(&mut cache.stable_record_groups, retained_range);
     cache.range = retained_range;
-    if additional_retired.is_some() || retired.iter().any(|entries| !entries.is_empty()) {
-        retire_idle_value((additional_retired, retired));
+    if additional_retired.is_some()
+        || retired.iter().any(|entries| !entries.is_empty())
+        || !retired_groups.is_empty()
+    {
+        retire_idle_value((additional_retired, retired, retired_groups));
     }
     true
 }
@@ -862,6 +1071,7 @@ pub(crate) fn raw_cache_has_any_tool_data(cache: &RawDataCache) -> bool {
         || !cache.gemini.is_empty()
         || !cache.kimi.is_empty()
         || !cache.omp.is_empty()
+        || !cache.stable_record_groups.is_empty()
 }
 
 pub(crate) fn all_tool_data_has_window_data(all_data: &AllToolData<'_>) -> bool {
@@ -900,33 +1110,26 @@ fn filter_all_tool_data_owned(
     now: DateTime<Local>,
 ) -> AllToolData<'static> {
     AllToolData {
-        claude: Cow::Owned(data::filter_usage_data_by_window_and_session(
-            &cache.claude,
-            window,
-            session_id,
-            now,
-        )),
-        codex: Cow::Owned(data::filter_usage_data_by_window_and_session(
-            &cache.codex,
-            window,
-            session_id,
-            now,
-        )),
-        gemini: Cow::Owned(data::filter_usage_data_by_window_and_session(
-            &cache.gemini,
-            window,
-            session_id,
-            now,
-        )),
-        kimi: Cow::Owned(data::filter_usage_data_by_window_and_session(
-            &cache.kimi,
-            window,
-            session_id,
-            now,
-        )),
-        omp: Cow::Owned(data::filter_usage_data_by_window_and_session(
-            &cache.omp, window, session_id, now,
-        )),
+        claude: Cow::Owned(
+            cached_window_with_stable_groups(cache, Tool::Claude, window, session_id, now)
+                .into_owned(),
+        ),
+        codex: Cow::Owned(
+            cached_window_with_stable_groups(cache, Tool::Codex, window, session_id, now)
+                .into_owned(),
+        ),
+        gemini: Cow::Owned(
+            cached_window_with_stable_groups(cache, Tool::Gemini, window, session_id, now)
+                .into_owned(),
+        ),
+        kimi: Cow::Owned(
+            cached_window_with_stable_groups(cache, Tool::Kimi, window, session_id, now)
+                .into_owned(),
+        ),
+        omp: Cow::Owned(
+            cached_window_with_stable_groups(cache, Tool::Omp, window, session_id, now)
+                .into_owned(),
+        ),
     }
 }
 
@@ -937,11 +1140,11 @@ pub(crate) fn filter_all_tool_data_borrowed<'a>(
     now: DateTime<Local>,
 ) -> AllToolData<'a> {
     AllToolData {
-        claude: cached_window(&cache.claude, window, session_id, now),
-        codex: cached_window(&cache.codex, window, session_id, now),
-        gemini: cached_window(&cache.gemini, window, session_id, now),
-        kimi: cached_window(&cache.kimi, window, session_id, now),
-        omp: cached_window(&cache.omp, window, session_id, now),
+        claude: cached_window_with_stable_groups(cache, Tool::Claude, window, session_id, now),
+        codex: cached_window_with_stable_groups(cache, Tool::Codex, window, session_id, now),
+        gemini: cached_window_with_stable_groups(cache, Tool::Gemini, window, session_id, now),
+        kimi: cached_window_with_stable_groups(cache, Tool::Kimi, window, session_id, now),
+        omp: cached_window_with_stable_groups(cache, Tool::Omp, window, session_id, now),
     }
 }
 
@@ -985,20 +1188,7 @@ fn tool_series(entries: &[UsageEntry], tool: Tool, interval_minutes: i64) -> Too
                     continue;
                 }
 
-                let total = match tool {
-                    Tool::Codex => {
-                        entry.usage.input_tokens
-                            + entry.usage.output_tokens
-                            + entry.usage.cache_read_input_tokens
-                            + entry.usage.reasoning_output_tokens
-                    }
-                    _ => {
-                        entry.usage.input_tokens
-                            + entry.usage.output_tokens
-                            + entry.usage.cache_read_input_tokens
-                            + entry.usage.cache_creation_input_tokens
-                    }
-                } as f64;
+                let total = stats::entry_total_with_cache(entry) as f64;
 
                 let parsed = entry
                     .parsed_timestamp

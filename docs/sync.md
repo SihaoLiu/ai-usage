@@ -7,8 +7,10 @@
 - Each client uploads its own local records.
 - Each client pulls records from other configured machines.
 - Remote records are cached below the normal cache root under `remote/<machine_id>.bin`.
-- Display commands merge local and remote records, so existing charts and breakdowns keep the same shape.
+- Display commands merge local and remote records. The all-host view collapses copied transcripts only when a harness exposes a globally stable response identity.
 - `--host <machine_id>` filters the merged view to one machine.
+
+Server records and integrity reports remain host-owned. A response copied between machines is retained once per host by synchronization and remains visible in each explicit host view; only the derived all-host presentation counts that stable response once. The preferred copy is selected after applying the visible time and session filters, so background cache prefetching cannot remove a response from the requested window. Path-, timestamp-, and ordinal-based fallback identities remain host-scoped and are never collapsed across machines.
 
 The server is intended for one user operating their own endpoint. It stores records in SQLite and exposes `/v1/upload`, `/v1/pull`, `/v1/machines`, `/v1/integrity/report`, `/v1/integrity/reports`, and `/v1/health`.
 

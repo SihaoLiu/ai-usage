@@ -5,6 +5,7 @@ use chrono::{DateTime, Duration, Local, NaiveDate};
 use serde::Serialize;
 
 use crate::constants::AllPricing;
+use crate::data::filter_usage_data_by_window_and_session;
 use crate::raw_data::{AllToolData, RawDataCache, RawDataRange, filter_all_tool_data_borrowed};
 use crate::stats::ModelBreakdownRow;
 use crate::table_view::{DisplayRow, TableMetric, TableView, build_table, table_totals};
@@ -68,6 +69,7 @@ pub(crate) struct SnapshotQuery {
     pub(crate) days: i64,
     pub(crate) tool: Tool,
     pub(crate) session_id: Option<String>,
+    pub(crate) captured_at: DateTime<Local>,
 }
 
 pub(crate) fn aggregate_metrics(rows: &[ModelBreakdownRow]) -> UsageMetrics {
@@ -165,6 +167,39 @@ fn selected_tool(mut data: AllToolData<'_>, tool: Tool) -> AllToolData<'_> {
     data
 }
 
+fn partition_projected_data(
+    data: &AllToolData<'_>,
+    window: &TimeWindow,
+    now: DateTime<Local>,
+) -> AllToolData<'static> {
+    AllToolData {
+        claude: Cow::Owned(filter_usage_data_by_window_and_session(
+            &data.claude,
+            window,
+            None,
+            now,
+        )),
+        codex: Cow::Owned(filter_usage_data_by_window_and_session(
+            &data.codex,
+            window,
+            None,
+            now,
+        )),
+        gemini: Cow::Owned(filter_usage_data_by_window_and_session(
+            &data.gemini,
+            window,
+            None,
+            now,
+        )),
+        kimi: Cow::Owned(filter_usage_data_by_window_and_session(
+            &data.kimi, window, None, now,
+        )),
+        omp: Cow::Owned(filter_usage_data_by_window_and_session(
+            &data.omp, window, None, now,
+        )),
+    }
+}
+
 fn day_window(date: NaiveDate, now: DateTime<Local>) -> TimeWindow {
     let full_day = TimeWindow::from_date(&date.to_string()).expect("valid calendar date");
     let (start, end) = full_day.bounds(now);
@@ -176,20 +211,20 @@ fn day_window(date: NaiveDate, now: DateTime<Local>) -> TimeWindow {
     }
 }
 
-pub(crate) fn required_range(query: &SnapshotQuery, now: DateTime<Local>) -> RawDataRange {
-    let dates = calendar_dates(now.date_naive(), query.days);
-    let (start, _) = day_window(dates[0], now).bounds(now);
-    RawDataRange::from_bounds(start, now)
+pub(crate) fn required_range(query: &SnapshotQuery) -> RawDataRange {
+    let dates = calendar_dates(query.captured_at.date_naive(), query.days);
+    let (start, _) = day_window(dates[0], query.captured_at).bounds(query.captured_at);
+    RawDataRange::from_bounds(start, query.captured_at)
 }
 
 pub(crate) fn build_from_cache(
     cache: &RawDataCache,
     query: &SnapshotQuery,
     pricing: &AllPricing,
-    now: DateTime<Local>,
 ) -> SnapshotDocument {
+    let now = query.captured_at;
     let dates = calendar_dates(now.date_naive(), query.days);
-    let range = required_range(query, now);
+    let range = required_range(query);
     let range_start = range.start();
     let window = TimeWindow::ExplicitRange {
         start: range_start,
@@ -206,10 +241,7 @@ pub(crate) fn build_from_cache(
         .into_iter()
         .map(|date| {
             let day = day_window(date, now);
-            let data = selected_tool(
-                filter_all_tool_data_borrowed(cache, &day, query.session_id.as_deref(), now),
-                query.tool,
-            );
+            let data = partition_projected_data(&window_data, &day, now);
             (date, crate::calculate_all_model_breakdown(&data, pricing))
         })
         .collect();
@@ -230,7 +262,7 @@ mod tests {
 
     use crate::constants::AllPricing;
     use crate::data::{TokenUsage, UsageCost, UsageEntry};
-    use crate::raw_data::{RawDataCache, RawDataRange};
+    use crate::raw_data::{RawDataCache, RawDataRange, merge_remote_records_into_raw_cache};
     use crate::stats::ModelBreakdownRow;
     use crate::tool::Tool;
     use chrono::{Local, NaiveDate, TimeZone};
@@ -309,6 +341,7 @@ mod tests {
             has_source_data: true,
             local_host_id: None,
             local_record_keys: HashMap::new(),
+            stable_record_groups: Vec::new(),
             persistent_generation: String::new(),
             local_parser_revision_current: true,
         };
@@ -316,9 +349,10 @@ mod tests {
             days: 1,
             tool: Tool::Claude,
             session_id: None,
+            captured_at: now,
         };
 
-        build_from_cache(&cache, &query, &AllPricing::load_raw().finalize(), now)
+        build_from_cache(&cache, &query, &AllPricing::load_raw().finalize())
     }
 
     #[test]
@@ -468,6 +502,7 @@ mod tests {
             has_source_data: true,
             local_host_id: None,
             local_record_keys: HashMap::new(),
+            stable_record_groups: Vec::new(),
             persistent_generation: String::new(),
             local_parser_revision_current: true,
         };
@@ -475,17 +510,132 @@ mod tests {
             days: 2,
             tool: Tool::Codex,
             session_id: None,
+            captured_at: now,
         };
         let pricing = AllPricing::load_raw().finalize();
 
-        let document = build_from_cache(&cache, &query, &pricing, now);
+        let document = build_from_cache(&cache, &query, &pricing);
 
         assert_eq!(document.window.request_count, 1);
-        assert_eq!(document.window.tokens.total, 117);
+        assert_eq!(document.window.tokens.total, 115);
         assert_eq!(document.daily.len(), 2);
         assert_eq!(document.daily[0].usage.tokens.total, 0);
-        assert_eq!(document.daily[1].usage.tokens.total, 117);
+        assert_eq!(document.daily[1].usage.tokens.total, 115);
         assert_eq!(document.top_models[0].model_id, "gpt-5.6-codex");
+    }
+
+    #[test]
+    fn daily_partitions_reuse_the_window_stable_identity_projection() {
+        let captured_at = local_timestamp("2026-05-18T23:59:59-07:00");
+        let local_time = local_timestamp("2026-05-17T12:00:00-07:00");
+        let remote_time = local_timestamp("2026-05-18T12:00:00-07:00");
+        let stable_key = "codex:turn:turn-a:cumulative:start->10,2,0,3,1,13";
+        let query = SnapshotQuery {
+            days: 2,
+            tool: Tool::Codex,
+            session_id: None,
+            captured_at,
+        };
+        let mut remote_entry = usage_entry(remote_time, "gpt-5.6-codex", 99);
+        remote_entry.host_id = Some("remote-host".to_string());
+        let mut cache = RawDataCache {
+            claude: Vec::new(),
+            codex: vec![usage_entry(local_time, "gpt-5.6-codex", 10)],
+            gemini: Vec::new(),
+            kimi: Vec::new(),
+            omp: Vec::new(),
+            range: required_range(&query),
+            has_source_data: true,
+            local_host_id: Some("local-host".to_string()),
+            local_record_keys: HashMap::from([(
+                Tool::Codex,
+                HashMap::from([(stable_key.to_string(), 0)]),
+            )]),
+            stable_record_groups: Vec::new(),
+            persistent_generation: String::new(),
+            local_parser_revision_current: true,
+        };
+        merge_remote_records_into_raw_cache(
+            &mut cache,
+            vec![crate::data::cache::RemoteUsageRecord {
+                vendor: "codex".to_string(),
+                dedup_key: stable_key.to_string(),
+                entry: remote_entry,
+            }],
+            true,
+        );
+        cache.local_record_keys.clear();
+
+        let document = build_from_cache(&cache, &query, &AllPricing::load_raw().finalize());
+        let daily_requests = document
+            .daily
+            .iter()
+            .map(|day| day.usage.request_count)
+            .sum::<i64>();
+        let daily_tokens = document
+            .daily
+            .iter()
+            .map(|day| day.usage.tokens.total)
+            .sum::<i64>();
+        let daily_cost = document
+            .daily
+            .iter()
+            .map(|day| day.usage.estimated_api_cost_usd)
+            .sum::<f64>();
+
+        assert_eq!(document.window.request_count, 1);
+        assert_eq!(daily_requests, document.window.request_count);
+        assert_eq!(daily_tokens, document.window.tokens.total);
+        assert!(
+            (daily_cost - document.window.estimated_api_cost_usd).abs() < f64::EPSILON,
+            "daily cost must equal the projected window cost"
+        );
+        assert_eq!(document.daily[0].usage, document.window);
+        assert_eq!(document.daily[1].usage.request_count, 0);
+    }
+
+    #[test]
+    fn query_capture_boundary_survives_repeated_hour_and_post_capture_rows() {
+        let captured_at = local_timestamp("2026-11-01T01:30:30-08:00");
+        let query = SnapshotQuery {
+            days: 1,
+            tool: Tool::Kimi,
+            session_id: None,
+            captured_at,
+        };
+        let range = required_range(&query);
+        let cache = RawDataCache {
+            claude: Vec::new(),
+            codex: Vec::new(),
+            gemini: Vec::new(),
+            kimi: vec![
+                usage_entry(local_timestamp("2026-11-01T01:30:00-07:00"), "k3", 10),
+                usage_entry(local_timestamp("2026-11-01T01:30:00-08:00"), "k3", 20),
+                usage_entry(local_timestamp("2026-11-01T01:31:00-08:00"), "k3", 30),
+            ],
+            omp: Vec::new(),
+            range,
+            has_source_data: true,
+            local_host_id: None,
+            local_record_keys: HashMap::new(),
+            stable_record_groups: Vec::new(),
+            persistent_generation: String::new(),
+            local_parser_revision_current: true,
+        };
+
+        let document = build_from_cache(&cache, &query, &AllPricing::load_raw().finalize());
+
+        assert_eq!(document.generated_at, captured_at.to_rfc3339());
+        assert_eq!(document.range.end, captured_at.to_rfc3339());
+        assert!(document.range.complete);
+        assert_eq!(document.window.request_count, 2);
+        assert_eq!(document.window.tokens.total, 60);
+        assert_eq!(document.daily.len(), 1);
+        assert_eq!(
+            document.daily[0].date,
+            NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()
+        );
+        assert_eq!(document.daily[0].usage, document.window);
     }
 
     #[test]
@@ -495,9 +645,10 @@ mod tests {
             days: 2,
             tool: Tool::All,
             session_id: None,
+            captured_at: now,
         };
 
-        let range = required_range(&query, now);
+        let range = required_range(&query);
 
         assert_eq!(
             range.start().date_naive(),

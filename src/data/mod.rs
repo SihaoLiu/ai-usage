@@ -5,6 +5,7 @@ pub mod gemini;
 pub mod kimi;
 pub mod omp;
 
+use std::fmt::{Display, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -12,9 +13,38 @@ use crate::time_utils::{TimeWindow, parse_timestamp};
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 pub const UNKNOWN_FAST_TIER: i8 = -1;
+
+pub(crate) fn file_fallback_key(vendor: &str, path: &Path, position: impl Display) -> String {
+    let digest = path_digest(path);
+    let mut path_hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut path_hash, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    format!("{vendor}:file:sha256:{path_hash}:{position}")
+}
+
+fn path_digest(path: &Path) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in path.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.finalize().into()
+}
 
 /// Recursively collect files under `dir` whose path satisfies `matches`,
 /// keeping only files modified within the last `max_age_days` (with one day
@@ -216,5 +246,22 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].usage.input_tokens, 20);
+    }
+
+    #[test]
+    fn file_fallback_keys_are_bounded_deterministic_and_path_scoped() {
+        let long_path = PathBuf::from(format!("/{}session.jsonl", "nested/".repeat(200)));
+        let other_path = PathBuf::from(format!("/{}other.jsonl", "nested/".repeat(200)));
+        let position = format!("{}:{}", i64::MAX, usize::MAX);
+
+        for vendor in ["claude", "codex", "gemini", "kimi", "omp"] {
+            let key = file_fallback_key(vendor, &long_path, &position);
+            assert!(key.len() <= 512, "vendor={vendor}, len={}", key.len());
+            assert!(key.starts_with(&format!("{vendor}:file:sha256:")));
+            assert!(key.ends_with(&format!(":{position}")));
+            assert_eq!(key, file_fallback_key(vendor, &long_path, &position));
+            assert_ne!(key, file_fallback_key(vendor, &other_path, &position));
+            assert_ne!(key, file_fallback_key(vendor, &long_path, "0"));
+        }
     }
 }

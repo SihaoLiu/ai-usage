@@ -149,12 +149,15 @@ pub struct RowMetrics {
 impl RowMetrics {
     pub fn from_breakdown(row: &ModelBreakdownRow) -> Self {
         let (prefill, decoding) = match row.tool.as_str() {
-            "codex" => (row.input, row.output + row.reasoning),
-            "gemini" => (row.input, row.output + row.thinking),
-            _ => (row.input + row.cache_creation, row.output),
+            "codex" => (
+                row.input.saturating_add(row.cache_creation),
+                row.output.saturating_add(row.reasoning),
+            ),
+            "gemini" => (row.input, row.output.saturating_add(row.thinking)),
+            _ => (row.input.saturating_add(row.cache_creation), row.output),
         };
         let (prefill_cost, decoding_cost) = match row.tool.as_str() {
-            "claude" | "kimi" | "omp" => {
+            "claude" | "codex" | "kimi" | "omp" => {
                 (row.input_cost + row.cache_creation_cost, row.output_cost)
             }
             _ => (row.input_cost, row.output_cost + row.cache_creation_cost),
@@ -171,17 +174,19 @@ impl RowMetrics {
     }
 
     pub fn add(&mut self, other: &RowMetrics) {
-        self.count += other.count;
-        self.cache_hit += other.cache_hit;
-        self.prefill += other.prefill;
-        self.decoding += other.decoding;
+        self.count = self.count.saturating_add(other.count);
+        self.cache_hit = self.cache_hit.saturating_add(other.cache_hit);
+        self.prefill = self.prefill.saturating_add(other.prefill);
+        self.decoding = self.decoding.saturating_add(other.decoding);
         self.cache_hit_cost += other.cache_hit_cost;
         self.prefill_cost += other.prefill_cost;
         self.decoding_cost += other.decoding_cost;
     }
 
     pub fn tokens(&self) -> i64 {
-        self.cache_hit + self.prefill + self.decoding
+        self.cache_hit
+            .saturating_add(self.prefill)
+            .saturating_add(self.decoding)
     }
 
     pub fn cost(&self) -> f64 {
@@ -634,10 +639,10 @@ mod tests {
         let mut codex = row("codex", "gpt-5.5", 1);
         codex.reasoning = 7;
         let m = RowMetrics::from_breakdown(&codex);
-        assert_eq!(m.prefill, 100);
+        assert_eq!(m.prefill, 105);
         assert_eq!(m.decoding, 17);
-        assert_eq!(m.prefill_cost, 1.0);
-        assert_eq!(m.decoding_cost, 2.25);
+        assert_eq!(m.prefill_cost, 1.25);
+        assert_eq!(m.decoding_cost, 2.0);
 
         let mut gemini = row("gemini", "gemini-2.5-pro", 1);
         gemini.thinking = 4;
@@ -859,10 +864,8 @@ mod tests {
         let rows = vec![codex, row("claude", "claude-opus-4-8", 5)];
         let totals = table_totals(&rows);
         assert_eq!(totals.count, 14);
-        // codex prefill 100 + claude prefill 105
-        assert_eq!(totals.prefill, 205);
-        // codex decoding 17 + claude decoding 10
+        assert_eq!(totals.prefill, 210);
         assert_eq!(totals.decoding, 27);
-        assert_eq!(totals.tokens(), 332);
+        assert_eq!(totals.tokens(), 337);
     }
 }

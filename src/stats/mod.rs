@@ -4,12 +4,9 @@ pub mod gemini;
 pub mod kimi;
 pub mod omp;
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
-use std::thread;
-
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 use crate::constants::{AllPricing, ModelPricing};
 use crate::data::UsageEntry;
@@ -58,7 +55,7 @@ fn resolve_entry_pricing<'a>(
 /// Model breakdown row (shared across all tools).
 /// Cost component fields are populated during aggregation by applying tiered
 /// pricing on each individual entry, then summing. This is the only correct
-/// way to handle Claude's 1M-context >200k-tier pricing — applying the tier
+/// way to handle the provider's 1M-context >200k-tier pricing; applying the tier
 /// post-aggregation overstates cost when many entries are below the threshold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelBreakdownRow {
@@ -99,28 +96,8 @@ pub type ToolTimeSeries = HashMap<DateTime<Local>, HashMap<String, f64>>;
 /// million-entry scan across every core.
 pub(crate) const PAR_CHUNK: usize = 16_384;
 
-fn dashboard_aggregation_parallelism(available: usize) -> usize {
-    (available / 2).clamp(1, 4)
-}
-
-fn dashboard_aggregation_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let available = thread::available_parallelism().map_or(1, usize::from);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(dashboard_aggregation_parallelism(available))
-            .thread_name(|index| format!("usage-dashboard-{index}"))
-            .build()
-            .ok()
-    })
-    .as_ref()
-}
-
 fn run_dashboard_aggregation<T: Send>(operation: impl FnOnce() -> T + Send) -> T {
-    match dashboard_aggregation_pool() {
-        Some(pool) => pool.install(operation),
-        None => operation(),
-    }
+    operation()
 }
 
 fn accumulate_breakdown_entry(
@@ -152,21 +129,40 @@ fn accumulate_breakdown_entry(
             cache_creation_cost: 0.0,
         });
 
-    row.count += 1;
-    row.input += entry.usage.input_tokens;
-    row.output += entry.usage.output_tokens;
-    row.cache_read += entry.usage.cache_read_input_tokens;
+    let (output, reasoning) = match tool {
+        "codex" => codex_output_split(
+            entry.usage.output_tokens,
+            entry.usage.reasoning_output_tokens,
+        ),
+        _ => (entry.usage.output_tokens, 0),
+    };
+
+    row.count = row.count.saturating_add(1);
+    row.input = row.input.saturating_add(entry.usage.input_tokens);
+    row.output = row.output.saturating_add(output);
+    row.cache_read = row
+        .cache_read
+        .saturating_add(entry.usage.cache_read_input_tokens);
 
     match tool {
         "codex" => {
-            row.reasoning += entry.usage.reasoning_output_tokens;
+            row.reasoning = row.reasoning.saturating_add(reasoning);
+            row.cache_creation = row
+                .cache_creation
+                .saturating_add(entry.usage.cache_creation_input_tokens);
         }
         "gemini" => {
-            row.thinking += entry.usage.cache_creation_input_tokens;
-            row.cache_creation += entry.usage.cache_creation_input_tokens;
+            row.thinking = row
+                .thinking
+                .saturating_add(entry.usage.cache_creation_input_tokens);
+            row.cache_creation = row
+                .cache_creation
+                .saturating_add(entry.usage.cache_creation_input_tokens);
         }
         _ => {
-            row.cache_creation += entry.usage.cache_creation_input_tokens;
+            row.cache_creation = row
+                .cache_creation
+                .saturating_add(entry.usage.cache_creation_input_tokens);
         }
     }
     if tool != "omp"
@@ -196,9 +192,9 @@ fn accumulate_breakdown_entry(
             p.cache_output_above_200k,
         ),
         "codex" => ModelPricing::tier_cost(
-            entry.usage.reasoning_output_tokens,
-            p.output,
-            p.output_above_200k,
+            entry.usage.cache_creation_input_tokens,
+            p.cache_output,
+            p.cache_output_above_200k,
         ),
         "gemini" => ModelPricing::tier_cost(
             entry.usage.cache_creation_input_tokens,
@@ -214,13 +210,13 @@ fn accumulate_breakdown_entry(
 }
 
 fn merge_breakdown_rows(a: &mut ModelBreakdownRow, b: ModelBreakdownRow) {
-    a.count += b.count;
-    a.input += b.input;
-    a.output += b.output;
-    a.cache_creation += b.cache_creation;
-    a.cache_read += b.cache_read;
-    a.reasoning += b.reasoning;
-    a.thinking += b.thinking;
+    a.count = a.count.saturating_add(b.count);
+    a.input = a.input.saturating_add(b.input);
+    a.output = a.output.saturating_add(b.output);
+    a.cache_creation = a.cache_creation.saturating_add(b.cache_creation);
+    a.cache_read = a.cache_read.saturating_add(b.cache_read);
+    a.reasoning = a.reasoning.saturating_add(b.reasoning);
+    a.thinking = a.thinking.saturating_add(b.thinking);
     a.input_cost += b.input_cost;
     a.output_cost += b.output_cost;
     a.cache_read_cost += b.cache_read_cost;
@@ -244,23 +240,18 @@ fn merge_breakdown_maps(
     a
 }
 
-fn strategy_tokens(tool: &str, cache_creation: i64, reasoning: i64) -> i64 {
-    match tool {
-        "codex" => reasoning,
-        _ => cache_creation,
-    }
+pub(crate) fn codex_output_split(output: i64, reasoning: i64) -> (i64, i64) {
+    let inclusive_output = output.max(0);
+    let reasoning = reasoning.clamp(0, inclusive_output);
+    (inclusive_output - reasoning, reasoning)
 }
 
-pub(crate) fn entry_total_with_cache(entry: &UsageEntry, tool: &str) -> u128 {
+pub(crate) fn entry_total_with_cache(entry: &UsageEntry) -> u128 {
     [
         entry.usage.input_tokens,
         entry.usage.output_tokens,
         entry.usage.cache_read_input_tokens,
-        strategy_tokens(
-            tool,
-            entry.usage.cache_creation_input_tokens,
-            entry.usage.reasoning_output_tokens,
-        ),
+        entry.usage.cache_creation_input_tokens,
     ]
     .into_iter()
     .map(|tokens| tokens.max(0) as u128)
@@ -275,11 +266,21 @@ fn finish_model_breakdown(
         .into_values()
         .filter(|row| !row.model.contains("<synthetic>"))
         .map(|mut row| {
-            row.total = row.input + row.output;
-            row.total_with_cache = row.input
-                + row.output
-                + row.cache_read
-                + strategy_tokens(tool, row.cache_creation, row.reasoning);
+            if tool == "codex" {
+                row.total = row
+                    .input
+                    .saturating_add(row.output)
+                    .saturating_add(row.reasoning)
+                    .saturating_add(row.cache_creation);
+                row.total_with_cache = row.total.saturating_add(row.cache_read);
+            } else {
+                row.total = row.input.saturating_add(row.output);
+                row.total_with_cache = row
+                    .input
+                    .saturating_add(row.output)
+                    .saturating_add(row.cache_read)
+                    .saturating_add(row.cache_creation);
+            }
             row
         })
         .collect();
@@ -328,11 +329,24 @@ fn accumulate_time_series_entry(
 
     let model_key = model_key_for_entry(entry, combine_effort);
 
+    let (output, reasoning) = match tool {
+        "codex" => codex_output_split(
+            entry.usage.output_tokens,
+            entry.usage.reasoning_output_tokens,
+        ),
+        _ => (entry.usage.output_tokens, 0),
+    };
     let tokens = TokenFractions {
-        input: entry.usage.input_tokens as f64,
-        output: entry.usage.output_tokens as f64,
+        input: match tool {
+            "codex" => entry
+                .usage
+                .input_tokens
+                .saturating_add(entry.usage.cache_creation_input_tokens),
+            _ => entry.usage.input_tokens,
+        } as f64,
+        output: output as f64,
         cache_creation: match tool {
-            "codex" => entry.usage.reasoning_output_tokens as f64,
+            "codex" => reasoning as f64,
             _ => entry.usage.cache_creation_input_tokens as f64,
         },
         cache_read: entry.usage.cache_read_input_tokens as f64,
@@ -390,26 +404,12 @@ fn accumulate_tool_time_series_entry(
     time_series: &mut ToolTimeSeries,
     entry: &UsageEntry,
     interval_minutes: i64,
-    tool: &str,
     tool_label: &str,
 ) {
     if entry.timestamp.is_empty() {
         return;
     }
-    let total = match tool {
-        "codex" => {
-            entry.usage.input_tokens
-                + entry.usage.output_tokens
-                + entry.usage.cache_read_input_tokens
-                + entry.usage.reasoning_output_tokens
-        }
-        _ => {
-            entry.usage.input_tokens
-                + entry.usage.output_tokens
-                + entry.usage.cache_read_input_tokens
-                + entry.usage.cache_creation_input_tokens
-        }
-    } as f64;
+    let total = entry_total_with_cache(entry) as f64;
     let timestamp = entry
         .parsed_timestamp
         .or_else(|| parse_timestamp(&entry.timestamp));
@@ -504,7 +504,6 @@ pub(crate) fn calculate_comparison_dashboard_data(
                             &mut time_series,
                             entry,
                             interval_minutes,
-                            tool,
                             tool_label,
                         );
                     }
@@ -570,6 +569,7 @@ pub(crate) use self::calculate_model_token_breakdown_time_series_generic as _cal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::ModelPricing;
     use crate::data::{TokenUsage, UNKNOWN_FAST_TIER, UsageCost};
 
     fn usage_entry(model: &str, effort: Option<&str>, costs: Option<UsageCost>) -> UsageEntry {
@@ -592,15 +592,6 @@ mod tests {
             },
             costs,
         }
-    }
-
-    #[test]
-    fn dashboard_aggregation_leaves_cpu_capacity_for_input_and_rendering() {
-        assert_eq!(dashboard_aggregation_parallelism(1), 1);
-        assert_eq!(dashboard_aggregation_parallelism(2), 1);
-        assert_eq!(dashboard_aggregation_parallelism(4), 2);
-        assert_eq!(dashboard_aggregation_parallelism(8), 4);
-        assert_eq!(dashboard_aggregation_parallelism(64), 4);
     }
 
     #[test]
@@ -627,6 +618,132 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model, "gpt-5");
         assert_eq!(rows[0].count, 2);
+    }
+
+    #[test]
+    fn codex_accounting_splits_reasoning_without_changing_total() {
+        let pricing = AllPricing::load_raw().finalize();
+        let mut entry = usage_entry("gpt-5", Some("high"), None);
+        entry.usage = TokenUsage {
+            input_tokens: 20,
+            output_tokens: 10,
+            cache_read_input_tokens: 80,
+            cache_creation_input_tokens: 5,
+            reasoning_output_tokens: 4,
+        };
+
+        let rows = codex::calculate_codex_model_breakdown(&[entry.clone()], &pricing);
+        let series = codex::calculate_codex_model_token_breakdown_time_series(&[entry.clone()], 60);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input, 20);
+        assert_eq!(rows[0].output, 6);
+        assert_eq!(rows[0].cache_creation, 5);
+        assert_eq!(rows[0].reasoning, 4);
+        assert_eq!(rows[0].total, 35);
+        assert_eq!(rows[0].total_with_cache, 115);
+        assert_eq!(entry_total_with_cache(&entry), 115);
+
+        let bucket = series.values().next().expect("time-series bucket");
+        let tokens = bucket.values().next().expect("model token breakdown");
+        assert_eq!(tokens.input, 25.0);
+        assert_eq!(tokens.output, 6.0);
+        assert_eq!(tokens.cache_creation, 4.0);
+        assert_eq!(tokens.cache_read, 80.0);
+    }
+
+    #[test]
+    fn codex_reasoning_is_clamped_to_inclusive_output() {
+        let pricing = AllPricing::load_raw().finalize();
+        let mut entry = usage_entry("gpt-5", Some("high"), None);
+        entry.usage = TokenUsage {
+            input_tokens: 2,
+            output_tokens: 3,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            reasoning_output_tokens: 9,
+        };
+
+        let rows = codex::calculate_codex_model_breakdown(&[entry.clone()], &pricing);
+
+        assert_eq!(rows[0].output, 0);
+        assert_eq!(rows[0].reasoning, 3);
+        assert_eq!(rows[0].total, 5);
+        assert_eq!(rows[0].total_with_cache, 5);
+        assert_eq!(entry_total_with_cache(&entry), 5);
+    }
+
+    #[test]
+    fn codex_cache_write_tokens_remain_part_of_input_total() {
+        let pricing = AllPricing::load_raw().finalize();
+        let mut entry = usage_entry("gpt-5", None, None);
+        entry.usage = TokenUsage {
+            input_tokens: 20,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5,
+            reasoning_output_tokens: 0,
+        };
+
+        let rows = codex::calculate_codex_model_breakdown(&[entry.clone()], &pricing);
+
+        assert_eq!(rows[0].input, 20);
+        assert_eq!(rows[0].cache_creation, 5);
+        assert_eq!(rows[0].total, 25);
+        assert_eq!(entry_total_with_cache(&entry), 25);
+    }
+
+    #[test]
+    fn codex_cost_uses_provider_buckets_and_prices_inclusive_output_once() {
+        let mut pricing = AllPricing::load_raw().finalize();
+        pricing.set_pricing_overrides(HashMap::from([(
+            "cost-contract-model".to_string(),
+            ModelPricing {
+                input: 1.0,
+                output: 10.0,
+                cache_input: 0.1,
+                cache_output: 5.0,
+                input_above_200k: None,
+                output_above_200k: Some(20.0),
+                cache_input_above_200k: None,
+                cache_output_above_200k: Some(7.0),
+                _comment: None,
+            },
+        )]));
+        let mut entry = usage_entry("cost-contract-model", None, None);
+        entry.usage = TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 250_000,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 100_000,
+            reasoning_output_tokens: 100_000,
+        };
+
+        let rows = codex::calculate_codex_model_breakdown(&[entry], &pricing);
+        let metrics = crate::table_view::RowMetrics::from_breakdown(&rows[0]);
+
+        assert!((rows[0].input_cost - 0.1).abs() < 1e-9);
+        assert!((rows[0].cache_creation_cost - 0.5).abs() < 1e-9);
+        assert!((rows[0].output_cost - 3.0).abs() < 1e-9);
+        assert!((metrics.prefill_cost - 0.6).abs() < 1e-9);
+        assert!((metrics.decoding_cost - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn codex_aggregate_saturates_instead_of_wrapping_token_totals() {
+        let pricing = AllPricing::load_raw().finalize();
+        let mut first = usage_entry("gpt-5", None, Some(UsageCost::default()));
+        first.usage = TokenUsage {
+            input_tokens: i64::MAX,
+            ..Default::default()
+        };
+        let second = first.clone();
+
+        let rows = codex::calculate_codex_model_breakdown(&[first, second], &pricing);
+
+        assert_eq!(rows[0].input, i64::MAX);
+        assert_eq!(rows[0].total, i64::MAX);
+        assert_eq!(rows[0].total_with_cache, i64::MAX);
     }
 
     #[test]
@@ -676,7 +793,7 @@ mod tests {
         assert_eq!(rows, expected_rows);
         let timestamp = parse_timestamp("2026-06-15T12:00:00Z").expect("timestamp");
         let bucket = to_interval(&timestamp, 60);
-        assert_eq!(comparison[&bucket]["Codex"], 3_200_000.0);
+        assert_eq!(comparison[&bucket]["Codex"], 3_240_000.0);
     }
 
     #[test]

@@ -297,6 +297,16 @@ const Y_GUTTER: u16 = 7;
 /// keeping the underlying chart buckets and values unchanged.
 const CURVE_SUBDIVISIONS: usize = 4;
 
+/// Map a chart x coordinate to the terminal column used by Ratatui's Braille
+/// canvas. Braille uses two horizontal dots per cell and truncates the scaled
+/// dot coordinate before selecting its terminal cell.
+fn braille_canvas_col(x: f64, len: usize, width: usize) -> usize {
+    let dot_width = width * 2;
+    let dot_x = ((x + 0.5) * (dot_width - 1) as f64 / len as f64).clamp(0.0, (dot_width - 1) as f64)
+        as usize;
+    dot_x / 2
+}
+
 /// Interpolate uniformly spaced chart samples with a monotone cubic curve.
 /// The result passes through every original point and is clamped to each
 /// segment's endpoints, so a visual smoothing pass cannot invent a higher
@@ -460,11 +470,7 @@ fn draw_chart(frame: &mut Frame, area: Rect, chart: &ChartData, bottom_label: Op
         Layout::horizontal([Constraint::Length(Y_GUTTER), Constraint::Min(4)]).areas(plot_area);
     let width = canvas_area.width as usize;
     let len = chart.len;
-    let col_of = |x: f64| {
-        (((x + 0.5) / len as f64) * width as f64)
-            .round()
-            .clamp(0.0, width.saturating_sub(1) as f64) as usize
-    };
+    let col_of = |x: f64| braille_canvas_col(x, len, width);
 
     // Y axis: a value label on every row, densest useful tick spacing.
     let top = (chart.max_y * 1.05).max(1.0);
@@ -763,7 +769,7 @@ mod tests {
     use chrono::TimeZone;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
@@ -1297,6 +1303,75 @@ mod tests {
             "sparse y ticks:\n{}",
             text
         );
+    }
+
+    #[test]
+    fn separator_lines_align_with_axis_ticks_at_fractional_columns() {
+        let day = |day: u32| {
+            chrono::Local
+                .with_ymd_and_hms(2026, 8, day, 0, 0, 0)
+                .unwrap()
+        };
+        let len = 73;
+        let chart = ChartData {
+            title: "test".to_string(),
+            series: vec![Series {
+                name: "All".to_string(),
+                color: 226,
+                points: (0..len).map(|i| (i as f64, 1.0)).collect(),
+            }],
+            max_y: 2.0,
+            len,
+            granularity: ChartGranularity::Day,
+            segments: vec![
+                Segment {
+                    start: 0,
+                    end: 19,
+                    total: 20.0,
+                    anchor: day(9),
+                },
+                Segment {
+                    start: 20,
+                    end: 43,
+                    total: 24.0,
+                    anchor: day(8),
+                },
+                Segment {
+                    start: 44,
+                    end: 67,
+                    total: 24.0,
+                    anchor: day(7),
+                },
+                Segment {
+                    start: 68,
+                    end: 72,
+                    total: 5.0,
+                    anchor: day(6),
+                },
+            ],
+            x_ticks: vec![
+                (19, "00".to_string()),
+                (43, "00".to_string()),
+                (67, "00".to_string()),
+            ],
+        };
+
+        let backend = TestBackend::new(182, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_chart(frame, frame.area(), &chart, Some("span")))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let separator_columns: BTreeSet<usize> = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| (buffer[(x, y)].fg == SEPARATOR_COLOR).then_some(x as usize))
+            .collect();
+        let text = buffer_text(&terminal);
+        let axis = line_containing(&text, "\u{2534}");
+        let tick_columns: BTreeSet<usize> = char_positions(&axis, '\u{2534}').into_iter().collect();
+
+        assert_eq!(separator_columns, tick_columns, "{text}");
     }
 
     #[test]

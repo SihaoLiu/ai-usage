@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
@@ -298,12 +298,13 @@ const Y_GUTTER: u16 = 7;
 const CURVE_SUBDIVISIONS: usize = 4;
 
 /// Map a chart x coordinate to the terminal column used by Ratatui's Braille
-/// canvas. Braille uses two horizontal dots per cell and truncates the scaled
-/// dot coordinate before selecting its terminal cell.
+/// canvas. Braille uses two horizontal dots per cell and rounds the scaled dot
+/// coordinate before selecting its terminal cell.
 fn braille_canvas_col(x: f64, len: usize, width: usize) -> usize {
     let dot_width = width * 2;
-    let dot_x = ((x + 0.5) * (dot_width - 1) as f64 / len as f64).clamp(0.0, (dot_width - 1) as f64)
-        as usize;
+    let dot_x = (((x + 0.5) * (dot_width - 1) as f64 / len as f64)
+        .clamp(0.0, (dot_width - 1) as f64)
+        .round()) as usize;
     dot_x / 2
 }
 
@@ -949,6 +950,49 @@ mod tests {
         assert!(text.contains("refresh:00:59:56"), "{text}");
         assert!(!status.contains("CPU"), "{status}");
         assert!(!status.contains("Mem"), "{status}");
+    }
+
+    #[test]
+    fn wide_chart_keeps_rendering_inside_a_nonzero_area() {
+        let chart = ChartData {
+            title: "wide chart".to_string(),
+            series: vec![Series {
+                name: "All".to_string(),
+                color: 226,
+                points: (0..73).map(|i| (i as f64, 1.0)).collect(),
+            }],
+            max_y: 2.0,
+            len: 73,
+            granularity: ChartGranularity::Day,
+            segments: vec![Segment {
+                start: 0,
+                end: 72,
+                total: 73.0,
+                anchor: chrono::Local
+                    .with_ymd_and_hms(2026, 8, 23, 0, 0, 0)
+                    .unwrap(),
+            }],
+            x_ticks: Vec::new(),
+        };
+        let screen = Rect::new(0, 0, 548, 129);
+        let chart_area = Rect::new(0, 8, 548, 120);
+        let backend = TestBackend::new(screen.width, screen.height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_chart(frame, chart_area, &chart, Some("span")))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let outside_symbols: Vec<(u16, u16)> = (screen.top()..screen.bottom())
+            .flat_map(|y| (screen.left()..screen.right()).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                !chart_area.contains(Position::new(x, y)) && buffer[(x, y)].symbol() != " "
+            })
+            .collect();
+        assert!(
+            outside_symbols.is_empty(),
+            "wide chart wrote outside its area: {outside_symbols:?}"
+        );
     }
 
     #[test]

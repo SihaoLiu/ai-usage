@@ -51,6 +51,8 @@ fn record(host_id: &str, vendor: &str, dedup_key: &str, input_tokens: i64) -> Wi
         output_tokens: 2,
         cache_read_input_tokens: 3,
         cache_creation_input_tokens: 4,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
         reasoning_output_tokens: 0,
         cost_input: None,
         cost_output: None,

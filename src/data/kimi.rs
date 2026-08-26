@@ -93,6 +93,8 @@ impl KimiUsageCounts {
             output_tokens: self.output,
             cache_read_input_tokens: self.cache_read,
             cache_creation_input_tokens: self.cache_creation,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: 0,
         }
     }

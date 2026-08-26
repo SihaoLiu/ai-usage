@@ -1,7 +1,7 @@
 {
   "_meta": {
     "description": "API pricing and subscription costs for AI services",
-    "last_updated": "2026-08-04",
+    "last_updated": "2026-08-26",
     "notes": "All prices are per million tokens (MTok) at standard API rates. Provider-specific and whole-request long-context premiums require an exact matching entry.",
     "sources": {
       "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
@@ -18,20 +18,23 @@
         "input": 5.00,
         "output": 25.00,
         "cache_input": 0.50,
-        "cache_output": 6.25
+        "cache_output": 6.25,
+        "cache_output_1h": 10.00
       },
       "claude-sonnet-5": {
         "input": 2.00,
         "output": 10.00,
         "cache_input": 0.20,
         "cache_output": 2.50,
-        "_comment": "Introductory rate through 2026-08-31; the published standard rate begins 2026-09-01"
+        "cache_output_1h": 4.00,
+        "_comment": "Current standard rate; the previously announced September 2026 increase was canceled"
       },
       "claude-fable-5": {
         "input": 10.00,
         "output": 50.00,
         "cache_input": 1.00,
         "cache_output": 12.50,
+        "cache_output_1h": 20.00,
         "_comment": "1M context at standard pricing, no long-context premium tier"
       },
       "claude-mythos-5": {
@@ -39,6 +42,7 @@
         "output": 50.00,
         "cache_input": 1.00,
         "cache_output": 12.50,
+        "cache_output_1h": 20.00,
         "_comment": "Same model and pricing as claude-fable-5"
       },
       "claude-opus-4-8": {
@@ -46,6 +50,7 @@
         "output": 25.00,
         "cache_input": 0.50,
         "cache_output": 6.25,
+        "cache_output_1h": 10.00,
         "_comment": "1M context at standard pricing, no long-context premium tier"
       },
       "claude-opus-4-7": {
@@ -53,6 +58,7 @@
         "output": 25.00,
         "cache_input": 0.50,
         "cache_output": 6.25,
+        "cache_output_1h": 10.00,
         "_comment": "1M context at standard pricing, no long-context premium tier"
       },
       "claude-opus-4-6": {
@@ -60,6 +66,7 @@
         "output": 25.00,
         "cache_input": 0.50,
         "cache_output": 6.25,
+        "cache_output_1h": 10.00,
         "_comment": "1M context at standard pricing, no long-context premium tier"
       },
       "claude-opus-4-5-20251101": {
@@ -71,6 +78,8 @@
         "output_above_200k": 50.00,
         "cache_input_above_200k": 1.00,
         "cache_output_above_200k": 12.50,
+        "cache_output_1h": 10.00,
+        "cache_output_1h_above_200k": 20.00,
         "_comment": "1M context model: 2x tier above 200k tokens per request"
       },
       "claude-sonnet-4-6": {
@@ -78,6 +87,7 @@
         "output": 15.00,
         "cache_input": 0.30,
         "cache_output": 3.75,
+        "cache_output_1h": 6.00,
         "_comment": "1M context at standard pricing, no long-context premium tier"
       },
       "claude-sonnet-4-5-20250929": {
@@ -89,13 +99,16 @@
         "output_above_200k": 22.50,
         "cache_input_above_200k": 0.60,
         "cache_output_above_200k": 7.50,
+        "cache_output_1h": 6.00,
+        "cache_output_1h_above_200k": 12.00,
         "_comment": "1M context model: 2x tier above 200k tokens per request"
       },
       "claude-haiku-4-5-20251001": {
         "input": 1.00,
         "output": 5.00,
         "cache_input": 0.10,
-        "cache_output": 1.25
+        "cache_output": 1.25,
+        "cache_output_1h": 2.00
       }
     },
     "default": {
@@ -103,6 +116,7 @@
       "output": 15.00,
       "cache_input": 0.30,
       "cache_output": 3.75,
+      "cache_output_1h": 6.00,
       "_comment": "Fallback for unknown models, using Sonnet standard pricing"
     }
   },
@@ -597,11 +611,10 @@
       "1": {
         "default": 1.0,
         "models": {
-          "claude-opus-4-6": 6.0,
-          "claude-opus-4-7": 6.0,
-          "claude-opus-4-8": 6.0
+          "claude-opus-4-8": 2.0,
+          "claude-opus-5": 2.0
         },
-        "_comment": "Fast mode published rate is 30/150 per MTok for listed Opus models."
+        "_comment": "Fast mode is 2x standard pricing for Opus 5 and Opus 4.8."
       }
     },
     "codex": {

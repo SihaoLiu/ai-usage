@@ -143,6 +143,8 @@ fn read_single_omp_file(path: &Path) -> Vec<SourceUsageRecord> {
                     output_tokens,
                     cache_read_input_tokens: cache_read,
                     cache_creation_input_tokens: cache_write,
+                    cache_creation_5m_input_tokens: 0,
+                    cache_creation_1h_input_tokens: 0,
                     reasoning_output_tokens: 0,
                 },
                 costs,

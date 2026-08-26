@@ -1609,6 +1609,8 @@ fn cached_record_to_wire(
     record: &CachedUsageRecord,
     dedup_key: &str,
 ) -> Result<WireRecord, SyncError> {
+    let mut usage = record.entry.usage.clone();
+    usage.normalize_cache_creation_buckets();
     let wire = WireRecord {
         schema_version: ai_usage_proto::SCHEMA_VERSION,
         host_id: config.machine_id.clone(),
@@ -1620,11 +1622,13 @@ fn cached_record_to_wire(
         model: record.entry.model.clone(),
         effort: record.entry.effort.clone(),
         fast_tier: record.entry.fast_tier,
-        input_tokens: record.entry.usage.input_tokens,
-        output_tokens: record.entry.usage.output_tokens,
-        cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
-        cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
-        reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
         cost_input: record.entry.costs.map(|costs| costs.input),
         cost_output: record.entry.costs.map(|costs| costs.output),
         cost_cache_read: record.entry.costs.map(|costs| costs.cache_read),
@@ -1656,6 +1660,7 @@ fn merge_pulled_records(cache_root: &Path, response: &PullResponse) -> Result<()
 }
 
 fn wire_to_remote_record(record: WireRecord) -> RemoteUsageRecord {
+    let record = record.normalize_for_current_schema();
     RemoteUsageRecord {
         vendor: record.vendor,
         dedup_key: record.dedup_key,
@@ -1674,6 +1679,8 @@ fn wire_to_remote_record(record: WireRecord) -> RemoteUsageRecord {
                 output_tokens: record.output_tokens,
                 cache_read_input_tokens: record.cache_read_input_tokens,
                 cache_creation_input_tokens: record.cache_creation_input_tokens,
+                cache_creation_5m_input_tokens: record.cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens: record.cache_creation_1h_input_tokens,
                 reasoning_output_tokens: record.reasoning_output_tokens,
             },
             costs: persisted_wire_costs(

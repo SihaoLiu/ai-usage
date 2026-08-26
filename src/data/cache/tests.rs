@@ -95,6 +95,8 @@ fn usage_record(key: &str, timestamp: &str, input_tokens: i64) -> SourceUsageRec
                 output_tokens: 2,
                 cache_read_input_tokens: 3,
                 cache_creation_input_tokens: 4,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
                 reasoning_output_tokens: 5,
             },
             costs: None,
@@ -133,6 +135,8 @@ fn remote_record(
                 output_tokens: 2,
                 cache_read_input_tokens: 3,
                 cache_creation_input_tokens: 4,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
                 reasoning_output_tokens: 5,
             },
             costs: None,
@@ -179,7 +183,7 @@ type EntryFingerprint = (
     i64,
     i64,
     i64,
-    i64,
+    (i64, i64, i64),
     i64,
     i8,
 );
@@ -188,6 +192,8 @@ fn entry_fingerprints(entries: &[UsageEntry]) -> Vec<EntryFingerprint> {
     entries
         .iter()
         .map(|entry| {
+            let mut usage = entry.usage.clone();
+            usage.normalize_cache_creation_buckets();
             (
                 entry.timestamp.clone(),
                 entry
@@ -197,11 +203,15 @@ fn entry_fingerprints(entries: &[UsageEntry]) -> Vec<EntryFingerprint> {
                 entry.session_end_time.clone(),
                 entry.model.clone(),
                 entry.effort.clone(),
-                entry.usage.input_tokens,
-                entry.usage.output_tokens,
-                entry.usage.cache_read_input_tokens,
-                entry.usage.cache_creation_input_tokens,
-                entry.usage.reasoning_output_tokens,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+                (
+                    usage.cache_creation_input_tokens,
+                    usage.cache_creation_5m_input_tokens,
+                    usage.cache_creation_1h_input_tokens,
+                ),
+                usage.reasoning_output_tokens,
                 entry.fast_tier,
             )
         })
@@ -277,7 +287,7 @@ fn cache_before_session_ids_remains_readable() {
     fs::create_dir_all(&entries_dir).expect("create entries directory");
 
     let legacy = super::PersistedVendorRecordsBeforeSession {
-        format_version: super::CACHE_VERSION,
+        format_version: super::LEGACY_CACHE_VERSION,
         records: vec![super::PersistedSourceRecordBeforeSession {
             source_path: "source.jsonl".to_string(),
             dedup_key: "stable-key".to_string(),
@@ -310,6 +320,54 @@ fn cache_before_session_ids_remains_readable() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].entry.session_id, None);
     assert_eq!(records[0].entry.usage.input_tokens, 42);
+}
+
+#[test]
+fn cache_before_duration_buckets_remains_readable() {
+    let cache_root = unique_temp_dir("before-cache-durations");
+    let entries_dir = cache_root.join(super::ENTRIES_DIR);
+    fs::create_dir_all(&entries_dir).expect("create entries directory");
+
+    let legacy = super::PersistedVendorRecordsBeforeCacheDurations {
+        format_version: super::LEGACY_CACHE_VERSION,
+        records: vec![super::PersistedSourceRecordBeforeCacheDurations {
+            source_path: "source.jsonl".to_string(),
+            dedup_key: "stable-key".to_string(),
+            timestamp: "2026-05-01T00:00:00Z".to_string(),
+            session_start_time: "2026-05-01T00:00:00Z".to_string(),
+            session_end_time: "2026-05-01T00:00:00Z".to_string(),
+            model: "claude-fable-5".to_string(),
+            effort: None,
+            input_tokens: 42,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 11,
+            reasoning_output_tokens: 0,
+            fast_tier: UNKNOWN_FAST_TIER,
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_creation: None,
+            session_id: Some("conversation-42".to_string()),
+        }],
+    };
+    let payload = bincode::serialize(&legacy).expect("serialize legacy cache");
+    let mut content = Vec::new();
+    content.extend_from_slice(super::ENTRY_FILE_MAGIC);
+    content.extend_from_slice(&super::fnv1a_bytes(0, &payload).to_le_bytes());
+    content.extend_from_slice(&payload);
+    fs::write(entries_dir.join("claude.bin"), content).expect("write legacy cache");
+
+    let records = super::load_vendor_cached_records(&cache_root, "claude");
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].entry.session_id.as_deref(),
+        Some("conversation-42")
+    );
+    assert_eq!(records[0].entry.usage.cache_creation_input_tokens, 11);
+    assert_eq!(records[0].entry.usage.cache_creation_5m_input_tokens, 11);
+    assert_eq!(records[0].entry.usage.cache_creation_1h_input_tokens, 0);
 }
 
 #[test]
@@ -1551,7 +1609,7 @@ fn old_cached_records_default_to_unknown_fast_tier() {
     let cache_root = unique_temp_dir("snapshot-old-fast-tier");
     fs::create_dir_all(cache_root.join("entries")).expect("create entries dir");
     let payload = bincode::serialize(&super::PersistedVendorRecordsV1 {
-        format_version: super::CACHE_VERSION,
+        format_version: super::LEGACY_CACHE_VERSION,
         records: vec![super::PersistedSourceRecordV1 {
             source_path: "source.jsonl".to_string(),
             dedup_key: "stable-key".to_string(),
@@ -1588,7 +1646,7 @@ fn cache_records_from_fast_tier_format_keep_fast_tier_after_cost_fields() {
     let entries_dir = cache_root.join("entries");
     fs::create_dir_all(&entries_dir).expect("create entries dir");
     let payload = bincode::serialize(&PersistedVendorRecordsWithFastTier {
-        format_version: super::CACHE_VERSION,
+        format_version: super::LEGACY_CACHE_VERSION,
         records: vec![PersistedSourceRecordWithFastTier {
             source_path: "source.jsonl".to_string(),
             dedup_key: "stable-key".to_string(),
@@ -1625,7 +1683,7 @@ fn remote_records_from_fast_tier_format_keep_fast_tier_after_cost_fields() {
     let remote_dir = cache_root.join("remote");
     fs::create_dir_all(&remote_dir).expect("create remote dir");
     let payload = bincode::serialize(&PersistedRemoteRecordsWithFastTier {
-        format_version: super::CACHE_VERSION,
+        format_version: super::LEGACY_CACHE_VERSION,
         records: vec![PersistedRemoteRecordWithFastTier {
             vendor: "codex".to_string(),
             dedup_key: "remote-key".to_string(),

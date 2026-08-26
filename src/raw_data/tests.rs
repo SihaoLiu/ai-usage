@@ -1409,6 +1409,8 @@ fn aggregate_tool_series_counts_codex_inclusive_output_once() {
         output_tokens: 10,
         cache_read_input_tokens: 80,
         cache_creation_input_tokens: 5,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
         reasoning_output_tokens: 4,
     };
     let data = AllToolData {

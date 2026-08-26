@@ -152,7 +152,12 @@ input = 3.0
 output = 15.0
 cache_read = 0.30
 cache_write = 3.75
+cache_write_1h = 6.0
 ```
+
+Claude transcript cache writes are kept in separate five-minute and one-hour
+retention buckets. Older aggregate-only records remain readable and are
+treated as five-minute writes, so upgrading does not erase historical usage.
 
 ## Architecture
 

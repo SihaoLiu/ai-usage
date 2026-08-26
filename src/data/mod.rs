@@ -135,7 +135,50 @@ pub struct TokenUsage {
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
+    /// Claude prompt-cache writes retained for five minutes.
+    #[serde(default)]
+    pub cache_creation_5m_input_tokens: i64,
+    /// Claude prompt-cache writes retained for one hour.
+    #[serde(default)]
+    pub cache_creation_1h_input_tokens: i64,
     pub reasoning_output_tokens: i64,
+}
+
+impl TokenUsage {
+    /// Return duration-specific cache-write buckets, preserving old records
+    /// that only carried the aggregate cache-creation count as five-minute
+    /// writes.
+    pub fn cache_creation_buckets(&self) -> (i64, i64) {
+        if self.cache_creation_5m_input_tokens == 0
+            && self.cache_creation_1h_input_tokens == 0
+            && self.cache_creation_input_tokens != 0
+        {
+            (self.cache_creation_input_tokens, 0)
+        } else {
+            (
+                self.cache_creation_5m_input_tokens,
+                self.cache_creation_1h_input_tokens,
+            )
+        }
+    }
+
+    /// Return the cache-write total using duration buckets when available.
+    pub fn effective_cache_creation_input_tokens(&self) -> i64 {
+        let (five_minute, one_hour) = self.cache_creation_buckets();
+        five_minute.saturating_add(one_hour)
+    }
+
+    /// Normalize legacy aggregate-only data before persistence or transport.
+    pub fn normalize_cache_creation_buckets(&mut self) {
+        let split_total = self
+            .cache_creation_5m_input_tokens
+            .saturating_add(self.cache_creation_1h_input_tokens);
+        if split_total > 0 {
+            self.cache_creation_input_tokens = split_total;
+        } else if self.cache_creation_input_tokens > 0 {
+            self.cache_creation_5m_input_tokens = self.cache_creation_input_tokens;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -202,6 +245,8 @@ mod tests {
                 output_tokens: 0,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
                 reasoning_output_tokens: 0,
             },
             costs: None,

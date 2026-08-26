@@ -131,6 +131,33 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
             .map(str::to_string)
             .or_else(|| fallback_session_id.clone());
 
+        // Claude reports cache creation by retention duration. Older
+        // transcript records only expose the aggregate field; retain those as
+        // five-minute writes so their cost remains reproducible.
+        let cache_creation = usage.get("cache_creation");
+        let cache_creation_5m_input_tokens = cache_creation
+            .and_then(|value| value.get("ephemeral_5m_input_tokens"))
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        let cache_creation_1h_input_tokens = cache_creation
+            .and_then(|value| value.get("ephemeral_1h_input_tokens"))
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        let legacy_cache_creation_input_tokens = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        let cache_creation_input_tokens = if cache_creation
+            .is_some_and(serde_json::Value::is_object)
+            && (cache_creation_5m_input_tokens != 0
+                || cache_creation_1h_input_tokens != 0
+                || legacy_cache_creation_input_tokens == 0)
+        {
+            cache_creation_5m_input_tokens.saturating_add(cache_creation_1h_input_tokens)
+        } else {
+            legacy_cache_creation_input_tokens
+        };
+
         let record = SourceUsageRecord {
             dedup_key,
             entry: UsageEntry {
@@ -156,10 +183,9 @@ pub fn read_jsonl_file_records(path: &Path) -> Vec<SourceUsageRecord> {
                         .get("cache_read_input_tokens")
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0),
-                    cache_creation_input_tokens: usage
-                        .get("cache_creation_input_tokens")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
+                    cache_creation_input_tokens,
+                    cache_creation_5m_input_tokens,
+                    cache_creation_1h_input_tokens,
                     reasoning_output_tokens: 0,
                 },
                 costs: None,
@@ -233,6 +259,34 @@ mod tests {
         assert_eq!(records[0].entry.usage.output_tokens, 8);
         assert_eq!(records[0].entry.usage.cache_read_input_tokens, 10);
         assert_eq!(records[0].entry.usage.cache_creation_input_tokens, 11);
+    }
+
+    #[test]
+    fn duration_specific_cache_writes_are_preserved() {
+        let records = read_fixture(
+            "cache-durations",
+            r#"{"timestamp":"2026-08-05T16:43:15Z","message":{"id":"message-a","model":"claude-fable-5","usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":3,"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":7}}}}"#,
+        );
+
+        assert_eq!(records.len(), 1);
+        let usage = &records[0].entry.usage;
+        assert_eq!(usage.cache_creation_5m_input_tokens, 4);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 7);
+        assert_eq!(usage.cache_creation_input_tokens, 11);
+    }
+
+    #[test]
+    fn empty_cache_creation_object_keeps_legacy_aggregate() {
+        let records = read_fixture(
+            "cache-duration-fallback",
+            r#"{"timestamp":"2026-08-05T16:43:15Z","message":{"id":"message-a","model":"claude-fable-5","usage":{"cache_creation_input_tokens":11,"cache_creation":{}}}}"#,
+        );
+
+        assert_eq!(records.len(), 1);
+        let usage = &records[0].entry.usage;
+        assert_eq!(usage.cache_creation_input_tokens, 11);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 0);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 0);
     }
 
     #[test]

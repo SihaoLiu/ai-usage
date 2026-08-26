@@ -7,7 +7,7 @@ fn hot_snapshot_with_previous_projection_magic_is_rejected() {
         .expect("write current hot snapshot");
     let path = cache_root.join(crate::data::cache::HOT_SNAPSHOT_FILE);
     let mut content = fs::read(&path).expect("read hot snapshot");
-    content[..8].copy_from_slice(b"AIUHOT02");
+    content[..8].copy_from_slice(b"AIUHOT03");
     fs::write(&path, content).expect("write previous hot snapshot");
 
     let error =
@@ -18,7 +18,7 @@ fn hot_snapshot_with_previous_projection_magic_is_rejected() {
 
 #[test]
 fn parser_revisions_are_owned_per_harness() {
-    assert_eq!(crate::data::cache::parser_revision("claude"), 3);
+    assert_eq!(crate::data::cache::parser_revision("claude"), 4);
     assert_eq!(crate::data::cache::parser_revision("codex"), 3);
     assert_eq!(crate::data::cache::parser_revision("gemini"), 3);
     assert_eq!(crate::data::cache::parser_revision("kimi"), 4);

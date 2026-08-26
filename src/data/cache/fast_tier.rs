@@ -15,6 +15,8 @@ struct RecordFingerprint {
     output_tokens: i64,
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
+    cache_creation_5m_input_tokens: i64,
+    cache_creation_1h_input_tokens: i64,
     reasoning_output_tokens: i64,
 }
 
@@ -29,6 +31,8 @@ struct RecordFingerprintWithoutEffort {
     output_tokens: i64,
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
+    cache_creation_5m_input_tokens: i64,
+    cache_creation_1h_input_tokens: i64,
     reasoning_output_tokens: i64,
 }
 
@@ -127,6 +131,8 @@ fn tiers_by_fingerprint_without_effort(
 }
 
 fn source_record_fingerprint(record: &SourceUsageRecord) -> RecordFingerprint {
+    let mut usage = record.entry.usage.clone();
+    usage.normalize_cache_creation_buckets();
     RecordFingerprint {
         dedup_key: record.dedup_key.clone(),
         timestamp: record.entry.timestamp.clone(),
@@ -134,28 +140,34 @@ fn source_record_fingerprint(record: &SourceUsageRecord) -> RecordFingerprint {
         session_end_time: record.entry.session_end_time.clone(),
         model: record.entry.model.clone(),
         effort: record.entry.effort.clone(),
-        input_tokens: record.entry.usage.input_tokens,
-        output_tokens: record.entry.usage.output_tokens,
-        cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
-        cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
-        reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
     }
 }
 
 fn source_record_fingerprint_without_effort(
     record: &SourceUsageRecord,
 ) -> RecordFingerprintWithoutEffort {
+    let mut usage = record.entry.usage.clone();
+    usage.normalize_cache_creation_buckets();
     RecordFingerprintWithoutEffort {
         dedup_key: record.dedup_key.clone(),
         timestamp: record.entry.timestamp.clone(),
         session_start_time: record.entry.session_start_time.clone(),
         session_end_time: record.entry.session_end_time.clone(),
         model: record.entry.model.clone(),
-        input_tokens: record.entry.usage.input_tokens,
-        output_tokens: record.entry.usage.output_tokens,
-        cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
-        cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
-        reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
     }
 }
 
@@ -171,6 +183,8 @@ fn persisted_record_fingerprint(record: &PersistedSourceRecord) -> RecordFingerp
         output_tokens: record.output_tokens,
         cache_read_input_tokens: record.cache_read_input_tokens,
         cache_creation_input_tokens: record.cache_creation_input_tokens,
+        cache_creation_5m_input_tokens: record.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: record.cache_creation_1h_input_tokens,
         reasoning_output_tokens: record.reasoning_output_tokens,
     }
 }
@@ -188,6 +202,8 @@ fn persisted_record_fingerprint_without_effort(
         output_tokens: record.output_tokens,
         cache_read_input_tokens: record.cache_read_input_tokens,
         cache_creation_input_tokens: record.cache_creation_input_tokens,
+        cache_creation_5m_input_tokens: record.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: record.cache_creation_1h_input_tokens,
         reasoning_output_tokens: record.reasoning_output_tokens,
     }
 }
@@ -215,6 +231,8 @@ mod tests {
                     output_tokens: 2,
                     cache_read_input_tokens: 3,
                     cache_creation_input_tokens: 4,
+                    cache_creation_5m_input_tokens: 0,
+                    cache_creation_1h_input_tokens: 0,
                     reasoning_output_tokens: 5,
                 },
                 costs: None,

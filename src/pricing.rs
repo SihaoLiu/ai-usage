@@ -220,6 +220,10 @@ fn parse_litellm_payload(s: &str) -> Option<VendorTables> {
             output: output * 1_000_000.0,
             cache_input: cache_read * 1_000_000.0,
             cache_output: cache_creation * 1_000_000.0,
+            // LiteLLM currently exposes one cache-creation rate. Treat it as
+            // the fallback for both retention durations until it publishes
+            // duration-specific fields.
+            cache_output_1h: None,
             input_above_200k: entry
                 .input_cost_per_token_above_200k_tokens
                 .map(|v| v * 1_000_000.0),
@@ -232,6 +236,7 @@ fn parse_litellm_payload(s: &str) -> Option<VendorTables> {
             cache_output_above_200k: entry
                 .cache_creation_input_token_cost_above_200k_tokens
                 .map(|v| v * 1_000_000.0),
+            cache_output_1h_above_200k: None,
             _comment: Some(format!("Source: LiteLLM ({})", raw_name)),
         };
 
@@ -480,10 +485,12 @@ mod tests {
             output: input,
             cache_input: input,
             cache_output: input,
+            cache_output_1h: None,
             input_above_200k: None,
             output_above_200k: None,
             cache_input_above_200k: None,
             cache_output_above_200k: None,
+            cache_output_1h_above_200k: None,
             _comment: None,
         }
     }

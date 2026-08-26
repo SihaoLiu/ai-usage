@@ -45,6 +45,8 @@ fn record(dedup_key: &str, output_tokens: i64) -> WireRecord {
         output_tokens,
         cache_read_input_tokens: 3,
         cache_creation_input_tokens: 4,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
         reasoning_output_tokens: 0,
         cost_input: None,
         cost_output: None,

@@ -64,6 +64,8 @@ fn record(host_id: &str, vendor: &str, dedup_key: &str, input_tokens: i64) -> Wi
         output_tokens: 2,
         cache_read_input_tokens: 3,
         cache_creation_input_tokens: 4,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
         reasoning_output_tokens: 5,
         cost_input: None,
         cost_output: None,
@@ -451,6 +453,73 @@ async fn upload_deduplicates_without_advancing_sequence() {
     assert_eq!(second_body.accepted, 0);
     assert_eq!(second_body.ignored, 1);
     assert_eq!(second_body.max_seq, 1);
+}
+
+#[tokio::test]
+async fn upload_and_pull_preserve_claude_cache_duration_buckets() {
+    let app = app("claude-cache-durations").await;
+    let mut current = record("laptop", "claude", "duration-aware", 10);
+    current.model = "claude-fable-5".to_string();
+    current.cache_creation_input_tokens = 11;
+    current.cache_creation_5m_input_tokens = 4;
+    current.cache_creation_1h_input_tokens = 7;
+
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/upload",
+            ndjson(&[current.clone()]),
+        ))
+        .await
+        .expect("duration upload response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let pull = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=claude",
+            Body::empty(),
+        ))
+        .await
+        .expect("duration pull response");
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 1);
+    let pulled = &body.records[0].record;
+    assert_eq!(pulled.cache_creation_input_tokens, 11);
+    assert_eq!(pulled.cache_creation_5m_input_tokens, 4);
+    assert_eq!(pulled.cache_creation_1h_input_tokens, 7);
+
+    let mut legacy = serde_json::to_value(current).expect("serialize legacy-shaped record");
+    let object = legacy.as_object_mut().expect("record object");
+    object.remove("cache_creation_5m_input_tokens");
+    object.remove("cache_creation_1h_input_tokens");
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/upload",
+            serde_json::to_string(&legacy).expect("serialize legacy upload"),
+        ))
+        .await
+        .expect("legacy duration upload response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let pull = app
+        .oneshot(authed_request(
+            "GET",
+            "/v1/pull?after_seq=0&supported_vendors=claude",
+            Body::empty(),
+        ))
+        .await
+        .expect("legacy duration pull response");
+    let body: PullResponse = read_json(pull).await;
+    assert_eq!(body.records.len(), 1);
+    let pulled = &body.records[0].record;
+    assert_eq!(pulled.cache_creation_input_tokens, 11);
+    assert_eq!(pulled.cache_creation_5m_input_tokens, 11);
+    assert_eq!(pulled.cache_creation_1h_input_tokens, 0);
 }
 
 #[tokio::test]

@@ -36,6 +36,8 @@ fn test_record() -> WireRecord {
         output_tokens: 20,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
         reasoning_output_tokens: 0,
         cost_input: None,
         cost_output: None,
@@ -113,6 +115,51 @@ fn upsert_outcome_distinguishes_insert_replace_and_noop() {
         upsert_record(&tx, &replacement, "2026-08-04T12:03:00Z").expect("replace record"),
         UpsertOutcome::Replaced
     );
+}
+
+#[test]
+fn cache_creation_duration_columns_migrate_aggregate_rows() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open database");
+    conn.execute_batch(
+        "CREATE TABLE records (
+            schema_version INTEGER NOT NULL,
+            cache_creation INTEGER NOT NULL
+        )",
+    )
+    .expect("create legacy records table");
+    conn.execute(
+        "INSERT INTO records (schema_version, cache_creation) VALUES (?1, ?2)",
+        params![SCHEMA_VERSION as i64, 11_i64],
+    )
+    .expect("insert aggregate row");
+
+    ensure_cache_creation_duration_columns(&conn).expect("migrate duration columns");
+    ensure_cache_creation_duration_columns(&conn).expect("migration is idempotent");
+
+    let columns = conn
+        .prepare("PRAGMA table_info(records)")
+        .expect("prepare table info")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query table info")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect table info");
+    assert!(columns.iter().any(|column| column == "cache_creation_5m"));
+    assert!(columns.iter().any(|column| column == "cache_creation_1h"));
+
+    let row = conn
+        .query_row(
+            "SELECT cache_creation, cache_creation_5m, cache_creation_1h FROM records",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .expect("read migrated row");
+    assert_eq!(row, (11, 11, 0));
 }
 
 #[test]

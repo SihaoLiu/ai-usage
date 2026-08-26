@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS records (
     output_tokens  INTEGER NOT NULL,
     cache_read     INTEGER NOT NULL,
     cache_creation INTEGER NOT NULL,
+    cache_creation_5m INTEGER NOT NULL DEFAULT 0,
+    cache_creation_1h INTEGER NOT NULL DEFAULT 0,
     reasoning_out  INTEGER NOT NULL,
     cost_input     REAL,
     cost_output    REAL,

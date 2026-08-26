@@ -9,7 +9,9 @@ use serde::de::DeserializeOwned;
 
 use crate::time_utils::parse_timestamp;
 
-const INDEX_VERSION: u32 = 4;
+use super::{CACHE_VERSION, persistence};
+
+const INDEX_VERSION: u32 = 5;
 const COMPATIBLE_INDEX_VERSION: u32 = 3;
 const SECONDS_PER_DAY: i64 = 86_400;
 const HEADER_LEN: u64 = 84;
@@ -253,7 +255,17 @@ pub(super) fn matches_source_generation(
     if loaded.header.version != INDEX_VERSION {
         return false;
     }
+    if source_format_version(path, data_magic).ok() != Some(CACHE_VERSION) {
+        return false;
+    }
     validate_header(&loaded, source_checksum, source_len).is_ok()
+}
+
+fn source_format_version(path: &Path, data_magic: &[u8]) -> io::Result<u32> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    persistence::read_framed_header(&mut reader, data_magic)?;
+    bincode::deserialize_from(&mut reader)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 pub(super) fn read_range<R>(

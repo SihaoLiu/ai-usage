@@ -287,6 +287,8 @@ fn read_single_codex_file(path: &Path) -> Vec<RawEntry> {
                                     output_tokens: last_usage.output,
                                     cache_read_input_tokens: last_usage.cached_input,
                                     cache_creation_input_tokens: last_usage.cache_write_input,
+                                    cache_creation_5m_input_tokens: 0,
+                                    cache_creation_1h_input_tokens: 0,
                                     reasoning_output_tokens: last_usage.reasoning_output,
                                 },
                                 costs: None,

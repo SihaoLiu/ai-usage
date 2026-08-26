@@ -19,7 +19,12 @@ pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
     pub cache_input: f64,
+    /// Five-minute prompt-cache write rate, in dollars per MTok.
     pub cache_output: f64,
+    /// Optional one-hour prompt-cache write rate. Older pricing layers only
+    /// have one cache-write rate and fall back to `cache_output`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_output_1h: Option<f64>,
     /// Optional per-MTok rate for input tokens above the 200k threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_above_200k: Option<f64>,
@@ -32,6 +37,9 @@ pub struct ModelPricing {
     /// Optional per-MTok rate for cache-creation tokens above the 200k threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_output_above_200k: Option<f64>,
+    /// Optional one-hour cache-write rate above the 200k context tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_output_1h_above_200k: Option<f64>,
     #[serde(rename = "_comment", default, skip_serializing_if = "Option::is_none")]
     pub _comment: Option<String>,
 }
@@ -47,6 +55,15 @@ struct FastTierPricing {
 }
 
 impl ModelPricing {
+    pub fn cache_output_1h_rate(&self) -> f64 {
+        self.cache_output_1h.unwrap_or(self.cache_output)
+    }
+
+    pub fn cache_output_1h_above_200k_rate(&self) -> Option<f64> {
+        self.cache_output_1h_above_200k
+            .or(self.cache_output_above_200k)
+    }
+
     /// Apply tiered pricing for a single token bucket within one request.
     ///
     /// When `tokens > TIER_THRESHOLD` and a tiered rate is configured, the portion
@@ -74,10 +91,12 @@ impl ModelPricing {
             output: self.output * multiplier,
             cache_input: self.cache_input * multiplier,
             cache_output: self.cache_output * multiplier,
+            cache_output_1h: self.cache_output_1h.map(|v| v * multiplier),
             input_above_200k: self.input_above_200k.map(|v| v * multiplier),
             output_above_200k: self.output_above_200k.map(|v| v * multiplier),
             cache_input_above_200k: self.cache_input_above_200k.map(|v| v * multiplier),
             cache_output_above_200k: self.cache_output_above_200k.map(|v| v * multiplier),
+            cache_output_1h_above_200k: self.cache_output_1h_above_200k.map(|v| v * multiplier),
             _comment: self._comment.clone(),
         }
     }
@@ -292,10 +311,12 @@ static UNPRICED_MODEL: ModelPricing = ModelPricing {
     output: 0.0,
     cache_input: 0.0,
     cache_output: 0.0,
+    cache_output_1h: None,
     input_above_200k: None,
     output_above_200k: None,
     cache_input_above_200k: None,
     cache_output_above_200k: None,
+    cache_output_1h_above_200k: None,
     _comment: None,
 };
 
@@ -735,10 +756,12 @@ mod tests {
             output: 10.0,
             cache_input: 0.125,
             cache_output: 0.0,
+            cache_output_1h: None,
             input_above_200k: None,
             output_above_200k: None,
             cache_input_above_200k: None,
             cache_output_above_200k: None,
+            cache_output_1h_above_200k: None,
             _comment: None,
         }
     }
@@ -771,6 +794,7 @@ mod tests {
         assert!((fable.output - 50.0).abs() < 1e-9);
         assert!((fable.cache_input - 1.0).abs() < 1e-9);
         assert!((fable.cache_output - 12.5).abs() < 1e-9);
+        assert_eq!(fable.cache_output_1h, Some(20.0));
         assert!(fable.input_above_200k.is_none());
 
         let mythos = p.get_pricing("claude", "claude-mythos-5");
@@ -779,6 +803,7 @@ mod tests {
         let opus8 = p.get_pricing("claude", "claude-opus-4-8");
         assert!((opus8.input - 5.0).abs() < 1e-9);
         assert!((opus8.output - 25.0).abs() < 1e-9);
+        assert_eq!(opus8.cache_output_1h, Some(10.0));
         assert!(opus8.input_above_200k.is_none());
 
         let opus7 = p.get_pricing("claude", "claude-opus-4-7");
@@ -800,10 +825,12 @@ mod tests {
                 output: 20.0,
                 cache_input: 0.4,
                 cache_output: 5.0,
+                cache_output_1h: None,
                 input_above_200k: None,
                 output_above_200k: None,
                 cache_input_above_200k: None,
                 cache_output_above_200k: None,
+                cache_output_1h_above_200k: None,
                 _comment: None,
             },
         );
@@ -1159,10 +1186,12 @@ mod tests {
                 output: 199.0,
                 cache_input: 9.0,
                 cache_output: 9.0,
+                cache_output_1h: None,
                 input_above_200k: None,
                 output_above_200k: None,
                 cache_input_above_200k: None,
                 cache_output_above_200k: None,
+                cache_output_1h_above_200k: None,
                 _comment: None,
             },
         );
@@ -1201,23 +1230,23 @@ mod tests {
         assert!((uppercase.input - 12.5).abs() < 1e-9);
         assert!((uppercase.output - 75.0).abs() < 1e-9);
 
-        let qualified = pricing.pricing_for_entry("claude", "anthropic/claude-opus-4-7", 1);
-        assert!((qualified.input - 30.0).abs() < 1e-9);
-        assert!((qualified.output - 150.0).abs() < 1e-9);
+        let qualified = pricing.pricing_for_entry("claude", "anthropic/claude-opus-4-8", 1);
+        assert!((qualified.input - 10.0).abs() < 1e-9);
+        assert!((qualified.output - 50.0).abs() < 1e-9);
     }
 
     #[test]
     fn pricing_for_entry_scales_claude_fast_model_specific_rate() {
         let pricing = AllPricing::load_raw().finalize();
 
-        let standard = pricing.pricing_for_entry("claude", "claude-opus-4-7", 0);
-        let fast = pricing.pricing_for_entry("claude", "claude-opus-4-7", 1);
+        let standard = pricing.pricing_for_entry("claude", "claude-opus-4-8", 0);
+        let fast = pricing.pricing_for_entry("claude", "claude-opus-4-8", 1);
 
         assert!(matches!(standard, Cow::Borrowed(_)));
         assert!(matches!(fast, Cow::Owned(_)));
         assert!((standard.input - 5.0).abs() < 1e-9);
-        assert!((fast.input - 30.0).abs() < 1e-9);
-        assert!((fast.output - 150.0).abs() < 1e-9);
+        assert!((fast.input - 10.0).abs() < 1e-9);
+        assert!((fast.output - 50.0).abs() < 1e-9);
     }
 
     #[test]

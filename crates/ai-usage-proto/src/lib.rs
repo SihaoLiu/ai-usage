@@ -2,6 +2,8 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+// Duration-specific cache fields are additive, so the existing wire schema
+// and integrity algorithm remain compatible with deployed v3 clients.
 pub const SCHEMA_VERSION: u32 = 1;
 pub const INTEGRITY_ALGORITHM: &str = "usage-record-sha256-v1";
 
@@ -26,6 +28,12 @@ pub struct WireRecord {
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
+    /// Claude cache writes retained for five minutes.
+    #[serde(default)]
+    pub cache_creation_5m_input_tokens: i64,
+    /// Claude cache writes retained for one hour.
+    #[serde(default)]
+    pub cache_creation_1h_input_tokens: i64,
     pub reasoning_output_tokens: i64,
     #[serde(default)]
     pub cost_input: Option<f64>,
@@ -207,6 +215,21 @@ impl fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 impl WireRecord {
+    /// Convert a legacy aggregate-only record to the current wire shape.
+    /// Duration-specific buckets are authoritative when present; otherwise
+    /// the aggregate is retained as a five-minute cache write.
+    pub fn normalize_for_current_schema(mut self) -> Self {
+        let split_total = self
+            .cache_creation_5m_input_tokens
+            .saturating_add(self.cache_creation_1h_input_tokens);
+        if split_total > 0 {
+            self.cache_creation_input_tokens = split_total;
+        } else if self.cache_creation_input_tokens > 0 {
+            self.cache_creation_5m_input_tokens = self.cache_creation_input_tokens;
+        }
+        self
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(ValidationError::UnsupportedSchemaVersion(
@@ -230,6 +253,14 @@ impl WireRecord {
             (
                 "cache_creation_input_tokens",
                 self.cache_creation_input_tokens,
+            ),
+            (
+                "cache_creation_5m_input_tokens",
+                self.cache_creation_5m_input_tokens,
+            ),
+            (
+                "cache_creation_1h_input_tokens",
+                self.cache_creation_1h_input_tokens,
             ),
             ("reasoning_output_tokens", self.reasoning_output_tokens),
         ] {
@@ -558,6 +589,8 @@ mod tests {
             output_tokens: 20,
             cache_read_input_tokens: 30,
             cache_creation_input_tokens: 40,
+            cache_creation_5m_input_tokens: 40,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: 50,
             cost_input: None,
             cost_output: None,
@@ -867,6 +900,40 @@ mod tests {
         .expect("deserialize");
 
         assert_eq!(record.fast_tier, -1);
+    }
+
+    #[test]
+    fn aggregate_only_wire_records_gain_a_five_minute_bucket() {
+        let mut record: WireRecord = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "host_id": "workstation-home",
+                "vendor": "claude",
+                "dedup_key": "source-record-1",
+                "timestamp": "2026-05-18T12:34:56Z",
+                "session_start_time": "2026-05-18T12:30:00Z",
+                "session_end_time": "2026-05-18T12:34:56Z",
+                "model": "claude-sonnet-4",
+                "effort": null,
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 40,
+                "reasoning_output_tokens": 0,
+                "project_path_sha256": null
+            }"#,
+        )
+        .expect("deserialize aggregate-only record");
+
+        assert!(record.validate().is_ok());
+        assert_eq!(record.cache_creation_5m_input_tokens, 0);
+        assert_eq!(record.cache_creation_1h_input_tokens, 0);
+
+        record = record.normalize_for_current_schema();
+        assert_eq!(record.schema_version, SCHEMA_VERSION);
+        assert_eq!(record.cache_creation_5m_input_tokens, 40);
+        assert_eq!(record.cache_creation_1h_input_tokens, 0);
+        assert_eq!(record.cache_creation_input_tokens, 40);
     }
 
     #[test]

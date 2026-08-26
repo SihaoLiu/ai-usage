@@ -303,6 +303,8 @@ mod tests {
                 output_tokens: 10,
                 cache_read_input_tokens: 5,
                 cache_creation_input_tokens: 0,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
                 reasoning_output_tokens: 2,
             },
             costs: Some(UsageCost {

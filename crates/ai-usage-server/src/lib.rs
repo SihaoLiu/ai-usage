@@ -1,8 +1,8 @@
 use ai_usage_proto::{
-    HealthResponse, IntegrityReport, IntegrityReportList, IntegritySubmitResponse, MachineInfo,
-    MachineList, PullResponse, RecordKey, SCHEMA_VERSION, SequencedWireRecord, SnapshotDiffRequest,
-    SnapshotDiffResponse, SnapshotFinalizeResponse, SnapshotRecordBatch, SyncPolicy,
-    UploadResponse, WireRecord, is_valid_host_id, is_valid_vendor,
+    HealthResponse, INTEGRITY_ALGORITHM, IntegrityReport, IntegrityReportList,
+    IntegritySubmitResponse, MachineInfo, MachineList, PullResponse, RecordKey, SCHEMA_VERSION,
+    SequencedWireRecord, SnapshotDiffRequest, SnapshotDiffResponse, SnapshotFinalizeResponse,
+    SnapshotRecordBatch, SyncPolicy, UploadResponse, WireRecord, is_valid_host_id, is_valid_vendor,
 };
 use axum::extract::{DefaultBodyLimit, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -165,6 +165,7 @@ impl AppState {
             conn.execute_batch(include_str!("../migrations/0001_init.sql"))?;
             ensure_fast_tier_column(&conn)?;
             ensure_cost_columns(&conn)?;
+            ensure_cache_creation_duration_columns(&conn)?;
             ensure_snapshot_id_column(&conn)?;
             cleanup_omp_alias_duplicates(&mut conn)?;
             load_or_create_server_instance_id(&conn, &config.db_path)?
@@ -441,6 +442,7 @@ async fn upload(
         record.validate().map_err(|err| {
             AppError::new(StatusCode::BAD_REQUEST, format!("line {}: {err}", idx + 1))
         })?;
+        let record = record.normalize_for_current_schema();
         validate_client_host(&headers, &record.host_id)?;
         if state
             .config
@@ -575,12 +577,13 @@ async fn snapshot_diff(
     let mut needed = Vec::new();
     let mut matched = 0usize;
     for record in &request.records {
-        let existing_hash =
-            stored_record_hash(&tx, &request.host_id, &record.vendor, &record.dedup_key)?;
-        if existing_hash
-            .as_deref()
-            .is_some_and(|hash| hash == record.record_hash)
-        {
+        if stored_record_matches_hash(
+            &tx,
+            &request.host_id,
+            &record.vendor,
+            &record.dedup_key,
+            &record.record_hash,
+        )? {
             mark_snapshot_key(
                 &tx,
                 &request.host_id,
@@ -640,7 +643,8 @@ async fn snapshot_records(
     let mut ignored = 0usize;
     let mut record_count_delta = 0i64;
     for record in &batch.records {
-        let outcome = upsert_record(&tx, record, &uploaded_at)?;
+        let record = record.clone().normalize_for_current_schema();
+        let outcome = upsert_record(&tx, &record, &uploaded_at)?;
         if outcome != UpsertOutcome::Unchanged {
             accepted += 1;
         } else {
@@ -654,7 +658,7 @@ async fn snapshot_records(
             &record.dedup_key,
             &batch.snapshot_id,
         )?;
-        record_count_delta -= delete_omp_v220_aliases_for_stable_record(&tx, record)? as i64;
+        record_count_delta -= delete_omp_v220_aliases_for_stable_record(&tx, &record)? as i64;
     }
 
     update_machine_count(&tx, &batch.host_id, &uploaded_at, record_count_delta)?;
@@ -782,28 +786,100 @@ fn mark_snapshot_key(
     )
 }
 
-fn stored_record_hash(
+fn stored_record_matches_hash(
     tx: &rusqlite::Transaction<'_>,
     host_id: &str,
     vendor: &str,
     dedup_key: &str,
-) -> rusqlite::Result<Option<String>> {
+    expected_hash: &str,
+) -> rusqlite::Result<bool> {
     tx.query_row(
         "SELECT host_id, vendor, dedup_key, schema_version, timestamp_utc,
             session_start, session_end, model, effort, fast_tier, input_tokens,
-            output_tokens, cache_read, cache_creation, reasoning_out, cost_input,
-            cost_output, cost_cache_read, cost_cache_creation, project_hash
+            output_tokens, cache_read, cache_creation, cache_creation_5m,
+            cache_creation_1h, reasoning_out, cost_input, cost_output,
+            cost_cache_read, cost_cache_creation, project_hash
          FROM records
          WHERE host_id = ?1 AND vendor = ?2 AND dedup_key = ?3
-         LIMIT 1",
+        LIMIT 1",
         params![host_id, vendor, dedup_key],
-        |row| row_to_wire_record(row).map(|record| wire_record_hash(&record)),
+        |row| {
+            let record = row_to_wire_record(row)?;
+            if wire_record_hash(&record) == expected_hash {
+                return Ok(true);
+            }
+            if raw_wire_record_hash(&record) == expected_hash {
+                return Ok(true);
+            }
+            Ok(legacy_wire_record_hash(&record) == expected_hash)
+        },
     )
     .optional()
+    .map(|matched| matched.unwrap_or(false))
 }
 
 fn wire_record_hash(record: &WireRecord) -> String {
-    let bytes = serde_json::to_vec(record).expect("wire record serialization cannot fail");
+    serialized_hash(record)
+}
+
+fn raw_wire_record_hash(record: &WireRecord) -> String {
+    let mut raw = record.clone();
+    raw.cache_creation_5m_input_tokens = 0;
+    raw.cache_creation_1h_input_tokens = 0;
+    serialized_hash(&raw)
+}
+
+#[derive(serde::Serialize)]
+struct LegacyWireRecord<'a> {
+    schema_version: u32,
+    host_id: &'a str,
+    vendor: &'a str,
+    dedup_key: &'a str,
+    timestamp: &'a str,
+    session_start_time: &'a str,
+    session_end_time: &'a str,
+    model: &'a str,
+    effort: &'a Option<String>,
+    fast_tier: i8,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+    cost_input: Option<f64>,
+    cost_output: Option<f64>,
+    cost_cache_read: Option<f64>,
+    cost_cache_creation: Option<f64>,
+    project_path_sha256: &'a Option<String>,
+}
+
+fn legacy_wire_record_hash(record: &WireRecord) -> String {
+    serialized_hash(&LegacyWireRecord {
+        schema_version: record.schema_version,
+        host_id: &record.host_id,
+        vendor: &record.vendor,
+        dedup_key: &record.dedup_key,
+        timestamp: &record.timestamp,
+        session_start_time: &record.session_start_time,
+        session_end_time: &record.session_end_time,
+        model: &record.model,
+        effort: &record.effort,
+        fast_tier: record.fast_tier,
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        cache_read_input_tokens: record.cache_read_input_tokens,
+        cache_creation_input_tokens: record.cache_creation_input_tokens,
+        reasoning_output_tokens: record.reasoning_output_tokens,
+        cost_input: record.cost_input,
+        cost_output: record.cost_output,
+        cost_cache_read: record.cost_cache_read,
+        cost_cache_creation: record.cost_cache_creation,
+        project_path_sha256: &record.project_path_sha256,
+    })
+}
+
+fn serialized_hash<T: serde::Serialize>(value: &T) -> String {
+    let bytes = serde_json::to_vec(value).expect("wire record serialization cannot fail");
     let digest = Sha256::digest(&bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -826,14 +902,15 @@ fn upsert_record(
     record: &WireRecord,
     uploaded_at: &str,
 ) -> rusqlite::Result<UpsertOutcome> {
-    let changed = insert_record(tx, record, uploaded_at)?;
+    let record = record.clone().normalize_for_current_schema();
+    let changed = insert_record(tx, &record, uploaded_at)?;
     if changed == 1 {
         return Ok(UpsertOutcome::Inserted);
     }
-    if record_matches_existing(tx, record)? {
+    if record_matches_existing(tx, &record)? {
         return Ok(UpsertOutcome::Unchanged);
     }
-    replace_record(tx, record, uploaded_at)?;
+    replace_record(tx, &record, uploaded_at)?;
     Ok(UpsertOutcome::Replaced)
 }
 
@@ -859,14 +936,16 @@ fn insert_record(
     record: &WireRecord,
     uploaded_at: &str,
 ) -> rusqlite::Result<usize> {
+    let record = record.clone().normalize_for_current_schema();
     tx.execute(
         "INSERT OR IGNORE INTO records (
             host_id, vendor, dedup_key, schema_version, timestamp_utc,
             session_start, session_end, model, effort, fast_tier, input_tokens,
-            output_tokens, cache_read, cache_creation, reasoning_out,
+            output_tokens, cache_read, cache_creation, cache_creation_5m,
+            cache_creation_1h, reasoning_out,
             cost_input, cost_output, cost_cache_read, cost_cache_creation,
             project_hash, uploaded_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             record.host_id,
             record.vendor,
@@ -882,6 +961,8 @@ fn insert_record(
             record.output_tokens,
             record.cache_read_input_tokens,
             record.cache_creation_input_tokens,
+            record.cache_creation_5m_input_tokens,
+            record.cache_creation_1h_input_tokens,
             record.reasoning_output_tokens,
             record.cost_input,
             record.cost_output,
@@ -910,6 +991,7 @@ fn record_matches_existing(
     tx: &rusqlite::Transaction<'_>,
     record: &WireRecord,
 ) -> rusqlite::Result<bool> {
+    let record = record.clone().normalize_for_current_schema();
     let found: Option<i64> = tx
         .query_row(
             "SELECT 1 FROM records
@@ -927,12 +1009,14 @@ fn record_matches_existing(
                AND output_tokens = ?12
                AND cache_read = ?13
                AND cache_creation = ?14
-               AND reasoning_out = ?15
-               AND cost_input IS ?16
-               AND cost_output IS ?17
-               AND cost_cache_read IS ?18
-               AND cost_cache_creation IS ?19
-               AND project_hash IS ?20
+               AND cache_creation_5m = ?15
+               AND cache_creation_1h = ?16
+               AND reasoning_out = ?17
+               AND cost_input IS ?18
+               AND cost_output IS ?19
+               AND cost_cache_read IS ?20
+               AND cost_cache_creation IS ?21
+               AND project_hash IS ?22
              LIMIT 1",
             params![
                 record.host_id,
@@ -949,6 +1033,8 @@ fn record_matches_existing(
                 record.output_tokens,
                 record.cache_read_input_tokens,
                 record.cache_creation_input_tokens,
+                record.cache_creation_5m_input_tokens,
+                record.cache_creation_1h_input_tokens,
                 record.reasoning_output_tokens,
                 record.cost_input,
                 record.cost_output,
@@ -991,8 +1077,9 @@ async fn pull(
     let mut sql = String::from(
         "SELECT seq, host_id, vendor, dedup_key, schema_version, timestamp_utc,
             session_start, session_end, model, effort, fast_tier, input_tokens, output_tokens,
-            cache_read, cache_creation, reasoning_out, cost_input, cost_output, cost_cache_read,
-            cost_cache_creation, project_hash, uploaded_at
+            cache_read, cache_creation, cache_creation_5m, cache_creation_1h, reasoning_out,
+            cost_input, cost_output, cost_cache_read, cost_cache_creation, project_hash,
+            uploaded_at
          FROM records
          WHERE seq > ?",
     );
@@ -1203,10 +1290,11 @@ async fn integrity_reports(
     let mut stmt = conn.prepare(
         "SELECT host_id, algorithm, range_end_utc, record_count, digest_sha256, computed_at
          FROM integrity_reports
+         WHERE algorithm = ?1
          ORDER BY host_id ASC, algorithm ASC",
     )?;
     let reports = stmt
-        .query_map([], |row| {
+        .query_map([INTEGRITY_ALGORITHM], |row| {
             Ok(IntegrityReport {
                 host_id: row.get(0)?,
                 algorithm: row.get(1)?,
@@ -1338,7 +1426,7 @@ fn row_to_sequenced_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sequence
     Ok(SequencedWireRecord {
         seq: row.get::<_, i64>(0)? as u64,
         record: row_to_wire_record_with_offset(row, 1)?,
-        uploaded_at: row.get(21)?,
+        uploaded_at: row.get(23)?,
     })
 }
 
@@ -1365,13 +1453,16 @@ fn row_to_wire_record_with_offset(
         output_tokens: row.get(offset + 11)?,
         cache_read_input_tokens: row.get(offset + 12)?,
         cache_creation_input_tokens: row.get(offset + 13)?,
-        reasoning_output_tokens: row.get(offset + 14)?,
-        cost_input: row.get(offset + 15)?,
-        cost_output: row.get(offset + 16)?,
-        cost_cache_read: row.get(offset + 17)?,
-        cost_cache_creation: row.get(offset + 18)?,
-        project_path_sha256: row.get(offset + 19)?,
-    })
+        cache_creation_5m_input_tokens: row.get(offset + 14)?,
+        cache_creation_1h_input_tokens: row.get(offset + 15)?,
+        reasoning_output_tokens: row.get(offset + 16)?,
+        cost_input: row.get(offset + 17)?,
+        cost_output: row.get(offset + 18)?,
+        cost_cache_read: row.get(offset + 19)?,
+        cost_cache_creation: row.get(offset + 20)?,
+        project_path_sha256: row.get(offset + 21)?,
+    }
+    .normalize_for_current_schema())
 }
 
 fn ensure_fast_tier_column(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -1406,6 +1497,32 @@ fn ensure_cost_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
+    Ok(())
+}
+
+fn ensure_cache_creation_duration_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(records)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for name in ["cache_creation_5m", "cache_creation_1h"] {
+        if !columns.iter().any(|column| column == name) {
+            conn.execute(
+                &format!("ALTER TABLE records ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            )?;
+        }
+    }
+    // Older rows had one aggregate cache-write bucket. Preserve their meaning
+    // as five-minute writes before exposing the new fields.
+    conn.execute(
+        "UPDATE records
+         SET cache_creation_5m = cache_creation
+         WHERE cache_creation_5m = 0
+           AND cache_creation_1h = 0
+           AND cache_creation > 0",
+        [],
+    )?;
     Ok(())
 }
 

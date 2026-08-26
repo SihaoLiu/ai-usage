@@ -17,6 +17,8 @@
 //! output = 15.0
 //! cache_read = 0.30
 //! cache_write = 3.75
+//! cache_write_1h = 6.0
+//! cache_write_1h_above_200k = 12.0
 //! ```
 
 use std::collections::HashMap;
@@ -55,10 +57,12 @@ struct PricingEntry {
     output: f64,
     cache_read: Option<f64>,
     cache_write: Option<f64>,
+    cache_write_1h: Option<f64>,
     input_above_200k: Option<f64>,
     output_above_200k: Option<f64>,
     cache_read_above_200k: Option<f64>,
     cache_write_above_200k: Option<f64>,
+    cache_write_1h_above_200k: Option<f64>,
 }
 
 impl PricingEntry {
@@ -70,10 +74,12 @@ impl PricingEntry {
             // the input rate rather than zero.
             cache_input: self.cache_read.unwrap_or(self.input),
             cache_output: self.cache_write.unwrap_or(self.input),
+            cache_output_1h: self.cache_write_1h,
             input_above_200k: self.input_above_200k,
             output_above_200k: self.output_above_200k,
             cache_input_above_200k: self.cache_read_above_200k,
             cache_output_above_200k: self.cache_write_above_200k,
+            cache_output_1h_above_200k: self.cache_write_1h_above_200k,
             _comment: Some("Source: user override (models.toml)".to_string()),
         }
     }
@@ -142,6 +148,8 @@ input = 3.0
 output = 15.0
 cache_read = 0.30
 cache_write = 3.75
+cache_write_1h = 6.0
+cache_write_1h_above_200k = 12.0
 input_above_200k = 6.0
 "#;
         let ov = parse_from_str(toml).expect("valid toml");
@@ -165,6 +173,8 @@ input_above_200k = 6.0
         assert!((p.output - 15.0).abs() < 1e-9);
         assert!((p.cache_input - 0.30).abs() < 1e-9);
         assert!((p.cache_output - 3.75).abs() < 1e-9);
+        assert_eq!(p.cache_output_1h, Some(6.0));
+        assert_eq!(p.cache_output_1h_above_200k, Some(12.0));
         assert_eq!(p.input_above_200k, Some(6.0));
     }
 

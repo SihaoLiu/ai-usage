@@ -40,6 +40,8 @@ pub(crate) fn assign_sync_dedup_keys(records: Vec<CachedUsageRecord>) -> Vec<Syn
 
 fn fallback_fingerprint(record: &CachedUsageRecord) -> String {
     let mut hasher = Sha256::new();
+    let mut usage = record.entry.usage.clone();
+    usage.normalize_cache_creation_buckets();
     for value in [
         record.vendor.as_str(),
         record.source_path.as_str(),
@@ -52,11 +54,13 @@ fn fallback_fingerprint(record: &CachedUsageRecord) -> String {
         update_string(&mut hasher, value);
     }
     for value in [
-        record.entry.usage.input_tokens,
-        record.entry.usage.output_tokens,
-        record.entry.usage.cache_read_input_tokens,
-        record.entry.usage.cache_creation_input_tokens,
-        record.entry.usage.reasoning_output_tokens,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+        usage.cache_creation_5m_input_tokens,
+        usage.cache_creation_1h_input_tokens,
+        usage.reasoning_output_tokens,
     ] {
         hasher.update(value.to_be_bytes());
     }

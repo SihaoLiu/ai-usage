@@ -147,7 +147,7 @@ After a full local snapshot finalizes, the client invalidates its integrity rece
 
 Integrity checks compute a SHA-256 digest for the machine's own cached records, submit that report to the server, download the other machine reports, and recompute the same digest over the pulled remote cache for each reported host. The monitor prompt shows `Integrity Checked` when the local remote-cache digest matches the host's own server report, and `Integrity Failed` when any reported host differs.
 
-The checked range is independent of local time zones. Clients include records with RFC3339 timestamps earlier than the current UTC day's `00:00:00Z` boundary, so every machine checks the same complete UTC-day prefix and avoids the still-changing current UTC day. The digest uses normalized usage fields that both local and remote caches persist, including vendor, dedup key, timestamps, model, effort, fast tier, token counts, and embedded costs. It does not include local source file paths or project hashes.
+The checked range is independent of local time zones. Clients include records with RFC3339 timestamps earlier than the current UTC day's `00:00:00Z` boundary, so every machine checks the same complete UTC-day prefix and avoids the still-changing current UTC day. The digest uses normalized usage fields that both local and remote caches persist, including vendor, dedup key, timestamps, model, effort, fast tier, token counts, and embedded costs. Claude duration-specific cache buckets are normalized to their aggregate cache-creation count for the digest so the additive fields remain compatible with older v3 clients. It does not include local source file paths or project hashes.
 
 Successful background checks are reused for up to six hours within the same server, machine, and upload-policy scope. A new UTC-day boundary, a sync-scope change, or any uploaded or pulled change inside the stable historical range invalidates the saved result immediately. `ai-usage sync push` and `ai-usage sync pull` always force a new check. Older servers that do not expose the integrity endpoints still allow record push and pull, but they cannot produce a checked integrity result until upgraded.
 
@@ -203,7 +203,7 @@ ai-usage sync status
 
 Client-side sync errors are recorded in the local cache root as `sync_state.json` and `sync.log`.
 
-Current clients and servers remain wire-compatible with v3.0.0 during a staggered rollout. Upgrade the server first when practical so current clients receive per-machine rate limits and smaller server-enforced pull pages immediately.
+Current clients and servers remain wire-compatible with v3.0.0 during a staggered rollout. The duration-specific Claude cache fields are optional additive fields; an older peer ignores them and a current peer maps an aggregate-only record to the five-minute bucket. Upgrade the server first when practical so current clients receive per-machine rate limits and smaller server-enforced pull pages immediately.
 
 ## Auto Update
 

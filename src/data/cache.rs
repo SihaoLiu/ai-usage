@@ -35,17 +35,18 @@ thread_local! {
     static HOT_SNAPSHOT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-const CACHE_VERSION: u32 = 1;
+const LEGACY_CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const ENTRY_FILE_MAGIC: &[u8; 8] = b"AIUCACH1";
 const REMOTE_FILE_MAGIC: &[u8; 8] = b"AIUREMT1";
 const ENTRY_INDEX_MAGIC: &[u8; 8] = b"AIUIDX01";
 const REMOTE_INDEX_MAGIC: &[u8; 8] = b"AIURIDX1";
 const HOT_SNAPSHOT_FILE: &str = "hot-snapshot.bin";
-const HOT_SNAPSHOT_MAGIC: &[u8; 8] = b"AIUHOT03";
+const HOT_SNAPSHOT_MAGIC: &[u8; 8] = b"AIUHOT04";
 const MANIFEST_FILE: &str = "manifest.json";
 const ENTRIES_DIR: &str = "entries";
 const REMOTE_DIR: &str = "remote";
-const CLAUDE_PARSER_REVISION: u32 = 3;
+const CLAUDE_PARSER_REVISION: u32 = 4;
 const CODEX_PARSER_REVISION: u32 = 3;
 const GEMINI_PARSER_REVISION: u32 = 3;
 const KIMI_PARSER_REVISION: u32 = 4;
@@ -200,6 +201,10 @@ struct PersistedSourceRecord {
     output_tokens: i64,
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
+    #[serde(default)]
+    cache_creation_5m_input_tokens: i64,
+    #[serde(default)]
+    cache_creation_1h_input_tokens: i64,
     reasoning_output_tokens: i64,
     #[serde(default = "default_fast_tier")]
     fast_tier: i8,
@@ -227,6 +232,42 @@ struct PersistedVendorRecords {
 struct PersistedVendorRecordsBeforeSession {
     format_version: u32,
     records: Vec<PersistedSourceRecordBeforeSession>,
+}
+
+/// Cache record layout before duration-specific Claude cache writes were
+/// retained, but after session ids were added.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedVendorRecordsBeforeCacheDurations {
+    format_version: u32,
+    records: Vec<PersistedSourceRecordBeforeCacheDurations>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSourceRecordBeforeCacheDurations {
+    source_path: String,
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
+    effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+    #[serde(default = "default_fast_tier")]
+    fast_tier: i8,
+    #[serde(default)]
+    cost_input: Option<f64>,
+    #[serde(default)]
+    cost_output: Option<f64>,
+    #[serde(default)]
+    cost_cache_read: Option<f64>,
+    #[serde(default)]
+    cost_cache_creation: Option<f64>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +309,10 @@ struct PersistedRemoteRecord {
     output_tokens: i64,
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
+    #[serde(default)]
+    cache_creation_5m_input_tokens: i64,
+    #[serde(default)]
+    cache_creation_1h_input_tokens: i64,
     reasoning_output_tokens: i64,
     #[serde(default = "default_fast_tier")]
     fast_tier: i8,
@@ -285,6 +330,38 @@ struct PersistedRemoteRecord {
 struct PersistedRemoteRecords {
     format_version: u32,
     records: Vec<PersistedRemoteRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRemoteRecordsBeforeCacheDurations {
+    format_version: u32,
+    records: Vec<PersistedRemoteRecordBeforeCacheDurations>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRemoteRecordBeforeCacheDurations {
+    vendor: String,
+    dedup_key: String,
+    timestamp: String,
+    session_start_time: String,
+    session_end_time: String,
+    model: String,
+    effort: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+    #[serde(default = "default_fast_tier")]
+    fast_tier: i8,
+    #[serde(default)]
+    cost_input: Option<f64>,
+    #[serde(default)]
+    cost_output: Option<f64>,
+    #[serde(default)]
+    cost_cache_read: Option<f64>,
+    #[serde(default)]
+    cost_cache_creation: Option<f64>,
 }
 
 impl index::IndexableRecord for PersistedSourceRecord {
@@ -514,6 +591,8 @@ impl From<PersistedSourceRecordV1> for PersistedSourceRecord {
             output_tokens: record.output_tokens,
             cache_read_input_tokens: record.cache_read_input_tokens,
             cache_creation_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: record.reasoning_output_tokens,
             fast_tier: UNKNOWN_FAST_TIER,
             cost_input: None,
@@ -539,6 +618,8 @@ impl From<PersistedSourceRecordWithFastTier> for PersistedSourceRecord {
             output_tokens: record.output_tokens,
             cache_read_input_tokens: record.cache_read_input_tokens,
             cache_creation_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: record.reasoning_output_tokens,
             fast_tier: record.fast_tier,
             cost_input: None,
@@ -564,6 +645,8 @@ impl From<PersistedSourceRecordBeforeSession> for PersistedSourceRecord {
             output_tokens: record.output_tokens,
             cache_read_input_tokens: record.cache_read_input_tokens,
             cache_creation_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: record.reasoning_output_tokens,
             fast_tier: record.fast_tier,
             cost_input: record.cost_input,
@@ -571,6 +654,33 @@ impl From<PersistedSourceRecordBeforeSession> for PersistedSourceRecord {
             cost_cache_read: record.cost_cache_read,
             cost_cache_creation: record.cost_cache_creation,
             session_id: None,
+        }
+    }
+}
+
+impl From<PersistedSourceRecordBeforeCacheDurations> for PersistedSourceRecord {
+    fn from(record: PersistedSourceRecordBeforeCacheDurations) -> Self {
+        Self {
+            source_path: record.source_path,
+            dedup_key: record.dedup_key,
+            timestamp: record.timestamp,
+            session_start_time: record.session_start_time,
+            session_end_time: record.session_end_time,
+            model: record.model,
+            effort: record.effort,
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            cache_read_input_tokens: record.cache_read_input_tokens,
+            cache_creation_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: 0,
+            reasoning_output_tokens: record.reasoning_output_tokens,
+            fast_tier: record.fast_tier,
+            cost_input: record.cost_input,
+            cost_output: record.cost_output,
+            cost_cache_read: record.cost_cache_read,
+            cost_cache_creation: record.cost_cache_creation,
+            session_id: record.session_id,
         }
     }
 }
@@ -589,6 +699,8 @@ impl From<PersistedRemoteRecordV1> for PersistedRemoteRecord {
             output_tokens: record.output_tokens,
             cache_read_input_tokens: record.cache_read_input_tokens,
             cache_creation_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: record.reasoning_output_tokens,
             fast_tier: UNKNOWN_FAST_TIER,
             cost_input: None,
@@ -613,6 +725,8 @@ impl From<PersistedRemoteRecordWithFastTier> for PersistedRemoteRecord {
             output_tokens: record.output_tokens,
             cache_read_input_tokens: record.cache_read_input_tokens,
             cache_creation_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: record.reasoning_output_tokens,
             fast_tier: record.fast_tier,
             cost_input: None,
@@ -623,8 +737,47 @@ impl From<PersistedRemoteRecordWithFastTier> for PersistedRemoteRecord {
     }
 }
 
+impl From<PersistedRemoteRecordBeforeCacheDurations> for PersistedRemoteRecord {
+    fn from(record: PersistedRemoteRecordBeforeCacheDurations) -> Self {
+        Self {
+            vendor: record.vendor,
+            dedup_key: record.dedup_key,
+            timestamp: record.timestamp,
+            session_start_time: record.session_start_time,
+            session_end_time: record.session_end_time,
+            model: record.model,
+            effort: record.effort,
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            cache_read_input_tokens: record.cache_read_input_tokens,
+            cache_creation_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: record.cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: 0,
+            reasoning_output_tokens: record.reasoning_output_tokens,
+            fast_tier: record.fast_tier,
+            cost_input: record.cost_input,
+            cost_output: record.cost_output,
+            cost_cache_read: record.cost_cache_read,
+            cost_cache_creation: record.cost_cache_creation,
+        }
+    }
+}
+
 impl PersistedSourceRecord {
+    fn normalize_cache_creation(&mut self) {
+        let split_total = self
+            .cache_creation_5m_input_tokens
+            .saturating_add(self.cache_creation_1h_input_tokens);
+        if split_total > 0 {
+            self.cache_creation_input_tokens = split_total;
+        } else if self.cache_creation_input_tokens > 0 {
+            self.cache_creation_5m_input_tokens = self.cache_creation_input_tokens;
+        }
+    }
+
     fn from_source_record(source_path: String, record: SourceUsageRecord, fast_tier: i8) -> Self {
+        let mut usage = record.entry.usage.clone();
+        usage.normalize_cache_creation_buckets();
         Self {
             source_path,
             dedup_key: record.dedup_key,
@@ -633,11 +786,13 @@ impl PersistedSourceRecord {
             session_end_time: record.entry.session_end_time,
             model: record.entry.model,
             effort: record.entry.effort,
-            input_tokens: record.entry.usage.input_tokens,
-            output_tokens: record.entry.usage.output_tokens,
-            cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
-            cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
-            reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+            reasoning_output_tokens: usage.reasoning_output_tokens,
             fast_tier,
             cost_input: record.entry.costs.map(|costs| costs.input),
             cost_output: record.entry.costs.map(|costs| costs.output),
@@ -664,6 +819,8 @@ impl PersistedSourceRecord {
                 output_tokens: self.output_tokens,
                 cache_read_input_tokens: self.cache_read_input_tokens,
                 cache_creation_input_tokens: self.cache_creation_input_tokens,
+                cache_creation_5m_input_tokens: self.cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens: self.cache_creation_1h_input_tokens,
                 reasoning_output_tokens: self.reasoning_output_tokens,
             },
             costs: persisted_costs(
@@ -692,6 +849,8 @@ impl PersistedSourceRecord {
                 output_tokens: self.output_tokens,
                 cache_read_input_tokens: self.cache_read_input_tokens,
                 cache_creation_input_tokens: self.cache_creation_input_tokens,
+                cache_creation_5m_input_tokens: self.cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens: self.cache_creation_1h_input_tokens,
                 reasoning_output_tokens: self.reasoning_output_tokens,
             },
             costs: persisted_costs(
@@ -720,13 +879,28 @@ impl PersistedSourceRecord {
             self.output_tokens,
             self.cache_read_input_tokens,
             self.cache_creation_input_tokens,
+            self.cache_creation_5m_input_tokens,
+            self.cache_creation_1h_input_tokens,
             self.reasoning_output_tokens,
         ])
     }
 }
 
 impl PersistedRemoteRecord {
+    fn normalize_cache_creation(&mut self) {
+        let split_total = self
+            .cache_creation_5m_input_tokens
+            .saturating_add(self.cache_creation_1h_input_tokens);
+        if split_total > 0 {
+            self.cache_creation_input_tokens = split_total;
+        } else if self.cache_creation_input_tokens > 0 {
+            self.cache_creation_5m_input_tokens = self.cache_creation_input_tokens;
+        }
+    }
+
     fn from_remote_record(record: RemoteUsageRecord) -> Self {
+        let mut usage = record.entry.usage.clone();
+        usage.normalize_cache_creation_buckets();
         Self {
             vendor: record.vendor,
             dedup_key: record.dedup_key,
@@ -735,11 +909,13 @@ impl PersistedRemoteRecord {
             session_end_time: record.entry.session_end_time,
             model: record.entry.model,
             effort: record.entry.effort,
-            input_tokens: record.entry.usage.input_tokens,
-            output_tokens: record.entry.usage.output_tokens,
-            cache_read_input_tokens: record.entry.usage.cache_read_input_tokens,
-            cache_creation_input_tokens: record.entry.usage.cache_creation_input_tokens,
-            reasoning_output_tokens: record.entry.usage.reasoning_output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+            reasoning_output_tokens: usage.reasoning_output_tokens,
             fast_tier: record.entry.fast_tier,
             cost_input: record.entry.costs.map(|costs| costs.input),
             cost_output: record.entry.costs.map(|costs| costs.output),
@@ -768,6 +944,8 @@ impl PersistedRemoteRecord {
                     output_tokens: self.output_tokens,
                     cache_read_input_tokens: self.cache_read_input_tokens,
                     cache_creation_input_tokens: self.cache_creation_input_tokens,
+                    cache_creation_5m_input_tokens: self.cache_creation_5m_input_tokens,
+                    cache_creation_1h_input_tokens: self.cache_creation_1h_input_tokens,
                     reasoning_output_tokens: self.reasoning_output_tokens,
                 },
                 costs: persisted_costs(
@@ -786,12 +964,14 @@ impl PersistedRemoteRecord {
             self.output_tokens,
             self.cache_read_input_tokens,
             self.cache_creation_input_tokens,
+            self.cache_creation_5m_input_tokens,
+            self.cache_creation_1h_input_tokens,
             self.reasoning_output_tokens,
         ])
     }
 }
 
-fn token_counts_are_non_negative(values: [i64; 5]) -> bool {
+fn token_counts_are_non_negative<const N: usize>(values: [i64; N]) -> bool {
     values.into_iter().all(|value| value >= 0)
 }
 
@@ -934,8 +1114,11 @@ fn read_cached_records_in_range(
         start,
         end,
     ) {
-        if indexed
-            .records
+        let mut records = indexed.records;
+        for record in &mut records {
+            record.normalize_cache_creation();
+        }
+        if records
             .iter()
             .any(|record| !record.has_non_negative_token_usage())
         {
@@ -944,7 +1127,7 @@ fn read_cached_records_in_range(
                 "cache entry has negative token count",
             ));
         }
-        return Ok((indexed.records, indexed.has_records));
+        return Ok((records, indexed.has_records));
     }
     let records = read_cached_records(path)?;
     let has_records = !records.is_empty();
@@ -1651,6 +1834,8 @@ fn update_record_hash(hash: u64, record: &PersistedSourceRecord) -> u64 {
         record.output_tokens,
         record.cache_read_input_tokens,
         record.cache_creation_input_tokens,
+        record.cache_creation_5m_input_tokens,
+        record.cache_creation_1h_input_tokens,
         record.reasoning_output_tokens,
     ] {
         h = fnv1a_bytes(h, &value.to_le_bytes());

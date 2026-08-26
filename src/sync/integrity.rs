@@ -383,6 +383,8 @@ fn canonical_record(
     dedup_key: String,
     entry: UsageEntry,
 ) -> CanonicalIntegrityRecord {
+    let mut usage = entry.usage;
+    usage.normalize_cache_creation_buckets();
     CanonicalIntegrityRecord {
         host_id,
         vendor,
@@ -393,11 +395,11 @@ fn canonical_record(
         model: entry.model,
         effort: entry.effort,
         fast_tier: entry.fast_tier,
-        input_tokens: entry.usage.input_tokens,
-        output_tokens: entry.usage.output_tokens,
-        cache_read_input_tokens: entry.usage.cache_read_input_tokens,
-        cache_creation_input_tokens: entry.usage.cache_creation_input_tokens,
-        reasoning_output_tokens: entry.usage.reasoning_output_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
         cost_input: entry.costs.map(|costs| costs.input),
         cost_output: entry.costs.map(|costs| costs.output),
         cost_cache_read: entry.costs.map(|costs| costs.cache_read),
@@ -456,6 +458,8 @@ mod tests {
                     output_tokens: 2,
                     cache_read_input_tokens: 3,
                     cache_creation_input_tokens: 4,
+                    cache_creation_5m_input_tokens: 0,
+                    cache_creation_1h_input_tokens: 0,
                     reasoning_output_tokens: 5,
                 },
                 costs: None,

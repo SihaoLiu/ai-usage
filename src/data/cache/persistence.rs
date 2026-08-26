@@ -170,90 +170,41 @@ pub(super) fn write_manifest(path: &Path, manifest: &CacheManifest) -> io::Resul
 pub(super) fn read_cached_records(path: &Path) -> io::Result<Vec<PersistedSourceRecord>> {
     #[cfg(test)]
     CACHED_RECORD_READS.set(CACHED_RECORD_READS.get() + 1);
-    if let Ok(decoded) = deserialize_framed::<PersistedVendorRecords>(path, ENTRY_FILE_MAGIC) {
-        if decoded.format_version != CACHE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported cache entry version",
-            ));
-        }
-        if decoded
-            .records
-            .iter()
-            .any(|record| !record.has_non_negative_token_usage())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cache entry has negative token count",
-            ));
-        }
-        return Ok(decoded.records);
+    if let Ok(decoded) = deserialize_framed::<PersistedVendorRecords>(path, ENTRY_FILE_MAGIC)
+        && decoded.format_version == CACHE_VERSION
+    {
+        return validate_source_records(decoded.records);
+    }
+
+    if let Ok(decoded) =
+        deserialize_framed::<PersistedVendorRecordsBeforeCacheDurations>(path, ENTRY_FILE_MAGIC)
+        && decoded.format_version == LEGACY_CACHE_VERSION
+    {
+        return validate_source_records(decoded.records.into_iter().map(Into::into).collect());
     }
 
     if let Ok(decoded) =
         deserialize_framed::<PersistedVendorRecordsBeforeSession>(path, ENTRY_FILE_MAGIC)
+        && decoded.format_version == LEGACY_CACHE_VERSION
     {
-        if decoded.format_version != CACHE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported cache entry version",
-            ));
-        }
-        let records: Vec<PersistedSourceRecord> =
-            decoded.records.into_iter().map(Into::into).collect();
-        if records
-            .iter()
-            .any(|record| !record.has_non_negative_token_usage())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cache entry has negative token count",
-            ));
-        }
-        return Ok(records);
+        return validate_source_records(decoded.records.into_iter().map(Into::into).collect());
     }
 
     if let Ok(decoded) =
         deserialize_framed::<PersistedVendorRecordsWithFastTier>(path, ENTRY_FILE_MAGIC)
+        && decoded.format_version == LEGACY_CACHE_VERSION
     {
-        if decoded.format_version != CACHE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported cache entry version",
-            ));
-        }
-        let records: Vec<PersistedSourceRecord> =
-            decoded.records.into_iter().map(Into::into).collect();
-        if records
-            .iter()
-            .any(|record| !record.has_non_negative_token_usage())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cache entry has negative token count",
-            ));
-        }
-        return Ok(records);
+        return validate_source_records(decoded.records.into_iter().map(Into::into).collect());
     }
 
     let decoded: PersistedVendorRecordsV1 = deserialize_framed(path, ENTRY_FILE_MAGIC)?;
-    if decoded.format_version != CACHE_VERSION {
+    if decoded.format_version != LEGACY_CACHE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported cache entry version",
         ));
     }
-    let records: Vec<PersistedSourceRecord> = decoded.records.into_iter().map(Into::into).collect();
-    if records
-        .iter()
-        .any(|record| !record.has_non_negative_token_usage())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cache entry has negative token count",
-        ));
-    }
-    Ok(records)
+    validate_source_records(decoded.records.into_iter().map(Into::into).collect())
 }
 
 pub(super) fn write_cached_records(
@@ -272,57 +223,60 @@ pub(super) fn write_cached_records(
 pub(super) fn read_remote_records(path: &Path) -> io::Result<Vec<PersistedRemoteRecord>> {
     #[cfg(test)]
     REMOTE_RECORD_READS.set(REMOTE_RECORD_READS.get() + 1);
-    if let Ok(decoded) = deserialize_framed::<PersistedRemoteRecords>(path, REMOTE_FILE_MAGIC) {
-        if decoded.format_version != CACHE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported remote cache entry version",
-            ));
-        }
-        if decoded
-            .records
-            .iter()
-            .any(|record| !record.has_non_negative_token_usage())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "remote cache entry has negative token count",
-            ));
-        }
-        return Ok(decoded.records);
+    if let Ok(decoded) = deserialize_framed::<PersistedRemoteRecords>(path, REMOTE_FILE_MAGIC)
+        && decoded.format_version == CACHE_VERSION
+    {
+        return validate_remote_records(decoded.records);
+    }
+
+    if let Ok(decoded) =
+        deserialize_framed::<PersistedRemoteRecordsBeforeCacheDurations>(path, REMOTE_FILE_MAGIC)
+        && decoded.format_version == LEGACY_CACHE_VERSION
+    {
+        return validate_remote_records(decoded.records.into_iter().map(Into::into).collect());
     }
 
     if let Ok(decoded) =
         deserialize_framed::<PersistedRemoteRecordsWithFastTier>(path, REMOTE_FILE_MAGIC)
+        && decoded.format_version == LEGACY_CACHE_VERSION
     {
-        if decoded.format_version != CACHE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported remote cache entry version",
-            ));
-        }
-        let records: Vec<PersistedRemoteRecord> =
-            decoded.records.into_iter().map(Into::into).collect();
-        if records
-            .iter()
-            .any(|record| !record.has_non_negative_token_usage())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "remote cache entry has negative token count",
-            ));
-        }
-        return Ok(records);
+        return validate_remote_records(decoded.records.into_iter().map(Into::into).collect());
     }
 
     let decoded: PersistedRemoteRecordsV1 = deserialize_framed(path, REMOTE_FILE_MAGIC)?;
-    if decoded.format_version != CACHE_VERSION {
+    if decoded.format_version != LEGACY_CACHE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported remote cache entry version",
         ));
     }
-    let records: Vec<PersistedRemoteRecord> = decoded.records.into_iter().map(Into::into).collect();
+    validate_remote_records(decoded.records.into_iter().map(Into::into).collect())
+}
+
+fn validate_source_records(
+    mut records: Vec<PersistedSourceRecord>,
+) -> io::Result<Vec<PersistedSourceRecord>> {
+    for record in &mut records {
+        record.normalize_cache_creation();
+    }
+    if records
+        .iter()
+        .any(|record| !record.has_non_negative_token_usage())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache entry has negative token count",
+        ));
+    }
+    Ok(records)
+}
+
+fn validate_remote_records(
+    mut records: Vec<PersistedRemoteRecord>,
+) -> io::Result<Vec<PersistedRemoteRecord>> {
+    for record in &mut records {
+        record.normalize_cache_creation();
+    }
     if records
         .iter()
         .any(|record| !record.has_non_negative_token_usage())
@@ -431,13 +385,14 @@ pub(super) fn try_for_each_current_cached_record<E>(
         VisitCurrentCachedRecordsError::Cache(io::Error::new(io::ErrorKind::InvalidData, error))
     })?;
     for _ in 0..record_count {
-        let record: PersistedSourceRecord =
+        let mut record: PersistedSourceRecord =
             bincode::deserialize_from(&mut reader).map_err(|error| {
                 VisitCurrentCachedRecordsError::Cache(io::Error::new(
                     io::ErrorKind::InvalidData,
                     error,
                 ))
             })?;
+        record.normalize_cache_creation();
         if !record.has_non_negative_token_usage() {
             return Err(VisitCurrentCachedRecordsError::Cache(io::Error::new(
                 io::ErrorKind::InvalidData,

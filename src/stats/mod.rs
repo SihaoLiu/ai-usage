@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::constants::{AllPricing, ModelPricing};
-use crate::data::UsageEntry;
+use crate::data::{TokenUsage, UsageEntry};
 use crate::model_id::normalize_reasoning_effort;
 use crate::time_utils::{
     TokenFractions, distribute_tokens_to_intervals, parse_timestamp, to_interval,
@@ -38,7 +38,7 @@ fn resolve_entry_pricing<'a>(
     let mut resolved = HashMap::new();
     for entry in usage_data
         .iter()
-        .filter(|entry| tool == "omp" || entry.costs.is_none())
+        .filter(|entry| tool == "omp" || entry.costs.is_none() || tool == "claude")
     {
         let tiers = resolved
             .entry(entry.model.as_str())
@@ -149,20 +149,20 @@ fn accumulate_breakdown_entry(
             row.reasoning = row.reasoning.saturating_add(reasoning);
             row.cache_creation = row
                 .cache_creation
-                .saturating_add(entry.usage.cache_creation_input_tokens);
+                .saturating_add(entry.usage.effective_cache_creation_input_tokens());
         }
         "gemini" => {
             row.thinking = row
                 .thinking
-                .saturating_add(entry.usage.cache_creation_input_tokens);
+                .saturating_add(entry.usage.effective_cache_creation_input_tokens());
             row.cache_creation = row
                 .cache_creation
-                .saturating_add(entry.usage.cache_creation_input_tokens);
+                .saturating_add(entry.usage.effective_cache_creation_input_tokens());
         }
         _ => {
             row.cache_creation = row
                 .cache_creation
-                .saturating_add(entry.usage.cache_creation_input_tokens);
+                .saturating_add(entry.usage.effective_cache_creation_input_tokens());
         }
     }
     if tool != "omp"
@@ -171,7 +171,12 @@ fn accumulate_breakdown_entry(
         row.input_cost += costs.input;
         row.output_cost += costs.output;
         row.cache_read_cost += costs.cache_read;
-        row.cache_creation_cost += costs.cache_creation;
+        row.cache_creation_cost += if tool == "claude" {
+            let p = &entry_pricing[entry.model.as_str()][&entry.fast_tier];
+            claude_cache_creation_cost(&entry.usage, p)
+        } else {
+            costs.cache_creation
+        };
         return;
     }
 
@@ -187,26 +192,40 @@ fn accumulate_breakdown_entry(
     );
     row.cache_creation_cost += match tool {
         "omp" => ModelPricing::tier_cost(
-            entry.usage.cache_creation_input_tokens,
+            entry.usage.effective_cache_creation_input_tokens(),
             p.cache_output,
             p.cache_output_above_200k,
         ),
         "codex" => ModelPricing::tier_cost(
-            entry.usage.cache_creation_input_tokens,
+            entry.usage.effective_cache_creation_input_tokens(),
             p.cache_output,
             p.cache_output_above_200k,
         ),
         "gemini" => ModelPricing::tier_cost(
-            entry.usage.cache_creation_input_tokens,
+            entry.usage.effective_cache_creation_input_tokens(),
             p.output,
             p.output_above_200k,
         ),
+        "claude" => claude_cache_creation_cost(&entry.usage, p),
         _ => ModelPricing::tier_cost(
-            entry.usage.cache_creation_input_tokens,
+            entry.usage.effective_cache_creation_input_tokens(),
             p.cache_output,
             p.cache_output_above_200k,
         ),
     };
+}
+
+fn claude_cache_creation_cost(usage: &TokenUsage, pricing: &ModelPricing) -> f64 {
+    let (five_minute, one_hour) = usage.cache_creation_buckets();
+    ModelPricing::tier_cost(
+        five_minute,
+        pricing.cache_output,
+        pricing.cache_output_above_200k,
+    ) + ModelPricing::tier_cost(
+        one_hour,
+        pricing.cache_output_1h_rate(),
+        pricing.cache_output_1h_above_200k_rate(),
+    )
 }
 
 fn merge_breakdown_rows(a: &mut ModelBreakdownRow, b: ModelBreakdownRow) {
@@ -251,7 +270,7 @@ pub(crate) fn entry_total_with_cache(entry: &UsageEntry) -> u128 {
         entry.usage.input_tokens,
         entry.usage.output_tokens,
         entry.usage.cache_read_input_tokens,
-        entry.usage.cache_creation_input_tokens,
+        entry.usage.effective_cache_creation_input_tokens(),
     ]
     .into_iter()
     .map(|tokens| tokens.max(0) as u128)
@@ -341,13 +360,13 @@ fn accumulate_time_series_entry(
             "codex" => entry
                 .usage
                 .input_tokens
-                .saturating_add(entry.usage.cache_creation_input_tokens),
+                .saturating_add(entry.usage.effective_cache_creation_input_tokens()),
             _ => entry.usage.input_tokens,
         } as f64,
         output: output as f64,
         cache_creation: match tool {
             "codex" => reasoning as f64,
-            _ => entry.usage.cache_creation_input_tokens as f64,
+            _ => entry.usage.effective_cache_creation_input_tokens() as f64,
         },
         cache_read: entry.usage.cache_read_input_tokens as f64,
     };
@@ -588,6 +607,8 @@ mod tests {
                 output_tokens: 100_000,
                 cache_read_input_tokens: 500_000,
                 cache_creation_input_tokens: 20_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
                 reasoning_output_tokens: 0,
             },
             costs,
@@ -605,6 +626,27 @@ mod tests {
         assert_eq!(rows[0].model, "gpt-5");
         assert!(rows[0].input_cost > 0.0);
         assert!(rows[0].output_cost > 0.0);
+    }
+
+    #[test]
+    fn claude_cache_creation_uses_retention_duration_rates() {
+        let pricing = AllPricing::load_raw().finalize();
+        let mut entry = usage_entry("claude-fable-5", None, None);
+        entry.usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 11,
+            cache_creation_5m_input_tokens: 4,
+            cache_creation_1h_input_tokens: 7,
+            reasoning_output_tokens: 0,
+        };
+
+        let rows = calculate_model_breakdown_generic(&[entry], "claude", true, &pricing);
+
+        assert_eq!(rows.len(), 1);
+        let expected = (4.0 * 12.5 + 7.0 * 20.0) / 1_000_000.0;
+        assert!((rows[0].cache_creation_cost - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -629,6 +671,8 @@ mod tests {
             output_tokens: 10,
             cache_read_input_tokens: 80,
             cache_creation_input_tokens: 5,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: 4,
         };
 
@@ -661,6 +705,8 @@ mod tests {
             output_tokens: 3,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: 9,
         };
 
@@ -682,6 +728,8 @@ mod tests {
             output_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 5,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: 0,
         };
 
@@ -703,10 +751,12 @@ mod tests {
                 output: 10.0,
                 cache_input: 0.1,
                 cache_output: 5.0,
+                cache_output_1h: None,
                 input_above_200k: None,
                 output_above_200k: Some(20.0),
                 cache_input_above_200k: None,
                 cache_output_above_200k: Some(7.0),
+                cache_output_1h_above_200k: None,
                 _comment: None,
             },
         )]));
@@ -716,6 +766,8 @@ mod tests {
             output_tokens: 250_000,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 100_000,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
             reasoning_output_tokens: 100_000,
         };
 

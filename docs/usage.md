@@ -112,15 +112,18 @@ In monitor mode, `cost` or `cost all` shows all current values, while `cost clau
 
 ## Supported Models
 
-Model display names and pricing are resolved **dynamically**, so newly released
-models (e.g. a future `claude-opus-4-9`, `gpt-5.6`, `gemini-3.2-pro`) render and
-price correctly with no upgrade required.
+Model display names and pricing are resolved **dynamically**, so a newly
+released point version (e.g. a future `claude-opus-4-9`, `gpt-6.1`,
+`gemini-3.9-flash`) renders and prices correctly with no upgrade required. A new
+*variant* token (the `sol` / `terra` / `astra` axis) is the one case that needs
+either an upgrade or a `models.toml` entry, since the parser cannot tell a
+variant name apart from an unrelated suffix.
 
 **Display names** are derived algorithmically from the model id:
 
-- `claude-opus-4-8` -> `Opus 4.8`
-- `gpt-5.5-codex` -> `GPT-5.5 Cdx`, `gpt-5.5:xhigh` -> `GPT-5.5(XH)`
-- `gemini-3.2-pro-preview` -> `Gem 3.2 Pro`
+- `claude-opus-4-8` -> `Opus 4.8`, `claude-fable-5-1` -> `Fable 5.1`
+- `gpt-6-astra` -> `GPT-6 Astra`, `gpt-5.5:xhigh` -> `GPT-5.5(XH)`
+- `gemini-3.8-flash` -> `Gem 3.8 Fl`
 - `k3` -> `K3`, `kimi-for-coding` -> `Kimi Coding`
 
 **Pricing** is layered, newest wins:

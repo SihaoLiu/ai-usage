@@ -5,9 +5,10 @@
 //! derived: a short display label, a chart sort key, and a chart color family.
 //!
 //! The point is to avoid hand-maintained per-model tables. A newly released
-//! model (e.g. `claude-opus-4-8`, `gpt-5.6`, `gemini-3.2-pro`) parses into a
-//! sensible label with zero code changes. Genuinely irregular cases are the
-//! job of the external user override file, not this parser.
+//! model (e.g. `claude-opus-4-9`, `gpt-6.1`, `gemini-3.9-flash`) parses into a
+//! sensible label with zero code changes. Only a new *variant* token (the
+//! `sol`/`terra`/`astra` axis) has to be registered below; genuinely irregular
+//! cases are the job of the external user override file, not this parser.
 
 /// The model maker (vendor) a model belongs to, inferred from the id itself
 /// (not from whichever harness happened to log it). This is the "Vendor" axis
@@ -621,11 +622,11 @@ pub fn parse_model_identity(raw: &str) -> ModelIdentity {
 }
 
 const OPENAI_MODIFIERS: &[&str] = &[
-    "mini", "nano", "max", "spark", "codex", "pro", "sol", "terra", "luna",
+    "mini", "nano", "max", "spark", "codex", "pro", "astra", "sol", "terra", "luna",
 ];
 const GEMINI_MODIFIERS: &[&str] = &["pro", "flash", "lite", "image", "ultra"];
 const KIMI_MODIFIERS: &[&str] = &["coding", "highspeed", "turbo"];
-const ZHIPU_MODIFIERS: &[&str] = &["air", "airx", "x", "flash", "flashx"];
+const ZHIPU_MODIFIERS: &[&str] = &["air", "airx", "x", "flash", "flashx", "turbo"];
 const GENERIC_MODIFIERS: &[&str] = &[
     "pro",
     "flash",
@@ -839,6 +840,8 @@ fn modifier_abbrev(vendor: Vendor, modifiers: &[String]) -> Option<&'static str>
                 Some("Nano")
             } else if has("spark") {
                 Some("Sprk")
+            } else if has("astra") {
+                Some("Astra")
             } else if has("sol") {
                 Some("Sol")
             } else if has("terra") {
@@ -889,6 +892,8 @@ fn modifier_abbrev(vendor: Vendor, modifiers: &[String]) -> Option<&'static str>
                 Some("Air")
             } else if has("flash") {
                 Some("Fl")
+            } else if has("turbo") {
+                Some("Tb")
             } else if has("x") {
                 Some("X")
             } else {
@@ -1065,6 +1070,7 @@ mod tests {
         assert_eq!(label("gpt-5.1-codex-max"), "GPT-5.1 Max");
         assert_eq!(label("gpt-5.1-codex-mini"), "GPT-5.1 Mini");
         assert_eq!(label("gpt-5.3-codex-spark"), "GPT-5.3 Sprk");
+        assert_eq!(label("gpt-6-astra"), "GPT-6 Astra");
         assert_eq!(label("gpt-5.6-sol"), "GPT-5.6 Sol");
         assert_eq!(label("gpt-5.6-terra"), "GPT-5.6 Terra");
         assert_eq!(label("gpt-5.6-luna"), "GPT-5.6 Luna");
@@ -1153,6 +1159,9 @@ mod tests {
         assert_eq!(label("glm-4.5-flash"), "GLM-4.5 Fl");
         assert_eq!(label("glm-4.5-x"), "GLM-4.5 X");
         assert_eq!(label("glm-4.5-airx"), "GLM-4.5 AirX");
+        // Turbo is its own price class; it must not collapse onto the base id.
+        assert_eq!(label("glm-5.2-turbo"), "GLM-5.2 Tb");
+        assert_eq!(label("glm-5-turbo"), "GLM-5 Tb");
         assert_eq!(label("zai-org/GLM-5.2"), "GLM-5.2");
         assert_eq!(label("z.ai.GLM-5.1"), "GLM-5.1");
         assert_eq!(canonical_model_leaf("z.ai.GLM-5.1"), "glm-5.1");

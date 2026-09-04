@@ -776,7 +776,7 @@ mod tests {
         assert!((opus_new.output - 25.0).abs() < 1e-9);
 
         // A future fable release borrows the newest fable rate (10/50).
-        let fable_new = p.get_pricing("claude", "claude-fable-5-1");
+        let fable_new = p.get_pricing("claude", "claude-fable-5-2");
         assert!((fable_new.input - 10.0).abs() < 1e-9);
         assert!((fable_new.output - 50.0).abs() < 1e-9);
 
@@ -796,6 +796,14 @@ mod tests {
         assert!((fable.cache_output - 12.5).abs() < 1e-9);
         assert_eq!(fable.cache_output_1h, Some(20.0));
         assert!(fable.input_above_200k.is_none());
+
+        // Fable 5.1 is the one family whose cache hits bill at 0.025x input
+        // rather than the 0.1x every other Claude model uses.
+        let fable51 = p.get_pricing("claude", "claude-fable-5-1");
+        assert!((fable51.cache_input - 0.25).abs() < 1e-9);
+        assert!((fable51.cache_output - 12.5).abs() < 1e-9);
+        let mythos51 = p.get_pricing("claude", "claude-mythos-5-1");
+        assert!((mythos51.cache_input - 0.25).abs() < 1e-9);
 
         let mythos = p.get_pricing("claude", "claude-mythos-5");
         assert!((mythos.input - 10.0).abs() < 1e-9);
@@ -869,16 +877,25 @@ mod tests {
     fn embedded_pricing_covers_current_models() {
         let p = AllPricing::load_raw().finalize();
         let cases = [
+            ("claude", "claude-fable-5-1", 10.0, 50.0),
+            ("claude", "claude-mythos-5-1", 10.0, 50.0),
             ("claude", "claude-opus-5", 5.0, 25.0),
             ("claude", "claude-sonnet-5", 2.0, 10.0),
-            ("codex", "gpt-5.6-sol", 5.0, 30.0),
-            ("codex", "gpt-5.6-terra", 2.5, 15.0),
-            ("codex", "gpt-5.6-luna", 1.0, 6.0),
-            ("gemini", "gemini-3.6-flash", 1.5, 7.5),
+            ("codex", "gpt-6-astra", 10.0, 50.0),
+            ("codex", "gpt-5.6-sol", 4.0, 20.0),
+            ("codex", "gpt-5.6-terra", 2.0, 12.0),
+            ("codex", "gpt-5.6-luna", 0.2, 1.2),
+            ("gemini", "gemini-3.8-flash", 0.75, 3.75),
+            ("gemini", "gemini-3.7-flash", 0.75, 3.75),
+            ("gemini", "gemini-3.6-flash", 0.75, 3.75),
             ("gemini", "gemini-3.5-flash", 1.5, 9.0),
             ("gemini", "gemini-3.5-flash-lite", 0.3, 2.5),
             ("deepseek", "deepseek-v4-flash", 0.14, 0.28),
+            ("zhipu", "glm-5.3", 1.4, 4.4),
+            ("zhipu", "glm-5.3-flash", 0.075, 0.25),
+            ("zhipu", "glm-5.2", 1.4, 4.4),
             ("zhipu", "glm-5.1", 1.4, 4.4),
+            ("spacexai", "grok-4.6", 2.0, 6.0),
             ("spacexai", "grok-4.5", 2.0, 6.0),
             ("spacexai", "grok-4.5-latest", 2.0, 6.0),
             ("spacexai", "grok-build-latest", 2.0, 6.0),
@@ -1169,7 +1186,7 @@ mod tests {
         assert!((unknown.input - 3.0).abs() < 1e-9);
 
         let omp = p.pricing_for_entry("omp", "totally-mystery-thing", 0);
-        assert!((omp.input - 5.0).abs() < 1e-9);
+        assert!((omp.input - 10.0).abs() < 1e-9);
 
         let recognized_without_book = p.pricing_for_entry("claude", "llama-4-maverick", 0);
         assert!(recognized_without_book.input.abs() < 1e-9);

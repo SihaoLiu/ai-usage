@@ -1,7 +1,7 @@
 {
   "_meta": {
     "description": "API pricing and subscription costs for AI services",
-    "last_updated": "2026-08-26",
+    "last_updated": "2026-09-04",
     "notes": "All prices are per million tokens (MTok) at standard API rates. Provider-specific and whole-request long-context premiums require an exact matching entry.",
     "sources": {
       "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
@@ -28,6 +28,22 @@
         "cache_output": 2.50,
         "cache_output_1h": 4.00,
         "_comment": "Current standard rate; the previously announced September 2026 increase was canceled"
+      },
+      "claude-fable-5-1": {
+        "input": 10.00,
+        "output": 50.00,
+        "cache_input": 0.25,
+        "cache_output": 12.50,
+        "cache_output_1h": 20.00,
+        "_comment": "Cache hits bill at 0.025x input instead of the usual 0.1x"
+      },
+      "claude-mythos-5-1": {
+        "input": 10.00,
+        "output": 50.00,
+        "cache_input": 0.25,
+        "cache_output": 12.50,
+        "cache_output_1h": 20.00,
+        "_comment": "Same model and pricing as claude-fable-5-1"
       },
       "claude-fable-5": {
         "input": 10.00,
@@ -122,30 +138,37 @@
   },
   "codex": {
     "models": {
+      "gpt-6-astra": {
+        "input": 10.00,
+        "output": 50.00,
+        "cache_input": 1.00,
+        "cache_output": 12.50,
+        "_comment": "Standard context rate; prompts above 272k reprice the whole request and are not represented by the prorated tier fields"
+      },
       "gpt-5.6": {
-        "input": 5.00,
-        "output": 30.00,
-        "cache_input": 0.50,
-        "cache_output": 6.25,
+        "input": 4.00,
+        "output": 20.00,
+        "cache_input": 0.40,
+        "cache_output": 5.00,
         "_comment": "Alias of gpt-5.6-sol"
       },
       "gpt-5.6-sol": {
-        "input": 5.00,
-        "output": 30.00,
-        "cache_input": 0.50,
-        "cache_output": 6.25
+        "input": 4.00,
+        "output": 20.00,
+        "cache_input": 0.40,
+        "cache_output": 5.00
       },
       "gpt-5.6-terra": {
-        "input": 2.50,
-        "output": 15.00,
-        "cache_input": 0.25,
-        "cache_output": 3.125
+        "input": 2.00,
+        "output": 12.00,
+        "cache_input": 0.20,
+        "cache_output": 2.50
       },
       "gpt-5.6-luna": {
-        "input": 1.00,
-        "output": 6.00,
-        "cache_input": 0.10,
-        "cache_output": 1.25
+        "input": 0.20,
+        "output": 1.20,
+        "cache_input": 0.02,
+        "cache_output": 0.25
       },
       "gpt-5.5": {
         "input": 5.00,
@@ -301,20 +324,35 @@
       }
     },
     "default": {
-      "input": 5.00,
-      "output": 30.00,
-      "cache_input": 0.50,
-      "cache_output": 6.25,
+      "input": 10.00,
+      "output": 50.00,
+      "cache_input": 1.00,
+      "cache_output": 12.50,
       "_comment": "Fallback, using the current flagship standard rate"
     }
   },
   "gemini": {
     "models": {
+      "gemini-3.8-flash": {
+        "input": 0.75,
+        "output": 3.75,
+        "cache_input": 0.075,
+        "cache_output": 0.0,
+        "_comment": "Introductory rate through 2026-12-31; doubles to 1.50/7.50 on 2027-01-01"
+      },
+      "gemini-3.7-flash": {
+        "input": 0.75,
+        "output": 3.75,
+        "cache_input": 0.075,
+        "cache_output": 0.0,
+        "_comment": "Shares the Flash 3.x introductory rate and its 2026-12-31 expiry"
+      },
       "gemini-3.6-flash": {
-        "input": 1.50,
-        "output": 7.50,
-        "cache_input": 0.15,
-        "cache_output": 0.0
+        "input": 0.75,
+        "output": 3.75,
+        "cache_input": 0.075,
+        "cache_output": 0.0,
+        "_comment": "Shares the Flash 3.x introductory rate and its 2026-12-31 expiry"
       },
       "gemini-3.5-flash": {
         "input": 1.50,
@@ -397,9 +435,9 @@
       }
     },
     "default": {
-      "input": 1.50,
-      "output": 7.50,
-      "cache_input": 0.15,
+      "input": 0.75,
+      "output": 3.75,
+      "cache_input": 0.075,
       "cache_output": 0.0,
       "_comment": "Fallback, using the current Flash standard rate"
     }
@@ -456,6 +494,24 @@
   },
   "zhipu": {
     "models": {
+      "glm-5.3": {
+        "input": 1.40,
+        "output": 4.40,
+        "cache_input": 0.26,
+        "cache_output": 1.40
+      },
+      "glm-5.3-flash": {
+        "input": 0.075,
+        "output": 0.25,
+        "cache_input": 0.015,
+        "cache_output": 0.075
+      },
+      "glm-5.2": {
+        "input": 1.40,
+        "output": 4.40,
+        "cache_input": 0.26,
+        "cache_output": 1.40
+      },
       "glm-5.1": {
         "input": 1.40,
         "output": 4.40,
@@ -534,6 +590,13 @@
   },
   "spacexai": {
     "models": {
+      "grok-4.6": {
+        "input": 2.00,
+        "output": 6.00,
+        "cache_input": 0.50,
+        "cache_output": 2.00,
+        "_comment": "Standard context rate; whole-request long-context pricing is not represented by the prorated tier fields"
+      },
       "grok-4.5": {
         "input": 2.00,
         "output": 6.00,
@@ -601,7 +664,7 @@
     "default": {
       "input": 2.00,
       "output": 6.00,
-      "cache_input": 0.30,
+      "cache_input": 0.50,
       "cache_output": 2.00,
       "_comment": "Fallback, using the current flagship standard-context rate"
     }
@@ -621,6 +684,7 @@
       "1": {
         "default": 1.0,
         "models": {
+          "gpt-6-astra": 2.0,
           "gpt-5.5": 2.5,
           "gpt-5.5-codex": 2.5,
           "gpt-5.4": 2.0,

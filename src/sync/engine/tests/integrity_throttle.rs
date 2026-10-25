@@ -340,7 +340,7 @@ fn degraded_integrity_repair_does_not_recheck_or_clear_on_the_next_attempt() {
     )
     .expect("owner report");
     let transport = FakeTransport {
-        reject_pull_vendor: Some("kimi"),
+        reject_pull_vendor: Some("dsh"),
         ..FakeTransport::new_with_integrity(
             vec![
                 PullResponse {

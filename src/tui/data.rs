@@ -357,6 +357,7 @@ pub fn build(state: &mut AppState) -> Dashboard {
             Tool::Gemini => &all_data.gemini,
             Tool::Kimi => &all_data.kimi,
             Tool::Omp => &all_data.omp,
+            Tool::Dsh => &all_data.dsh,
             _ => &all_data.claude,
         };
         let (model_stats, model_ts) = stats::calculate_model_dashboard_data(

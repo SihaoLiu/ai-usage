@@ -157,7 +157,7 @@ impl RowMetrics {
             _ => (row.input.saturating_add(row.cache_creation), row.output),
         };
         let (prefill_cost, decoding_cost) = match row.tool.as_str() {
-            "claude" | "codex" | "kimi" | "omp" => {
+            "claude" | "codex" | "kimi" | "omp" | "dsh" => {
                 (row.input_cost + row.cache_creation_cost, row.output_cost)
             }
             _ => (row.input_cost, row.output_cost + row.cache_creation_cost),

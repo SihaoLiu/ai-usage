@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A Rust utility for monitoring token usage and costs across multiple AI coding assistants: **Claude Code**, **OpenAI Codex**, **Google Gemini CLI**, **Kimi Code**, and **Oh My Pi**.
+A Rust utility for monitoring token usage and costs across multiple AI coding assistants: **Claude Code**, **OpenAI Codex**, **Google Gemini CLI**, **Kimi Code**, **Oh My Pi**, and **DeepSeek Harness (`dsh`)**.
 
 ## Building and Running
 
@@ -27,6 +27,7 @@ cargo build --release
 ./target/release/ai-usage --tool gemini
 ./target/release/ai-usage --tool kimi
 ./target/release/ai-usage --tool omp
+./target/release/ai-usage --tool dsh
 
 # Breakdown table shape and descending sort key
 ./target/release/ai-usage --view flat --sort msgs    # one row per model, harnesses merged
@@ -42,6 +43,7 @@ cargo build --release
 | Gemini | `~/.gemini/tmp/` | `<hash>/chats/session-*.json` |
 | Kimi Code | `~/.kimi-code/sessions/` | `**/agents/*/wire.jsonl` |
 | Oh My Pi | `~/.omp/agent/sessions/` | `**/*.jsonl` |
+| DeepSeek Harness (`dsh`) | `~/.dsh/sessions/` | `--<cwd>--/<session>/session[.vN].jsonl[.zstd]` |
 
 Environment variables can override default paths:
 - `CLAUDE_CONFIG_DIR` (default: `~/.claude`)
@@ -49,6 +51,7 @@ Environment variables can override default paths:
 - `GEMINI_CONFIG_DIR` (default: `~/.gemini`)
 - `KIMI_CONFIG_DIR` (default: `~/.kimi-code`)
 - `OMP_CONFIG_DIR` (default: `~/.omp`)
+- `DSH_HOME` (default: `~/.dsh`; checkpoints live below `sessions/`)
 
 ## Architecture
 
@@ -84,6 +87,7 @@ src/
     gemini.rs        # Gemini data reader (JSON sessions)
     kimi.rs          # Kimi Code data reader (wire.jsonl usage.record events)
     omp.rs           # Oh My Pi data reader (message usage lines)
+    dsh.rs           # DeepSeek Harness reader (zstd session-log frames, provider usage)
   stats/
     mod.rs           # Generic model breakdown and time series calculation
     claude.rs        # Claude statistics wrappers
@@ -91,6 +95,7 @@ src/
     gemini.rs        # Gemini statistics wrappers
     kimi.rs          # Kimi statistics wrappers
     omp.rs           # Oh My Pi statistics wrappers
+    dsh.rs           # DeepSeek Harness statistics wrappers
   sync/              # Optional cross-machine sync client (see docs/sync.md)
 crates/
   ai-usage-proto     # Shared wire types and validation for sync

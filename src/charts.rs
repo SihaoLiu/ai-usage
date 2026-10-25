@@ -877,6 +877,7 @@ pub(crate) fn tool_color_index(tool: &str) -> u8 {
         "Gemini CLI" => 33,
         "Kimi Code" => 49,
         "Oh My Pi" => 141,
+        "dsh" => 51,
         "All" => 226,
         _ => 135,
     }
@@ -1801,6 +1802,7 @@ pub(crate) fn comparison_tool_order(all_tools: &HashSet<String>) -> Vec<String> 
         "Gemini CLI",
         "Kimi Code",
         "Oh My Pi",
+        "dsh",
     ];
     let mut tools_sorted: Vec<String> = tool_order
         .iter()

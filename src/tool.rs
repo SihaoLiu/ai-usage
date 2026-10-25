@@ -9,17 +9,19 @@ pub enum Tool {
     Gemini,
     Kimi,
     Omp,
+    Dsh,
     All,
 }
 
 impl Tool {
-    pub const ROTATION: [Tool; 6] = [
+    pub const ROTATION: [Tool; 7] = [
         Tool::All,
         Tool::Claude,
         Tool::Codex,
         Tool::Gemini,
         Tool::Kimi,
         Tool::Omp,
+        Tool::Dsh,
     ];
 
     pub fn key(self) -> &'static str {
@@ -29,6 +31,7 @@ impl Tool {
             Tool::Gemini => "gemini",
             Tool::Kimi => "kimi",
             Tool::Omp => "omp",
+            Tool::Dsh => "dsh",
             Tool::All => "all",
         }
     }
@@ -40,6 +43,7 @@ impl Tool {
             Tool::Gemini => "Gemini CLI",
             Tool::Kimi => "Kimi Code",
             Tool::Omp => "Oh My Pi",
+            Tool::Dsh => "dsh",
             Tool::All => "All Tools",
         }
     }
@@ -59,6 +63,7 @@ impl Tool {
             Tool::Gemini => "GCli",
             Tool::Kimi => "KC",
             Tool::Omp => "OMP",
+            Tool::Dsh => "dsh",
             Tool::All => "All",
         }
     }
@@ -70,6 +75,7 @@ impl Tool {
             "gemini" => Some(Tool::Gemini),
             "kimi" => Some(Tool::Kimi),
             "omp" => Some(Tool::Omp),
+            "dsh" => Some(Tool::Dsh),
             "all" => Some(Tool::All),
             _ => None,
         }

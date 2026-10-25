@@ -23,12 +23,13 @@ fn parser_revisions_are_owned_per_harness() {
     assert_eq!(crate::data::cache::parser_revision("gemini"), 3);
     assert_eq!(crate::data::cache::parser_revision("kimi"), 4);
     assert_eq!(crate::data::cache::parser_revision("omp"), 4);
+    assert_eq!(crate::data::cache::parser_revision("dsh"), 1);
     assert_eq!(crate::data::cache::parser_revision("unknown"), 0);
 }
 
 #[test]
 fn changed_harness_parsers_reparse_active_sources_and_drop_stale_inactive_records() {
-    for vendor in ["claude", "codex", "gemini", "kimi", "omp"] {
+    for vendor in ["claude", "codex", "gemini", "kimi", "omp", "dsh"] {
         let cache_root = unique_temp_dir(&format!("{vendor}-parser-migration"));
         let active = cache_root.join("active.jsonl");
         let retired = cache_root.join("retired.jsonl");
@@ -52,16 +53,18 @@ fn changed_harness_parsers_reparse_active_sources_and_drop_stale_inactive_record
             },
         );
 
+        let stale_revision = crate::data::cache::parser_revision(vendor).saturating_sub(1);
         let manifest_path = cache_root.join(crate::data::cache::MANIFEST_FILE);
         let mut manifest: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read old manifest"))
                 .expect("parse old manifest");
-        manifest["vendors"][vendor]["session_metadata_revision"] = serde_json::json!(1);
+        manifest["vendors"][vendor]["session_metadata_revision"] =
+            serde_json::json!(stale_revision);
         manifest["vendors"][vendor]["files"]
             .as_object_mut()
             .expect("files object")
             .values_mut()
-            .for_each(|meta| meta["parser_revision"] = serde_json::json!(1));
+            .for_each(|meta| meta["parser_revision"] = serde_json::json!(stale_revision));
         fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&manifest).expect("serialize old manifest"),

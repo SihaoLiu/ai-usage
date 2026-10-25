@@ -1048,7 +1048,7 @@ fn pull_and_integrity_skips_integrity_on_degraded_pull() {
             max_seq: 0,
             truncated: false,
         }],
-        "kimi",
+        "dsh",
     );
 
     run_pull_and_integrity_once_with_progress(

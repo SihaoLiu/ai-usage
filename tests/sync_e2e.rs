@@ -95,6 +95,9 @@ fn run_cli(home: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(home)
         .env("HOME", home)
+        // Keep the DSH harness source inside the temporary home even when the
+        // test runner itself was started from a dsh session.
+        .env("DSH_HOME", home.join(".dsh"))
         .env("AI_USAGE_CACHE_DIR", home.join(".cache").join("ai-usage"))
         .env(
             "AI_USAGE_SECRETS",

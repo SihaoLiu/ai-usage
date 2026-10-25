@@ -181,7 +181,7 @@ ai-usage --tool claude --host laptop
 
 ### Upgrade ordering when a release adds a vendor
 
-When a release adds a new tracked vendor (as v2.5.0 adds `kimi`), upgrade the server binary first, then upgrade every client promptly.
+When a release adds a new tracked vendor (as v2.5.0 added `kimi` and the current release adds `dsh`), upgrade the server binary first, then upgrade every client promptly. A client that upgrades first keeps syncing with the previous vendor set until the server is upgraded.
 
 A newer client against an older server degrades gracefully: it holds the new vendor's uploads back (reported as `holding back ... record(s)`), pulls the previous vendor set (reported as `server does not serve vendor(s) ... yet`), and skips integrity checking for that cycle. Everything self-heals on the first sync after the server upgrade.
 

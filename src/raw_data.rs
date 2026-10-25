@@ -22,6 +22,7 @@ use crate::data::claude::detect_fast_tier_snapshot as detect_claude_fast_tier_sn
 use crate::data::codex::{
     detect_fast_tier_snapshot as detect_codex_fast_tier_snapshot, get_codex_dir,
 };
+use crate::data::dsh::get_dsh_dir;
 use crate::data::gemini::get_gemini_dir;
 use crate::data::kimi::get_kimi_dir;
 use crate::data::omp::get_omp_dir;
@@ -97,6 +98,7 @@ pub(crate) struct RawDataCache {
     pub(crate) gemini: Vec<UsageEntry>,
     pub(crate) kimi: Vec<UsageEntry>,
     pub(crate) omp: Vec<UsageEntry>,
+    pub(crate) dsh: Vec<UsageEntry>,
     pub(crate) range: RawDataRange,
     #[serde(default)]
     pub(crate) has_source_data: bool,
@@ -200,6 +202,7 @@ fn prepare_hot_raw_snapshot(source: &RawDataCache, captured_at: DateTime<Local>)
             gemini: recent_entries(&source.gemini, captured_at),
             kimi: recent_entries(&source.kimi, captured_at),
             omp: recent_entries(&source.omp, captured_at),
+            dsh: recent_entries(&source.dsh, captured_at),
             range,
             has_source_data: source.has_source_data,
             local_host_id: source.local_host_id.clone(),
@@ -248,6 +251,7 @@ pub(crate) fn get_tool_data_dir(tool: &str) -> Option<PathBuf> {
         "gemini" => Some(get_gemini_dir().join("tmp")),
         "kimi" => Some(get_kimi_dir().join("sessions")),
         "omp" => Some(get_omp_dir().join("agent").join("sessions")),
+        "dsh" => Some(get_dsh_dir().join("sessions")),
         "claude" => {
             let dirs = data::claude::get_claude_dirs();
             Some(
@@ -354,6 +358,7 @@ fn sort_raw_cache(cache: &mut RawDataCache) {
     sort(&mut cache.gemini);
     sort(&mut cache.kimi);
     sort(&mut cache.omp);
+    sort(&mut cache.dsh);
 }
 
 fn tool_entries(cache: &RawDataCache, tool: Tool) -> &[UsageEntry] {
@@ -363,6 +368,7 @@ fn tool_entries(cache: &RawDataCache, tool: Tool) -> &[UsageEntry] {
         Tool::Gemini => &cache.gemini,
         Tool::Kimi => &cache.kimi,
         Tool::Omp => &cache.omp,
+        Tool::Dsh => &cache.dsh,
         Tool::All => unreachable!("all is not a source tool"),
     }
 }
@@ -374,6 +380,7 @@ fn tool_entries_mut(cache: &mut RawDataCache, tool: Tool) -> &mut Vec<UsageEntry
         Tool::Gemini => &mut cache.gemini,
         Tool::Kimi => &mut cache.kimi,
         Tool::Omp => &mut cache.omp,
+        Tool::Dsh => &mut cache.dsh,
         Tool::All => unreachable!("all is not a source tool"),
     }
 }
@@ -574,7 +581,7 @@ pub(crate) fn local_cached_raw_cache(
 ) -> RawDataCache {
     // Decode one cache at a time so a large history cannot multiply its peak
     // memory use across all vendors.
-    let mut loaded: Vec<LoadedVendorCache> = ["claude", "codex", "gemini", "kimi", "omp"]
+    let mut loaded: Vec<LoadedVendorCache> = ["claude", "codex", "gemini", "kimi", "omp", "dsh"]
         .iter()
         .map(|tool| {
             if include_local {
@@ -600,6 +607,7 @@ pub(crate) fn local_cached_raw_cache(
     let gemini = take(Tool::Gemini, &mut loaded[2]);
     let kimi = take(Tool::Kimi, &mut loaded[3]);
     let omp = take(Tool::Omp, &mut loaded[4]);
+    let dsh = take(Tool::Dsh, &mut loaded[5]);
 
     RawDataCache {
         claude,
@@ -607,6 +615,7 @@ pub(crate) fn local_cached_raw_cache(
         gemini,
         kimi,
         omp,
+        dsh,
         range,
         has_source_data,
         local_host_id: local_host_id.map(str::to_string),
@@ -746,6 +755,15 @@ pub(crate) fn refresh_all_tool_caches() {
         data::omp::collect_usage_files(&omp_dir, None),
         0,
         data::omp::read_omp_file_records,
+    );
+
+    let dsh_dir = get_dsh_dir().join("sessions");
+    data::cache::refresh_retaining_vendor_cache(
+        &cache_root,
+        "dsh",
+        data::dsh::collect_usage_files(&dsh_dir, None),
+        0,
+        data::dsh::read_dsh_file_records,
     );
 }
 
@@ -1006,6 +1024,7 @@ fn compact_resident_raw_cache(
         take_entries_outside_range(&mut cache.gemini, retained_range),
         take_entries_outside_range(&mut cache.kimi, retained_range),
         take_entries_outside_range(&mut cache.omp, retained_range),
+        take_entries_outside_range(&mut cache.dsh, retained_range),
     ];
     let retired_groups =
         take_group_entries_outside_range(&mut cache.stable_record_groups, retained_range);
@@ -1026,6 +1045,7 @@ pub(crate) struct AllToolData<'a> {
     pub(crate) gemini: Cow<'a, [UsageEntry]>,
     pub(crate) kimi: Cow<'a, [UsageEntry]>,
     pub(crate) omp: Cow<'a, [UsageEntry]>,
+    pub(crate) dsh: Cow<'a, [UsageEntry]>,
 }
 
 impl Default for AllToolData<'_> {
@@ -1036,6 +1056,7 @@ impl Default for AllToolData<'_> {
             gemini: Cow::Borrowed(&[]),
             kimi: Cow::Borrowed(&[]),
             omp: Cow::Borrowed(&[]),
+            dsh: Cow::Borrowed(&[]),
         }
     }
 }
@@ -1065,6 +1086,7 @@ pub(crate) fn raw_cache_has_any_tool_data(cache: &RawDataCache) -> bool {
         || !cache.gemini.is_empty()
         || !cache.kimi.is_empty()
         || !cache.omp.is_empty()
+        || !cache.dsh.is_empty()
         || !cache.stable_record_groups.is_empty()
 }
 
@@ -1074,6 +1096,7 @@ pub(crate) fn all_tool_data_has_window_data(all_data: &AllToolData<'_>) -> bool 
         || !all_data.gemini.is_empty()
         || !all_data.kimi.is_empty()
         || !all_data.omp.is_empty()
+        || !all_data.dsh.is_empty()
 }
 
 pub(crate) fn load_all_tool_data(
@@ -1124,6 +1147,10 @@ fn filter_all_tool_data_owned(
             cached_window_with_stable_groups(cache, Tool::Omp, window, session_id, now)
                 .into_owned(),
         ),
+        dsh: Cow::Owned(
+            cached_window_with_stable_groups(cache, Tool::Dsh, window, session_id, now)
+                .into_owned(),
+        ),
     }
 }
 
@@ -1139,6 +1166,7 @@ pub(crate) fn filter_all_tool_data_borrowed<'a>(
         gemini: cached_window_with_stable_groups(cache, Tool::Gemini, window, session_id, now),
         kimi: cached_window_with_stable_groups(cache, Tool::Kimi, window, session_id, now),
         omp: cached_window_with_stable_groups(cache, Tool::Omp, window, session_id, now),
+        dsh: cached_window_with_stable_groups(cache, Tool::Dsh, window, session_id, now),
     }
 }
 
@@ -1205,12 +1233,13 @@ pub(crate) fn calculate_tool_aggregate_time_series(
     all_data: &AllToolData<'_>,
     interval_minutes: i64,
 ) -> ToolTimeSeries {
-    let buckets: [(&[UsageEntry], Tool); 5] = [
+    let buckets: [(&[UsageEntry], Tool); 6] = [
         (&all_data.claude, Tool::Claude),
         (&all_data.codex, Tool::Codex),
         (&all_data.gemini, Tool::Gemini),
         (&all_data.kimi, Tool::Kimi),
         (&all_data.omp, Tool::Omp),
+        (&all_data.dsh, Tool::Dsh),
     ];
     buckets
         .into_iter()
@@ -1252,6 +1281,9 @@ pub(crate) fn calculate_all_model_breakdown(
     if !all_data.omp.is_empty() {
         all_stats.extend(stats::calculate_omp_model_breakdown(&all_data.omp, pricing));
     }
+    if !all_data.dsh.is_empty() {
+        all_stats.extend(stats::calculate_dsh_model_breakdown(&all_data.dsh, pricing));
+    }
 
     all_stats.sort_by(|a, b| b.count.cmp(&a.count));
     all_stats
@@ -1262,12 +1294,13 @@ pub(crate) fn calculate_all_dashboard_data(
     pricing: &AllPricing,
     interval_minutes: i64,
 ) -> (Vec<ModelBreakdownRow>, ToolTimeSeries) {
-    let buckets: [(&[UsageEntry], Tool); 5] = [
+    let buckets: [(&[UsageEntry], Tool); 6] = [
         (&all_data.claude, Tool::Claude),
         (&all_data.codex, Tool::Codex),
         (&all_data.gemini, Tool::Gemini),
         (&all_data.kimi, Tool::Kimi),
         (&all_data.omp, Tool::Omp),
+        (&all_data.dsh, Tool::Dsh),
     ];
     let mut model_stats = Vec::new();
     let mut tool_time_series = HashMap::new();
@@ -1312,7 +1345,7 @@ pub(crate) fn calculate_weighted_cost_per_mtok(
     let mut weighted_cost = 0.0;
     let mut total_savings = 0.0;
 
-    for tool in ["claude", "codex", "gemini", "kimi", "omp"] {
+    for tool in ["claude", "codex", "gemini", "kimi", "omp", "dsh"] {
         let Some(&(tokens, api_cost)) = by_tool.get(tool) else {
             continue;
         };

@@ -164,6 +164,9 @@ fn selected_tool(mut data: AllToolData<'_>, tool: Tool) -> AllToolData<'_> {
     if !matches!(tool, Tool::All | Tool::Omp) {
         data.omp = Cow::Borrowed(&[]);
     }
+    if !matches!(tool, Tool::All | Tool::Dsh) {
+        data.dsh = Cow::Borrowed(&[]);
+    }
     data
 }
 
@@ -196,6 +199,9 @@ fn partition_projected_data(
         )),
         omp: Cow::Owned(filter_usage_data_by_window_and_session(
             &data.omp, window, None, now,
+        )),
+        dsh: Cow::Owned(filter_usage_data_by_window_and_session(
+            &data.dsh, window, None, now,
         )),
     }
 }
@@ -339,6 +345,7 @@ mod tests {
             gemini: Vec::new(),
             kimi: Vec::new(),
             omp: Vec::new(),
+            dsh: Vec::new(),
             range: RawDataRange::from_bounds(now - Duration::days(2), now + Duration::days(1)),
             has_source_data: true,
             local_host_id: None,
@@ -500,6 +507,7 @@ mod tests {
             gemini: Vec::new(),
             kimi: Vec::new(),
             omp: Vec::new(),
+            dsh: Vec::new(),
             range: RawDataRange::from_bounds(now - Duration::days(3), now + Duration::days(1)),
             has_source_data: true,
             local_host_id: None,
@@ -546,6 +554,7 @@ mod tests {
             gemini: Vec::new(),
             kimi: Vec::new(),
             omp: Vec::new(),
+            dsh: Vec::new(),
             range: required_range(&query),
             has_source_data: true,
             local_host_id: Some("local-host".to_string()),
@@ -616,6 +625,7 @@ mod tests {
                 usage_entry(local_timestamp("2026-11-01T01:31:00-08:00"), "k3", 30),
             ],
             omp: Vec::new(),
+            dsh: Vec::new(),
             range,
             has_source_data: true,
             local_host_id: None,

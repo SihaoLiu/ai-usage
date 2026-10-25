@@ -112,7 +112,7 @@ struct Args {
     once: bool,
 
     /// Tool to collect statistics from
-    #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "kimi", "omp", "all"])]
+    #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "kimi", "omp", "dsh", "all"])]
     tool: String,
 
     /// Breakdown table shape: flat models or models grouped by vendor
@@ -158,7 +158,7 @@ enum CliCommand {
         days: i64,
 
         /// Tool to include in the snapshot
-        #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "kimi", "omp", "all"])]
+        #[arg(long, default_value = "all", value_parser = ["claude", "codex", "gemini", "kimi", "omp", "dsh", "all"])]
         tool: String,
 
         /// Filter usage to a single machine id
@@ -282,6 +282,7 @@ fn get_version(state: &mut AppState, tool: &str) -> String {
         Some(Tool::Codex) => ("codex", Tool::Codex.display_name()),
         Some(Tool::Gemini) => ("gemini", Tool::Gemini.display_name()),
         Some(Tool::Kimi) => ("kimi", Tool::Kimi.display_name()),
+        Some(Tool::Dsh) => ("dsh", Tool::Dsh.display_name()),
         _ => return String::new(),
     };
 
@@ -428,6 +429,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         "gemini" => &cache.gemini,
         "kimi" => &cache.kimi,
         "omp" => &cache.omp,
+        "dsh" => &cache.dsh,
         _ => &cache.claude,
     };
     let filtered = data::filter_usage_data_by_window_and_session(
@@ -458,6 +460,7 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         "gemini" => stats::calculate_gemini_model_breakdown(&filtered, &state.pricing),
         "kimi" => stats::calculate_kimi_model_breakdown(&filtered, &state.pricing),
         "omp" => stats::calculate_omp_model_breakdown(&filtered, &state.pricing),
+        "dsh" => stats::calculate_dsh_model_breakdown(&filtered, &state.pricing),
         _ => stats::calculate_claude_model_breakdown(&filtered, &state.pricing),
     };
     let table_rows = build_table(&model_stats, state.table_view, state.sort_metric);
@@ -515,6 +518,9 @@ fn print_stats_single(state: &mut AppState, once: bool) -> Option<bool> {
         }
         "omp" => {
             stats::calculate_omp_model_token_breakdown_time_series(&filtered, interval_minutes)
+        }
+        "dsh" => {
+            stats::calculate_dsh_model_token_breakdown_time_series(&filtered, interval_minutes)
         }
         _ => stats::calculate_claude_model_token_breakdown_time_series(&filtered, interval_minutes),
     };
@@ -1060,6 +1066,7 @@ mod tests {
             gemini: Vec::new(),
             kimi: Vec::new(),
             omp: Vec::new(),
+            dsh: Vec::new(),
             range: RawDataRange::from_bounds(
                 center - chrono::Duration::days(1),
                 center + chrono::Duration::days(1),

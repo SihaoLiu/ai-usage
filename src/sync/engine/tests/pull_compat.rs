@@ -3,9 +3,8 @@ use super::*;
 #[test]
 fn pull_downgrade_after_rollback_keeps_cached_records_and_cursor() {
     let cache_root = unique_temp_dir("pull-rollback");
-    let cached_kimi =
-        remote_usage_record("laptop", "kimi", "remote-kimi", "2026-05-18T12:00:00Z", 10);
-    crate::data::cache::merge_remote_records(&cache_root, "laptop", vec![cached_kimi])
+    let cached_dsh = remote_usage_record("laptop", "dsh", "remote-dsh", "2026-05-18T12:00:00Z", 10);
+    crate::data::cache::merge_remote_records(&cache_root, "laptop", vec![cached_dsh])
         .expect("seed remote cache");
     crate::sync::state::save_sync_state(
         &cache_root,
@@ -31,7 +30,7 @@ fn pull_downgrade_after_rollback_keeps_cached_records_and_cursor() {
             max_seq: 12,
             truncated: false,
         }],
-        "kimi",
+        "dsh",
     );
 
     run_pull_once_with_progress(
@@ -48,7 +47,8 @@ fn pull_downgrade_after_rollback_keeps_cached_records_and_cursor() {
     assert!(requests.iter().all(|request| request.1 == "workstation"));
     let remote = crate::data::cache::load_remote_entries(&cache_root, None);
     assert_eq!(remote.len(), 1);
-    assert_eq!(remote[0].dedup_key, "remote-kimi");
+    assert_eq!(remote[0].vendor, "dsh");
+    assert_eq!(remote[0].dedup_key, "remote-dsh");
     let state = crate::sync::state::load_sync_state(&cache_root);
     assert_eq!(
         state.pull_vendors,
@@ -88,7 +88,7 @@ fn pull_preserves_cache_and_downgrades_when_older_server_rejects_new_vendor() {
             max_seq: 11,
             truncated: false,
         }],
-        "kimi",
+        "dsh",
     );
 
     let mut events = Vec::new();
@@ -102,14 +102,14 @@ fn pull_preserves_cache_and_downgrades_when_older_server_rejects_new_vendor() {
 
     let requests = transport.pull_requests.borrow();
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].3.contains(&"kimi".to_string()));
-    assert!(!requests[1].3.contains(&"kimi".to_string()));
+    assert!(requests[0].3.contains(&"dsh".to_string()));
+    assert!(!requests[1].3.contains(&"dsh".to_string()));
     assert_eq!(requests[1].0, 10);
     assert!(requests.iter().all(|request| request.1 == "workstation"));
     assert!(events.iter().any(|event| matches!(
         event,
         SyncProgress::PullVendorsUnavailable { vendors }
-            if vendors == &vec!["kimi".to_string()]
+            if vendors == &vec!["dsh".to_string()]
     )));
     let mut remote_keys: Vec<String> = crate::data::cache::load_remote_entries(&cache_root, None)
         .iter()
@@ -148,8 +148,7 @@ fn pull_migrates_vendor_fingerprint_once_server_accepts_new_vendor() {
         },
     )
     .expect("save pre-upgrade state");
-    let refetched =
-        remote_usage_record("laptop", "kimi", "remote-kimi", "2026-05-18T13:00:00Z", 20);
+    let refetched = remote_usage_record("laptop", "dsh", "remote-dsh", "2026-05-18T13:00:00Z", 20);
     let transport = FakeTransport::new(vec![PullResponse {
         records: vec![sequenced_remote_record(12, refetched)],
         max_seq: 12,
@@ -170,7 +169,8 @@ fn pull_migrates_vendor_fingerprint_once_server_accepts_new_vendor() {
     assert_eq!(requests[0].1, "workstation");
     let remote = crate::data::cache::load_remote_entries(&cache_root, None);
     assert_eq!(remote.len(), 1);
-    assert_eq!(remote[0].dedup_key, "remote-kimi");
+    assert_eq!(remote[0].vendor, "dsh");
+    assert_eq!(remote[0].dedup_key, "remote-dsh");
     let state = crate::sync::state::load_sync_state(&cache_root);
     assert_eq!(
         state.pull_vendors,

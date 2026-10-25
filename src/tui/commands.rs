@@ -147,7 +147,7 @@ fn switch_tool(state: &mut AppState, requested: &str) -> Outcome {
         }
         None => Outcome::message(
             Effect::None,
-            "Usage: t, tool [claude|codex|gemini|kimi|omp|all]",
+            "Usage: t, tool [claude|codex|gemini|kimi|omp|dsh|all]",
         ),
     }
 }
@@ -435,7 +435,7 @@ pub fn execute(state: &mut AppState, raw: &str) -> Outcome {
         "t" | "tool" => Outcome {
             messages: vec![
                 format!("Current tool: {}", state.tool),
-                "Usage: t, tool [claude|codex|gemini|kimi|omp|all]".to_string(),
+                "Usage: t, tool [claude|codex|gemini|kimi|omp|dsh|all]".to_string(),
             ],
             effect: Effect::None,
         },
@@ -591,9 +591,9 @@ static HELP_TOPICS: &[HelpTopic] = &[
         name: "tool",
         invocation: "t <X> | n | a | Tab",
         keys: &["t", "n", "a", "tab"],
-        summary: "Switch harness (claude|codex|gemini|kimi|omp|all)",
+        summary: "Switch harness (claude|codex|gemini|kimi|omp|dsh|all)",
         detail: &[
-            "Usage: t <claude|codex|gemini|kimi|omp|all>",
+            "Usage: t <claude|codex|gemini|kimi|omp|dsh|all>",
             "       n              rotate to the next tool",
             "       Tab / Shift+Tab cycle the header tabs forward / backward",
             "       a              jump straight to tool=all",
@@ -1147,6 +1147,7 @@ mod tests {
                     ..Default::default()
                 },
             )],
+            dsh: Vec::new(),
             range: crate::RawDataRange::from_bounds(
                 now - chrono::Duration::days(3),
                 now + chrono::Duration::days(1),

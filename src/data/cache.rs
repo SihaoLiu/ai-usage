@@ -51,6 +51,7 @@ const CODEX_PARSER_REVISION: u32 = 3;
 const GEMINI_PARSER_REVISION: u32 = 3;
 const KIMI_PARSER_REVISION: u32 = 4;
 const OMP_PARSER_REVISION: u32 = 4;
+const DSH_PARSER_REVISION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheManifest {
@@ -126,6 +127,7 @@ fn parser_revision(vendor: &str) -> u32 {
         "codex" => CODEX_PARSER_REVISION,
         "gemini" => GEMINI_PARSER_REVISION,
         "kimi" => KIMI_PARSER_REVISION,
+        "dsh" => DSH_PARSER_REVISION,
         _ => 0,
     }
 }
@@ -140,7 +142,7 @@ pub(crate) fn vendor_parser_revision_is_current(cache_root: &Path, vendor: &str)
 }
 
 pub(crate) fn local_parser_revisions_are_current(cache_root: &Path) -> bool {
-    ["claude", "codex", "gemini", "kimi", "omp"]
+    ["claude", "codex", "gemini", "kimi", "omp", "dsh"]
         .into_iter()
         .all(|vendor| vendor_parser_revision_is_current(cache_root, vendor))
 }

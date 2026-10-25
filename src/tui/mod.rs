@@ -866,6 +866,7 @@ mod tests {
                 gemini: Vec::new(),
                 kimi: Vec::new(),
                 omp: Vec::new(),
+                dsh: Vec::new(),
                 range: crate::RawDataRange::from_bounds(
                     now - ChronoDuration::days(8),
                     now + ChronoDuration::days(8),

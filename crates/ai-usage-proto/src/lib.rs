@@ -373,7 +373,10 @@ pub fn is_valid_host_id(host_id: &str) -> bool {
 }
 
 pub fn is_valid_vendor(vendor: &str) -> bool {
-    matches!(vendor, "claude" | "codex" | "gemini" | "kimi" | "omp")
+    matches!(
+        vendor,
+        "claude" | "codex" | "gemini" | "kimi" | "omp" | "dsh"
+    )
 }
 
 pub fn is_globally_stable_usage_key(vendor: &str, dedup_key: &str) -> bool {
@@ -401,6 +404,12 @@ pub fn is_globally_stable_usage_key(vendor: &str, dedup_key: &str) -> bool {
                 has_nonempty_suffix(dedup_key, "omp:response:")
             }
         }
+        "dsh" => dedup_key
+            .strip_prefix("dsh:session:")
+            .and_then(|suffix| suffix.split_once(':'))
+            .is_some_and(|(session_id, identity)| {
+                !session_id.is_empty() && session_id != "unknown" && !identity.is_empty()
+            }),
         _ => false,
     }
 }
@@ -639,7 +648,7 @@ mod tests {
 
     #[test]
     fn accepts_every_tracked_vendor() {
-        for vendor in ["claude", "codex", "gemini", "kimi", "omp"] {
+        for vendor in ["claude", "codex", "gemini", "kimi", "omp", "dsh"] {
             let mut record = valid_record();
             record.vendor = vendor.to_string();
 
@@ -696,6 +705,18 @@ mod tests {
                 true,
             ),
             ("omp response", "omp", "omp:response:response-a", true),
+            (
+                "dsh message settlement",
+                "dsh",
+                "dsh:session:session-a:message:turn:1:step:2:settlement:0",
+                true,
+            ),
+            (
+                "dsh compaction",
+                "dsh",
+                "dsh:session:session-a:compaction:compaction-a",
+                true,
+            ),
             ("empty key", "claude", "", false),
             (
                 "vendor prefix mismatch",
@@ -810,6 +831,24 @@ mod tests {
             ("empty gemini message", "gemini", "gemini:session-a:", false),
             ("empty gemini msg", "gemini", "gemini:msg:", false),
             ("empty kimi response", "kimi", "kimi:response:", false),
+            (
+                "dsh unknown session",
+                "dsh",
+                "dsh:session:unknown:message:turn:1:step:1:settlement:0",
+                false,
+            ),
+            (
+                "dsh empty session",
+                "dsh",
+                "dsh:session::compaction:compaction-a",
+                false,
+            ),
+            (
+                "dsh file fallback",
+                "dsh",
+                "dsh:file:/tmp/session.v4.jsonl:0",
+                false,
+            ),
             ("empty omp message", "omp", "omp:message:", false),
             ("empty omp response", "omp", "omp:response:", false),
             (

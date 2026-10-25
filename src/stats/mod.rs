@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod dsh;
 pub mod gemini;
 pub mod kimi;
 pub mod omp;
@@ -575,6 +576,7 @@ pub use claude::{
 pub use codex::{
     calculate_codex_model_breakdown, calculate_codex_model_token_breakdown_time_series,
 };
+pub use dsh::{calculate_dsh_model_breakdown, calculate_dsh_model_token_breakdown_time_series};
 pub use gemini::{
     calculate_gemini_model_breakdown, calculate_gemini_model_token_breakdown_time_series,
 };

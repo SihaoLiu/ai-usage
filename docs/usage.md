@@ -8,7 +8,7 @@ ai-usage [OPTIONS]
 Options:
   --once              Show stats once and exit (no monitor loop)
   --days <N>          Number of days to analyze (default: 3)
-  --tool <TOOL>       Filter to a single tool: claude, codex, gemini, kimi, or omp
+  --tool <TOOL>       Filter to a single tool: claude, codex, gemini, kimi, omp, or dsh
   --view <VIEW>       Table shape: flat or vendor (default: flat)
   --sort <KEY>        Descending sort key: msgs, cache, prefill, decode, total,
                       cost, or rate (default: msgs)
@@ -29,7 +29,7 @@ ai-usage snapshot --days 7 --tool all
 ```
 
 The command writes one versioned JSON document to stdout. Diagnostics are written
-to stderr. `--tool` accepts `claude`, `codex`, `gemini`, `kimi`, `omp`, or `all`;
+to stderr. `--tool` accepts `claude`, `codex`, `gemini`, `kimi`, `omp`, `dsh`, or `all`;
 `--host` and `--session` apply the same filters as the interactive dashboard.
 
 The document contains `schema_version`, `generated_at`, `timezone`, `range`,
@@ -43,7 +43,7 @@ The document contains `schema_version`, `generated_at`, `timezone`, `range`,
 | `q` / `Esc` | Quit |
 | `n` | Cycle to the next harness |
 | `r` | Refresh now |
-| `t claude` / `t codex` / `t gemini` / `t kimi` / `t omp` / `t all` | Switch tool (also `tool <name>`) |
+| `t claude` / `t codex` / `t gemini` / `t kimi` / `t omp` / `t dsh` / `t all` | Switch tool (also `tool <name>`) |
 | `host all` / `host <HOST>` | Switch between all machines and one machine |
 | `d <N>` | Change days range |
 | `i <N>` / `i auto` | Set the refresh cadence in seconds, or follow the chart interval (also `interval <N\|auto>`) |
@@ -82,6 +82,16 @@ The tool reads local usage data written by each harness:
 | Gemini | `~/.gemini/tmp/` | `<hash>/chats/session-*.json` |
 | Kimi Code | `~/.kimi-code/sessions/` | `**/agents/*/wire.jsonl` |
 | Oh My Pi | `~/.omp/agent/sessions/` | `**/*.jsonl` |
+| DeepSeek Harness (`dsh`) | `~/.dsh/sessions/` | `--<cwd>--/<session>/session[.vN].jsonl[.zstd]` |
+
+`dsh` persists one log per session below `$DSH_HOME/sessions/`, appending each
+new batch as an independent zstd frame; logs migrated to a newer format appear
+as `session.vN.jsonl.zstd` beside the older `session.jsonl[.zstd]`. Only the
+newest generation of a session is read, and records keep content-stable keys so
+migrated or forked sessions are never billed twice. Usage comes from provider
+`assistant/message` settlements, retried `assistant/attempt` calls, and
+`compaction/summary` calls. A seeded child's inherited prefix was already
+counted in its parent session and is skipped.
 
 ### Environment Variable Overrides
 
@@ -92,6 +102,7 @@ Override default config directories:
 - `GEMINI_CONFIG_DIR` (default: `~/.gemini`)
 - `KIMI_CONFIG_DIR` (default: `~/.kimi-code`)
 - `OMP_CONFIG_DIR` (default: `~/.omp`)
+- `DSH_HOME` (default: `~/.dsh`)
 
 ## Display Modes
 
@@ -181,6 +192,7 @@ src/
     gemini.rs        # Gemini JSON reader
     kimi.rs          # Kimi Code wire JSONL reader
     omp.rs           # Oh My Pi JSONL reader
+    dsh.rs           # DeepSeek Harness zstd session-log reader
   stats/
     mod.rs           # Model breakdown and time series calculation
     claude.rs        # Claude statistics
@@ -188,6 +200,7 @@ src/
     gemini.rs        # Gemini statistics
     kimi.rs          # Kimi Code statistics
     omp.rs           # Oh My Pi statistics
+    dsh.rs           # DeepSeek Harness statistics
 pricing.json         # API pricing data
 ```
 

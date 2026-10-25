@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod claude;
 pub mod codex;
+pub mod dsh;
 pub mod gemini;
 pub mod kimi;
 pub mod omp;
@@ -299,7 +300,7 @@ mod tests {
         let other_path = PathBuf::from(format!("/{}other.jsonl", "nested/".repeat(200)));
         let position = format!("{}:{}", i64::MAX, usize::MAX);
 
-        for vendor in ["claude", "codex", "gemini", "kimi", "omp"] {
+        for vendor in ["claude", "codex", "gemini", "kimi", "omp", "dsh"] {
             let key = file_fallback_key(vendor, &long_path, &position);
             assert!(key.len() <= 512, "vendor={vendor}, len={}", key.len());
             assert!(key.starts_with(&format!("{vendor}:file:sha256:")));

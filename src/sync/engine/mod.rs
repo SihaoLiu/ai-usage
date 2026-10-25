@@ -17,12 +17,12 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const SUPPORTED_PULL_VENDORS: [&str; 5] = ["claude", "codex", "gemini", "kimi", "omp"];
-const VENDORS: [&str; 5] = SUPPORTED_PULL_VENDORS;
+pub const SUPPORTED_PULL_VENDORS: [&str; 6] = ["claude", "codex", "gemini", "kimi", "omp", "dsh"];
+const VENDORS: [&str; 6] = SUPPORTED_PULL_VENDORS;
 /// The previous release's vendor set, offered as a fallback when an older
 /// server rejects [`SUPPORTED_PULL_VENDORS`]. Keeps sync alive (minus the new
 /// vendor) while the client is upgraded before the server.
-const PREVIOUS_PULL_VENDORS: [&str; 4] = ["claude", "codex", "gemini", "omp"];
+const PREVIOUS_PULL_VENDORS: [&str; 5] = ["claude", "codex", "gemini", "kimi", "omp"];
 /// Vendors every supported server generation knows. An "invalid vendor"
 /// rejection for one of these signals a broken server or proxy rather than
 /// version skew, and must fail the upload loudly instead of being held back.
